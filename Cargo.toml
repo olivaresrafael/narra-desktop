@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/olivaresrafael/narra-desktop"
+rust-version = "1.95"
+
+[workspace.dependencies]
