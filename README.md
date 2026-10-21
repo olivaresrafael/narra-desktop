@@ -37,6 +37,19 @@ cargo test --workspace
 
 CI runs the same three commands on `macos-latest`.
 
+### macOS build prerequisite (affects `spike-editor`)
+
+GPUI compiles Metal shaders at build time. If you see
+`cannot execute tool 'metal' due to missing Metal Toolchain`:
+
+```sh
+xcodebuild -checkFirstLaunchStatus
+xcodebuild -runFirstLaunch
+xcodebuild -downloadComponent MetalToolchain
+```
+
+Recorded in the context pack `TECHNICAL_SPIKES.md` (Spike A, environment findings).
+
 ## Conventions
 
 - Decisions are recorded with IDs in the context pack `DECISIONS.md`; code and PRs reference those IDs rather than restating decisions.

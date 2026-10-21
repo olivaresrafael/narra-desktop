@@ -1,0 +1,15 @@
+[package]
+name = "spike-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Spike A: native editor framework assessment (temporary, deleted after the spike)"
+publish = false
+
+# Spike-only dependency (D-003 / Spike A). License: Apache-2.0, verified
+# compatible with GPL-3.0 (D-015). Candidate status: not approved for the
+# product until the spike report records a verdict in PERFORMANCE_BASELINES.md.
+[dependencies]
+gpui = "0.2"
