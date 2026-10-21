@@ -13,3 +13,6 @@ publish = false
 # product until the spike report records a verdict in PERFORMANCE_BASELINES.md.
 [dependencies]
 gpui = "0.2"
+# Grapheme-correct cursor movement (Spike B requirement). MIT/Apache-2.0, and
+# already present in the GPUI dependency tree, so no new supply-chain surface.
+unicode-segmentation = "1"

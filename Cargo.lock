@@ -4959,6 +4959,7 @@ name = "spike-editor"
 version = "0.0.0"
 dependencies = [
  "gpui",
+ "unicode-segmentation",
 ]
 
 [[package]]
