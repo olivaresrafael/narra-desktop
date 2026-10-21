@@ -1,0 +1,13 @@
+[package]
+name = "fixture-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Deterministic Fountain fixture generator for performance measurement (D-019)"
+publish = false
+
+# No dependencies on purpose: a seeded PRNG and std-only argument parsing keep
+# the measurement toolchain reproducible and the license surface empty.
+[dependencies]

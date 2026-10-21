@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
+name = "fixture-gen"
+version = "0.0.0"
+
+[[package]]
 name = "narra-core"
 version = "0.0.0"
