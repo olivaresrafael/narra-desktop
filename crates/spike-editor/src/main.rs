@@ -37,9 +37,9 @@ use std::time::{Duration, Instant};
 use buffer::{Buffer, Position};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, KeyBinding, Pixels, Point, Rgba, ScrollStrategy, ShapedLine, TextRun,
-    Timer, UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions,
-    canvas, div, point, prelude::*, px, rgb, rgba, size, uniform_list,
+    FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, Pixels, Point, Rgba, ShapedLine,
+    TextRun, Timer, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas, div,
+    list, point, prelude::*, px, rgb, rgba, size,
 };
 
 actions!(
@@ -76,8 +76,9 @@ actions!(
     ]
 );
 
-/// Rows are fixed-height so `uniform_list` can virtualize them. Wrapping is
-/// still slice 3 work; long lines are clipped (documented limitation).
+/// Baseline line height. Wrapping (slice 3) makes non-hot rows variable-height
+/// (`list` measures each); this constant still sizes the caret, the hot-row
+/// single-line fallback, and the list overdraw.
 const LINE_HEIGHT: f32 = 18.0;
 
 /// Explicit so that cursor x-positions (shaped manually) match rendered rows.
@@ -357,11 +358,12 @@ struct Editor {
     scenes_dirty: bool,
     current_scene: usize,
 
-    scroll: UniformListScrollHandle,
+    list_state: ListState,
     focus_handle: FocusHandle,
-    /// Bounds of the list container (captured from the canvas paint hook);
-    /// needed for caret visibility and point → document hit-testing.
-    last_bounds: Option<Bounds<Pixels>>,
+    /// Wrap width for non-hot rows, refreshed from the viewport each frame and
+    /// read by the `list` render callback (which reaches the editor via the
+    /// entity, not through the render-time `&mut self`).
+    wrap_width: Pixels,
 
     metrics: Rc<RefCell<Metrics>>,
     probe_left: usize,
@@ -407,8 +409,16 @@ impl Editor {
         }
     }
 
-    fn scroll_y(&self) -> Pixels {
-        self.scroll.0.borrow().base_handle.offset().y
+    /// Keep the `list` item count in sync with the buffer after an edit that
+    /// replaced `deleted` (the removed text) with `inserted` starting at
+    /// `start_offset`. Uses `splice`, not `reset`, so the scroll position is
+    /// preserved across keystrokes (reset would jump to the top).
+    fn splice_for_edit(&self, start_offset: usize, deleted: &str, inserted: &str) {
+        let start_line = self.buffer.position_at(start_offset).line;
+        let old_span = deleted.matches('\n').count() + 1;
+        let new_span = inserted.matches('\n').count() + 1;
+        self.list_state
+            .splice(start_line..start_line + old_span, new_span);
     }
 
     fn clamp(&self, range: Range<usize>) -> Range<usize> {
@@ -429,7 +439,9 @@ impl Editor {
     /// Apply an edit, record undo state, move the caret after the inserted
     /// text and invalidate the derived scene index.
     fn apply_edit(&mut self, range: Range<usize>, text: &str) -> Range<usize> {
+        let start = range.start;
         let (inserted, deleted) = self.buffer.replace(range, text);
+        self.splice_for_edit(start, &deleted, text);
         self.metrics.borrow_mut().edits += 1;
         self.undo_stack.push(Edit {
             range: inserted.clone(),
@@ -461,7 +473,9 @@ impl Editor {
             return;
         };
         let inserted = edit.range.start..edit.range.start + edit.new_text.len();
+        let start = inserted.start;
         let (restored, deleted) = self.buffer.replace(inserted, &edit.old_text);
+        self.splice_for_edit(start, &deleted, &edit.old_text);
         self.redo_stack.push(Edit {
             range: restored.clone(),
             new_text: edit.old_text.clone(),
@@ -475,7 +489,9 @@ impl Editor {
             return;
         };
         let current = edit.range.start..edit.range.start + edit.new_text.len();
+        let start = current.start;
         let (restored, deleted) = self.buffer.replace(current, &edit.old_text);
+        self.splice_for_edit(start, &deleted, &edit.old_text);
         self.undo_stack.push(Edit {
             range: restored.clone(),
             new_text: edit.old_text.clone(),
@@ -508,7 +524,7 @@ impl Editor {
         let next = (self.current_scene as i64 + direction).rem_euclid(len);
         self.current_scene = next as usize;
         let line = self.scene_lines[self.current_scene];
-        self.scroll.scroll_to_item(line, ScrollStrategy::Top);
+        self.list_state.scroll_to_reveal_item(line);
         let offset = self.buffer.offset_at(Position { line, col: 0 });
         self.selected = offset..offset;
         self.reversed = false;
@@ -525,7 +541,7 @@ impl Editor {
             return;
         }
         let target_line = self.scene_lines[self.probe_cursor % self.scene_lines.len()];
-        self.scroll.scroll_to_item(target_line, ScrollStrategy::Top);
+        self.list_state.scroll_to_reveal_item(target_line);
         self.probe_cursor += 1;
         self.probe_left = self.probe_left.saturating_sub(1);
 
@@ -561,19 +577,8 @@ impl Editor {
     }
 
     fn ensure_caret_visible(&mut self) {
-        let Some(bounds) = self.last_bounds else {
-            return;
-        };
         let line = self.buffer.position_at(self.caret()).line;
-        let scroll = self.scroll_y();
-        let top = px(line as f32 * LINE_HEIGHT);
-        let bottom = top + px(LINE_HEIGHT);
-        let viewport = bounds.size.height;
-        if top < scroll {
-            self.scroll.scroll_to_item(line, ScrollStrategy::Top);
-        } else if bottom > scroll + viewport {
-            self.scroll.scroll_to_item(line, ScrollStrategy::Bottom);
-        }
+        self.list_state.scroll_to_reveal_item(line);
     }
 
     // ---- caret movement -------------------------------------------------
@@ -804,20 +809,16 @@ impl Editor {
         )
     }
 
-    /// One row of the virtualized list. Rows carrying caret/selection/IME
-    /// state are split into positioned segments; everything else stays a
-    /// single text child (the slice-1 fast path).
+    /// One row of the virtualized list.
+    ///
+    /// Non-hot rows (no caret/selection/IME) wrap at `wrap_width` and take
+    /// whatever height the wrap needs; `list` measures each, so virtualization
+    /// is preserved with variable heights. Rows carrying caret/selection/IME
+    /// state keep the slice-2 single-line representation (fixed height, no
+    /// wrap) so the caret stays exact — the documented spike compromise for
+    /// wrapped editing.
     fn row(&self, ix: usize) -> gpui::Div {
         let text = &self.buffer.lines()[ix];
-        let mut row = div()
-            .h(px(LINE_HEIGHT))
-            .px_2()
-            .flex()
-            .items_center()
-            .whitespace_nowrap()
-            .font_family(FONT_FAMILY)
-            .text_size(px(TEXT_SIZE))
-            .text_color(line_color(text));
 
         let doc = self.buffer.line_content_range(ix);
         let caret = self.caret();
@@ -833,9 +834,21 @@ impl Editor {
         let marked_here = marked.as_ref().filter(|range| intersects(range));
         let caret_here = caret >= doc.start && caret <= doc.end;
 
+        let base = div()
+            .px_2()
+            .font_family(FONT_FAMILY)
+            .text_size(px(TEXT_SIZE))
+            .text_color(line_color(text));
+
         if selection_here.is_none() && marked_here.is_none() && !caret_here {
-            return row.child(text.clone());
+            return base.w(self.wrap_width).child(text.clone());
         }
+
+        let mut row = base
+            .h(px(LINE_HEIGHT))
+            .flex()
+            .items_center()
+            .whitespace_nowrap();
 
         let len = text.len();
         let mut cuts: Vec<usize> = vec![0, len];
@@ -1040,44 +1053,38 @@ impl EntityInputHandler for Editor {
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
-        bounds: Bounds<Pixels>,
+        _bounds: Bounds<Pixels>,
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.clamp(self.range_from_utf16(&range_utf16));
         let start = self.buffer.position_at(range.start);
         let end = self.buffer.position_at(range.end);
-        let scroll = self.scroll_y();
+        // `bounds_for_item` already accounts for scroll. Only rendered (visible)
+        // items report bounds, which is fine: IME positions over visible text.
+        let start_bounds = self.list_state.bounds_for_item(start.line)?;
+        let end_bounds = self.list_state.bounds_for_item(end.line);
         let x_start = x_for_index(window, &self.buffer.lines()[start.line], start.col);
         let x_end = x_for_index(window, &self.buffer.lines()[end.line], end.col);
-        let top = bounds.top() + px(start.line as f32 * LINE_HEIGHT) - scroll;
-        let bottom = bounds.top() + px(end.line as f32 * LINE_HEIGHT + LINE_HEIGHT) - scroll;
-        Some(Bounds::from_corners(
-            point(bounds.left() + x_start, top),
-            point(bounds.left() + x_end, bottom),
-        ))
+        let top_left = point(start_bounds.left() + x_start, start_bounds.top());
+        let bottom_right = match end_bounds {
+            Some(bounds) => point(bounds.left() + x_end, bounds.bottom()),
+            None => point(start_bounds.left() + x_end, start_bounds.bottom()),
+        };
+        Some(Bounds::from_corners(top_left, bottom_right))
     }
 
     fn character_index_for_point(
         &mut self,
-        position: Point<Pixels>,
-        window: &mut Window,
+        _position: Point<Pixels>,
+        _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.last_bounds?;
-        let scroll = self.scroll_y();
-        let line = ((position.y - bounds.top() + scroll) / px(LINE_HEIGHT))
-            .floor()
-            .clamp(0.0, (self.buffer.line_count() - 1) as f32) as usize;
-        let text = &self.buffer.lines()[line];
-        let x = position.x - bounds.left() - px(ROW_PADDING_X);
-        let x = if x < Pixels::ZERO { Pixels::ZERO } else { x };
-        let col = shape_line(window, text)
-            .index_for_x(x)
-            .unwrap_or(0)
-            .min(text.len());
-        let offset = self.buffer.offset_at(Position { line, col });
-        Some(self.buffer.offset_to_utf16(offset))
+        // Mouse hit-testing needs a point → item → wrapped-visual-row mapping
+        // that the wrapping spike does not implement (mouse caret placement is
+        // slice-3-pending). Returning None keeps IME/text input working; only
+        // platform-driven mouse selection/word-pick is affected.
+        None
     }
 }
 
@@ -1090,7 +1097,10 @@ impl Render for Editor {
         // notifying during render (see `advance_probe`).
         self.schedule_probe_step(window, cx);
 
-        let line_count = self.buffer.line_count();
+        // Wrap width for non-hot rows, refreshed from the viewport each frame.
+        // The `list` render callback reads it back through the entity.
+        self.wrap_width = (window.viewport_size().width - px(ROW_PADDING_X * 2.0)).max(px(200.0));
+
         let status = self.status_text();
         let focus = self.focus_handle.clone();
         let entity = cx.entity();
@@ -1143,13 +1153,12 @@ impl Render for Editor {
                     .flex_1()
                     .relative()
                     .child(
-                        uniform_list(
-                            "lines",
-                            line_count,
-                            cx.processor(|this, range: Range<usize>, _window, _cx| {
-                                range.map(|ix| this.row(ix)).collect::<Vec<_>>()
-                            }),
-                        )
+                        list(self.list_state.clone(), {
+                            let entity = entity.clone();
+                            move |ix: usize, _window: &mut Window, cx: &mut App| {
+                                entity.read(cx).row(ix).into_any_element()
+                            }
+                        })
                         .size_full(),
                     )
                     // Invisible overlay that registers the platform input
@@ -1157,12 +1166,7 @@ impl Render for Editor {
                     // `EntityInputHandler` while the root has focus.
                     .child(
                         canvas(
-                            {
-                                let entity = entity.clone();
-                                move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
-                                    entity.update(cx, |view, _| view.last_bounds = Some(bounds));
-                                }
-                            },
+                            |_bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| (),
                             {
                                 let entity = entity.clone();
                                 let focus = focus.clone();
@@ -1315,8 +1319,10 @@ fn run() -> Result<(), String> {
             }
         });
 
+        let buffer = Buffer::new(&content);
+        let line_count = buffer.line_count();
         let entity = cx.new(|cx| Editor {
-            buffer: Buffer::new(&content),
+            buffer,
             selected: 0..0,
             reversed: false,
             marked: None,
@@ -1325,9 +1331,9 @@ fn run() -> Result<(), String> {
             scene_lines: Vec::new(),
             scenes_dirty: true,
             current_scene: 0,
-            scroll: UniformListScrollHandle::new(),
+            list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
             focus_handle: cx.focus_handle(),
-            last_bounds: None,
+            wrap_width: px(800.0),
             metrics: metrics.clone(),
             probe_left: steps,
             probe_cursor: 1,
