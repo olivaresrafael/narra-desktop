@@ -9,3 +9,13 @@ description = "UI-neutral application and agent core for the writing environment
 publish = false
 
 [dependencies]
+# YAML parser: serde_yaml is deprecated upstream (0.9.34+deprecated); saphyr is
+# its actively maintained successor line (MIT/Apache-2.0). The manifest is small
+# and parsed manually for strict rejection semantics (no serde layer needed).
+saphyr = "0.2"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -11,7 +11,7 @@ Native desktop environment for audiovisual writing with AI-assisted agents.
 
 ## Status
 
-Milestone 0 — repository and engineering foundation. No feature implementation yet: the editor spike (Milestone 1) gates everything after it.
+Milestones 0–1 foundation complete (editor spike + approved performance baselines); Milestone 2 in progress: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO and disposable index rebuild — lives in `narra-core`.
 
 ## Layout
 
@@ -20,10 +20,15 @@ narra-desktop/
 ├── LICENSE                     # GPL-3.0-or-later
 ├── .github/workflows/ci.yml    # fmt + clippy + test on macOS
 └── crates/
-    └── narra-core/             # UI-neutral application/agent core (placeholder)
+    ├── narra-core/             # UI-neutral application/agent core
+    │   └── src/manifest.rs     # project.yaml v1: parse/serialize/validate
+    │   └── src/project.rs      # create/open project, template, index rebuild
+    │   └── src/document.rs     # boundary-checked, atomic document IO
+    ├── spike-editor/           # GPUI editor spike (Milestone 1 evidence)
+    └── fixture-gen/            # deterministic Fountain fixture generator
 ```
 
-`narra-core` is intentionally empty of features. Core services must not depend on desktop UI state (D-005) and must be invocable later by a CLI, so the crate boundary exists from day one.
+`narra-core` carries the project model (Milestone 2). Core services must not depend on desktop UI state (D-005) and must be invocable later by a CLI, so the crate boundary exists from day one.
 
 ## Development
 
