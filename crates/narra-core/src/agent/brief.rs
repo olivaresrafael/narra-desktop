@@ -124,6 +124,8 @@ impl ProjectBriefTask {
                  sobre este proyecto: premisa, escala y estado actual."
             ),
             max_output_tokens: BRIEF_MAX_TOKENS,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let remaining = options
             .timeout

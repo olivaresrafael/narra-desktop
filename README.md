@@ -110,6 +110,34 @@ cargo run -p narra-harness -- proposals <project-root> renew <proposal-id>
 
 `renew` accepts the same adapter options as `propose` (mock by default).
 
+### Permission-gated tool loop (M4 slice 3b)
+
+The `loop` task lets the model request declared tools over the standard
+OpenAI tool-calling wire. Every call is checked against an explicit
+permission policy **before** execution — deny-by-default:
+
+```sh
+# Read-only tools work out of the box; writes are refused until granted.
+cargo run -p narra-harness -- loop <project-root> \
+    --instruction "rehaz el diálogo de la escena 1"
+
+# Grant a tool by name (stages a reviewable proposal; canon untouched).
+cargo run -p narra-harness -- loop <project-root> \
+    --instruction "rehaz el diálogo de la escena 1" \
+    --allow-tool propose_scene_edit
+
+# Applying to the canonical file needs its own destructive grant.
+cargo run -p narra-harness -- loop <project-root> \
+    --instruction "aplica la propuesta <id>" \
+    --allow-destructive apply_proposal
+```
+
+`--allow-tool` never implies `--allow-destructive` (a write grant cannot
+silently unlock canonical writes). Each call appears as a `tool_executed`
+event and in the final output's `data.tools` audit (decision + outcome),
+including the denials: the model sees why it was refused, and the audit is
+the record of what actually ran — not the model's claims.
+
 ### macOS build prerequisite (affects `spike-editor`)
 
 GPUI compiles Metal shaders at build time. If you see

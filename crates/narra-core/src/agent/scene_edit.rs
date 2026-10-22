@@ -197,6 +197,8 @@ impl SceneEditTask {
                 scene_text,
             ),
             max_output_tokens: SCENE_EDIT_MAX_TOKENS,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let remaining = options
             .timeout

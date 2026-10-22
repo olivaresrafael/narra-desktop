@@ -335,6 +335,7 @@ impl ModelAdapter for FixedRewriter {
         Ok(narra_core::agent::ModelResponse {
             text: self.text.to_string(),
             model: "fixed-1".to_string(),
+            tool_calls: Vec::new(),
             input_tokens: Some(1),
             output_tokens: Some(2),
         })

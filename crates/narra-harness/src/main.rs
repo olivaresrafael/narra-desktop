@@ -26,6 +26,8 @@
 //!   --base-url <url>   openai-compat endpoint (default http://localhost:11434/v1)
 //!   --model <name>     model name for openai-compat (required with it)
 //!   --stream           stream text deltas (JSONL `model_delta` events)
+//!   --allow-tool <n>     (loop) grant a propose-write tool by name
+//!   --allow-destructive <n> (loop) grant a destructive tool by name
 //!   --scene <n>        1-based scene number (propose only)
 //!   --instruction <t>  writer's instruction (propose only)
 //!   --hunks <a,b>      0-based hunk indices to accept (apply only; default all)
@@ -48,8 +50,8 @@ use std::time::Duration;
 
 use narra_core::agent::proposal;
 use narra_core::agent::{
-    AgentError, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
-    ProjectBriefTask, SceneEditTask, TaskEvent, TaskOptions,
+    AgentError, GrantPolicy, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
+    ProjectBriefTask, SceneEditTask, TaskEvent, TaskOptions, ToolLoopTask,
 };
 use narra_core::cancel::CancellationToken;
 
@@ -135,6 +137,29 @@ fn main() -> ExitCode {
             .map_err(AgentError::Proposal)
             .and_then(|record| SceneEditTask::from_proposal(root, &record))
             .and_then(|task| task.run(adapter.as_ref(), &options, &mut emit)),
+        Command::Loop {
+            root,
+            instruction,
+            allowed,
+            destructive,
+        } => {
+            // Deny-by-default: only the named tools are granted, and a
+            // destructive grant must name the tool explicitly. In headless
+            // mode `Ask` becomes an actionable denial in the audit trail.
+            let mut policy = GrantPolicy::new();
+            for tool in &allowed {
+                policy = policy.allow(tool.clone());
+            }
+            for tool in &destructive {
+                policy = policy.allow_destructive(tool.clone());
+            }
+            ToolLoopTask::new(root, instruction).run(
+                adapter.as_ref(),
+                &mut policy,
+                &options,
+                &mut emit,
+            )
+        }
         // Handled before the adapter is built.
         Command::Proposals { .. } => unreachable!("proposals run locally"),
     };
@@ -187,7 +212,9 @@ const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [
      narra-harness proposals <project-root> show <id>
      narra-harness proposals <project-root> apply <id> [--hunks 0,2]
      narra-harness proposals <project-root> reject <id>
-     narra-harness proposals <project-root> renew <id> [--adapter ...] [--model ...]";
+     narra-harness proposals <project-root> renew <id> [--adapter ...] [--model ...]
+     narra-harness loop <project-root> --instruction <texto> [--allow-tool <nombre>]...
+         [--allow-destructive <nombre>]... [mismas opciones de modelo]";
 
 #[derive(Debug)]
 struct Parsed {
@@ -216,6 +243,14 @@ enum Command {
         root: String,
         action: ProposalsAction,
     },
+    /// Tool loop: the model requests declared tools under an explicit
+    /// permission policy (deny-by-default; see --allow-tool).
+    Loop {
+        root: String,
+        instruction: String,
+        allowed: Vec<String>,
+        destructive: Vec<String>,
+    },
 }
 
 /// Local review operations: no model, no events, JSONL records on stdout.
@@ -233,7 +268,7 @@ impl Command {
     fn runs_model(&self) -> bool {
         matches!(
             self,
-            Self::Brief { .. } | Self::Propose { .. } | Self::Renew { .. }
+            Self::Brief { .. } | Self::Propose { .. } | Self::Renew { .. } | Self::Loop { .. }
         )
     }
 }
@@ -277,6 +312,8 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut hunks: Option<Vec<usize>> = None;
     let mut model_options_seen = false;
     let mut stream = false;
+    let mut allow_tool: Vec<String> = Vec::new();
+    let mut allow_destructive: Vec<String> = Vec::new();
     let mut positional: Vec<&str> = Vec::new();
 
     let mut iter = args.iter();
@@ -300,6 +337,16 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--stream" => {
                 stream = true;
                 model_options_seen = true;
+            }
+            "--allow-tool" => {
+                let value = iter.next().ok_or("--allow-tool requiere un nombre")?;
+                allow_tool.push((*value).clone());
+            }
+            "--allow-destructive" => {
+                let value = iter
+                    .next()
+                    .ok_or("--allow-destructive requiere un nombre")?;
+                allow_destructive.push((*value).clone());
             }
             "--adapter" => {
                 let value = iter.next().ok_or("--adapter requiere un valor")?;
@@ -380,6 +427,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let scene_seen = scene.is_some();
     let instruction_seen = instruction.is_some();
     let hunks_seen = hunks.is_some();
+    let allow_seen = !allow_tool.is_empty() || !allow_destructive.is_empty();
 
     let command = match positional.as_slice() {
         ["brief", root] if !root.is_empty() => Command::Brief {
@@ -418,12 +466,28 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             root: (*root).to_string(),
             id: (*id).to_string(),
         },
+        ["loop", root] if !root.is_empty() => Command::Loop {
+            root: (*root).to_string(),
+            instruction: instruction
+                .take()
+                .ok_or("--loop requiere --instruction <texto>")?,
+            allowed: std::mem::take(&mut allow_tool),
+            destructive: std::mem::take(&mut allow_destructive),
+        },
         _ => return Err(USAGE.to_string()),
     };
 
     // Per-command flags: a stray flag is an explicit error, not a silence.
-    if (scene_seen || instruction_seen) && !matches!(command, Command::Propose { .. }) {
-        return Err("--scene/--instruction solo se pueden usar con la orden propose".to_string());
+    if scene_seen && !matches!(command, Command::Propose { .. }) {
+        return Err("--scene solo se puede usar con la orden propose".to_string());
+    }
+    if instruction_seen && !matches!(command, Command::Propose { .. } | Command::Loop { .. }) {
+        return Err("--instruction solo se puede usar con las órdenes propose y loop".to_string());
+    }
+    if allow_seen && !matches!(command, Command::Loop { .. }) {
+        return Err(
+            "--allow-tool/--allow-destructive solo se pueden usar con la orden loop".to_string(),
+        );
     }
     if hunks_seen
         && !matches!(

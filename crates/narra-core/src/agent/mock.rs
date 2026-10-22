@@ -3,8 +3,12 @@
 //!
 //! Behavior is a pure function of the request: same input, same output, no
 //! network, no credentials. Cancellation is honored between short sleeps so
-//! tests can exercise the cancellation path without real latency.
+//! tests can exercise the cancellation path without real latency. For tool
+//! loops, [`MockAdapter::scripted`] replays a fixed sequence of responses
+//! (text and/or tool calls) so multi-round behavior stays deterministic.
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -13,22 +17,36 @@ use super::adapter::{ModelAdapter, ModelRequest, ModelResponse};
 use crate::cancel::CancellationToken;
 
 /// A provider that never talks to a network.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MockAdapter {
     /// Simulated latency in 5 ms slices; 0 keeps tests instant.
     pub simulated_latency: Duration,
+    /// Optional scripted responses, replayed one per `complete` call (tool
+    /// loop tests). Empty script = the default deterministic answer.
+    script: Option<Mutex<VecDeque<ModelResponse>>>,
 }
 
 impl MockAdapter {
     pub fn new() -> Self {
         Self {
             simulated_latency: Duration::ZERO,
+            script: None,
         }
     }
 
     pub fn with_latency(latency: Duration) -> Self {
         Self {
             simulated_latency: latency,
+            script: None,
+        }
+    }
+
+    /// A mock that replays `responses` in order, one per `complete` call.
+    /// Once the script is exhausted it falls back to the default answer.
+    pub fn scripted(responses: Vec<ModelResponse>) -> Self {
+        Self {
+            simulated_latency: Duration::ZERO,
+            script: Some(Mutex::new(VecDeque::from(responses))),
         }
     }
 
@@ -68,6 +86,13 @@ impl ModelAdapter for MockAdapter {
     ) -> Result<ModelResponse, AgentError> {
         // Cooperative latency: wake in small slices and observe cancellation.
         self.wait_latency(cancel)?;
+
+        // Scripted runs (tool loops) replay their fixed sequence first.
+        if let Some(script) = &self.script
+            && let Some(next) = script.lock().expect("script lock").pop_front()
+        {
+            return Ok(next);
+        }
 
         // Deterministic output derived only from the request.
         Ok(response_for(request))
@@ -116,6 +141,7 @@ fn response_for(request: &ModelRequest) -> ModelResponse {
     ModelResponse {
         text,
         model: "mock-1".to_string(),
+        tool_calls: Vec::new(),
         input_tokens: Some(request.prompt.len() as u32 / 4),
         output_tokens: Some(request.max_output_tokens / 2),
     }
@@ -156,6 +182,8 @@ mod tests {
             system: "s".to_string(),
             prompt: "hola mundo".to_string(),
             max_output_tokens: 100,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let token = CancellationToken::new();
         let a = adapter.complete(&request, &token).expect("ok");
@@ -171,6 +199,8 @@ mod tests {
             system: "s".to_string(),
             prompt: "p".to_string(),
             max_output_tokens: 10,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let token = CancellationToken::new();
         token.cancel();
@@ -185,6 +215,8 @@ mod tests {
             system: "s".to_string(),
             prompt: "p".to_string(),
             max_output_tokens: 10,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let token = CancellationToken::new();
         let killer = token.clone();
@@ -204,6 +236,8 @@ mod tests {
             system: "s".to_string(),
             prompt: "hola mundo".to_string(),
             max_output_tokens: 100,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let token = CancellationToken::new();
         let mut deltas = String::new();
@@ -229,6 +263,8 @@ mod tests {
             system: "s".to_string(),
             prompt: "p".to_string(),
             max_output_tokens: 10,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let token = CancellationToken::new();
         let mut seen = 0;

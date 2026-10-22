@@ -18,6 +18,8 @@ pub mod mock;
 pub mod openai_compat;
 pub mod proposal;
 pub mod scene_edit;
+pub mod tool_loop;
+pub mod tools;
 
 pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
@@ -25,6 +27,11 @@ pub use mock::MockAdapter;
 pub use openai_compat::{LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig};
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use scene_edit::SceneEditTask;
+pub use tool_loop::ToolLoopTask;
+pub use tools::{
+    ChatMessage, ChatRole, GrantPolicy, PermissionDecision, PermissionPolicy, ToolCall,
+    ToolOutcome, ToolPermission, ToolResult, ToolSpec,
+};
 
 use std::time::Duration;
 
@@ -85,6 +92,14 @@ pub enum TaskEvent {
         id: String,
         target: String,
         hunks: usize,
+    },
+    /// One tool call was processed: the policy ruled and the outcome is
+    /// recorded (`allowed: false` means the call never executed).
+    ToolExecuted {
+        id: String,
+        tool: String,
+        allowed: bool,
+        outcome: String,
     },
     Completed {
         summary: String,

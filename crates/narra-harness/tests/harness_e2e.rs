@@ -570,3 +570,64 @@ fn stream_flag_emits_model_delta_events() {
         "task_output present\n{stdout}"
     );
 }
+
+#[test]
+fn loop_runs_with_default_mock_and_reports_an_audit_trail() {
+    let root = sample_with_scenes();
+    let output = harness()
+        .args([
+            "loop",
+            root.to_str().expect("utf8"),
+            "--instruction",
+            "haz el diálogo más tenso",
+        ])
+        .output()
+        .expect("run harness");
+
+    assert_eq!(output.status.code(), Some(0), "success exit code");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("valid JSONL"))
+        .collect();
+    let last = records.last().expect("task_output present");
+    assert_eq!(last["record"], "task_output", "{last:?}");
+    assert_eq!(last["exit"], "success", "{last:?}");
+    // The audit array is always present (empty when the mock never asks
+    // for tools): clients can rely on the field, not on hope.
+    assert!(last["data"]["tools"].is_array(), "{last:?}");
+    assert!(stdout.contains("\"event\":\"started\""));
+}
+
+#[test]
+fn loop_permission_flags_on_other_commands_are_explicit_errors() {
+    let root = sample_project();
+    let output = harness()
+        .args([
+            "brief",
+            root.to_str().expect("utf8"),
+            "--allow-tool",
+            "read_scene",
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1), "flag misuse is an error");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--allow-tool") && stderr.contains("loop"),
+        "actionable message: {stderr}"
+    );
+}
+
+#[test]
+fn loop_requires_an_instruction() {
+    let root = sample_project();
+    let output = harness()
+        .args(["loop", root.to_str().expect("utf8")])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--instruction"), "stderr: {stderr}");
+}

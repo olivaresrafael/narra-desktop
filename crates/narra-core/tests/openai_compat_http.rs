@@ -143,6 +143,8 @@ fn request(system: &str, prompt: &str) -> ModelRequest {
         system: system.to_string(),
         prompt: prompt.to_string(),
         max_output_tokens: 64,
+        tools: Vec::new(),
+        history: Vec::new(),
     }
 }
 
@@ -642,4 +644,218 @@ fn real_ollama_streams_a_brief_exchange() {
         "ollama streamió {} deltas ({}): {}",
         deltas, response.model, response.text
     );
+}
+
+// --- Tool-calling wire format (slice 3b) ---------------------------------
+
+/// A single-request server that echoes the received request body back as a
+/// `tool_calls` response, so we can assert what goes *out* on the wire and
+/// what comes back, deterministically.
+fn spawn_tool_server(received: std::sync::Arc<std::sync::Mutex<String>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tool server");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            // Read the request head and body, capturing the body.
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(position) = find_subsequence(&buffer, b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = buffer[head_end..].to_vec();
+            while body.len() < content_length {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..read]);
+            }
+            *received.lock().expect("lock") = String::from_utf8_lossy(&body).to_string();
+
+            // Respond with a tool call whose `arguments` is a JSON *string*
+            // (the wire format) — the adapter must parse it into a value.
+            let response_body = serde_json::json!({
+                "model": "tool-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "read_scene",
+                                "arguments": "{\"scene\": 1}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    base_url
+}
+
+#[test]
+fn tool_declarations_and_history_go_out_in_openai_wire_format() {
+    use narra_core::agent::{ChatMessage, ChatRole, ToolCall, ToolSpec};
+
+    let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let base_url = spawn_tool_server(received.clone());
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+
+    let request = ModelRequest {
+        system: "sistema".to_string(),
+        prompt: "prompt".to_string(),
+        max_output_tokens: 100,
+        tools: vec![ToolSpec {
+            name: "read_scene".to_string(),
+            description: "lee una escena".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"scene": {"type": "integer"}}
+            }),
+            permission: narra_core::agent::ToolPermission::ReadOnly,
+        }],
+        history: vec![
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_prev".to_string(),
+                    name: "read_scene".to_string(),
+                    arguments: serde_json::json!({"scene": 2}),
+                }],
+                tool_call_id: None,
+                tool_name: None,
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: "INT. CALLE - DÍA".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_prev".to_string()),
+                tool_name: Some("read_scene".to_string()),
+            },
+        ],
+    };
+    let token = CancellationToken::new();
+    let response = adapter.complete(&request, &token).expect("tool round");
+
+    // Outgoing wire: tools in function shape, arguments re-encoded as a
+    // JSON string, tool results with role/tool_call_id.
+    let sent: serde_json::Value =
+        serde_json::from_str(&received.lock().expect("lock")).expect("valid JSON body");
+    assert_eq!(sent["tools"][0]["type"], "function", "{}", sent["tools"]);
+    assert_eq!(sent["tools"][0]["function"]["name"], "read_scene");
+    assert_eq!(sent["tools"][0]["function"]["parameters"]["type"], "object");
+    assert_eq!(
+        sent["messages"][2]["tool_calls"][0]["function"]["arguments"],
+        "{\"scene\":2}"
+    );
+    assert_eq!(sent["messages"][3]["role"], "tool");
+    assert_eq!(sent["messages"][3]["tool_call_id"], "call_prev");
+    assert_eq!(sent["stream"], false);
+
+    // Incoming: arguments string parsed into a value.
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].id, "call_abc");
+    assert_eq!(response.tool_calls[0].name, "read_scene");
+    assert_eq!(
+        response.tool_calls[0].arguments,
+        serde_json::json!({"scene": 1})
+    );
+    assert!(response.text.is_empty(), "tool round has no final text");
+}
+
+#[test]
+fn empty_tools_are_omitted_from_the_wire() {
+    let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let base_url = spawn_tool_server(received.clone());
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let _ = adapter.complete(&request("s", "p"), &token).expect("round");
+
+    let sent: serde_json::Value =
+        serde_json::from_str(&received.lock().expect("lock")).expect("valid JSON body");
+    assert!(
+        sent.get("tools").is_none(),
+        "no tools key without declarations: {sent}"
+    );
+    assert!(
+        sent["messages"].as_array().expect("messages").len() == 2,
+        "single-shot messages unchanged: {}",
+        sent["messages"]
+    );
+}
+
+#[test]
+fn malformed_tool_arguments_are_an_error_not_a_guess() {
+    use narra_core::agent::{AgentError, OpenAiCompatAdapter, OpenAiCompatConfig};
+
+    // A server that returns tool_calls with non-JSON arguments.
+    let body = serde_json::json!({
+        "model": "x",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_bad",
+                    "type": "function",
+                    "function": {"name": "read_scene", "arguments": "esto no es json"}
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let base_url = spawn_mock_server(MockReply {
+        status: 200,
+        body,
+        delay: Duration::ZERO,
+    });
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "x".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("bad arguments must fail");
+    assert!(matches!(error, AgentError::Adapter(_)), "{error:?}");
+    assert!(error.to_string().contains("JSON"), "{error}");
 }

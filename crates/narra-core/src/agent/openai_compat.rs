@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use super::AgentError;
 use super::adapter::{ModelAdapter, ModelRequest, ModelResponse};
+use super::tools::{ChatRole, ToolCall, ToolSpec};
 use crate::cancel::CancellationToken;
 
 /// Default endpoints, used when the caller does not configure one.
@@ -139,15 +140,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
             return Err(AgentError::Cancelled);
         }
 
-        let body = json!({
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.prompt},
-            ],
-            "max_tokens": request.max_output_tokens,
-            "stream": false,
-        });
+        let body = chat_body(&self.config.model, request, false);
 
         let mut response = self
             .send_chat(&body)
@@ -183,19 +176,11 @@ impl ModelAdapter for OpenAiCompatAdapter {
             return Err(AgentError::Cancelled);
         }
 
-        let body = json!({
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.prompt},
-            ],
-            "max_tokens": request.max_output_tokens,
-            "stream": true,
-            // Standard OpenAI knob: usage arrives in a final chunk instead of
-            // being dropped. Servers that ignore it (older local servers)
-            // simply report no usage — never an error.
-            "stream_options": {"include_usage": true},
-        });
+        let mut body = chat_body(&self.config.model, request, true);
+        // Standard OpenAI knob: usage arrives in a final chunk instead of
+        // being dropped. Servers that ignore it (older local servers)
+        // simply report no usage — never an error.
+        body["stream_options"] = json!({"include_usage": true});
 
         let response = self
             .send_chat(&body)
@@ -280,6 +265,10 @@ impl ModelAdapter for OpenAiCompatAdapter {
         Ok(ModelResponse {
             text,
             model: model.unwrap_or_else(|| "desconocido".to_string()),
+            // Streaming delivers text deltas; the tool loop runs on the
+            // non-streaming `complete` path, so streamed responses never
+            // carry tool calls (documented limitation, not silent data).
+            tool_calls: Vec::new(),
             input_tokens: usage
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
@@ -359,14 +348,69 @@ fn parse_response(payload: Value) -> Result<ModelResponse, AgentError> {
         return Err(AgentError::Adapter(crate::git::redact_secrets(&message)));
     }
 
+    // Tool calls (OpenAI function-calling wire): `arguments` is a JSON
+    // *string* on the wire; a malformed one is an actionable error, never
+    // silently dropped.
+    let mut tool_calls = Vec::new();
+    if let Some(calls) = payload.pointer("/choices/0/message/tool_calls") {
+        let Some(calls) = calls.as_array() else {
+            return Err(AgentError::Adapter(
+                "tool_calls del proveedor no es una lista".to_string(),
+            ));
+        };
+        for call in calls {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default();
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    AgentError::Adapter("tool_call sin function.name en la respuesta".to_string())
+                })?;
+            let arguments = match call.pointer("/function/arguments") {
+                // Wire format: JSON-encoded string.
+                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).map_err(|_| {
+                    AgentError::Adapter(format!(
+                        "los argumentos de la herramienta «{name}» no son JSON válido"
+                    ))
+                })?,
+                // Some local servers already send an object.
+                Some(value @ Value::Object(_)) => value.clone(),
+                _ => json!({}),
+            };
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+
     let text = payload
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| {
-            AgentError::Adapter("la respuesta no contiene choices[0].message.content".to_string())
-        })?;
+        .unwrap_or_default();
+
+    // A response with neither text nor tool calls carries nothing usable.
+    // The finish reason tells the user *why* (e.g. a reasoning model spent
+    // its whole token budget on reasoning and stopped at the length limit).
+    if text.trim().is_empty() && tool_calls.is_empty() {
+        let finish = payload
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "desconocida".to_string());
+        return Err(AgentError::Adapter(format!(
+            "la respuesta no contiene choices[0].message.content ni tool_calls \
+             (finish_reason: {finish}); posible presupuesto de tokens agotado \
+             en el razonamiento del modelo"
+        )));
+    }
 
     let usage = payload.get("usage");
     Ok(ModelResponse {
@@ -376,6 +420,7 @@ fn parse_response(payload: Value) -> Result<ModelResponse, AgentError> {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| "desconocido".to_string()),
+        tool_calls,
         input_tokens: usage
             .and_then(|usage| usage.get("prompt_tokens"))
             .and_then(Value::as_u64)
@@ -385,6 +430,88 @@ fn parse_response(payload: Value) -> Result<ModelResponse, AgentError> {
             .and_then(Value::as_u64)
             .map(|tokens| tokens as u32),
     })
+}
+
+/// Full chat body for the wire: system + user + tool-loop history, plus the
+/// tool declarations when the request offers any (omitted otherwise so
+/// single-shot traffic stays byte-identical to pre-tool-call requests).
+fn chat_body(model: &str, request: &ModelRequest, stream: bool) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": chat_messages(request),
+        "max_tokens": request.max_output_tokens,
+        "stream": stream,
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = tool_declarations(&request.tools);
+    }
+    body
+}
+
+/// System, user, then the recorded tool-loop turns (assistant tool requests
+/// and tool results), oldest first.
+fn chat_messages(request: &ModelRequest) -> Value {
+    let mut messages = vec![
+        json!({"role": "system", "content": request.system}),
+        json!({"role": "user", "content": request.prompt}),
+    ];
+    for turn in &request.history {
+        match turn.role {
+            ChatRole::Assistant => {
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": turn.content,
+                });
+                if !turn.tool_calls.is_empty() {
+                    let calls: Vec<Value> = turn
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    // Wire format: arguments as a JSON string.
+                                    "arguments": serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                },
+                            })
+                        })
+                        .collect();
+                    message["tool_calls"] = Value::Array(calls);
+                }
+                messages.push(message);
+            }
+            ChatRole::Tool => {
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": turn.tool_call_id,
+                    "content": turn.content,
+                }));
+            }
+        }
+    }
+    Value::Array(messages)
+}
+
+/// Tool declarations in the OpenAI function-calling shape.
+fn tool_declarations(tools: &[ToolSpec]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|spec| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    },
+                })
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -451,6 +578,8 @@ mod tests {
             system: "s".into(),
             prompt: "p".into(),
             max_output_tokens: 10,
+            tools: Vec::new(),
+            history: Vec::new(),
         };
         let error = adapter.complete(&request, &token).expect_err("cancelled");
         assert!(matches!(error, AgentError::Cancelled), "{error:?}");

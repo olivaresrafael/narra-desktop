@@ -5,12 +5,14 @@
 //! SDK is pulled into the core: the first real adapter speaks the OpenAI
 //! HTTP API directly behind this interface.
 //!
-//! The trait is synchronous by design for now: tasks already run on worker
-//! threads (never the UI thread), and cancellation is cooperative through
-//! [`CancellationToken`]. If Spike C shows streaming is needed, the trait
-//! gains an event-callback variant — a compatible, additive change.
+//! The trait is synchronous by design: tasks already run on worker threads
+//! (never the UI thread), and cancellation is cooperative through
+//! [`CancellationToken`]. Streaming is an additive trait method
+//! ([`ModelAdapter::complete_streaming`]) so non-streaming providers keep
+//! working unchanged.
 
 use crate::agent::AgentError;
+use crate::agent::tools::{ChatMessage, ToolCall, ToolSpec};
 use crate::cancel::CancellationToken;
 
 /// Explicit, serializable model input (Spike F).
@@ -22,6 +24,11 @@ pub struct ModelRequest {
     pub prompt: String,
     /// Hard cap on generated tokens; adapters must enforce it.
     pub max_output_tokens: u32,
+    /// Tools the model may request in this turn (empty = plain completion).
+    pub tools: Vec<ToolSpec>,
+    /// Prior tool-loop turns: the model's tool requests and the tool
+    /// results fed back, oldest first. Empty for a single-shot request.
+    pub history: Vec<ChatMessage>,
 }
 
 /// Minimal model output contract. The raw text stays available for display;
@@ -31,6 +38,9 @@ pub struct ModelResponse {
     pub text: String,
     /// Provider-reported model identifier (for provenance records).
     pub model: String,
+    /// Tool calls the model requested in this turn (empty = none; the text
+    /// is the final answer when this is empty).
+    pub tool_calls: Vec<ToolCall>,
     /// Token usage if the provider reported it.
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
