@@ -1,5 +1,5 @@
 //! Rebuild the derived index against the real performance fixture
-//! (`fixtures/screenplay-1000.fountain`): 18 549 lines, 1 000 scenes,
+//! (`fixtures/screenplay-1000.fountain`): 19 347 lines, 1 000 scenes,
 //! accented text, character cues, parentheticals, notes and sections. The
 //! parser and index must stay derived conveniences: they never modify the
 //! source file.
@@ -62,7 +62,7 @@ fn fixture_index_matches_scene_heading_count() {
 
 /// Element census of the real fixture, cross-checked against an independent
 /// line-by-line analysis of `screenplay-1000.fountain` (Python, 2026-10-22).
-/// Locks the parser's behavior on real content: 18 549 lines, accented text,
+/// Locks the parser's behavior on real content: 19 347 lines, accented text,
 /// inline notes, sections and a title page.
 #[test]
 fn fixture_element_census_is_stable() {
@@ -85,14 +85,18 @@ fn fixture_element_census_is_stable() {
         *counts.entry(element.kind).or_default() += 1;
     }
     let get = |kind: ElementKind| counts.get(&kind).copied().unwrap_or(0);
+    // Census frozen after fixing the fixture (2026-10-22): 798 character cues
+    // had been generated glued to the previous dialogue block, which Fountain
+    // treats as dialogue continuation — the spec requires a blank line before
+    // a cue. The fixture was corrected; the parser was already spec-correct.
     assert_eq!(get(ElementKind::SceneHeading), 1000);
-    assert_eq!(get(ElementKind::Character), 2036);
-    assert_eq!(get(ElementKind::Dialogue), 3632);
+    assert_eq!(get(ElementKind::Character), 2834);
+    assert_eq!(get(ElementKind::Dialogue), 2834);
     assert_eq!(get(ElementKind::Parenthetical), 731);
     assert_eq!(get(ElementKind::Note), 244);
     assert_eq!(get(ElementKind::Section), 4);
     assert_eq!(get(ElementKind::TitlePage), 4);
-    assert_eq!(get(ElementKind::Action), 10898);
+    assert_eq!(get(ElementKind::Action), 11696);
     // The fixture contains none of these elements today; if the fixture grows
     // them, the census must be updated deliberately.
     assert_eq!(get(ElementKind::Transition), 0);

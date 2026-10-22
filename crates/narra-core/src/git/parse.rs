@@ -119,6 +119,27 @@ fn split_xy(xy: &[u8]) -> (WorktreeStatus, WorktreeStatus) {
     }
 }
 
+/// Parse `git for-each-ref refs/heads` output: `<short>%09<objectname>%09<HEAD>`
+/// per line, where the third field is `*` for the current branch.
+pub(crate) fn parse_branches(raw: &str) -> Vec<super::Branch> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?.trim();
+            let id = fields.next()?.trim();
+            let current = fields.next().is_some_and(|flag| flag.trim() == "*");
+            if name.is_empty() || id.is_empty() {
+                return None;
+            }
+            Some(super::Branch {
+                name: name.to_string(),
+                id: id.to_string(),
+                current,
+            })
+        })
+        .collect()
+}
+
 /// Parse the NUL-safe record format produced by
 /// `git log --format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e`.
 pub(crate) fn parse_log(raw: &str) -> Vec<Commit> {
@@ -214,6 +235,17 @@ mod tests {
         let branch = branch.expect("head still known");
         assert!(branch.oid.is_none());
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn parses_branch_list() {
+        let raw = "main\tabc123\t*\nfeature/escena\tdef456\t\n";
+        let branches = parse_branches(raw);
+        assert_eq!(branches.len(), 2);
+        assert!(branches[0].current);
+        assert_eq!(branches[0].name, "main");
+        assert!(!branches[1].current);
+        assert_eq!(branches[1].name, "feature/escena");
     }
 
     #[test]

@@ -221,6 +221,9 @@ fn dialogue_block(rng: &mut Rng, out: &mut String) {
                 break candidate;
             }
         };
+        // Fountain requires a blank line before a character cue; glued to the
+        // previous dialogue line, the cue would parse as dialogue.
+        out.push('\n');
         out.push_str(responder);
         out.push('\n');
         let line = rng.pick(DIALOGUE);
@@ -439,5 +442,24 @@ mod tests {
     fn milestone_fixture_has_1000_scenes() {
         let content = generate(&config(1000, 42));
         assert_eq!(count_scenes(&content), 1000);
+    }
+
+    #[test]
+    fn every_character_cue_follows_a_blank_line() {
+        // Regresión (2026-10-22): el segundo hablante se generaba pegado al
+        // diálogo anterior y Fountain lo leería como continuación del mismo.
+        let content = generate(&config(500, 42));
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if CHARACTERS.contains(line) {
+                let previous = if i == 0 { "" } else { lines[i - 1] };
+                assert_eq!(
+                    previous,
+                    "",
+                    "cue `{line}` en línea {} sin línea en blanco antes",
+                    i + 1
+                );
+            }
+        }
     }
 }

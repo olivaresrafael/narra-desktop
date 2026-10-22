@@ -17,6 +17,7 @@ mod runner;
 pub use runner::{CancellationToken, GitError, OpOptions, redact_secrets};
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use runner::run_git;
 
@@ -133,6 +134,37 @@ pub struct FileChange {
     pub path: String,
     pub added: u32,
     pub removed: u32,
+}
+
+/// Default bound for network operations (clone/fetch/pull/push): much more
+/// generous than local ops, still bounded so a stalled network fails instead
+/// of hanging a worker forever.
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A local branch from `git for-each-ref refs/heads`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    /// Full object id of the branch tip.
+    pub id: String,
+    /// True for the branch currently checked out.
+    pub current: bool,
+}
+
+/// Result of [`Repository::merge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The branch was already an ancestor; nothing changed.
+    UpToDate,
+    /// The merge was a fast-forward; HEAD moved to the merged tip, no merge
+    /// commit was created.
+    FastForward,
+    /// A merge commit was created; carries its id.
+    Merged { id: String },
+    /// The merge stopped on conflicts. Nothing was committed: conflicted
+    /// files carry conflict markers and can be resolved and committed, or
+    /// discarded with [`Repository::abort_merge`].
+    Conflicts { files: Vec<String> },
 }
 
 /// Which comparison a diff should compute.
@@ -345,6 +377,301 @@ impl Repository {
         }
         Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
     }
+
+    /// Current branch name, or `None` on a detached HEAD / unborn branch.
+    pub fn current_branch(&self, options: OpOptions) -> Result<Option<String>, GitError> {
+        let output = run_git(
+            Some(&self.root),
+            "branch",
+            &["branch", "--show-current"],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("branch", &output.stderr));
+        }
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(if name.is_empty() { None } else { Some(name) })
+    }
+
+    /// All local branches, current one flagged.
+    pub fn branches(&self, options: OpOptions) -> Result<Vec<Branch>, GitError> {
+        let output = run_git(
+            Some(&self.root),
+            "for-each-ref",
+            &[
+                "for-each-ref",
+                "refs/heads",
+                "--format=%(refname:short)%09%(objectname)%09%(HEAD)",
+            ],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("for-each-ref", &output.stderr));
+        }
+        Ok(parse::parse_branches(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    /// Create `name` at the current HEAD without switching to it.
+    ///
+    /// Branch names are validated against a conservative subset of
+    /// `git check-ref-format`; anything flag-like or ambiguous is rejected
+    /// before it reaches Git.
+    pub fn create_branch(&self, name: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_branch_name(name)?;
+        let output = run_git(Some(&self.root), "branch", &["branch", "--", name], options)?;
+        if !output.status.success() {
+            return Err(command_failed("branch", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Switch to an existing branch. Git itself refuses when uncommitted
+    /// changes would be overwritten — no data is ever discarded here.
+    pub fn checkout(&self, name: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_branch_name(name)?;
+        let output = run_git(Some(&self.root), "checkout", &["checkout", name], options)?;
+        if !output.status.success() {
+            return Err(command_failed("checkout", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Create `name` at HEAD and switch to it in one step.
+    pub fn checkout_new(&self, name: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_branch_name(name)?;
+        let output = run_git(
+            Some(&self.root),
+            "checkout",
+            &["checkout", "-b", "--", name],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("checkout", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Delete `name` with Git's *safe* `-d`: a branch that is not fully
+    /// merged is refused instead of force-removed.
+    pub fn delete_branch(&self, name: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_branch_name(name)?;
+        let output = run_git(
+            Some(&self.root),
+            "branch",
+            &["branch", "-d", "--", name],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("branch -d", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Merge `name` into the current branch without opening an editor.
+    ///
+    /// Conflicts are reported as [`MergeOutcome::Conflicts`] — never resolved
+    /// automatically — and the repository is left in a merge state the user
+    /// can complete (commit) or undo ([`Repository::abort_merge`]).
+    pub fn merge(&self, name: &str, options: OpOptions) -> Result<MergeOutcome, GitError> {
+        validate_branch_name(name)?;
+        let head_before = self.head_id(options.clone())?;
+        let output = run_git(
+            Some(&self.root),
+            "merge",
+            &["merge", "--no-edit", "--", name],
+            options.clone(),
+        )?;
+        if output.status.success() {
+            let head_after = self.head_id(options)?;
+            return Ok(if head_after == head_before {
+                MergeOutcome::UpToDate
+            } else if self.is_merge_commit(&head_after)? {
+                MergeOutcome::Merged { id: head_after }
+            } else {
+                MergeOutcome::FastForward
+            });
+        }
+        // Conflict or refusal: distinguish by the merge state Git records.
+        if self.is_merging(options)? {
+            let (_, entries) = self.status(OpOptions::default())?;
+            let files = entries
+                .into_iter()
+                .filter(|entry| entry.is_conflicted())
+                .map(|entry| entry.path)
+                .collect();
+            return Ok(MergeOutcome::Conflicts { files });
+        }
+        Err(command_failed("merge", &output.stderr))
+    }
+
+    /// Abort an in-progress merge, restoring the pre-merge state exactly.
+    /// Safe no-op when no merge is in progress.
+    pub fn abort_merge(&self, options: OpOptions) -> Result<(), GitError> {
+        let output = run_git(Some(&self.root), "merge", &["merge", "--abort"], options)?;
+        if !output.status.success() {
+            return Err(command_failed("merge --abort", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// True while a conflicted merge is unresolved (MERGE_HEAD exists).
+    pub fn is_merging(&self, options: OpOptions) -> Result<bool, GitError> {
+        let output = run_git(
+            Some(&self.root),
+            "rev-parse",
+            &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            options,
+        )?;
+        Ok(output.status.success())
+    }
+
+    /// Configured remotes as `(name, fetch_url)` pairs. URLs are redacted:
+    /// credential-bearing remotes are safe to display and log.
+    pub fn remotes(&self, options: OpOptions) -> Result<Vec<(String, String)>, GitError> {
+        let output = run_git(Some(&self.root), "remote", &["remote", "-v"], options)?;
+        if !output.status.success() {
+            return Err(command_failed("remote", &output.stderr));
+        }
+        // `origin  https://host/x.git (fetch)` — dedupe fetch/push lines.
+        let mut remotes = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(name), Some(url)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let url = redact_secrets(url);
+            if !remotes.iter().any(|(existing, _)| existing == name) {
+                remotes.push((name.to_string(), url));
+            }
+        }
+        Ok(remotes)
+    }
+
+    /// Fetch from `remote` (no merge, no working-tree changes).
+    pub fn fetch(&self, remote: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_remote_name(remote)?;
+        let output = run_git(Some(&self.root), "fetch", &["fetch", remote], options)?;
+        if !output.status.success() {
+            return Err(command_failed("fetch", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Fast-forward pull of `branch` from `remote`.
+    ///
+    /// Deliberately `--ff-only`: a pull never creates surprise merge commits
+    /// and never resolves conflicts implicitly — when it fails, the user
+    /// brings the branches together with an explicit [`Repository::merge`].
+    pub fn pull(&self, remote: &str, branch: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_remote_name(remote)?;
+        validate_branch_name(branch)?;
+        let output = run_git(
+            Some(&self.root),
+            "pull",
+            &["pull", "--ff-only", remote, branch],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("pull --ff-only", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Push `branch` to `remote`. Callers must have shown explicit user
+    /// confirmation first (`AGENTS.md`: publication requires confirmation).
+    pub fn push(&self, remote: &str, branch: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_remote_name(remote)?;
+        validate_branch_name(branch)?;
+        let output = run_git(Some(&self.root), "push", &["push", remote, branch], options)?;
+        if !output.status.success() {
+            return Err(command_failed("push", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// HEAD commit id (empty repository → empty string).
+    fn head_id(&self, options: OpOptions) -> Result<String, GitError> {
+        let output = run_git(
+            Some(&self.root),
+            "rev-parse",
+            &["rev-parse", "-q", "--verify", "HEAD"],
+            options,
+        )?;
+        Ok(if output.status.success() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            String::new()
+        })
+    }
+
+    /// True when `id` has more than one parent (a real merge commit).
+    fn is_merge_commit(&self, id: &str) -> Result<bool, GitError> {
+        let output = run_git(
+            Some(&self.root),
+            "rev-list",
+            &["rev-list", "--parents", "-n", "1", id],
+            OpOptions::default(),
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("rev-list", &output.stderr));
+        }
+        let parents = String::from_utf8_lossy(&output.stdout);
+        Ok(parents.split_whitespace().count() > 2)
+    }
+}
+
+/// Clone `url` into `destination` (which must not exist yet) and return the
+/// new repository. Credentials in `url` never appear in errors or messages.
+pub fn clone(url: &str, destination: &Path, options: OpOptions) -> Result<Repository, GitError> {
+    if url.trim().is_empty() {
+        return Err(GitError::InvalidInput("clone URL must not be empty"));
+    }
+    let destination_str = destination.to_str().ok_or(GitError::InvalidInput(
+        "clone destination is not valid UTF-8",
+    ))?;
+    let output = run_git(None, "clone", &["clone", url, destination_str], options)?;
+    if !output.status.success() {
+        return Err(command_failed("clone", &output.stderr));
+    }
+    Repository::open(destination, OpOptions::default())
+}
+
+/// Validate a branch name against a conservative subset of
+/// `git check-ref-format`: enough to guarantee the name is safe as an argv
+/// element and unambiguous as a ref, without a full refspec implementation.
+pub fn validate_branch_name(name: &str) -> Result<(), GitError> {
+    let invalid = |reason: &'static str| Err(GitError::InvalidInput(reason));
+    if name.is_empty() {
+        return invalid("branch name must not be empty");
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') {
+        return invalid("branch name must not start with '-' or '/' or end with '/'");
+    }
+    if name.ends_with(".lock") || name.ends_with('.') {
+        return invalid("branch name must not end with '.lock' or '.'");
+    }
+    if name.contains("..") || name.contains("@{") {
+        return invalid("branch name must not contain '..' or '@{'");
+    }
+    if name.split('/').any(|component| {
+        component.is_empty() || component.starts_with('.') || component.ends_with('.')
+    }) {
+        return invalid("branch name components must not be empty, start or end with '.'");
+    }
+    if name.chars().any(|c| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '\x7f')
+    }) {
+        return invalid("branch name contains forbidden characters");
+    }
+    Ok(())
+}
+
+/// Remote names get the same treatment as branch names (they are argv
+/// elements in fetch/pull/push).
+fn validate_remote_name(name: &str) -> Result<(), GitError> {
+    validate_branch_name(name)
 }
 
 fn not_a_repository(root: &Path, stderr: &[u8]) -> GitError {

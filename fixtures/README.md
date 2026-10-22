@@ -2,7 +2,7 @@
 
 | File | Scenes | Lines | Bytes | Seed | SHA-256 |
 |---|---|---|---|---|---|
-| `screenplay-1000.fountain` | 1000 | 18549 | 384754 | 42 | `f70a97b5c4abaab2ecec2febbc8822184c1426cba581af5ec10e3436824f187c` |
+| `screenplay-1000.fountain` | 1000 | 19347 | 385552 | 42 | `11f5d31bc8803000633e89a86f815201bbb7ca3bd378ecac9096c1d175dcbe7e` |
 
 Regenerate (byte-identical output is guaranteed for a given seed):
 
