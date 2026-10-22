@@ -18,6 +18,11 @@
 //!   narra-harness proposals <project-root> apply <proposal-id> [--hunks 0,2]
 //!   narra-harness proposals <project-root> reject <proposal-id>
 //!   narra-harness proposals <project-root> renew <proposal-id> [options]
+//!   narra-harness provider caps
+//!   narra-harness provider login [--from-env] [--api-url <url>]
+//!   narra-harness provider logout
+//!   narra-harness provider whoami [--api-url <url>]
+//!   narra-harness provider connect <owner>/<repo> [--api-url <url>]
 //!
 //! Options:
 //!   --timeout <secs>   task timeout (default 120)
@@ -39,7 +44,10 @@
 //! The provider API key is read **only** from the `OPENAI_API_KEY`
 //! environment variable (empty/unset = no key, right for local servers).
 //! It is never accepted as a command-line argument — argv is world-readable
-//! via `ps`.
+//! via `ps`. The same rule applies to GitHub tokens: `provider login` reads
+//! the token from stdin (or `--from-env`), stores it in the OS keychain and
+//! everything else resolves it from there. `NARRA_SECRET_STORE=memory`
+//! switches the store to in-memory for tests and CI.
 
 use std::io::Write;
 use std::path::Path;
@@ -69,6 +77,12 @@ fn main() -> ExitCode {
     // Local review operations never touch the network or a model.
     if let Command::Proposals { root, action } = &parsed.command {
         return run_proposals(root, action);
+    }
+
+    // Provider commands use the token store and (some) the REST API, but
+    // never a model adapter.
+    if let Command::Provider { action } = &parsed.command {
+        return run_provider(action, &parsed.provider, parsed.timeout);
     }
 
     let token = CancellationToken::new();
@@ -161,7 +175,9 @@ fn main() -> ExitCode {
             )
         }
         // Handled before the adapter is built.
-        Command::Proposals { .. } => unreachable!("proposals run locally"),
+        Command::Proposals { .. } | Command::Provider { .. } => {
+            unreachable!("proposals y provider run locally")
+        }
     };
 
     match result {
@@ -214,7 +230,12 @@ const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [
      narra-harness proposals <project-root> reject <id>
      narra-harness proposals <project-root> renew <id> [--adapter ...] [--model ...]
      narra-harness loop <project-root> --instruction <texto> [--allow-tool <nombre>]...
-         [--allow-destructive <nombre>]... [mismas opciones de modelo]";
+         [--allow-destructive <nombre>]... [mismas opciones de modelo]
+     narra-harness provider caps
+     narra-harness provider login [--from-env] [--api-url <url>]
+     narra-harness provider logout
+     narra-harness provider whoami [--api-url <url>]
+     narra-harness provider connect <owner>/<repo> [--api-url <url>]";
 
 #[derive(Debug)]
 struct Parsed {
@@ -223,6 +244,15 @@ struct Parsed {
     latency: Duration,
     adapter: AdapterChoice,
     stream: bool,
+    provider: ProviderOptions,
+}
+
+/// Options for the `provider` subcommands.
+#[derive(Debug, Default)]
+struct ProviderOptions {
+    /// API root override (tests/mocks; GHES support later). Default:
+    /// GitHub.com.
+    api_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -251,6 +281,28 @@ enum Command {
         allowed: Vec<String>,
         destructive: Vec<String>,
     },
+    /// Remote provider operations (M5): capability matrix, token storage
+    /// in OS secret storage, auth check and repository connect.
+    Provider {
+        action: ProviderAction,
+    },
+}
+
+/// Provider subactions. The token itself is never an argument: `login`
+/// reads it from stdin (or `--from-env`), everything else resolves it from
+/// the keychain with `GITHUB_TOKEN` as the headless fallback (D-022).
+#[derive(Debug)]
+enum ProviderAction {
+    /// Print the GitHub capability matrix (what the UI must show).
+    Caps,
+    /// Verify a token against the API and store it in the OS keychain.
+    Login { from_env: bool },
+    /// Remove the stored token (idempotent).
+    Logout,
+    /// Verify the resolved token (`GET /user`).
+    Whoami,
+    /// "Connect" a repository: `GET /repos/{owner}/{repo}`.
+    Connect { repo: String },
 }
 
 /// Local review operations: no model, no events, JSONL records on stdout.
@@ -314,6 +366,8 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut stream = false;
     let mut allow_tool: Vec<String> = Vec::new();
     let mut allow_destructive: Vec<String> = Vec::new();
+    let mut api_url: Option<String> = None;
+    let mut from_env = false;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut iter = args.iter();
@@ -389,6 +443,13 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 let value = iter.next().ok_or("--hunks requiere un valor")?;
                 hunks = Some(parse_hunks(value)?);
             }
+            "--api-url" => {
+                let value = iter.next().ok_or("--api-url requiere un valor")?;
+                api_url = Some((*value).clone());
+            }
+            "--from-env" => {
+                from_env = true;
+            }
             other if other.starts_with('-') => {
                 return Err(format!("opción desconocida: {other}"));
             }
@@ -428,6 +489,8 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let instruction_seen = instruction.is_some();
     let hunks_seen = hunks.is_some();
     let allow_seen = !allow_tool.is_empty() || !allow_destructive.is_empty();
+    let api_url_seen = api_url.is_some();
+    let from_env_seen = from_env;
 
     let command = match positional.as_slice() {
         ["brief", root] if !root.is_empty() => Command::Brief {
@@ -474,6 +537,25 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             allowed: std::mem::take(&mut allow_tool),
             destructive: std::mem::take(&mut allow_destructive),
         },
+        ["provider", "caps"] => Command::Provider {
+            action: ProviderAction::Caps,
+        },
+        ["provider", "login"] => Command::Provider {
+            action: ProviderAction::Login { from_env },
+        },
+        ["provider", "logout"] => Command::Provider {
+            action: ProviderAction::Logout,
+        },
+        ["provider", "whoami"] => Command::Provider {
+            action: ProviderAction::Whoami,
+        },
+        ["provider", "connect", repo] if !repo.is_empty() && repo.contains('/') => {
+            Command::Provider {
+                action: ProviderAction::Connect {
+                    repo: (*repo).to_string(),
+                },
+            }
+        }
         _ => return Err(USAGE.to_string()),
     };
 
@@ -500,6 +582,30 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     {
         return Err("--hunks solo se puede usar con proposals <root> apply".to_string());
     }
+    if api_url_seen
+        && !matches!(
+            command,
+            Command::Provider {
+                action: ProviderAction::Login { .. }
+                    | ProviderAction::Whoami
+                    | ProviderAction::Connect { .. }
+            }
+        )
+    {
+        return Err(
+            "--api-url solo se puede usar con provider login, whoami o connect".to_string(),
+        );
+    }
+    if from_env_seen
+        && !matches!(
+            command,
+            Command::Provider {
+                action: ProviderAction::Login { .. }
+            }
+        )
+    {
+        return Err("--from-env solo se puede usar con provider login".to_string());
+    }
     if model_options_seen && !command.runs_model() {
         return Err(
             "esta orden no ejecuta el modelo; quita --adapter/--latency/--base-url/--model/--stream"
@@ -513,6 +619,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         latency,
         adapter,
         stream,
+        provider: ProviderOptions { api_url },
     })
 }
 
@@ -646,6 +753,163 @@ fn run_proposals(root: &str, action: &ProposalsAction) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Environment variable selecting the secret store: `memory` for tests and
+/// CI (nothing persisted); unset/anything else = OS keychain (D-022). Same
+/// process privilege either way — it is not a privilege boundary.
+const SECRET_STORE_ENV: &str = "NARRA_SECRET_STORE";
+
+/// Remote provider commands (M5): capability matrix, token lifecycle and
+/// repository connect. Tokens are resolved from the OS keychain with
+/// `GITHUB_TOKEN` as the headless fallback (D-022) and are never printed.
+fn run_provider(action: &ProviderAction, options: &ProviderOptions, timeout: Duration) -> ExitCode {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    // `memory` keeps automated runs deterministic (no keychain access in
+    // CI or test suites); the default is the real OS keychain.
+    let store: Box<dyn narra_core::provider::SecretStore> =
+        match std::env::var(SECRET_STORE_ENV).as_deref() {
+            Ok("memory") => Box::new(narra_core::provider::MemorySecretStore::default()),
+            _ => Box::new(narra_core::provider::OsKeychain::new()),
+        };
+
+    match provider_record(action, options, store.as_ref(), timeout) {
+        Ok(record) => {
+            let _ = writeln!(out, "{}", serde_json::to_string(&record).expect("json"));
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::json!({ "record": "provider_error", "error": message })
+            );
+            eprintln!("orden fallida: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The provider-command logic, separated from I/O so errors stay typed
+/// strings and the exit-code policy lives in one place.
+fn provider_record(
+    action: &ProviderAction,
+    options: &ProviderOptions,
+    store: &dyn narra_core::provider::SecretStore,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    use narra_core::provider::{
+        GITHUB_API_BASE_URL, GITHUB_CAPABILITIES, GitHubClient, GitHubConfig,
+    };
+
+    let base_url = options
+        .api_url
+        .clone()
+        .unwrap_or_else(|| GITHUB_API_BASE_URL.to_string());
+    let client_for = |token: String| {
+        GitHubClient::new(
+            GitHubConfig::github_com(token)
+                .with_base_url(base_url.clone())
+                .with_timeout(timeout),
+        )
+    };
+
+    match action {
+        ProviderAction::Caps => Ok(serde_json::json!({
+            "record": "provider_capabilities",
+            "provider": "github",
+            "capabilities": GITHUB_CAPABILITIES
+                .iter()
+                .map(|capability| capability.label())
+                .collect::<Vec<_>>(),
+        })),
+        ProviderAction::Login { from_env } => {
+            // Token never via argv (world-readable in `ps`): stdin by
+            // default, `--from-env` for automation. Verify against the API
+            // *before* storing — a rejected token is never persisted.
+            let token = if *from_env {
+                std::env::var("GITHUB_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| "GITHUB_TOKEN no está definida o está vacía".to_string())?
+            } else {
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|error| format!("no se pudo leer el token de stdin: {error}"))?;
+                let token = line.trim().to_string();
+                if token.is_empty() {
+                    return Err("login requiere el token por stdin, p. ej.:
+  pbpaste | narra-harness provider login
+o bien --from-env con la variable GITHUB_TOKEN"
+                        .to_string());
+                }
+                token
+            };
+            let user = client_for(token.clone())
+                .authenticated_user()
+                .map_err(|error| format!("el token fue rechazado por el proveedor: {error}"))?;
+            store
+                .set(narra_core::provider::GITHUB_TOKEN_ACCOUNT, &token)
+                .map_err(|error| format!("no se pudo guardar el token: {error}"))?;
+            Ok(serde_json::json!({
+                "record": "provider_login",
+                "login": user.login,
+                "stored": true,
+            }))
+        }
+        ProviderAction::Logout => {
+            store
+                .delete(narra_core::provider::GITHUB_TOKEN_ACCOUNT)
+                .map_err(|error| format!("no se pudo eliminar el token: {error}"))?;
+            Ok(serde_json::json!({ "record": "provider_logout", "removed": true }))
+        }
+        ProviderAction::Whoami => {
+            let token = resolve_token(store)?;
+            let user = client_for(token)
+                .authenticated_user()
+                .map_err(|error| format!("GET /user falló: {error}"))?;
+            Ok(serde_json::json!({ "record": "provider_whoami", "login": user.login }))
+        }
+        ProviderAction::Connect { repo } => {
+            let (owner, name) = repo
+                .split_once('/')
+                .filter(|(owner, name)| !owner.is_empty() && !name.is_empty())
+                .ok_or_else(|| format!("«{repo}» no es un repositorio <owner>/<repo>"))?;
+            let token = resolve_token(store)?;
+            let repository = client_for(token)
+                .get_repository(owner, name)
+                .map_err(|error| format!("GET /repos/{owner}/{name} falló: {error}"))?;
+            let permissions = repository
+                .permissions
+                .as_ref()
+                .map(|p| serde_json::json!({ "admin": p.admin, "push": p.push, "pull": p.pull }));
+            Ok(serde_json::json!({
+                "record": "provider_connect",
+                "full_name": repository.full_name,
+                "default_branch": repository.default_branch,
+                "clone_url": repository.clone_url,
+                "html_url": repository.html_url,
+                "private": repository.private,
+                "permissions": permissions,
+            }))
+        }
+    }
+}
+
+/// Token resolution shared by whoami/connect: keychain first, then
+/// `GITHUB_TOKEN` (D-022). The error tells the user exactly what to do.
+fn resolve_token(store: &dyn narra_core::provider::SecretStore) -> Result<String, String> {
+    narra_core::provider::secrets::github_token(
+        store,
+        std::env::var("GITHUB_TOKEN").ok().as_deref(),
+    )
+    .map_err(|error| format!("no se pudo leer el token guardado: {error}"))?
+    .ok_or_else(|| {
+        "no hay token de GitHub: ejecuta `narra-harness provider login` o define GITHUB_TOKEN"
+            .to_string()
+    })
 }
 
 #[cfg(test)]
@@ -834,5 +1098,66 @@ mod tests {
         assert!(parse_hunks("").is_err());
         assert!(parse_hunks("a,b").is_err());
         assert!(parse_hunks("0,,1").is_err());
+    }
+
+    #[test]
+    fn provider_subcommands_parse() {
+        let parsed = parse(&["provider", "caps"]).expect("caps");
+        assert!(matches!(
+            parsed.command,
+            Command::Provider {
+                action: ProviderAction::Caps
+            }
+        ));
+        let parsed = parse(&["provider", "login", "--from-env"]).expect("login");
+        assert!(matches!(
+            parsed.command,
+            Command::Provider {
+                action: ProviderAction::Login { from_env: true }
+            }
+        ));
+        let parsed = parse(&["provider", "logout"]).expect("logout");
+        assert!(matches!(
+            parsed.command,
+            Command::Provider {
+                action: ProviderAction::Logout
+            }
+        ));
+        let parsed =
+            parse(&["provider", "whoami", "--api-url", "http://127.0.0.1:9"]).expect("whoami");
+        assert!(matches!(
+            parsed.command,
+            Command::Provider {
+                action: ProviderAction::Whoami
+            }
+        ));
+        assert_eq!(
+            parsed.provider.api_url.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        let parsed =
+            parse(&["provider", "connect", "olivaresrafael/narra-desktop"]).expect("connect");
+        assert!(matches!(
+            parsed.command,
+            Command::Provider {
+                action: ProviderAction::Connect { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_flags_reject_wrong_commands() {
+        let error = parse(&["provider", "connect", "owner"]).expect_err("owner/repo required");
+        assert!(error.contains("provider"), "{error}");
+        let error = match parse(&["brief", "/tmp/p", "--api-url", "http://x"]) {
+            Err(error) => error,
+            Ok(_) => panic!("--api-url solo con provider"),
+        };
+        assert!(error.contains("provider"), "{error}");
+        let error =
+            parse(&["provider", "whoami", "--from-env"]).expect_err("--from-env only with login");
+        assert!(error.contains("login"), "{error}");
+        // The token is never an argument.
+        assert!(parse(&["provider", "login", "ghp_token"]).is_err());
     }
 }

@@ -19,14 +19,18 @@
 //! read-only live probes, 2026-10-22).
 
 pub mod github;
+pub mod secrets;
 
 use std::fmt;
 use std::time::Duration;
 
 pub use github::{
-    Comment, GITHUB_CAPABILITIES, GitHubClient, GitHubConfig, MergeMethod, MergeOptions,
-    MergeResult, NewPullRequest, NewRepository, Permissions, PullRequest, PullRequestState,
-    Repository, UpdatePullRequest, User,
+    Comment, GITHUB_API_BASE_URL, GITHUB_CAPABILITIES, GitHubClient, GitHubConfig, MergeMethod,
+    MergeOptions, MergeResult, NewPullRequest, NewRepository, Permissions, PullRequest,
+    PullRequestState, Repository, UpdatePullRequest, User,
+};
+pub use secrets::{
+    GITHUB_TOKEN_ACCOUNT, MemorySecretStore, NARRA_SERVICE, OsKeychain, SecretError, SecretStore,
 };
 
 /// One operation the product may want from a remote provider. The enum is

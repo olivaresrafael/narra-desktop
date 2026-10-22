@@ -11,7 +11,7 @@ Native desktop environment for audiovisual writing with AI-assisted agents.
 
 ## Status
 
-Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete). Slice 2a complete: one OpenAI-compatible model adapter (`OpenAiCompatAdapter`) verified against a real local Ollama and against a deterministic mock server, with the API key accepted only from the environment (D-018 clarified). Slice 2b complete: the `scene_edit` task turns a model rewrite into a reviewable `FileProposal` (hunks, provenance, `.narra/proposals/` storage) with hunk-level partial acceptance, rejection and content-hash stale detection; `narra-harness` drives the full propose/review/apply/reject/renew flow headless.
+Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete). Slice 2a complete: one OpenAI-compatible model adapter (`OpenAiCompatAdapter`) verified against a real local Ollama and against a deterministic mock server, with the API key accepted only from the environment (D-018 clarified). Slice 2b complete: the `scene_edit` task turns a model rewrite into a reviewable `FileProposal` (hunks, provenance, `.narra/proposals/` storage) with hunk-level partial acceptance, rejection and content-hash stale detection; `narra-harness` drives the full propose/review/apply/reject/renew flow headless. Milestone 5 in progress (Spike E complete): slice 1 delivers `narra-core::provider` — a GitHub REST adapter behind a capability matrix with provider-confirmed results only and typed rate-limit/auth/permission errors; slice 2 adds token storage in the macOS Keychain (D-022, `keyring`) and the headless `provider` commands (`caps`, `login`, `logout`, `whoami`, `connect`).
 
 ## Layout
 
@@ -137,6 +137,36 @@ silently unlock canonical writes). Each call appears as a `tool_executed`
 event and in the final output's `data.tools` audit (decision + outcome),
 including the denials: the model sees why it was refused, and the audit is
 the record of what actually ran — not the model's claims.
+
+### GitHub provider (M5 slices 1–2)
+
+Remote provider integration starts with GitHub (D-018). The token is a
+fine-grained PAT that the app stores in the **macOS Keychain** (D-022);
+`GITHUB_TOKEN` works as the headless/CI fallback. The token is never an
+argument (argv is world-readable via `ps`), never printed, and only the
+provider's own 2xx response counts as success:
+
+```sh
+# Show exactly which operations this provider supports (what the UI lists).
+cargo run -p narra-harness -- provider caps
+
+# Store a token in the Keychain (verified against the API *before* storing).
+pbpaste | cargo run -p narra-harness -- provider login
+# …or, for automation/CI:
+GITHUB_TOKEN=… cargo run -p narra-harness -- provider login --from-env
+
+# Verify the stored token and connect a repository (read-only).
+cargo run -p narra-harness -- provider whoami
+cargo run -p narra-harness -- provider connect <owner>/<repo>
+
+# Remove the stored token (idempotent).
+cargo run -p narra-harness -- provider logout
+```
+
+Every command emits one JSON record on stdout. `NARRA_SECRET_STORE=memory`
+switches to an in-memory store for tests and CI. Unsupported operations
+(merge reviews today) are listed as absent by `caps` — the product shows
+capability gaps instead of failing at request time.
 
 ### macOS build prerequisite (affects `spike-editor`)
 

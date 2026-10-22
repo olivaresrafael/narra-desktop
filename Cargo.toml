@@ -24,3 +24,8 @@ similar = "2"
 # RustCrypto standard. Needed because `std`'s hasher makes no stability
 # guarantee across releases and proposals persist on disk.
 sha2 = "0.10"
+# OS secret storage for provider tokens (M5 slice 2, D-022): MIT/Apache-2.0,
+# actively maintained, platform-native stores (the default `v1` feature set
+# target-gates each platform's store: Apple Keychain on macOS, which is all
+# the MVP compiles for).
+keyring = "4"

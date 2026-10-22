@@ -25,6 +25,8 @@ similar.workspace = true
 # Content hashing for stale proposal detection (M4 slice 2b, MIT/Apache-2.0):
 # proposals persist on disk, so the hash must be stable across releases.
 sha2.workspace = true
+# OS secret storage for provider tokens (M5 slice 2, D-022, MIT/Apache-2.0).
+keyring.workspace = true
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 uuid = { version = "1", features = ["v4"] }

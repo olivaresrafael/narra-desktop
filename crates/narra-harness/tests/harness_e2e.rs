@@ -631,3 +631,194 @@ fn loop_requires_an_instruction() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--instruction"), "stderr: {stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// Provider subcommands (M5): capability matrix, token lifecycle and connect.
+// These tests use a local one-request HTTP mock and the in-memory secret
+// store (`NARRA_SECRET_STORE=memory`) — no keychain, no network, no secrets
+// in fixtures.
+// ---------------------------------------------------------------------------
+
+use std::io::Write as _;
+use std::net::TcpListener;
+use std::time::Instant;
+
+/// One canned GitHub reply on an ephemeral port. Returns the base URL.
+fn spawn_github_reply(status: u16, body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            // Drain whatever arrived; these tests do not assert the request.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut sink = [0u8; 4096];
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < deadline {
+                match stream.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(n) if n > 0 && !sink[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                    _ => break,
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    base_url
+}
+
+fn provider_env(cmd: &mut Command) {
+    // Isolated, deterministic store: no keychain access in tests.
+    cmd.env("NARRA_SECRET_STORE", "memory");
+}
+
+#[test]
+fn provider_caps_lists_the_github_surface() {
+    let output = harness().args(["provider", "caps"]).output().expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "provider_capabilities");
+    assert_eq!(record["provider"], "github");
+    let caps: Vec<String> = record["capabilities"]
+        .as_array()
+        .expect("capabilities array")
+        .iter()
+        .map(|value| value.as_str().expect("label").to_string())
+        .collect();
+    assert!(caps.contains(&"merge_pull_request".to_string()));
+    assert!(
+        !caps.contains(&"review_pull_request".to_string()),
+        "honesty: reviews not implemented"
+    );
+}
+
+#[test]
+fn provider_login_via_env_verifies_then_stores() {
+    let base = spawn_github_reply(200, r#"{"login":"olivaresrafael"}"#);
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["provider", "login", "--from-env", "--api-url", &base])
+        .env("GITHUB_TOKEN", "ghp_pruebanoreal")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "provider_login");
+    assert_eq!(record["login"], "olivaresrafael");
+    assert_eq!(record["stored"], true);
+    // The token never appears in any output stream.
+    assert!(!stdout.contains("ghp_pruebanoreal"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("ghp_pruebanoreal"));
+}
+
+#[test]
+fn provider_login_rejects_a_token_the_provider_refuses() {
+    let base = spawn_github_reply(401, r#"{"message":"Bad credentials","status":"401"}"#);
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["provider", "login", "--from-env", "--api-url", &base])
+        .env("GITHUB_TOKEN", "ghp_invalida")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "provider_error");
+    assert!(
+        record["error"]
+            .as_str()
+            .expect("error")
+            .contains("Bad credentials"),
+        "provider's own message surfaced: {record}"
+    );
+}
+
+#[test]
+fn provider_whoami_and_connect_use_the_env_fallback() {
+    let base = spawn_github_reply(200, r#"{"login":"olivaresrafael"}"#);
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["provider", "whoami", "--api-url", &base])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "provider_whoami");
+    assert_eq!(record["login"], "olivaresrafael");
+
+    let base = spawn_github_reply(
+        200,
+        r#"{"full_name":"olivaresrafael/narra-desktop","name":"narra-desktop","default_branch":"main","clone_url":"https://github.com/olivaresrafael/narra-desktop.git","html_url":"https://github.com/olivaresrafael/narra-desktop","private":false,"permissions":{"admin":true,"push":true,"pull":true}}"#,
+    );
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "provider",
+            "connect",
+            "olivaresrafael/narra-desktop",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "provider_connect");
+    assert_eq!(record["default_branch"], "main");
+    assert_eq!(record["permissions"]["admin"], true);
+}
+
+#[test]
+fn provider_without_any_token_fails_actionably() {
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["provider", "whoami", "--api-url", "http://127.0.0.1:1"])
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("provider login") && stderr.contains("GITHUB_TOKEN"),
+        "actionable guidance: {stderr}"
+    );
+}
+
+#[test]
+fn provider_connect_rejects_a_malformed_repository() {
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["provider", "connect", "sin-owner"])
+        .env("GITHUB_TOKEN", "ghp_x")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("owner"), "actionable message: {stderr}");
+}
