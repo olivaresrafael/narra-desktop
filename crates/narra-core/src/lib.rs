@@ -9,11 +9,14 @@
 //! - a derived Fountain 1.1 parser (`fountain`) used for the disposable scene
 //!   index — source files stay authoritative (`DATA_MODEL.md` §1);
 //! - local Git over the system `git` executable (`git`): init/open, status,
-//!   log, diff and commit — cancellable, timeout-bounded, secret-free errors.
+//!   log and diff — cancellable, timeout-bounded, secret-free errors;
+//! - agent tasks over an OpenAI-compatible protocol (`agent`): tasks,
+//!   streaming, proposals and a permission-gated tool loop (Milestone 4);
+//! - remote provider integrations (`provider`): GitHub first (D-018), with
+//!   a capability matrix and provider-confirmed results only (Milestone 5).
 //!
 //! What belongs here next:
-//! - Git: clone/fetch/pull/push, branches, merges and conflicts (Milestone 3)
-//! - agent task orchestration, permissions and proposals (Milestone 4, Spike C/F)
+//! - provider auth storage in OS secret storage, GitLab/Bitbucket adapters
 //!
 //! Rules for anything added here:
 //! - no UI framework types in public APIs; commands are explicit inputs and
@@ -28,6 +31,7 @@ pub mod fountain;
 pub mod git;
 pub mod manifest;
 pub mod project;
+pub mod provider;
 
 pub use document::{DocumentError, read_document, resolve_within, write_document};
 pub use fountain::{Element as FountainElement, ElementKind, parse as parse_fountain};
