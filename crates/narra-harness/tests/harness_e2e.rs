@@ -79,6 +79,102 @@ fn usage_errors_exit_one_and_print_usage() {
 }
 
 #[test]
+fn openai_compat_adapter_completes_against_mock_server() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    // Minimal single-request OpenAI-compatible server.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let body = serde_json::json!({
+                "model": "mock-real",
+                "choices": [{"message": {"content": "Resumen del proyecto."}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let root = sample_project();
+    let output = harness()
+        .args([
+            "brief",
+            root.to_str().expect("utf8"),
+            "--adapter",
+            "openai-compat",
+            "--base-url",
+            &base_url,
+            "--model",
+            "mock-real",
+        ])
+        // The key must come from the environment, never from argv.
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("run harness");
+    server.join().expect("server thread");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"model\":\"mock-real\""),
+        "provenance must name the real model: {stdout}"
+    );
+    assert!(
+        stdout.contains("Resumen del proyecto."),
+        "model text must reach the output: {stdout}"
+    );
+}
+
+#[test]
+fn openai_compat_without_model_exits_one() {
+    let root = sample_project();
+    let output = harness()
+        .args([
+            "brief",
+            root.to_str().expect("utf8"),
+            "--adapter",
+            "openai-compat",
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--model"), "stderr: {stderr}");
+}
+
+#[test]
+fn unreachable_endpoint_fails_with_actionable_error() {
+    let root = sample_project();
+    let output = harness()
+        .args([
+            "brief",
+            root.to_str().expect("utf8"),
+            "--adapter",
+            "openai-compat",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "x",
+            "--timeout",
+            "5",
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("127.0.0.1:1"), "stdout: {stdout}");
+}
+
+#[test]
 fn sigint_cancels_the_task_with_exit_two() {
     let root = sample_project();
     // 30 s of simulated latency: the task only ends when SIGINT cancels it.

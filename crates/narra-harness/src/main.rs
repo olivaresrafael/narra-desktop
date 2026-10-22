@@ -11,10 +11,19 @@
 //! - exit status is defined: 0 success, 1 failure, 2 cancelled.
 //!
 //! Usage:
-//!   narra-harness brief <project-root> [--timeout <secs>] [--latency <ms>]
+//!   narra-harness brief <project-root> [options]
 //!
-//! `--latency` sets the mock adapter's simulated latency, so cancellation
-//! can be exercised deterministically without a network.
+//! Options:
+//!   --timeout <secs>   task timeout (default 120)
+//!   --latency <ms>     mock adapter simulated latency (cancellation demos)
+//!   --adapter <name>   mock (default) | openai-compat
+//!   --base-url <url>   openai-compat endpoint (default http://localhost:11434/v1)
+//!   --model <name>     model name for openai-compat (required with it)
+//!
+//! The provider API key is read **only** from the `OPENAI_API_KEY`
+//! environment variable (empty/unset = no key, right for local servers).
+//! It is never accepted as a command-line argument — argv is world-readable
+//! via `ps`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -22,7 +31,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use narra_core::agent::{MockAdapter, ProjectBriefTask, TaskEvent, TaskOptions};
+use narra_core::agent::{
+    AgentError, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
+    ProjectBriefTask, TaskEvent, TaskOptions,
+};
 use narra_core::cancel::CancellationToken;
 
 fn main() -> ExitCode {
@@ -61,7 +73,20 @@ fn main() -> ExitCode {
         timeout: parsed.timeout,
         cancel: token,
     };
-    let adapter = MockAdapter::with_latency(parsed.latency);
+    let adapter: Box<dyn ModelAdapter> = match parsed.adapter {
+        AdapterChoice::Mock => Box::new(MockAdapter::with_latency(parsed.latency)),
+        AdapterChoice::OpenAiCompat(OpenAiCompatChoice {
+            base_url,
+            model,
+            api_key,
+        }) => Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig {
+            base_url,
+            api_key,
+            model,
+            timeout: parsed.timeout,
+            extra_headers: Vec::new(),
+        })),
+    };
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -74,7 +99,9 @@ fn main() -> ExitCode {
     };
 
     let result = match parsed.task {
-        CliTask::Brief(root) => ProjectBriefTask::new(root).run(&adapter, &options, &mut emit),
+        CliTask::Brief(root) => {
+            ProjectBriefTask::new(root).run(adapter.as_ref(), &options, &mut emit)
+        }
     };
 
     match result {
@@ -95,7 +122,7 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = error.to_string();
             let event = match error {
-                narra_core::agent::AgentError::Cancelled => TaskEvent::Cancelled,
+                AgentError::Cancelled => TaskEvent::Cancelled,
                 _ => TaskEvent::Failed {
                     error: message.clone(),
                 },
@@ -118,21 +145,56 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [--latency <ms>]";
+const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [--latency <ms>]
+       [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>]";
 
+#[derive(Debug)]
 struct Parsed {
     task: CliTask,
     timeout: Duration,
     latency: Duration,
+    adapter: AdapterChoice,
 }
 
+#[derive(Debug)]
 enum CliTask {
     Brief(String),
 }
 
+/// Which provider to use. The API key itself is never an argument.
+#[derive(Debug)]
+enum AdapterChoice {
+    Mock,
+    OpenAiCompat(OpenAiCompatChoice),
+}
+
+/// The OpenAI-compatible provider settings. `Debug` is manual so the key
+/// can never reach logs, panics or test output.
+struct OpenAiCompatChoice {
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+}
+
+impl std::fmt::Debug for OpenAiCompatChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatChoice")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The environment variable the harness reads the provider key from.
+const API_KEY_ENV: &str = "OPENAI_API_KEY";
+
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut timeout = Duration::from_secs(120);
     let mut latency = Duration::ZERO;
+    let mut adapter = AdapterChoice::Mock;
+    let mut base_url: Option<String> = None;
+    let mut model: Option<String> = None;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut iter = args.iter();
@@ -152,6 +214,30 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     .map_err(|_| format!("--latency: «{value}» no es un número"))?;
                 latency = Duration::from_millis(ms);
             }
+            "--adapter" => {
+                let value = iter.next().ok_or("--adapter requiere un valor")?;
+                adapter = match value.as_str() {
+                    "mock" => AdapterChoice::Mock,
+                    "openai-compat" => AdapterChoice::OpenAiCompat(OpenAiCompatChoice {
+                        base_url: narra_core::agent::LOCAL_DEFAULT_BASE_URL.to_string(),
+                        model: String::new(),
+                        api_key: None,
+                    }),
+                    other => {
+                        return Err(format!(
+                            "adapter desconocido: «{other}» (esperado mock u openai-compat)"
+                        ));
+                    }
+                };
+            }
+            "--base-url" => {
+                let value = iter.next().ok_or("--base-url requiere un valor")?;
+                base_url = Some((*value).clone());
+            }
+            "--model" => {
+                let value = iter.next().ok_or("--model requiere un valor")?;
+                model = Some((*value).clone());
+            }
             other if other.starts_with('-') => {
                 return Err(format!("opción desconocida: {other}"));
             }
@@ -159,11 +245,39 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         }
     }
 
+    // Late options only make sense together with --adapter openai-compat.
+    if (base_url.is_some() || model.is_some())
+        && !matches!(adapter, AdapterChoice::OpenAiCompat { .. })
+    {
+        return Err(
+            "--base-url/--model solo se pueden usar con --adapter openai-compat".to_string(),
+        );
+    }
+    if let AdapterChoice::OpenAiCompat(OpenAiCompatChoice {
+        base_url: url,
+        model: name,
+        api_key,
+    }) = &mut adapter
+    {
+        if let Some(value) = base_url {
+            *url = value;
+        }
+        match model {
+            Some(value) => *name = value,
+            None => return Err("--adapter openai-compat requiere --model <nombre>".to_string()),
+        }
+        // Key from the environment only: never from argv (visible in `ps`).
+        *api_key = std::env::var(API_KEY_ENV)
+            .ok()
+            .filter(|key| !key.is_empty());
+    }
+
     match positional.as_slice() {
         ["brief", root] if !root.is_empty() => Ok(Parsed {
             task: CliTask::Brief((*root).to_string()),
             timeout,
             latency,
+            adapter,
         }),
         _ => Err(USAGE.to_string()),
     }
@@ -191,5 +305,83 @@ mod tests {
         assert!(parse_args(&["brief".to_string()]).is_err());
         assert!(parse_args(&["brief".to_string(), "/p".into(), "--nope".into()]).is_err());
         assert!(parse_args(&["brief".into(), "/p".into(), "--timeout".into()]).is_err());
+    }
+
+    #[test]
+    fn defaults_to_the_mock_adapter() {
+        let args: Vec<String> = ["brief", "/tmp/p"].iter().map(|s| s.to_string()).collect();
+        let parsed = parse_args(&args).expect("parse");
+        assert!(matches!(parsed.adapter, AdapterChoice::Mock));
+    }
+
+    #[test]
+    fn openai_compat_requires_model() {
+        let args: Vec<String> = ["brief", "/tmp/p", "--adapter", "openai-compat"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let error = parse_args(&args).expect_err("model required");
+        assert!(error.contains("--model"), "{error}");
+    }
+
+    #[test]
+    fn base_url_and_model_need_their_adapter() {
+        let args: Vec<String> = ["brief", "/tmp/p", "--model", "qwen"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let error = parse_args(&args).expect_err("adapter required");
+        assert!(error.contains("openai-compat"), "{error}");
+    }
+
+    #[test]
+    fn unknown_adapter_is_rejected() {
+        let args: Vec<String> = ["brief", "/tmp/p", "--adapter", "gemini"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn api_key_never_appears_in_debug_output() {
+        let choice = OpenAiCompatChoice {
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen".to_string(),
+            api_key: Some("sk-super-secret-value".to_string()),
+        };
+        let rendered = format!("{choice:?}");
+        assert!(
+            !rendered.contains("sk-super-secret-value"),
+            "key leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn openai_compat_with_model_parses_with_local_default_url() {
+        let args: Vec<String> = [
+            "brief",
+            "/tmp/p",
+            "--adapter",
+            "openai-compat",
+            "--model",
+            "qwen2.5vl:7b",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_args(&args).expect("parse");
+        match parsed.adapter {
+            AdapterChoice::OpenAiCompat(OpenAiCompatChoice {
+                ref base_url,
+                ref model,
+                ..
+            }) => {
+                assert_eq!(base_url, narra_core::agent::LOCAL_DEFAULT_BASE_URL);
+                assert_eq!(model, "qwen2.5vl:7b");
+            }
+            AdapterChoice::Mock => panic!("expected openai-compat"),
+        }
     }
 }

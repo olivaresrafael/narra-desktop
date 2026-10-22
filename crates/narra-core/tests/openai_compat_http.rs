@@ -1,0 +1,383 @@
+//! HTTP-level tests for the OpenAI-compatible adapter against a local mock
+//! server (Spike C: free, repeatable runs — no network, no credentials, no
+//! real provider). Each case exercises one wire behavior we depend on:
+//! success parsing, actionable errors, timeouts, probes and secret hygiene.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+use narra_core::agent::{ModelAdapter, ModelRequest, OpenAiCompatAdapter, OpenAiCompatConfig};
+use narra_core::cancel::CancellationToken;
+
+/// One canned HTTP exchange: what the mock server returns, and (optionally)
+/// how long it waits before answering, to exercise timeouts.
+struct MockReply {
+    status: u16,
+    body: String,
+    delay: Duration,
+}
+
+/// A single-request HTTP server: binds an ephemeral port, answers exactly
+/// one request, then exits. Returns the base URL (`http://127.0.0.1:<port>/v1`).
+fn spawn_mock_server(reply: MockReply) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            if !reply.delay.is_zero() {
+                thread::sleep(reply.delay);
+            }
+            let _ = serve_once(&mut stream, reply.status, &reply.body);
+        }
+    });
+    // Detach: the test does not need to join, but keep the join handle
+    // referenced so the thread is not leaked silently in panicking paths.
+    drop(handle);
+    base_url
+}
+
+fn serve_once(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    // Read the request head and any body we are told to expect.
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = find_subsequence(&buffer, b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+    let content_length: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    let mut body_read = buffer.len() - head_end;
+    while body_read < content_length {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        body_read += read;
+    }
+
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Status",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn request(system: &str, prompt: &str) -> ModelRequest {
+    ModelRequest {
+        system: system.to_string(),
+        prompt: prompt.to_string(),
+        max_output_tokens: 64,
+    }
+}
+
+#[test]
+fn success_parses_content_model_and_usage() {
+    let body = serde_json::json!({
+        "model": "qwen2.5vl:7b",
+        "choices": [{"message": {"role": "assistant", "content": "Hola desde el mock"}}],
+        "usage": {"prompt_tokens": 21, "completion_tokens": 7}
+    })
+    .to_string();
+    let base_url = spawn_mock_server(MockReply {
+        status: 200,
+        body,
+        delay: Duration::ZERO,
+    });
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "qwen2.5vl:7b".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let response = adapter
+        .complete(&request("s", "p"), &token)
+        .expect("mock success");
+
+    assert_eq!(response.text, "Hola desde el mock");
+    assert_eq!(response.model, "qwen2.5vl:7b");
+    assert_eq!(response.input_tokens, Some(21));
+    assert_eq!(response.output_tokens, Some(7));
+}
+
+#[test]
+fn unauthorized_surfaces_server_message_without_the_key() {
+    // The server echoes a message that *contains* a token-like string; the
+    // adapter must redact it before it reaches the error value.
+    let body = serde_json::json!({
+        "error": {"message": "invalid authorization: sk-abcdefghijklmnop"}
+    })
+    .to_string();
+    let base_url = spawn_mock_server(MockReply {
+        status: 401,
+        body,
+        delay: Duration::ZERO,
+    });
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: Some("sk-should-never-appear-anywhere".to_string()),
+        model: "gpt-4o-mini".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("401 must fail");
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("401"), "{rendered}");
+    assert!(rendered.contains("invalid authorization"), "{rendered}");
+    assert!(
+        !rendered.contains("sk-should-never-appear-anywhere"),
+        "configured key leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains("sk-abcdefghijk"),
+        "server echo leaked: {rendered}"
+    );
+}
+
+#[test]
+fn unknown_model_is_actionable() {
+    let body = serde_json::json!({
+        "error": {"message": "model 'nope' not found, try pulling it first"}
+    })
+    .to_string();
+    let base_url = spawn_mock_server(MockReply {
+        status: 404,
+        body,
+        delay: Duration::ZERO,
+    });
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "nope".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("404 must fail");
+    let rendered = error.to_string();
+    assert!(rendered.contains("404"), "{rendered}");
+    assert!(rendered.contains("not found"), "{rendered}");
+}
+
+#[test]
+fn native_ollama_error_string_is_surfaced() {
+    // Ollama's native error wire style is a bare string, not an object.
+    let body = serde_json::json!({"error": "model requires more system memory"}).to_string();
+    let base_url = spawn_mock_server(MockReply {
+        status: 500,
+        body,
+        delay: Duration::ZERO,
+    });
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "big".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("500 must fail");
+    let rendered = error.to_string();
+    assert!(rendered.contains("500"), "{rendered}");
+    assert!(rendered.contains("system memory"), "{rendered}");
+}
+
+#[test]
+fn non_json_body_is_reported_not_panicked() {
+    let base_url = spawn_mock_server(MockReply {
+        status: 200,
+        body: "<html>oops</html>".to_string(),
+        delay: Duration::ZERO,
+    });
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "x".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("non-JSON must fail");
+    assert!(error.to_string().contains("interpretable"), "{error}");
+}
+
+#[test]
+fn timeout_bounds_a_stuck_endpoint() {
+    // The server waits far longer than the adapter's timeout.
+    let base_url = spawn_mock_server(MockReply {
+        status: 200,
+        body: "{}".to_string(),
+        delay: Duration::from_secs(30),
+    });
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "x".to_string(),
+        timeout: Duration::from_millis(300),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let started = std::time::Instant::now();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("timeout must fail");
+    let elapsed = started.elapsed();
+
+    assert!(error.to_string().contains("timeout"), "{error}");
+    assert!(elapsed < Duration::from_secs(10), "bounded: {elapsed:?}");
+}
+
+#[test]
+fn unreachable_endpoint_is_actionable() {
+    // Port 1 on localhost: nothing listens there (reserved, unprivileged).
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url: "http://127.0.0.1:1/v1".to_string(),
+        api_key: None,
+        model: "x".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("must fail");
+    let rendered = error.to_string();
+    assert!(rendered.contains("127.0.0.1:1"), "{rendered}");
+}
+
+#[test]
+fn probe_reports_compatible_auth_required_and_down() {
+    // 200 on /models → fully compatible.
+    let ok_url = spawn_mock_server(MockReply {
+        status: 200,
+        body: "{}".to_string(),
+        delay: Duration::ZERO,
+    });
+    let probe = |base_url: &str| {
+        OpenAiCompatAdapter::new(OpenAiCompatConfig {
+            base_url: base_url.to_string(),
+            api_key: None,
+            model: "x".to_string(),
+            timeout: Duration::from_secs(5),
+            extra_headers: Vec::new(),
+        })
+        .probe()
+    };
+    assert!(probe(&ok_url).expect("200 probe"));
+
+    // 401 on /models → endpoint speaks HTTP, only auth is missing.
+    let auth_url = spawn_mock_server(MockReply {
+        status: 401,
+        body: "{}".to_string(),
+        delay: Duration::ZERO,
+    });
+    assert!(probe(&auth_url).expect("401 probe"));
+
+    // Connection refused → unreachable, reported as an error.
+    let down = probe("http://127.0.0.1:1/v1").expect_err("down must error");
+    assert!(down.to_string().contains("127.0.0.1:1"), "{down}");
+}
+
+#[test]
+fn success_response_with_error_envelope_fails_cleanly() {
+    // Some servers answer 200 but carry an error envelope; we must not
+    // treat that as a model response.
+    let body = serde_json::json!({
+        "error": {"message": "quota exceeded for this org"}
+    })
+    .to_string();
+    let base_url = spawn_mock_server(MockReply {
+        status: 200,
+        body,
+        delay: Duration::ZERO,
+    });
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model: "x".to_string(),
+        timeout: Duration::from_secs(5),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete(&request("s", "p"), &token)
+        .expect_err("error envelope must fail");
+    assert!(error.to_string().contains("quota exceeded"), "{error}");
+}
+
+/// End-to-end against a real Ollama server when present. Ignored by default;
+/// run with `cargo test -p narra-core --test openai_compat_http -- --ignored`
+/// on a machine with `ollama serve` running and a pulled model.
+#[test]
+#[ignore = "requires a running Ollama server (OLLAMA_URL, default localhost:11434)"]
+fn real_ollama_completes_a_brief_exchange() {
+    let base_url = std::env::var("OLLAMA_URL")
+        .unwrap_or_else(|_| narra_core::agent::LOCAL_DEFAULT_BASE_URL.to_string());
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model,
+        timeout: Duration::from_secs(120),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let response = adapter
+        .complete(
+            &request(
+                "Eres un asistente de guion.",
+                "Di hola en una frase corta de menos de diez palabras.",
+            ),
+            &token,
+        )
+        .expect("real Ollama completion");
+
+    assert!(!response.text.is_empty(), "model produced no text");
+    eprintln!("ollama respondió ({}): {}", response.model, response.text);
+}

@@ -11,7 +11,7 @@ Native desktop environment for audiovisual writing with AI-assisted agents.
 
 ## Status
 
-Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete; real OpenAI adapter and write proposals pending).
+Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete). Slice 2a complete: one OpenAI-compatible model adapter (`OpenAiCompatAdapter`) verified against a real local Ollama and against a deterministic mock server, with the API key accepted only from the environment (D-018 clarified). Write proposals with stale-base detection still pending.
 
 ## Layout
 
@@ -27,6 +27,7 @@ narra-desktop/
     │   └── src/fountain.rs     # derived Fountain 1.1 parser (index only)
     │   └── src/git/            # local Git via system git (cancellable ops)
     │   └── src/agent/          # agent task contracts + first task (project_brief)
+    │   │                        + OpenAI-compatible model adapter (D-018)
     │   └── src/cancel.rs       # shared cooperative cancellation
     ├── narra-harness/          # headless agent runner: JSONL events, exit codes (Spike F)
     ├── spike-editor/           # GPUI editor spike (Milestone 1 evidence)
@@ -46,6 +47,28 @@ cargo test --workspace
 ```
 
 CI runs the same three commands on `macos-latest`.
+
+### Running the agent harness
+
+`narra-harness` runs an agent task with no desktop window. The default
+provider is the deterministic mock (no network, no key):
+
+```sh
+cargo run -p narra-harness -- brief <project-root>
+```
+
+To use a real model, point it at any OpenAI-compatible endpoint. For a local
+Ollama server (no account, no cost):
+
+```sh
+cargo run -p narra-harness -- brief <project-root> \
+    --adapter openai-compat --model qwen2.5vl:7b
+```
+
+The endpoint defaults to `http://localhost:11434/v1`; override with
+`--base-url`. The API key is read **only** from the `OPENAI_API_KEY`
+environment variable (unset = no key, which is correct for local servers) —
+never pass it as an argument.
 
 ### macOS build prerequisite (affects `spike-editor`)
 

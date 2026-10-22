@@ -15,10 +15,12 @@
 pub mod adapter;
 pub mod brief;
 pub mod mock;
+pub mod openai_compat;
 
 pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
 pub use mock::MockAdapter;
+pub use openai_compat::{LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig};
 
 use std::time::Duration;
 
