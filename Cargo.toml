@@ -17,3 +17,10 @@ serde_json = "1"
 # Synchronous HTTP for the OpenAI-compatible model adapter: no async runtime
 # imposed on a blocking, cancellation-token-driven core (MIT/Apache-2.0).
 ureq = { version = "3", features = ["json"] }
+# Line diff for reviewable edit proposals (M4 slice 2b): pure Rust, MIT/
+# Apache-2.0, maintained; the standard diff engine in the Rust ecosystem.
+similar = "2"
+# Content hashing to detect stale proposal bases (M4 slice 2b): MIT/Apache-2.0,
+# RustCrypto standard. Needed because `std`'s hasher makes no stability
+# guarantee across releases and proposals persist on disk.
+sha2 = "0.10"

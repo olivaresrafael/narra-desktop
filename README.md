@@ -11,7 +11,7 @@ Native desktop environment for audiovisual writing with AI-assisted agents.
 
 ## Status
 
-Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete). Slice 2a complete: one OpenAI-compatible model adapter (`OpenAiCompatAdapter`) verified against a real local Ollama and against a deterministic mock server, with the API key accepted only from the environment (D-018 clarified). Write proposals with stale-base detection still pending.
+Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete). Slice 2a complete: one OpenAI-compatible model adapter (`OpenAiCompatAdapter`) verified against a real local Ollama and against a deterministic mock server, with the API key accepted only from the environment (D-018 clarified). Slice 2b complete: the `scene_edit` task turns a model rewrite into a reviewable `FileProposal` (hunks, provenance, `.narra/proposals/` storage) with hunk-level partial acceptance, rejection and content-hash stale detection; `narra-harness` drives the full propose/review/apply/reject/renew flow headless.
 
 ## Layout
 
@@ -69,6 +69,40 @@ The endpoint defaults to `http://localhost:11434/v1`; override with
 `--base-url`. The API key is read **only** from the `OPENAI_API_KEY`
 environment variable (unset = no key, which is correct for local servers) —
 never pass it as an argument.
+
+### Reviewing edit proposals (M4 slice 2b)
+
+The `scene_edit` task asks the model to rewrite one scene and persists the
+answer as a **reviewable proposal** — canonical files are never written by
+the task. Records live in `<project>/.narra/proposals/<uuid>.json` with the
+line diff (hunks), provenance (task, adapter, model, timestamp, base
+content hash) and lifecycle state.
+
+```sh
+# 1. Propose a rewrite of scene 2 (no canonical file is touched)
+cargo run -p narra-harness -- propose <project-root> \
+    --scene 2 --instruction "haz el diálogo más tenso"
+
+# 2. Inspect what was proposed
+cargo run -p narra-harness -- proposals <project-root> list
+cargo run -p narra-harness -- proposals <project-root> show <proposal-id>
+
+# 3. Accept everything, only some hunks (0-based), or reject
+cargo run -p narra-harness -- proposals <project-root> apply <proposal-id>
+cargo run -p narra-harness -- proposals <project-root> apply <proposal-id> --hunks 0,2
+cargo run -p narra-harness -- proposals <project-root> reject <proposal-id>
+```
+
+Applying is refused (exit 1) when the target file changed after the
+proposal was created: staleness is decided by content hash, so a later user
+edit can never be silently overwritten. Renewed review re-runs the same
+task against the current content and produces a fresh proposal:
+
+```sh
+cargo run -p narra-harness -- proposals <project-root> renew <proposal-id>
+```
+
+`renew` accepts the same adapter options as `propose` (mock by default).
 
 ### macOS build prerequisite (affects `spike-editor`)
 

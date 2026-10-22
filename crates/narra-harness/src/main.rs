@@ -1,17 +1,23 @@
 //! Headless agent harness (Milestone 4, Spike F).
 //!
-//! Runs an agent task with **no desktop window**:
+//! Runs agent tasks and proposal review with **no desktop window**:
 //!
 //! - task input is explicit and serializable (CLI arguments; a JSON input
 //!   variant lands with the first real provider adapter);
 //! - progress events are UI-neutral, emitted as JSONL on stdout;
 //! - Ctrl-C cancels cooperatively;
 //! - output is both human-readable (stderr summary) and machine-readable
-//!   (final `task_output` JSONL record on stdout);
+//!   (final record JSONL on stdout);
 //! - exit status is defined: 0 success, 1 failure, 2 cancelled.
 //!
 //! Usage:
 //!   narra-harness brief <project-root> [options]
+//!   narra-harness propose <project-root> --scene <n> --instruction <texto> [options]
+//!   narra-harness proposals <project-root> [list]
+//!   narra-harness proposals <project-root> show <proposal-id>
+//!   narra-harness proposals <project-root> apply <proposal-id> [--hunks 0,2]
+//!   narra-harness proposals <project-root> reject <proposal-id>
+//!   narra-harness proposals <project-root> renew <proposal-id> [options]
 //!
 //! Options:
 //!   --timeout <secs>   task timeout (default 120)
@@ -19,6 +25,13 @@
 //!   --adapter <name>   mock (default) | openai-compat
 //!   --base-url <url>   openai-compat endpoint (default http://localhost:11434/v1)
 //!   --model <name>     model name for openai-compat (required with it)
+//!   --scene <n>        1-based scene number (propose only)
+//!   --instruction <t>  writer's instruction (propose only)
+//!   --hunks <a,b>      0-based hunk indices to accept (apply only; default all)
+//!
+//! `apply` refuses a stale proposal (the file changed after it was created)
+//! and exits 1; `renew` re-runs the originating task against the current
+//! content to produce a fresh proposal for renewed review.
 //!
 //! The provider API key is read **only** from the `OPENAI_API_KEY`
 //! environment variable (empty/unset = no key, right for local servers).
@@ -26,14 +39,16 @@
 //! via `ps`.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use narra_core::agent::proposal;
 use narra_core::agent::{
     AgentError, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
-    ProjectBriefTask, TaskEvent, TaskOptions,
+    ProjectBriefTask, SceneEditTask, TaskEvent, TaskOptions,
 };
 use narra_core::cancel::CancellationToken;
 
@@ -47,6 +62,11 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // Local review operations never touch the network or a model.
+    if let Command::Proposals { root, action } = &parsed.command {
+        return run_proposals(root, action);
+    }
 
     let token = CancellationToken::new();
     // Ctrl-C sets the token; the task observes it between stages and the
@@ -98,10 +118,23 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = match parsed.task {
-        CliTask::Brief(root) => {
+    let result = match parsed.command {
+        Command::Brief { root } => {
             ProjectBriefTask::new(root).run(adapter.as_ref(), &options, &mut emit)
         }
+        Command::Propose {
+            root,
+            scene,
+            instruction,
+        } => {
+            SceneEditTask::new(root, scene, instruction).run(adapter.as_ref(), &options, &mut emit)
+        }
+        Command::Renew { root, id } => proposal::load(Path::new(&root), &id)
+            .map_err(AgentError::Proposal)
+            .and_then(|record| SceneEditTask::from_proposal(root, &record))
+            .and_then(|task| task.run(adapter.as_ref(), &options, &mut emit)),
+        // Handled before the adapter is built.
+        Command::Proposals { .. } => unreachable!("proposals run locally"),
     };
 
     match result {
@@ -146,19 +179,60 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [--latency <ms>]
-       [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>]";
+       [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>]
+     narra-harness propose <project-root> --scene <n> --instruction <texto> [mismas opciones]
+     narra-harness proposals <project-root> [list]
+     narra-harness proposals <project-root> show <id>
+     narra-harness proposals <project-root> apply <id> [--hunks 0,2]
+     narra-harness proposals <project-root> reject <id>
+     narra-harness proposals <project-root> renew <id> [--adapter ...] [--model ...]";
 
 #[derive(Debug)]
 struct Parsed {
-    task: CliTask,
+    command: Command,
     timeout: Duration,
     latency: Duration,
     adapter: AdapterChoice,
 }
 
 #[derive(Debug)]
-enum CliTask {
-    Brief(String),
+enum Command {
+    Brief {
+        root: String,
+    },
+    Propose {
+        root: String,
+        scene: usize,
+        instruction: String,
+    },
+    Renew {
+        root: String,
+        id: String,
+    },
+    Proposals {
+        root: String,
+        action: ProposalsAction,
+    },
+}
+
+/// Local review operations: no model, no events, JSONL records on stdout.
+#[derive(Debug)]
+enum ProposalsAction {
+    List,
+    Show(String),
+    Apply(String, Option<Vec<usize>>),
+    Reject(String),
+}
+
+impl Command {
+    /// Commands that call a model adapter (the others must not take
+    /// provider/latency options).
+    fn runs_model(&self) -> bool {
+        matches!(
+            self,
+            Self::Brief { .. } | Self::Propose { .. } | Self::Renew { .. }
+        )
+    }
 }
 
 /// Which provider to use. The API key itself is never an argument.
@@ -195,6 +269,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut adapter = AdapterChoice::Mock;
     let mut base_url: Option<String> = None;
     let mut model: Option<String> = None;
+    let mut scene: Option<usize> = None;
+    let mut instruction: Option<String> = None;
+    let mut hunks: Option<Vec<usize>> = None;
+    let mut model_options_seen = false;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut iter = args.iter();
@@ -213,9 +291,11 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     .parse()
                     .map_err(|_| format!("--latency: «{value}» no es un número"))?;
                 latency = Duration::from_millis(ms);
+                model_options_seen = true;
             }
             "--adapter" => {
                 let value = iter.next().ok_or("--adapter requiere un valor")?;
+                model_options_seen = true;
                 adapter = match value.as_str() {
                     "mock" => AdapterChoice::Mock,
                     "openai-compat" => AdapterChoice::OpenAiCompat(OpenAiCompatChoice {
@@ -233,10 +313,26 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--base-url" => {
                 let value = iter.next().ok_or("--base-url requiere un valor")?;
                 base_url = Some((*value).clone());
+                model_options_seen = true;
             }
             "--model" => {
                 let value = iter.next().ok_or("--model requiere un valor")?;
                 model = Some((*value).clone());
+                model_options_seen = true;
+            }
+            "--scene" => {
+                let value = iter.next().ok_or("--scene requiere un valor")?;
+                scene = Some(value.parse().map_err(|_| {
+                    format!("--scene: «{value}» no es un número (escenas desde la 1)")
+                })?);
+            }
+            "--instruction" => {
+                let value = iter.next().ok_or("--instruction requiere un valor")?;
+                instruction = Some((*value).clone());
+            }
+            "--hunks" => {
+                let value = iter.next().ok_or("--hunks requiere un valor")?;
+                hunks = Some(parse_hunks(value)?);
             }
             other if other.starts_with('-') => {
                 return Err(format!("opción desconocida: {other}"));
@@ -272,14 +368,210 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             .filter(|key| !key.is_empty());
     }
 
-    match positional.as_slice() {
-        ["brief", root] if !root.is_empty() => Ok(Parsed {
-            task: CliTask::Brief((*root).to_string()),
-            timeout,
-            latency,
-            adapter,
+    // Capture presence before the match consumes the options.
+    let scene_seen = scene.is_some();
+    let instruction_seen = instruction.is_some();
+    let hunks_seen = hunks.is_some();
+
+    let command = match positional.as_slice() {
+        ["brief", root] if !root.is_empty() => Command::Brief {
+            root: (*root).to_string(),
+        },
+        ["propose", root] if !root.is_empty() => Command::Propose {
+            root: (*root).to_string(),
+            scene: scene.ok_or("--propose requiere --scene <número>")?,
+            instruction: instruction.ok_or("--propose requiere --instruction <texto>")?,
+        },
+        ["proposals", root] | ["proposals", root, "list"] if !root.is_empty() => {
+            Command::Proposals {
+                root: (*root).to_string(),
+                action: ProposalsAction::List,
+            }
+        }
+        ["proposals", root, "show", id] if !root.is_empty() && !id.is_empty() => {
+            Command::Proposals {
+                root: (*root).to_string(),
+                action: ProposalsAction::Show((*id).to_string()),
+            }
+        }
+        ["proposals", root, "apply", id] if !root.is_empty() && !id.is_empty() => {
+            Command::Proposals {
+                root: (*root).to_string(),
+                action: ProposalsAction::Apply((*id).to_string(), hunks.take()),
+            }
+        }
+        ["proposals", root, "reject", id] if !root.is_empty() && !id.is_empty() => {
+            Command::Proposals {
+                root: (*root).to_string(),
+                action: ProposalsAction::Reject((*id).to_string()),
+            }
+        }
+        ["proposals", root, "renew", id] if !root.is_empty() && !id.is_empty() => Command::Renew {
+            root: (*root).to_string(),
+            id: (*id).to_string(),
+        },
+        _ => return Err(USAGE.to_string()),
+    };
+
+    // Per-command flags: a stray flag is an explicit error, not a silence.
+    if (scene_seen || instruction_seen) && !matches!(command, Command::Propose { .. }) {
+        return Err("--scene/--instruction solo se pueden usar con la orden propose".to_string());
+    }
+    if hunks_seen
+        && !matches!(
+            command,
+            Command::Proposals {
+                action: ProposalsAction::Apply(..),
+                ..
+            }
+        )
+    {
+        return Err("--hunks solo se puede usar con proposals <root> apply".to_string());
+    }
+    if model_options_seen && !command.runs_model() {
+        return Err(
+            "esta orden no ejecuta el modelo; quita --adapter/--latency/--base-url/--model"
+                .to_string(),
+        );
+    }
+
+    Ok(Parsed {
+        command,
+        timeout,
+        latency,
+        adapter,
+    })
+}
+
+/// Parse a 0-based comma-separated hunk list, e.g. `0,2`.
+fn parse_hunks(value: &str) -> Result<Vec<usize>, String> {
+    if value.trim().is_empty() {
+        return Err("--hunks requiere índices separados por comas, p. ej. 0,2".to_string());
+    }
+    value
+        .split(',')
+        .map(|part| {
+            part.trim().parse::<usize>().map_err(|_| {
+                format!("--hunks: «{part}» no es un índice válido (0-based, p. ej. 0,2)")
+            })
+        })
+        .collect()
+}
+
+/// Emit one JSONL record on stdout (local review operations).
+fn emit_line(value: &serde_json::Value) {
+    let Ok(line) = serde_json::to_string(value) else {
+        return;
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// Run a local proposal review operation (list/show/apply/reject): JSONL on
+/// stdout, human summary on stderr, exit 0/1.
+fn run_proposals(root: &str, action: &ProposalsAction) -> ExitCode {
+    let path = Path::new(root);
+    let action_name = match action {
+        ProposalsAction::List => "list",
+        ProposalsAction::Show(_) => "show",
+        ProposalsAction::Apply(..) => "apply",
+        ProposalsAction::Reject(_) => "reject",
+    };
+
+    let outcome: Result<(serde_json::Value, String), proposal::ProposalError> = match action {
+        ProposalsAction::List => proposal::list(path).map(|records| {
+            for record in &records {
+                emit_line(&serde_json::json!({
+                    "record": "proposal",
+                    "id": record.id,
+                    "state": record.state,
+                    "target": record.target,
+                    "hunks": record.hunks.len(),
+                    "task": record.origin.task,
+                    "created_at": record.created_at,
+                }));
+            }
+            (
+                serde_json::json!({ "record": "proposals_list", "count": records.len() }),
+                format!("{} propuestas en {root}.", records.len()),
+            )
         }),
-        _ => Err(USAGE.to_string()),
+        ProposalsAction::Show(id) => proposal::load(path, id).map(|record| {
+            let summary = format!(
+                "Propuesta {} ({}) sobre {}: {} hunks.",
+                &record.id[..8],
+                record.state,
+                record.target,
+                record.hunks.len()
+            );
+            (
+                serde_json::json!({ "record": "proposal_detail", "proposal": record }),
+                summary,
+            )
+        }),
+        ProposalsAction::Apply(id, hunks) => {
+            proposal::apply(path, id, hunks.as_deref()).map(|outcome| {
+                let total = outcome.applied_hunks.len() + outcome.skipped_hunks.len();
+                let summary = if outcome.skipped_hunks.is_empty() {
+                    format!(
+                        "Propuesta {} aplicada: {} hunks en {}.",
+                        &outcome.proposal.id[..8],
+                        outcome.applied_hunks.len(),
+                        outcome.proposal.target
+                    )
+                } else {
+                    format!(
+                        "Propuesta {} aplicada parcialmente: {} de {} hunks en {}.",
+                        &outcome.proposal.id[..8],
+                        outcome.applied_hunks.len(),
+                        total,
+                        outcome.proposal.target
+                    )
+                };
+                let record = serde_json::json!({
+                    "record": "proposal_apply",
+                    "proposal_id": outcome.proposal.id,
+                    "state": outcome.proposal.state,
+                    "target": outcome.proposal.target,
+                    "applied_hunks": outcome.applied_hunks,
+                    "skipped_hunks": outcome.skipped_hunks,
+                });
+                (record, summary)
+            })
+        }
+        ProposalsAction::Reject(id) => proposal::reject(path, id).map(|record| {
+            (
+                serde_json::json!({
+                    "record": "proposal_reject",
+                    "proposal_id": record.id,
+                    "state": record.state,
+                }),
+                format!(
+                    "Propuesta {} rechazada; {} queda intacto.",
+                    &record.id[..8],
+                    record.target
+                ),
+            )
+        }),
+    };
+
+    match outcome {
+        Ok((record, summary)) => {
+            emit_line(&record);
+            eprintln!("{summary}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            emit_line(&serde_json::json!({
+                "record": "proposal_error",
+                "action": action_name,
+                "error": error.to_string(),
+            }));
+            eprintln!("orden fallida: {error}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -287,60 +579,50 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
 mod tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> Result<Parsed, String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned)
+    }
+
     #[test]
     fn parses_brief_task_with_options() {
-        let args: Vec<String> = ["brief", "/tmp/p", "--timeout", "5", "--latency", "10"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let parsed = parse_args(&args).expect("parse");
-        assert!(matches!(parsed.task, CliTask::Brief(ref root) if root == "/tmp/p"));
+        let parsed =
+            parse(&["brief", "/tmp/p", "--timeout", "5", "--latency", "10"]).expect("parse");
+        assert!(matches!(parsed.command, Command::Brief { ref root } if root == "/tmp/p"));
         assert_eq!(parsed.timeout, Duration::from_secs(5));
         assert_eq!(parsed.latency, Duration::from_millis(10));
     }
 
     #[test]
     fn rejects_unknown_and_incomplete_input() {
-        assert!(parse_args(&[]).is_err());
-        assert!(parse_args(&["brief".to_string()]).is_err());
-        assert!(parse_args(&["brief".to_string(), "/p".into(), "--nope".into()]).is_err());
-        assert!(parse_args(&["brief".into(), "/p".into(), "--timeout".into()]).is_err());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["brief"]).is_err());
+        assert!(parse(&["brief", "/p", "--nope"]).is_err());
+        assert!(parse(&["brief", "/p", "--timeout"]).is_err());
     }
 
     #[test]
     fn defaults_to_the_mock_adapter() {
-        let args: Vec<String> = ["brief", "/tmp/p"].iter().map(|s| s.to_string()).collect();
-        let parsed = parse_args(&args).expect("parse");
+        let parsed = parse(&["brief", "/tmp/p"]).expect("parse");
         assert!(matches!(parsed.adapter, AdapterChoice::Mock));
     }
 
     #[test]
     fn openai_compat_requires_model() {
-        let args: Vec<String> = ["brief", "/tmp/p", "--adapter", "openai-compat"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let error = parse_args(&args).expect_err("model required");
+        let error =
+            parse(&["brief", "/tmp/p", "--adapter", "openai-compat"]).expect_err("model required");
         assert!(error.contains("--model"), "{error}");
     }
 
     #[test]
     fn base_url_and_model_need_their_adapter() {
-        let args: Vec<String> = ["brief", "/tmp/p", "--model", "qwen"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let error = parse_args(&args).expect_err("adapter required");
+        let error = parse(&["brief", "/tmp/p", "--model", "qwen"]).expect_err("adapter required");
         assert!(error.contains("openai-compat"), "{error}");
     }
 
     #[test]
     fn unknown_adapter_is_rejected() {
-        let args: Vec<String> = ["brief", "/tmp/p", "--adapter", "gemini"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(parse_args(&args).is_err());
+        assert!(parse(&["brief", "/tmp/p", "--adapter", "gemini"]).is_err());
     }
 
     #[test]
@@ -360,18 +642,15 @@ mod tests {
 
     #[test]
     fn openai_compat_with_model_parses_with_local_default_url() {
-        let args: Vec<String> = [
+        let parsed = parse(&[
             "brief",
             "/tmp/p",
             "--adapter",
             "openai-compat",
             "--model",
             "qwen2.5vl:7b",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let parsed = parse_args(&args).expect("parse");
+        ])
+        .expect("parse");
         match parsed.adapter {
             AdapterChoice::OpenAiCompat(OpenAiCompatChoice {
                 ref base_url,
@@ -383,5 +662,104 @@ mod tests {
             }
             AdapterChoice::Mock => panic!("expected openai-compat"),
         }
+    }
+
+    #[test]
+    fn parses_propose_with_scene_and_instruction() {
+        let parsed = parse(&[
+            "propose",
+            "/tmp/p",
+            "--scene",
+            "3",
+            "--instruction",
+            "haz el diálogo más tenso",
+        ])
+        .expect("parse");
+        match parsed.command {
+            Command::Propose {
+                ref root,
+                scene,
+                ref instruction,
+            } => {
+                assert_eq!(root, "/tmp/p");
+                assert_eq!(scene, 3);
+                assert_eq!(instruction, "haz el diálogo más tenso");
+            }
+            other => panic!("expected propose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn propose_requires_scene_and_instruction() {
+        let error = parse(&["propose", "/tmp/p"]).expect_err("both required");
+        assert!(error.contains("--scene"), "{error}");
+        let error = parse(&["propose", "/tmp/p", "--scene", "1"]).expect_err("instruction");
+        assert!(error.contains("--instruction"), "{error}");
+        // Scene 0 parses (a number) and is rejected by the task itself with
+        // a clear message; a non-number is a parse error up front.
+        let error = parse(&["propose", "/tmp/p", "--scene", "una", "--instruction", "x"])
+            .expect_err("not a number");
+        assert!(error.contains("--scene"), "{error}");
+    }
+
+    #[test]
+    fn parses_proposal_review_actions() {
+        let parsed = parse(&["proposals", "/tmp/p"]).expect("list");
+        assert!(matches!(
+            parsed.command,
+            Command::Proposals {
+                action: ProposalsAction::List,
+                ..
+            }
+        ));
+        let parsed = parse(&["proposals", "/tmp/p", "show", "abc"]).expect("show");
+        assert!(matches!(
+            parsed.command,
+            Command::Proposals {
+                action: ProposalsAction::Show(ref id),
+                ..
+            } if id == "abc"
+        ));
+        let parsed =
+            parse(&["proposals", "/tmp/p", "apply", "abc", "--hunks", "0,2"]).expect("apply");
+        assert!(matches!(
+            parsed.command,
+            Command::Proposals {
+                action: ProposalsAction::Apply(ref id, Some(ref hunks)),
+                ..
+            } if id == "abc" && hunks == &vec![0, 2]
+        ));
+        let parsed = parse(&["proposals", "/tmp/p", "reject", "abc"]).expect("reject");
+        assert!(matches!(
+            parsed.command,
+            Command::Proposals {
+                action: ProposalsAction::Reject(_),
+                ..
+            }
+        ));
+        let parsed = parse(&["proposals", "/tmp/p", "renew", "abc"]).expect("renew");
+        assert!(matches!(parsed.command, Command::Renew { .. }));
+    }
+
+    #[test]
+    fn review_flags_reject_wrong_commands() {
+        let error =
+            parse(&["brief", "/tmp/p", "--scene", "1"]).expect_err("--scene only with propose");
+        assert!(error.contains("propose"), "{error}");
+        let error =
+            parse(&["brief", "/tmp/p", "--hunks", "0"]).expect_err("--hunks only with apply");
+        assert!(error.contains("apply"), "{error}");
+        let error = parse(&["proposals", "/tmp/p", "list", "--adapter", "mock"])
+            .expect_err("local op without a model");
+        assert!(error.contains("modelo"), "{error}");
+        assert!(parse(&["proposals", "/tmp/p", "renew", "abc", "--latency", "5"]).is_ok());
+    }
+
+    #[test]
+    fn hunks_list_is_strictly_parsed() {
+        assert_eq!(parse_hunks("0,2").expect("ok"), vec![0, 2]);
+        assert!(parse_hunks("").is_err());
+        assert!(parse_hunks("a,b").is_err());
+        assert!(parse_hunks("0,,1").is_err());
     }
 }

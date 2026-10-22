@@ -16,11 +16,15 @@ pub mod adapter;
 pub mod brief;
 pub mod mock;
 pub mod openai_compat;
+pub mod proposal;
+pub mod scene_edit;
 
 pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
 pub use mock::MockAdapter;
 pub use openai_compat::{LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig};
+pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
+pub use scene_edit::SceneEditTask;
 
 use std::time::Duration;
 
@@ -65,6 +69,12 @@ pub enum TaskEvent {
     ModelResponded {
         model: String,
         output_chars: usize,
+    },
+    /// A reviewable edit proposal was persisted; canonical files untouched.
+    ProposalCreated {
+        id: String,
+        target: String,
+        hunks: usize,
     },
     Completed {
         summary: String,
@@ -135,4 +145,10 @@ pub enum AgentError {
     Timeout(Duration),
     #[error("invalid task input: {0}")]
     InvalidInput(&'static str),
+    #[error(
+        "invalid task input: scene {number} does not exist (the screenplay has {total} scenes)"
+    )]
+    SceneNumber { number: usize, total: usize },
+    #[error("proposal: {0}")]
+    Proposal(#[from] proposal::ProposalError),
 }
