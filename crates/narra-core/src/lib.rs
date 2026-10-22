@@ -5,7 +5,9 @@
 //!
 //! Delivered so far:
 //! - project lifecycle, `project.yaml` validation and safe document IO
-//!   (Milestone 2, Spike G-1); on-disk names are English (D-017).
+//!   (Milestone 2, Spike G-1); on-disk names are English (D-017);
+//! - a derived Fountain 1.1 parser (`fountain`) used for the disposable scene
+//!   index — source files stay authoritative (`DATA_MODEL.md` §1).
 //!
 //! What belongs here next:
 //! - local Git operations (Milestone 3, Spike D)
@@ -18,10 +20,12 @@
 //! - no secrets in errors, logs or events.
 
 pub mod document;
+pub mod fountain;
 pub mod manifest;
 pub mod project;
 
 pub use document::{DocumentError, read_document, resolve_within, write_document};
+pub use fountain::{Element as FountainElement, ElementKind, parse as parse_fountain};
 pub use manifest::{
     MANIFEST_SCHEMA_VERSION, Manifest, ManifestError, ProjectType, parse_manifest,
     serialize_manifest,

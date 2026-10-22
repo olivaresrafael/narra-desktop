@@ -1,7 +1,8 @@
 //! Rebuild the derived index against the real performance fixture
-//! (`fixtures/screenplay-1000.fountain`): 1 000 lines with accented text,
-//! character cues, parentheticals and section headings. The scan must stay a
-//! derived convenience: it never modifies the source file.
+//! (`fixtures/screenplay-1000.fountain`): 18 549 lines, 1 000 scenes,
+//! accented text, character cues, parentheticals, notes and sections. The
+//! parser and index must stay derived conveniences: they never modify the
+//! source file.
 
 use narra_core::{DEFAULT_SCREENPLAY, ProjectType, create_project};
 use std::fs;
@@ -57,4 +58,46 @@ fn fixture_index_matches_scene_heading_count() {
         .read_document(DEFAULT_SCREENPLAY)
         .expect("read back");
     assert_eq!(after, fixture, "rebuild_index must not touch source files");
+}
+
+/// Element census of the real fixture, cross-checked against an independent
+/// line-by-line analysis of `screenplay-1000.fountain` (Python, 2026-10-22).
+/// Locks the parser's behavior on real content: 18 549 lines, accented text,
+/// inline notes, sections and a title page.
+#[test]
+fn fixture_element_census_is_stable() {
+    use narra_core::{ElementKind, parse_fountain};
+    use std::collections::BTreeMap;
+
+    let fixture = fs::read_to_string(fixture_path()).expect("fixture present");
+    let elements = parse_fountain(&fixture);
+
+    // One element per line, strictly sequential (never merges or skips lines).
+    assert_eq!(elements.len(), fixture.lines().count());
+    assert!(
+        elements
+            .windows(2)
+            .all(|w| w[1].line_number == w[0].line_number + 1)
+    );
+
+    let mut counts: BTreeMap<ElementKind, usize> = BTreeMap::new();
+    for element in &elements {
+        *counts.entry(element.kind).or_default() += 1;
+    }
+    let get = |kind: ElementKind| counts.get(&kind).copied().unwrap_or(0);
+    assert_eq!(get(ElementKind::SceneHeading), 1000);
+    assert_eq!(get(ElementKind::Character), 2036);
+    assert_eq!(get(ElementKind::Dialogue), 3632);
+    assert_eq!(get(ElementKind::Parenthetical), 731);
+    assert_eq!(get(ElementKind::Note), 244);
+    assert_eq!(get(ElementKind::Section), 4);
+    assert_eq!(get(ElementKind::TitlePage), 4);
+    assert_eq!(get(ElementKind::Action), 10898);
+    // The fixture contains none of these elements today; if the fixture grows
+    // them, the census must be updated deliberately.
+    assert_eq!(get(ElementKind::Transition), 0);
+    assert_eq!(get(ElementKind::Centered), 0);
+    assert_eq!(get(ElementKind::Lyric), 0);
+    assert_eq!(get(ElementKind::PageBreak), 0);
+    assert_eq!(get(ElementKind::Boneyard), 0);
 }

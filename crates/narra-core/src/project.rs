@@ -91,16 +91,16 @@ impl Project {
     pub fn rebuild_index(&self) -> Result<ProjectIndex, ProjectError> {
         let mut index = ProjectIndex::default();
 
-        // Scene headings from the primary screenplay: the Fountain parser is
-        // deliberately derived (not authoritative), so this scan is a cheap
-        // heuristic that tolerates hand-edited files.
+        // Scene headings from the primary screenplay via the derived Fountain
+        // parser (Spike G-1). The Fountain file, not this index, stays
+        // authoritative (`DATA_MODEL.md` §1).
         match self.read_document(&self.manifest.default_screenplay_path) {
             Ok(text) => {
-                for (line_number, line) in text.lines().enumerate() {
-                    if is_scene_heading(line) {
+                for element in crate::fountain::parse(&text) {
+                    if element.kind == crate::fountain::ElementKind::SceneHeading {
                         index.scenes.push(SceneRef {
-                            heading: line.trim().to_string(),
-                            line_number: line_number + 1,
+                            heading: element.text,
+                            line_number: element.line_number,
                         });
                     }
                 }
@@ -133,27 +133,6 @@ pub struct SceneRef {
     pub heading: String,
     /// 1-based line in the source file.
     pub line_number: usize,
-}
-
-/// Fountain scene headings start with INT./EXT./EST./INT-EXT/I-E
-/// (case-insensitive). Derived heuristic only: the Fountain file, not this
-/// scan, stays authoritative (`DATA_MODEL.md` §1).
-fn is_scene_heading(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-        return false;
-    }
-    const PREFIXES: &[&str] = &[
-        "INT.", "EXT.", "EST.", "INT/EXT", "INT-EXT", "I/E", "I.N.T.", "E.X.T.",
-    ];
-    PREFIXES.iter().any(|prefix| {
-        // Prefixes are ASCII; compare on bytes so non-ASCII text (e.g. "MARÍA")
-        // can never panic on a char boundary.
-        trimmed
-            .as_bytes()
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
-    })
 }
 
 /// Create a new project at `root` with the D-017 template.
