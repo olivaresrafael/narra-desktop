@@ -11,7 +11,7 @@ Native desktop environment for audiovisual writing with AI-assisted agents.
 
 ## Status
 
-Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 in progress: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`.
+Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 in progress: local Git operations over the system `git` executable.
 
 ## Layout
 
@@ -25,6 +25,7 @@ narra-desktop/
     │   └── src/project.rs      # create/open project, template, index rebuild
     │   └── src/document.rs     # boundary-checked, atomic document IO
     │   └── src/fountain.rs     # derived Fountain 1.1 parser (index only)
+    │   └── src/git/            # local Git via system git (cancellable ops)
     ├── spike-editor/           # GPUI editor spike (Milestone 1 evidence)
     └── fixture-gen/            # deterministic Fountain fixture generator
 ```

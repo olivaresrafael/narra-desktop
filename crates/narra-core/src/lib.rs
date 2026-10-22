@@ -7,10 +7,12 @@
 //! - project lifecycle, `project.yaml` validation and safe document IO
 //!   (Milestone 2, Spike G-1); on-disk names are English (D-017);
 //! - a derived Fountain 1.1 parser (`fountain`) used for the disposable scene
-//!   index — source files stay authoritative (`DATA_MODEL.md` §1).
+//!   index — source files stay authoritative (`DATA_MODEL.md` §1);
+//! - local Git over the system `git` executable (`git`): init/open, status,
+//!   log, diff and commit — cancellable, timeout-bounded, secret-free errors.
 //!
 //! What belongs here next:
-//! - local Git operations (Milestone 3, Spike D)
+//! - Git: clone/fetch/pull/push, branches, merges and conflicts (Milestone 3)
 //! - agent task orchestration, permissions and proposals (Milestone 4, Spike C/F)
 //!
 //! Rules for anything added here:
@@ -21,6 +23,7 @@
 
 pub mod document;
 pub mod fountain;
+pub mod git;
 pub mod manifest;
 pub mod project;
 
