@@ -4,9 +4,9 @@
 //! system `git`. Offline operations only: nothing here touches the network.
 
 use narra_core::git::{
-    CancellationToken, DiffScope, GitError, OpOptions, WorktreeStatus, detect, redact_secrets,
+    CancellationToken, Commit, DiffScope, GitError, MergeOutcome, OpOptions, Repository,
+    WorktreeStatus, clone, detect, redact_secrets, validate_branch_name,
 };
-use narra_core::git::{Commit, Repository};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,7 +21,8 @@ fn options() -> OpOptions {
 
 fn new_repo() -> Repository {
     let root = temp_root();
-    Repository::init(&root, options()).expect("init")
+    // Pin the branch name: machine git config must not decide test outcomes.
+    Repository::init_with_branch(&root, "main", options()).expect("init")
 }
 
 fn write(repo: &Repository, relative: &str, contents: &str) {
@@ -34,6 +35,18 @@ fn commit_all(repo: &Repository, message: &str) -> String {
     repo.stage_all(options()).expect("stage");
     repo.commit(message, "Ana Autora", "ana@ejemplo.com", options())
         .expect("commit")
+}
+
+/// Test setup only: allow pushes into the checked-out branch of a non-bare
+/// "server" repo (git denies this by default; the app itself never sets this
+/// — real remotes are bare or hosted).
+fn allow_push_into_checked_out_branch(repo: &Repository) {
+    let status = std::process::Command::new("git")
+        .args(["config", "receive.denyCurrentBranch", "updateInstead"])
+        .current_dir(repo.root())
+        .status()
+        .expect("git config");
+    assert!(status.success(), "git config must succeed");
 }
 
 #[test]
@@ -251,4 +264,306 @@ fn errors_never_leak_credentials() {
     let rendered = error.to_string();
     assert!(!rendered.contains("hunter2"), "{rendered}");
     assert!(rendered.contains("example.com"), "host is useful context");
+}
+
+// --- Branches (M3 slice 2) -------------------------------------------------
+
+#[test]
+fn branch_lifecycle_create_list_checkout() {
+    let repo = new_repo();
+    write(&repo, "a.md", "uno\n");
+    commit_all(&repo, "base");
+
+    repo.create_branch("feature/escena", options())
+        .expect("create");
+    let branches = repo.branches(options()).expect("branches");
+    assert_eq!(branches.len(), 2);
+    let main = branches.iter().find(|b| b.name == "main").expect("main");
+    assert!(main.current, "main still checked out");
+    assert!(!branches.iter().any(|b| b.current && b.name != "main"));
+
+    repo.checkout("feature/escena", options())
+        .expect("checkout");
+    assert_eq!(
+        repo.current_branch(options()).expect("current"),
+        Some("feature/escena".to_string())
+    );
+    let branches = repo.branches(options()).expect("branches");
+    assert!(
+        branches
+            .iter()
+            .find(|b| b.name == "feature/escena")
+            .expect("feature")
+            .current
+    );
+
+    // Commit on the branch, return to main: history diverges cleanly.
+    write(&repo, "a.md", "uno\ndos\n");
+    commit_all(&repo, "en feature");
+    repo.checkout("main", options()).expect("back to main");
+    let log = repo.log(1, options()).expect("log");
+    assert_eq!(log[0].subject, "base", "main did not move");
+}
+
+#[test]
+fn checkout_new_creates_and_switches() {
+    let repo = new_repo();
+    write(&repo, "a.md", "uno\n");
+    commit_all(&repo, "base");
+    repo.checkout_new("experimento", options())
+        .expect("checkout -b");
+    assert_eq!(
+        repo.current_branch(options()).expect("current"),
+        Some("experimento".to_string())
+    );
+}
+
+#[test]
+fn branch_names_are_validated_before_reaching_git() {
+    for bad in [
+        "",
+        "-d",          // would be read as a flag
+        "a b",         // whitespace breaks argv semantics for users
+        "a..b",        // range, not a name
+        "feature@{u}", // reflog syntax
+        "x.lock",      // reserved suffix
+        ".oculto",     // component starts with dot
+        "fin.",        // trailing dot
+        "car\\acter",  // escape
+        "rama/con//",  // empty trailing component
+    ] {
+        assert!(
+            validate_branch_name(bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    for good in ["main", "feature/escena-2", "corrección/ñ", "v1.0"] {
+        assert!(
+            validate_branch_name(good).is_ok(),
+            "{good:?} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn delete_branch_refuses_unmerged_and_allows_merged() {
+    let repo = new_repo();
+    write(&repo, "a.md", "uno\n");
+    commit_all(&repo, "base");
+
+    // Branch with its own commit: not merged anywhere.
+    repo.checkout_new("temporal", options()).expect("branch");
+    write(&repo, "b.md", "x\n");
+    commit_all(&repo, "commit exclusivo de temporal");
+    repo.checkout("main", options()).expect("main");
+
+    // Safe -d must refuse (no data loss) and say why.
+    let error = repo
+        .delete_branch("temporal", options())
+        .expect_err("unmerged branch must be refused");
+    assert!(!error.to_string().is_empty(), "actionable message");
+    assert!(
+        repo.branches(options())
+            .expect("branches")
+            .iter()
+            .any(|b| b.name == "temporal"),
+        "branch still exists after refusal"
+    );
+
+    // Advance main so the merge cannot fast-forward, then merge and delete.
+    write(&repo, "a.md", "uno\nmain tambien\n");
+    commit_all(&repo, "main avanza");
+    let outcome = repo.merge("temporal", options()).expect("merge");
+    assert!(
+        matches!(outcome, MergeOutcome::Merged { .. }),
+        "{outcome:?}"
+    );
+    repo.delete_branch("temporal", options())
+        .expect("merged branch deletable");
+}
+
+// --- Merge and conflicts (M3 slice 2) --------------------------------------
+
+fn divergent_repos() -> (Repository, String) {
+    let repo = new_repo();
+    write(&repo, "a.md", "linea base\n");
+    commit_all(&repo, "base");
+    repo.checkout_new("feature", options()).expect("branch");
+    write(&repo, "a.md", "linea base\nfeature change\n");
+    let feature = commit_all(&repo, "cambio en feature");
+    repo.checkout("main", options()).expect("main");
+    (repo, feature)
+}
+
+#[test]
+fn merge_fast_forwards_when_main_has_not_moved() {
+    let (repo, feature) = divergent_repos();
+    let outcome = repo.merge("feature", options()).expect("merge");
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    let log = repo.log(1, options()).expect("log");
+    assert_eq!(log[0].id, feature, "main moved to the feature tip");
+}
+
+#[test]
+fn merge_creates_commit_when_both_sides_advanced() {
+    let (repo, _feature) = divergent_repos();
+    write(&repo, "otro.md", "contenido\n");
+    commit_all(&repo, "en main");
+    let outcome = repo.merge("feature", options()).expect("merge");
+    let MergeOutcome::Merged { id } = outcome else {
+        panic!("expected a merge commit, got {outcome:?}");
+    };
+    assert_eq!(id.len(), 40);
+    let log = repo.log(1, options()).expect("log");
+    assert_eq!(log[0].id, id);
+    // Both parents present: the feature history was preserved, not rewritten.
+    assert!(
+        repo.status(options()).expect("status").1.is_empty(),
+        "clean after merge"
+    );
+}
+
+#[test]
+fn merge_up_to_date_is_a_no_op() {
+    let (repo, _feature) = divergent_repos();
+    repo.merge("feature", options()).expect("first merge");
+    let outcome = repo.merge("feature", options()).expect("second merge");
+    assert_eq!(outcome, MergeOutcome::UpToDate);
+}
+
+#[test]
+fn merge_conflicts_are_reported_and_abortable_without_data_loss() {
+    let repo = new_repo();
+    write(&repo, "a.md", "linea base\n");
+    commit_all(&repo, "base");
+    repo.checkout_new("feature", options()).expect("branch");
+    write(&repo, "a.md", "version feature\n");
+    commit_all(&repo, "feature");
+    repo.checkout("main", options()).expect("main");
+    write(&repo, "a.md", "version main\n");
+    commit_all(&repo, "main");
+
+    let outcome = repo.merge("feature", options()).expect("merge");
+    let MergeOutcome::Conflicts { files } = outcome else {
+        panic!("expected conflicts, got {outcome:?}");
+    };
+    assert_eq!(files, vec!["a.md".to_string()]);
+
+    // The conflicted file carries markers and MERGE_HEAD is set.
+    let conflicted = fs::read_to_string(repo.root().join("a.md")).expect("read");
+    assert!(conflicted.contains("<<<<<<<"), "{conflicted}");
+    assert!(repo.is_merging(options()).expect("merging"));
+
+    // Abort restores the exact pre-merge content: nothing is lost.
+    repo.abort_merge(options()).expect("abort");
+    assert!(!repo.is_merging(options()).expect("merging"));
+    assert_eq!(
+        fs::read_to_string(repo.root().join("a.md")).expect("read"),
+        "version main\n",
+        "abort restores main's version byte for byte"
+    );
+    let (_, entries) = repo.status(options()).expect("status");
+    assert!(entries.is_empty(), "clean worktree after abort");
+}
+
+// --- Remotes over local paths (M3 slice 2; offline: path transport) -------
+
+#[test]
+fn clone_over_local_path_then_fetch_pull_push() {
+    let source = new_repo();
+    write(&source, "a.md", "uno\n");
+    let first = commit_all(&source, "primero");
+
+    // Clone via plain path (local transport — no network involved).
+    allow_push_into_checked_out_branch(&source);
+    let destination = temp_root().join("copia");
+    let cloned = clone(
+        source.root().to_str().expect("utf8"),
+        &destination,
+        options(),
+    )
+    .expect("clone");
+    let log = cloned.log(10, options()).expect("log");
+    assert_eq!(log[0].id, first, "clone carries history");
+
+    let remotes = cloned.remotes(options()).expect("remotes");
+    assert_eq!(remotes.len(), 1);
+    assert_eq!(remotes[0].0, "origin");
+
+    // The clone knows its upstream; a new commit pushes back to the source.
+    write(&cloned, "a.md", "uno\ndos\n");
+    let second = commit_all(&cloned, "segundo");
+    cloned.push("origin", "main", options()).expect("push");
+    let source_log = source.log(1, options()).expect("source log");
+    assert_eq!(
+        source_log[0].id, second,
+        "push must be confirmed by the receiving repo, not just exit 0"
+    );
+
+    // Source advances; clone fetches and fast-forward pulls.
+    write(&source, "a.md", "uno\ndos\ntres\n");
+    let third = commit_all(&source, "tercero");
+    cloned.fetch("origin", options()).expect("fetch");
+    cloned.pull("origin", "main", options()).expect("pull");
+    assert_eq!(
+        fs::read_to_string(cloned.root().join("a.md")).expect("read"),
+        "uno\ndos\ntres\n",
+        "pull brings the new content"
+    );
+    assert_eq!(cloned.log(1, options()).expect("log")[0].id, third);
+}
+
+#[test]
+fn pull_refuses_non_fast_forward_and_explains() {
+    let source = new_repo();
+    write(&source, "a.md", "uno\n");
+    commit_all(&source, "primero");
+    let destination = temp_root().join("copia");
+    let cloned = clone(
+        source.root().to_str().expect("utf8"),
+        &destination,
+        options(),
+    )
+    .expect("clone");
+
+    // Both sides commit different content: no fast-forward possible.
+    write(&source, "a.md", "uno\nsource\n");
+    commit_all(&source, "source");
+    write(&cloned, "a.md", "uno\nclon\n");
+    commit_all(&cloned, "clon");
+
+    let error = cloned
+        .pull("origin", "main", options())
+        .expect_err("diverged pull must fail");
+    match &error {
+        GitError::CommandFailed { stderr, .. } => {
+            assert!(!stderr.is_empty(), "must explain the refusal");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    // Nothing was lost: the local commit is still there.
+    assert_eq!(cloned.log(1, options()).expect("log")[0].subject, "clon");
+}
+
+#[test]
+fn fetch_from_missing_remote_fails_fast_and_actionably() {
+    let repo = new_repo();
+    let error = repo
+        .fetch("no-existe", options().timeout(Duration::from_secs(10)))
+        .expect_err("missing remote");
+    match error {
+        GitError::CommandFailed { stderr, .. } => {
+            assert!(!stderr.is_empty(), "actionable");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn remote_arguments_cannot_inject_flags() {
+    let repo = new_repo();
+    let error = repo
+        .fetch("--upload-pack=rm", options())
+        .expect_err("flag-like remote");
+    assert!(matches!(error, GitError::InvalidInput(_)), "{error:?}");
 }

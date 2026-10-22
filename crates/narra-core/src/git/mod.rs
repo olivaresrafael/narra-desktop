@@ -211,8 +211,31 @@ impl Repository {
     }
 
     /// Initialize a new repository at `root` (the directory must exist).
+    ///
+    /// The initial branch name follows the machine's git configuration; code
+    /// that needs determinism (tests, project templates) should use
+    /// [`Repository::init_with_branch`] instead.
     pub fn init(root: &Path, options: OpOptions) -> Result<Self, GitError> {
         let output = run_git(Some(root), "init", &["init"], options)?;
+        if !output.status.success() {
+            return Err(command_failed("init", &output.stderr));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    /// Like [`Repository::init`] but pins the initial branch name. Passed as
+    /// config rather than `--initial-branch`, which needs git ≥ 2.28 while
+    /// [`MIN_GIT_VERSION`] is 2.25.
+    pub fn init_with_branch(
+        root: &Path,
+        branch: &str,
+        options: OpOptions,
+    ) -> Result<Self, GitError> {
+        validate_branch_name(branch)?;
+        let config = format!("init.defaultBranch={branch}");
+        let output = run_git(Some(root), "init", &["-c", &config, "init"], options)?;
         if !output.status.success() {
             return Err(command_failed("init", &output.stderr));
         }
@@ -439,12 +462,16 @@ impl Repository {
     }
 
     /// Create `name` at HEAD and switch to it in one step.
+    ///
+    /// No `--` separator here: `checkout -b -- <name>` would read `--` as the
+    /// start point. Flag injection is impossible because `name` is validated
+    /// first and can never start with `-`.
     pub fn checkout_new(&self, name: &str, options: OpOptions) -> Result<(), GitError> {
         validate_branch_name(name)?;
         let output = run_git(
             Some(&self.root),
             "checkout",
-            &["checkout", "-b", "--", name],
+            &["checkout", "-b", name],
             options,
         )?;
         if !output.status.success() {
@@ -668,10 +695,26 @@ pub fn validate_branch_name(name: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Remote names get the same treatment as branch names (they are argv
-/// elements in fetch/pull/push).
+/// Remote names, local paths and URLs are all valid `remote` arguments to
+/// fetch/pull/push. The only security requirement is that the value can never
+/// be mistaken for a flag (`-x`) or break the argv element (whitespace,
+/// control characters); everything else is data.
 fn validate_remote_name(name: &str) -> Result<(), GitError> {
-    validate_branch_name(name)
+    if name.trim().is_empty() {
+        return Err(GitError::InvalidInput("remote must not be empty"));
+    }
+    if name.starts_with('-') {
+        return Err(GitError::InvalidInput("remote must not start with '-'"));
+    }
+    if name
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_whitespace())
+    {
+        return Err(GitError::InvalidInput(
+            "remote must not contain whitespace or control characters",
+        ));
+    }
+    Ok(())
 }
 
 fn not_a_repository(root: &Path, stderr: &[u8]) -> GitError {
