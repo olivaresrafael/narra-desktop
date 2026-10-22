@@ -25,6 +25,7 @@
 //!   --adapter <name>   mock (default) | openai-compat
 //!   --base-url <url>   openai-compat endpoint (default http://localhost:11434/v1)
 //!   --model <name>     model name for openai-compat (required with it)
+//!   --stream           stream text deltas (JSONL `model_delta` events)
 //!   --scene <n>        1-based scene number (propose only)
 //!   --instruction <t>  writer's instruction (propose only)
 //!   --hunks <a,b>      0-based hunk indices to accept (apply only; default all)
@@ -92,6 +93,7 @@ fn main() -> ExitCode {
     let options = TaskOptions {
         timeout: parsed.timeout,
         cancel: token,
+        stream: parsed.stream,
     };
     let adapter: Box<dyn ModelAdapter> = match parsed.adapter {
         AdapterChoice::Mock => Box::new(MockAdapter::with_latency(parsed.latency)),
@@ -179,7 +181,7 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [--latency <ms>]
-       [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>]
+       [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>] [--stream]
      narra-harness propose <project-root> --scene <n> --instruction <texto> [mismas opciones]
      narra-harness proposals <project-root> [list]
      narra-harness proposals <project-root> show <id>
@@ -193,6 +195,7 @@ struct Parsed {
     timeout: Duration,
     latency: Duration,
     adapter: AdapterChoice,
+    stream: bool,
 }
 
 #[derive(Debug)]
@@ -273,6 +276,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut instruction: Option<String> = None;
     let mut hunks: Option<Vec<usize>> = None;
     let mut model_options_seen = false;
+    let mut stream = false;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut iter = args.iter();
@@ -291,6 +295,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     .parse()
                     .map_err(|_| format!("--latency: «{value}» no es un número"))?;
                 latency = Duration::from_millis(ms);
+                model_options_seen = true;
+            }
+            "--stream" => {
+                stream = true;
                 model_options_seen = true;
             }
             "--adapter" => {
@@ -430,7 +438,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     }
     if model_options_seen && !command.runs_model() {
         return Err(
-            "esta orden no ejecuta el modelo; quita --adapter/--latency/--base-url/--model"
+            "esta orden no ejecuta el modelo; quita --adapter/--latency/--base-url/--model/--stream"
                 .to_string(),
         );
     }
@@ -440,6 +448,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         timeout,
         latency,
         adapter,
+        stream,
     })
 }
 

@@ -31,6 +31,23 @@ impl MockAdapter {
             simulated_latency: latency,
         }
     }
+
+    /// Cooperative latency: wake in 5 ms slices, observing cancellation.
+    fn wait_latency(&self, cancel: &CancellationToken) -> Result<(), AgentError> {
+        let mut waited = Duration::ZERO;
+        while waited < self.simulated_latency {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            let slice = Duration::from_millis(5);
+            thread::sleep(slice);
+            waited += slice;
+        }
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        Ok(())
+    }
 }
 
 impl Default for MockAdapter {
@@ -50,33 +67,74 @@ impl ModelAdapter for MockAdapter {
         cancel: &CancellationToken,
     ) -> Result<ModelResponse, AgentError> {
         // Cooperative latency: wake in small slices and observe cancellation.
-        let mut waited = Duration::ZERO;
-        while waited < self.simulated_latency {
+        self.wait_latency(cancel)?;
+
+        // Deterministic output derived only from the request.
+        Ok(response_for(request))
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelResponse, AgentError> {
+        // Same deterministic text, delivered in fixed-size chunks with the
+        // simulated latency spread between them: cancellation is observed
+        // *between* chunks, mirroring a real streaming provider.
+        let response = response_for(request);
+        let chunks: Vec<&str> = chunked(&response.text, 12);
+        let slice = if chunks.is_empty() {
+            Duration::ZERO
+        } else {
+            self.simulated_latency / chunks.len().max(1) as u32
+        };
+        for chunk in chunks {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let slice = Duration::from_millis(5);
-            thread::sleep(slice);
-            waited += slice;
+            if slice > Duration::ZERO {
+                thread::sleep(slice);
+            }
+            on_delta(chunk);
         }
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-
-        // Deterministic output derived only from the request.
-        let text = format!(
-            "MOCK BRIEF ({} entrada / {} salida tokens declarados)\n{}",
-            request.max_output_tokens,
-            request.max_output_tokens / 2,
-            summarize(&request.prompt)
-        );
-        Ok(ModelResponse {
-            text,
-            model: "mock-1".to_string(),
-            input_tokens: Some(request.prompt.len() as u32 / 4),
-            output_tokens: Some(request.max_output_tokens / 2),
-        })
+        Ok(response)
     }
+}
+
+/// The mock's deterministic answer for a request.
+fn response_for(request: &ModelRequest) -> ModelResponse {
+    let text = format!(
+        "MOCK BRIEF ({} entrada / {} salida tokens declarados)\n{}",
+        request.max_output_tokens,
+        request.max_output_tokens / 2,
+        summarize(&request.prompt)
+    );
+    ModelResponse {
+        text,
+        model: "mock-1".to_string(),
+        input_tokens: Some(request.prompt.len() as u32 / 4),
+        output_tokens: Some(request.max_output_tokens / 2),
+    }
+}
+
+/// Split `text` into fixed-size chunks on char boundaries. Deterministic:
+/// same text, same chunks. Empty text yields no chunks.
+fn chunked(text: &str, size: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + size).min(text.len());
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
 }
 
 /// Deterministic, allocation-light digest of the prompt for the mock output.
@@ -137,5 +195,50 @@ mod tests {
         let error = adapter.complete(&request, &token).expect_err("must cancel");
         handle.join().expect("killer thread");
         assert!(matches!(error, AgentError::Cancelled), "{error:?}");
+    }
+
+    #[test]
+    fn streaming_deltas_reassemble_the_full_text() {
+        let adapter = MockAdapter::new();
+        let request = ModelRequest {
+            system: "s".to_string(),
+            prompt: "hola mundo".to_string(),
+            max_output_tokens: 100,
+        };
+        let token = CancellationToken::new();
+        let mut deltas = String::new();
+        let streamed = adapter
+            .complete_streaming(&request, &token, &mut |chunk| deltas.push_str(chunk))
+            .expect("stream ok");
+        let direct = adapter.complete(&request, &token).expect("complete ok");
+        assert_eq!(streamed, direct, "streaming must not change the result");
+        assert_eq!(deltas, streamed.text, "deltas reassemble the full text");
+        assert!(
+            deltas.len() > 12,
+            "mock streams multiple chunks: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_cancellation_between_chunks_is_immediate() {
+        // Latency spread across chunks; the consumer cancels after the
+        // first delta — exactly the mid-generation cancellation Spike C
+        // requires.
+        let adapter = MockAdapter::with_latency(Duration::from_millis(200));
+        let request = ModelRequest {
+            system: "s".to_string(),
+            prompt: "p".to_string(),
+            max_output_tokens: 10,
+        };
+        let token = CancellationToken::new();
+        let mut seen = 0;
+        let error = adapter
+            .complete_streaming(&request, &token, &mut |_| {
+                seen += 1;
+                token.cancel();
+            })
+            .expect_err("cancel between chunks");
+        assert!(matches!(error, AgentError::Cancelled), "{error:?}");
+        assert_eq!(seen, 1, "exactly one delta before cancellation");
     }
 }

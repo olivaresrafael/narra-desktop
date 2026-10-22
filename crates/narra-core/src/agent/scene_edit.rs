@@ -205,8 +205,9 @@ impl SceneEditTask {
         let adapter_options = TaskOptions {
             timeout: remaining,
             cancel: options.cancel.clone(),
+            stream: options.stream,
         };
-        let response = run_model(adapter, &request, &adapter_options)?;
+        let response = run_model(adapter, &request, &adapter_options, &mut emit)?;
         emit(TaskEvent::ModelResponded {
             model: response.model.clone(),
             output_chars: response.text.chars().count(),
@@ -318,16 +319,27 @@ impl SceneEditTask {
 }
 
 /// Model call isolated so the timeout slice and cancellation map cleanly.
+/// When `options.stream` is set, each chunk is forwarded to `emit` as a
+/// [`TaskEvent::ModelDelta`] before the full response is returned.
 fn run_model(
     adapter: &dyn ModelAdapter,
     request: &ModelRequest,
     options: &TaskOptions,
+    emit: &mut dyn FnMut(TaskEvent),
 ) -> Result<crate::agent::ModelResponse, AgentError> {
     if options.cancel.is_cancelled() {
         return Err(AgentError::Cancelled);
     }
     let started = Instant::now();
-    let response = adapter.complete(request, &options.cancel)?;
+    let response = if options.stream {
+        adapter.complete_streaming(request, &options.cancel, &mut |chunk| {
+            emit(TaskEvent::ModelDelta {
+                text: chunk.to_string(),
+            });
+        })?
+    } else {
+        adapter.complete(request, &options.cancel)?
+    };
     if started.elapsed() > options.timeout {
         return Err(AgentError::Timeout(options.timeout));
     }

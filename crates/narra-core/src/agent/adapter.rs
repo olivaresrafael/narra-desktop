@@ -50,4 +50,25 @@ pub trait ModelAdapter {
         request: &ModelRequest,
         cancel: &CancellationToken,
     ) -> Result<ModelResponse, AgentError>;
+
+    /// Stream the completion, delivering incremental text through `on_delta`
+    /// as the provider generates it (Spike C: real mid-generation
+    /// cancellation — the token is observed *between* chunks, not only
+    /// around the request).
+    ///
+    /// The returned [`ModelResponse`] carries the **full** accumulated text
+    /// (plus model and usage), so callers can treat streaming as an
+    /// enhancement of [`ModelAdapter::complete`], never as a different
+    /// result. Adapters without native streaming keep the default: one
+    /// final delta, then the response.
+    fn complete_streaming(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelResponse, AgentError> {
+        let response = self.complete(request, cancel)?;
+        on_delta(&response.text);
+        Ok(response)
+    }
 }

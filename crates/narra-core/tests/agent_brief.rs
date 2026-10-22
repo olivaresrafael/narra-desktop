@@ -35,6 +35,7 @@ fn brief_options() -> TaskOptions {
     TaskOptions {
         timeout: Duration::from_secs(30),
         cancel: CancellationToken::new(),
+        stream: false,
     }
 }
 
@@ -132,6 +133,7 @@ fn pre_cancelled_task_stops_before_any_work() {
     let options = TaskOptions {
         timeout: Duration::from_secs(30),
         cancel: token,
+        stream: false,
     };
     let mut events = Vec::new();
     let error = ProjectBriefTask::new(root.to_str().expect("utf8"))
@@ -155,6 +157,7 @@ fn cancellation_during_model_call_stops_the_task() {
     let options = TaskOptions {
         timeout: Duration::from_secs(30),
         cancel: token,
+        stream: false,
     };
     // Cancel while the mock adapter is "thinking" (10 s simulated latency).
     let handle = std::thread::spawn(move || {
@@ -234,5 +237,49 @@ fn adapter_failure_becomes_a_failed_task_not_a_panic() {
         events
             .iter()
             .any(|e| matches!(e, TaskEvent::ContextCollected { .. }))
+    );
+}
+
+#[test]
+fn streaming_emits_deltas_and_identical_output() {
+    let root = sample_project();
+    let options = TaskOptions {
+        stream: true,
+        ..brief_options()
+    };
+    let mut streamed_events = Vec::new();
+    let streamed = ProjectBriefTask::new(root.to_str().expect("utf8"))
+        .run(&MockAdapter::new(), &options, |e| streamed_events.push(e))
+        .expect("streamed brief");
+
+    let deltas: Vec<&str> = streamed_events
+        .iter()
+        .filter_map(|event| match event {
+            TaskEvent::ModelDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        deltas.len() > 1,
+        "expected incremental deltas, got {}",
+        deltas.len()
+    );
+
+    // Same task without streaming must produce the same human output.
+    let mut plain_events = Vec::new();
+    let plain = ProjectBriefTask::new(root.to_str().expect("utf8"))
+        .run(&MockAdapter::new(), &brief_options(), |e| {
+            plain_events.push(e)
+        })
+        .expect("plain brief");
+    assert_eq!(
+        streamed.summary, plain.summary,
+        "streaming is presentation only"
+    );
+    assert!(
+        !plain_events
+            .iter()
+            .any(|e| matches!(e, TaskEvent::ModelDelta { .. })),
+        "no deltas without stream: true"
     );
 }

@@ -36,6 +36,7 @@ fn task_options() -> TaskOptions {
     TaskOptions {
         timeout: Duration::from_secs(30),
         cancel: CancellationToken::new(),
+        stream: false,
     }
 }
 

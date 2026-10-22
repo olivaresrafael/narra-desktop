@@ -70,6 +70,12 @@ The endpoint defaults to `http://localhost:11434/v1`; override with
 environment variable (unset = no key, which is correct for local servers) —
 never pass it as an argument.
 
+Add `--stream` to any model task (`brief`, `propose`, `renew`) to receive the
+text as it is generated: the JSONL stream then carries `model_delta` events
+before the final `task_output`, and cancellation (Ctrl-C) takes effect
+*between* chunks instead of waiting for the request to end. The final result
+is identical with or without `--stream`.
+
 ### Reviewing edit proposals (M4 slice 2b)
 
 The `scene_edit` task asks the model to rewrite one scene and persists the

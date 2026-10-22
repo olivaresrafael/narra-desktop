@@ -38,6 +38,10 @@ use crate::cancel::CancellationToken;
 pub struct TaskOptions {
     pub timeout: Duration,
     pub cancel: CancellationToken,
+    /// Deliver text to the UI as the model generates it (Spike C streaming).
+    /// Tasks emit [`TaskEvent::ModelDelta`] per chunk when set; the final
+    /// [`TaskOutput`] is identical either way.
+    pub stream: bool,
 }
 
 impl Default for TaskOptions {
@@ -45,6 +49,7 @@ impl Default for TaskOptions {
         Self {
             timeout: Duration::from_secs(120),
             cancel: CancellationToken::new(),
+            stream: false,
         }
     }
 }
@@ -69,6 +74,11 @@ pub enum TaskEvent {
     ModelResponded {
         model: String,
         output_chars: usize,
+    },
+    /// One incremental text chunk while streaming (Spike C). Only emitted
+    /// when `TaskOptions::stream` is set; never carries credentials.
+    ModelDelta {
+        text: String,
     },
     /// A reviewable edit proposal was persisted; canonical files untouched.
     ProposalCreated {

@@ -8,7 +8,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use narra_core::agent::{ModelAdapter, ModelRequest, OpenAiCompatAdapter, OpenAiCompatConfig};
+use narra_core::agent::{
+    AgentError, ModelAdapter, ModelRequest, OpenAiCompatAdapter, OpenAiCompatConfig,
+};
 use narra_core::cancel::CancellationToken;
 
 /// One canned HTTP exchange: what the mock server returns, and (optionally)
@@ -40,7 +42,25 @@ fn spawn_mock_server(reply: MockReply) -> String {
 }
 
 fn serve_once(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    // Read the request head and any body we are told to expect.
+    read_request(stream)?;
+
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Status",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
+/// Read one HTTP request (head plus `Content-Length` body) off the stream.
+fn read_request(stream: &mut TcpStream) -> std::io::Result<()> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -70,20 +90,48 @@ fn serve_once(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Resul
         }
         body_read += read;
     }
+    Ok(())
+}
 
-    let reason = match status {
-        200 => "OK",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Status",
-    };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()
+/// An SSE streaming server: accepts one request and writes `events` (each a
+/// complete SSE `data:` line without terminator) one by one, flushing and
+/// pausing between them so the client observes genuine streaming. When
+/// `tail_stall` is set, the server keeps the connection open and silent for
+/// that long after the last event — modeling a provider that stalls
+/// mid-generation. The stream ends by closing the connection.
+fn spawn_sse_server(
+    events: Vec<String>,
+    inter_event_delay: Duration,
+    tail_stall: Option<Duration>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind sse server");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = read_request(&mut stream);
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            for event in events {
+                if stream.write_all(format!("{event}\n\n").as_bytes()).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+                if !inter_event_delay.is_zero() {
+                    thread::sleep(inter_event_delay);
+                }
+            }
+            if let Some(stall) = tail_stall {
+                thread::sleep(stall);
+            }
+            // Connection close terminates the (close-delimited) stream.
+        }
+    });
+    base_url
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -350,6 +398,184 @@ fn success_response_with_error_envelope_fails_cleanly() {
     assert!(error.to_string().contains("quota exceeded"), "{error}");
 }
 
+// --- Streaming (Spike C) -------------------------------------------------
+
+/// Build one SSE `data:` event carrying the given JSON chunk.
+fn sse(chunk: serde_json::Value) -> String {
+    format!("data: {chunk}")
+}
+
+fn stream_adapter(base_url: &str, timeout: Duration) -> OpenAiCompatAdapter {
+    OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url: base_url.to_string(),
+        api_key: None,
+        model: "x".to_string(),
+        timeout,
+        extra_headers: Vec::new(),
+    })
+}
+
+#[test]
+fn streaming_delivers_deltas_in_order_and_assembles_the_text() {
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen", "choices": [{"index": 0, "delta": {"content": "Hola"}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen", "choices": [{"index": 0, "delta": {"content": " mundo"}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 2}
+        })),
+        "data: [DONE]".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::from_millis(5), None);
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let mut deltas: Vec<String> = Vec::new();
+    let response = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |chunk| {
+            deltas.push(chunk.to_string())
+        })
+        .expect("stream completes");
+
+    assert_eq!(deltas, vec!["Hola", " mundo"], "deltas in order");
+    assert_eq!(response.text, "Hola mundo", "assembled text");
+    assert_eq!(response.model, "qwen", "model from chunks");
+    assert_eq!(response.input_tokens, Some(9), "usage from final chunk");
+    assert_eq!(response.output_tokens, Some(2), "usage from final chunk");
+}
+
+#[test]
+fn streaming_cancel_between_chunks_stops_before_the_stall() {
+    // The server stalls 30 s after the first event; the consumer cancels as
+    // soon as the first delta arrives. The adapter must return Cancelled
+    // immediately — this is real mid-generation cancellation.
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen", "choices": [{"index": 0, "delta": {"content": "primero"}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen", "choices": [{"index": 0, "delta": {"content": "segundo"}}]
+        })),
+    ];
+    let base_url = spawn_sse_server(
+        events,
+        Duration::from_millis(5),
+        Some(Duration::from_secs(30)),
+    );
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(60));
+    let token = CancellationToken::new();
+    let mut seen = 0;
+    let started = std::time::Instant::now();
+    let error = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {
+            seen += 1;
+            token.cancel();
+        })
+        .expect_err("cancel between chunks");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(error, AgentError::Cancelled), "{error:?}");
+    assert_eq!(seen, 1, "exactly one delta before cancellation");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must not wait for the stall: {elapsed:?}"
+    );
+}
+
+#[test]
+fn streaming_stall_is_bounded_by_the_timeout() {
+    let events = vec![sse(serde_json::json!({
+        "model": "qwen", "choices": [{"index": 0, "delta": {"content": "inicio"}}]
+    }))];
+    let base_url = spawn_sse_server(events, Duration::ZERO, Some(Duration::from_secs(30)));
+
+    let adapter = stream_adapter(&base_url, Duration::from_millis(400));
+    let token = CancellationToken::new();
+    let started = std::time::Instant::now();
+    let error = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect_err("stalled stream must error");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, AgentError::Adapter(_)),
+        "bounded stream error: {error:?}"
+    );
+    assert!(elapsed < Duration::from_secs(10), "bounded: {elapsed:?}");
+}
+
+#[test]
+fn streaming_malformed_chunk_is_an_error_not_a_silent_drop() {
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen", "choices": [{"index": 0, "delta": {"content": "ok"}}]
+        })),
+        "data: {esto no es json}".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::from_millis(5), None);
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect_err("malformed chunk must fail");
+    assert!(error.to_string().contains("JSON"), "{error}");
+}
+
+#[test]
+fn streaming_eof_without_done_marker_is_accepted() {
+    // Some servers close without `[DONE]`; content already delivered is kept.
+    let events = vec![sse(serde_json::json!({
+        "model": "qwen", "choices": [{"index": 0, "delta": {"content": "hola"}}]
+    }))];
+    let base_url = spawn_sse_server(events, Duration::from_millis(5), None);
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let response = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect("EOF ends the stream");
+    assert_eq!(response.text, "hola");
+}
+
+#[test]
+fn streaming_without_any_content_is_an_error() {
+    let events = vec!["data: [DONE]".to_string()];
+    let base_url = spawn_sse_server(events, Duration::ZERO, None);
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect_err("empty stream must fail");
+    assert!(error.to_string().contains("sin contenido"), "{error}");
+}
+
+#[test]
+fn streaming_error_status_is_actionable() {
+    // Errors are JSON bodies, not streams — even with stream: true.
+    let base_url = spawn_mock_server(MockReply {
+        status: 404,
+        body: serde_json::json!({"error": {"message": "model not found"}}).to_string(),
+        delay: Duration::ZERO,
+    });
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect_err("404 must fail");
+    let rendered = error.to_string();
+    assert!(rendered.contains("404"), "{rendered}");
+    assert!(rendered.contains("not found"), "{rendered}");
+}
+
 /// End-to-end against a real Ollama server when present. Ignored by default;
 /// run with `cargo test -p narra-core --test openai_compat_http -- --ignored`
 /// on a machine with `ollama serve` running and a pulled model.
@@ -380,4 +606,40 @@ fn real_ollama_completes_a_brief_exchange() {
 
     assert!(!response.text.is_empty(), "model produced no text");
     eprintln!("ollama respondió ({}): {}", response.model, response.text);
+}
+
+/// Real streaming against Ollama, same rules as the completion test above.
+#[test]
+#[ignore = "requires a running Ollama server (OLLAMA_URL, default localhost:11434)"]
+fn real_ollama_streams_a_brief_exchange() {
+    let base_url = std::env::var("OLLAMA_URL")
+        .unwrap_or_else(|_| narra_core::agent::LOCAL_DEFAULT_BASE_URL.to_string());
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
+
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig {
+        base_url,
+        api_key: None,
+        model,
+        timeout: Duration::from_secs(120),
+        extra_headers: Vec::new(),
+    });
+    let token = CancellationToken::new();
+    let mut deltas = 0usize;
+    let response = adapter
+        .complete_streaming(
+            &request(
+                "Eres un asistente de guion.",
+                "Cuenta hasta cinco, un número por línea.",
+            ),
+            &token,
+            &mut |_| deltas += 1,
+        )
+        .expect("real Ollama stream");
+
+    assert!(!response.text.is_empty(), "model produced no text");
+    assert!(deltas > 1, "expected multiple deltas, got {deltas}");
+    eprintln!(
+        "ollama streamió {} deltas ({}): {}",
+        deltas, response.model, response.text
+    );
 }

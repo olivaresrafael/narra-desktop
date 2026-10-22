@@ -18,6 +18,7 @@
 //! - no provider SDK is used — the wire format is small and stable, and a
 //!   dependency-free client keeps provider code behind one trait.
 
+use std::io::BufRead;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -148,20 +149,8 @@ impl ModelAdapter for OpenAiCompatAdapter {
             "stream": false,
         });
 
-        let mut call = self
-            .agent
-            .post(self.config.chat_url())
-            .header("Content-Type", "application/json");
-        // The key exists only here: header value, never in our error text.
-        if let Some(key) = &self.config.api_key {
-            call = call.header("Authorization", bearer(key));
-        }
-        for (name, value) in &self.config.extra_headers {
-            call = call.header(name, value);
-        }
-
-        let mut response = call
-            .send_json(&body)
+        let mut response = self
+            .send_chat(&body)
             .map_err(|error| classify_error(error, &self.config))?;
         let status = response.status();
 
@@ -174,12 +163,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
         })?;
 
         if !status.is_success() {
-            let detail =
-                server_error_detail(&payload).unwrap_or_else(|| self.config.base_url.clone());
-            return Err(AgentError::Adapter(format!(
-                "el endpoint devolvió HTTP {status}: {}",
-                crate::git::redact_secrets(&detail)
-            )));
+            return Err(http_error(status.as_u16(), &payload, &self.config));
         }
 
         if cancel.is_cancelled() {
@@ -187,6 +171,142 @@ impl ModelAdapter for OpenAiCompatAdapter {
         }
 
         parse_response(payload)
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelResponse, AgentError> {
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+
+        let body = json!({
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": request.system},
+                {"role": "user", "content": request.prompt},
+            ],
+            "max_tokens": request.max_output_tokens,
+            "stream": true,
+            // Standard OpenAI knob: usage arrives in a final chunk instead of
+            // being dropped. Servers that ignore it (older local servers)
+            // simply report no usage — never an error.
+            "stream_options": {"include_usage": true},
+        });
+
+        let response = self
+            .send_chat(&body)
+            .map_err(|error| classify_error(error, &self.config))?;
+        let status = response.status();
+
+        // Non-2xx: the server answered with a JSON error body, not a
+        // stream — surface it exactly like the non-streaming path.
+        if !status.is_success() {
+            let payload: Value = response.into_body().read_json().unwrap_or(Value::Null);
+            return Err(http_error(status.as_u16(), &payload, &self.config));
+        }
+
+        // The SSE stream. `timeout_global` (set in `new`) bounds the whole
+        // exchange including this read, so a stalled provider errors instead
+        // of hanging; `cancel` is observed *between* chunks, which is what
+        // makes mid-generation cancellation real.
+        let mut reader = std::io::BufReader::new(response.into_body().into_reader());
+        let mut text = String::new();
+        let mut model: Option<String> = None;
+        let mut usage: Option<Value> = None;
+        let mut line = String::new();
+
+        loop {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            line.clear();
+            let read = reader.read_line(&mut line).map_err(|error| {
+                AgentError::Adapter(format!("el stream se interrumpió: {error}"))
+            })?;
+            if read == 0 {
+                // Clean EOF: some servers close without `[DONE]`. Accept it
+                // as end-of-stream; content validity is checked below.
+                break;
+            }
+            let trimmed = line.trim_end();
+            // SSE framing: blank separators, `event:` fields and `:`
+            // comments are not data. Only `data:` lines carry payloads.
+            let Some(data) = trimmed.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim_start();
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                // A malformed chunk is a protocol violation, not something
+                // to silently drop: the caller must know the text is partial.
+                return Err(AgentError::Adapter(
+                    "el stream contiene un chunk que no es JSON válido".to_string(),
+                ));
+            };
+            if let Some(message) = server_error_detail(&chunk) {
+                return Err(AgentError::Adapter(crate::git::redact_secrets(&message)));
+            }
+            if let Some(name) = chunk.get("model").and_then(Value::as_str) {
+                model = Some(name.to_string());
+            }
+            if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
+                usage = chunk.get("usage").cloned();
+            }
+            if let Some(delta) = chunk.pointer("/choices/0/delta/content")
+                && let Some(piece) = delta.as_str()
+                && !piece.is_empty()
+            {
+                text.push_str(piece);
+                on_delta(piece);
+            }
+        }
+
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if text.is_empty() {
+            return Err(AgentError::Adapter(
+                "el stream terminó sin contenido de texto".to_string(),
+            ));
+        }
+
+        let usage = usage.unwrap_or(Value::Null);
+        Ok(ModelResponse {
+            text,
+            model: model.unwrap_or_else(|| "desconocido".to_string()),
+            input_tokens: usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32),
+            output_tokens: usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32),
+        })
+    }
+}
+
+impl OpenAiCompatAdapter {
+    /// POST one chat-completions body with the configured auth and headers.
+    fn send_chat(&self, body: &Value) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let mut call = self
+            .agent
+            .post(self.config.chat_url())
+            .header("Content-Type", "application/json");
+        // The key exists only here: header value, never in our error text.
+        if let Some(key) = &self.config.api_key {
+            call = call.header("Authorization", bearer(key));
+        }
+        for (name, value) in &self.config.extra_headers {
+            call = call.header(name, value);
+        }
+        call.send_json(body)
     }
 }
 
@@ -207,6 +327,16 @@ fn server_error_detail(payload: &Value) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+/// Build the actionable message for a non-2xx reply, quoting the server's
+/// own error detail when present and never leaking credentials.
+fn http_error(status: u16, payload: &Value, config: &OpenAiCompatConfig) -> AgentError {
+    let detail = server_error_detail(payload).unwrap_or_else(|| config.base_url.clone());
+    AgentError::Adapter(format!(
+        "el endpoint devolvió HTTP {status}: {}",
+        crate::git::redact_secrets(&detail)
+    ))
 }
 
 /// Turn transport failures into actionable messages with **no secret

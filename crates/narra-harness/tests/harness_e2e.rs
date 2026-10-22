@@ -539,3 +539,34 @@ fn stale_proposal_apply_fails_and_renew_produces_a_fresh_one() {
     let applied = fs::read_to_string(&screenplay).expect("read");
     assert!(applied.contains("MOCK BRIEF"), "{applied}");
 }
+
+#[test]
+fn stream_flag_emits_model_delta_events() {
+    let root = sample_project();
+    let output = harness()
+        .args([
+            "brief",
+            root.to_str().expect("utf8"),
+            "--stream",
+            "--latency",
+            "40",
+        ])
+        .output()
+        .expect("run harness");
+
+    assert_eq!(output.status.code(), Some(0), "success exit code");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let deltas = stdout
+        .lines()
+        .filter(|line| line.contains("\"event\":\"model_delta\""))
+        .count();
+    assert!(
+        deltas > 1,
+        "expected incremental model_delta events, got {deltas}\n{stdout}"
+    );
+    // The final output still arrives and is unchanged in shape.
+    assert!(
+        stdout.contains("\"record\":\"task_output\""),
+        "task_output present\n{stdout}"
+    );
+}
