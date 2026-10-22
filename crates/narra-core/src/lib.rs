@@ -21,6 +21,8 @@
 //! - long-running work is cancellable and bounded by timeouts;
 //! - no secrets in errors, logs or events.
 
+pub mod agent;
+pub mod cancel;
 pub mod document;
 pub mod fountain;
 pub mod git;

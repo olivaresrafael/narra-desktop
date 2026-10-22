@@ -16,12 +16,12 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+pub use crate::cancel::CancellationToken;
 
 /// Default bound for local Git operations. Generous for slow disks and cold
 /// caches; callers doing network work should raise it explicitly.
@@ -29,30 +29,6 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait between cancellation/timeout polls of the child process.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-/// Cooperative cancellation for a running operation.
-///
-/// Cheap to clone (shared atomic flag). Cancel kills the child process; the
-/// operation then fails with [`GitError::Cancelled`].
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken {
-    flag: Arc<AtomicBool>,
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Request cancellation. Idempotent and safe to call from any thread.
-    pub fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
-    }
-}
 
 /// Per-call options: timeout and optional cancellation.
 #[derive(Debug, Clone)]

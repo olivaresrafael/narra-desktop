@@ -11,7 +11,7 @@ Native desktop environment for audiovisual writing with AI-assisted agents.
 
 ## Status
 
-Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021 proposed).
+Milestones 0–1 foundation complete (editor spike + approved performance baselines). Milestone 2 complete: the project model — `project.yaml` schema v1 validation, create/open with the English template (D-017), boundary-safe document IO, the derived Fountain 1.1 parser and the disposable scene index — lives in `narra-core`. Milestone 3 (Spike D) complete in `narra-core::git`: local and remote Git operations over the system `git` executable — init/open, status, log, diff, commit, branches, merge with conflict reporting and abort, clone/fetch/pull/push — all cancellable, timeout-bounded and with secret-redacted errors (D-021). Milestone 4 in progress: UI-neutral agent task contracts and the `project_brief` task in `narra-core::agent`, run headless by `narra-harness` (Spike F complete; real OpenAI adapter and write proposals pending).
 
 ## Layout
 
@@ -26,6 +26,9 @@ narra-desktop/
     │   └── src/document.rs     # boundary-checked, atomic document IO
     │   └── src/fountain.rs     # derived Fountain 1.1 parser (index only)
     │   └── src/git/            # local Git via system git (cancellable ops)
+    │   └── src/agent/          # agent task contracts + first task (project_brief)
+    │   └── src/cancel.rs       # shared cooperative cancellation
+    ├── narra-harness/          # headless agent runner: JSONL events, exit codes (Spike F)
     ├── spike-editor/           # GPUI editor spike (Milestone 1 evidence)
     └── fixture-gen/            # deterministic Fountain fixture generator
 ```

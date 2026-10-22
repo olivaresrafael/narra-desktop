@@ -1,0 +1,19 @@
+[package]
+name = "narra-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Headless harness to run agent tasks without a desktop window (Spike F)"
+publish = false
+
+[dependencies]
+narra-core = { path = "../narra-core" }
+# SIGINT handling for cooperative cancellation without unsafe signal code
+# (MIT/Apache-2.0, maintained, no transitive deps of note).
+ctrlc = "3"
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
