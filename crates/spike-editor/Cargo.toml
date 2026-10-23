@@ -16,3 +16,11 @@ gpui = "0.2"
 # Grapheme-correct cursor movement (Spike B requirement). MIT/Apache-2.0, and
 # already present in the GPUI dependency tree, so no new supply-chain surface.
 unicode-segmentation = "1"
+# Unified/side-by-side diff engine (Spike A slice 3, M1-3b). A hand-rolled
+# Myers would be a correctness risk for the one surface whose whole job is
+# reviewing AI-authored changes (M4 proposals); a wrong diff is a safety bug,
+# not a cosmetic one. License: Apache-2.0 (verified compatible with GPL-3.0,
+# D-015). Maintenance: Armin Ronacher (mitsuhiko), 227M downloads, latest
+# 3.2.0 (2026-08). Candidate status: not approved for the product until the
+# spike report records a verdict in PERFORMANCE_BASELINES.md.
+similar = "3.2"

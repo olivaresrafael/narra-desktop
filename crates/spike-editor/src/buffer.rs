@@ -478,4 +478,94 @@ mod tests {
             assert_eq!(back, probe, "roundtrip failed at byte {probe}");
         }
     }
+
+    /// M1-3b integrity: the diff must reconstruct the edited document from
+    /// the base. This is exactly what an M4 proposal does when it is applied
+    /// (base + diff = proposal result), so a wrong diff is a safety bug, not
+    /// a cosmetic one. The invariant is the round trip: replaying the
+    /// delete/insert hunks over the base must reproduce the edited text byte
+    /// for byte, and must be a no-op when the two sides are identical.
+    #[test]
+    fn diff_reconstructs_edited_document() {
+        let base = "INT. SALA - DIA\n\nNoche cerrada.\nMARIANA entra.\n";
+        let buffer = Buffer::new(base);
+        let matches = buffer.find_all("Noche");
+        assert_eq!(matches.len(), 1, "expected one case-folded match");
+
+        // Apply the replace the editor's replace-all performs, in reverse
+        // offset order so earlier offsets stay valid.
+        let mut edited = Buffer::new(base);
+        for range in matches.iter().rev() {
+            edited.replace(range.clone(), "Luz");
+        }
+
+        // Build both diff sides from `Buffer::lines()` — the exact
+        // representation `recompute_diff` uses — so this test pins the
+        // shipped invariant rather than a slightly different one.
+        let base_text = buffer.lines().join("\n");
+        let edited_text = edited.lines().join("\n");
+        let d = similar::TextDiff::from_lines(&base_text, &edited_text);
+
+        // Replay the hunks over the base: every Equal line is kept, every
+        // Delete is dropped, every Insert is taken from the new side. That
+        // reconstruction must equal the edited document.
+        let mut replayed = String::new();
+        for change in d.iter_all_changes() {
+            if change.tag() != similar::ChangeTag::Delete {
+                replayed.push_str(change.value());
+            }
+        }
+        assert_eq!(
+            replayed, edited_text,
+            "replaying the diff over the base must reproduce the edited document"
+        );
+
+        // And a diff of a document against itself must be pure Equal.
+        let identity = similar::TextDiff::from_lines(&base_text, &base_text);
+        let changed = identity
+            .iter_all_changes()
+            .filter(|c| c.tag() != similar::ChangeTag::Equal)
+            .count();
+        assert_eq!(changed, 0, "self-diff must contain no changes");
+    }
+
+    /// A genuine single-line edit must produce exactly one remove + one add,
+    /// so the diff is not trivially always-empty.
+    #[test]
+    fn single_edit_produces_one_add_one_remove() {
+        let base = "uno\ndos\ntres\n";
+        let buffer = Buffer::new(base);
+        let range = buffer.find_all("dos")[0].clone();
+        let mut edited = Buffer::new(base);
+        edited.replace(range, "DOS");
+
+        let edited_text = edited.lines().join("\n");
+        let d = similar::TextDiff::from_lines(base, &edited_text);
+        let mut added = 0;
+        let mut removed = 0;
+        for change in d.iter_all_changes() {
+            match change.tag() {
+                similar::ChangeTag::Insert => added += 1,
+                similar::ChangeTag::Delete => removed += 1,
+                similar::ChangeTag::Equal => {}
+            }
+        }
+        assert_eq!((added, removed), (1, 1));
+    }
+
+    /// The diff base is seeded with `text.split('\n')` (see `run()`), the
+    /// same representation `Buffer::new` uses. If the two ever diverge, every
+    /// diff would show a phantom one-line change at EOF, so pin the match.
+    #[test]
+    fn diff_base_seeding_matches_buffer_lines() {
+        for base in ["a\nb\n", "a\nb", "a\n\nb\n", "", "\n"] {
+            let buffer = Buffer::new(base);
+            let seeded: Vec<String> = base.split('\n').map(str::to_string).collect();
+            assert_eq!(
+                buffer.lines(),
+                seeded.as_slice(),
+                "base seeding diverged for {base:?}"
+            );
+        }
+    }
 }

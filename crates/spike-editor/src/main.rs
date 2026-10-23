@@ -20,9 +20,12 @@
 //!           next match / next+prev match / focus replacement /
 //!           replace match / replace all
 //!       escape                                     close find bar
+//!       cmd-d                                     diff view (toggle)
+//!       cmd-g / cmd-shift-g (diff open)           next/previous hunk
 //!       cmd-q                                     quit (prints the JSON report)
 //!   spike-editor --fixture <path> --steps 60      automated scroll probe (slice 1)
 //!   spike-editor --fixture <path> --find-steps 60 automated find probe (slice 3)
+//!   spike-editor --fixture <path> --diff-steps 30 automated diff probe (M1-3b)
 //!   spike-editor --report-after-ms <ms>           print the report and exit
 //!   spike-editor --dump-after-ms <ms>             print a buffer dump and exit
 //!       (used by the scripted typing verification: text, enter, backspace,
@@ -93,6 +96,8 @@ actions!(
         CloseFind,
         ReplaceCurrent,
         ReplaceAll,
+        // diff view (slice 3, M1-3b)
+        ToggleDiff,
     ]
 );
 
@@ -130,6 +135,13 @@ const MATCH_CURRENT_BG: u32 = 0xeab30855;
 const FIND_BG: u32 = 0x252526;
 const FIND_FG: u32 = 0xd4d4d4;
 const FIND_DIM_FG: u32 = 0x808080;
+/// Diff view colors (slice 3, M1-3b): added/removed row backgrounds and the
+/// line-label gutter text.
+const DIFF_ADD_BG: u32 = 0x16321f;
+const DIFF_ADD_LABEL: u32 = 0x7ee08a;
+const DIFF_REMOVE_BG: u32 = 0x3a1a1f;
+const DIFF_REMOVE_LABEL: u32 = 0xe08a95;
+const DIFF_CONTEXT_LABEL: u32 = 0x606060;
 /// Which find field owns keystrokes while the bar is open (single-focus
 /// spike compromise — see the module header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -153,6 +165,31 @@ struct FindState {
     current: usize,
     /// Replace-all counter for the dump/report (verified evidence).
     replaced_total: usize,
+}
+
+/// One row of the unified diff view: the label and the line text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffRow {
+    /// Unified-diff label: " ", "-", "+".
+    label: char,
+    text: String,
+}
+
+/// Diff view state (slice 3, M1-3b). The base is a snapshot of the file as
+/// loaded, so the diff stays meaningful while the buffer keeps changing —
+/// the same model the M4 proposal surface needs (canonical file vs. edited
+/// buffer). Rows are recomputed on open and on the explicit refresh.
+#[derive(Debug, Default)]
+struct DiffState {
+    open: bool,
+    /// Snapshot of the loaded file, one entry per line (no newline).
+    base_lines: Vec<String>,
+    rows: Vec<DiffRow>,
+    /// Highlighted cursor row in `rows` (0 when empty).
+    cursor: usize,
+    /// Cumulative counters for the dump/report.
+    added_total: usize,
+    removed_total: usize,
 }
 
 fn is_scene_heading(line: &str) -> bool {
@@ -249,11 +286,29 @@ struct Metrics {
     search_to_frame_ms: Vec<f64>,
     /// Wall time of each replace-all over the whole document.
     replace_all_ms: Vec<f64>,
+    /// A diff open/refresh was just requested; the next render closes the
+    /// "diff requested → diff rendered" sample (slice 3, M1-3b baseline).
+    pending_diff: Option<Instant>,
+    /// Time spent computing the unified diff (base → current buffer).
+    diff_compute_ms: Vec<f64>,
+    /// Diff open/refresh requested → next render pass (same method as
+    /// keystroke_to_frame: input → start of render, no vsync term).
+    diff_render_ms: Vec<f64>,
     renders: usize,
     edits: usize,
     searches: usize,
+    diff_opens: usize,
     probe_steps: usize,
     find_probe_steps: usize,
+    diff_probe_steps: usize,
+}
+
+/// The three probe step counts. Grouped so `Metrics::new` stays under the
+/// clippy argument limit instead of carrying an `#[allow]`.
+struct ProbeSteps {
+    scroll: usize,
+    find: usize,
+    diff: usize,
 }
 
 impl Metrics {
@@ -263,8 +318,7 @@ impl Metrics {
         fixture_read_ms: f64,
         lines: usize,
         scenes: usize,
-        probe_steps: usize,
-        find_probe_steps: usize,
+        probe: ProbeSteps,
     ) -> Self {
         Metrics {
             started,
@@ -276,16 +330,21 @@ impl Metrics {
             last_render: None,
             pending_keystroke: None,
             pending_search: None,
+            pending_diff: None,
             frame_gaps_ms: Vec::new(),
             keystroke_to_frame_ms: Vec::new(),
             search_compute_ms: Vec::new(),
             search_to_frame_ms: Vec::new(),
             replace_all_ms: Vec::new(),
+            diff_compute_ms: Vec::new(),
+            diff_render_ms: Vec::new(),
             renders: 0,
             edits: 0,
             searches: 0,
-            probe_steps,
-            find_probe_steps,
+            diff_opens: 0,
+            probe_steps: probe.scroll,
+            find_probe_steps: probe.find,
+            diff_probe_steps: probe.diff,
         }
     }
 
@@ -299,6 +358,9 @@ impl Metrics {
         }
         if let Some(pending) = self.pending_search.take() {
             self.search_to_frame_ms.push(duration_ms(now - pending));
+        }
+        if let Some(pending) = self.pending_diff.take() {
+            self.diff_render_ms.push(duration_ms(now - pending));
         }
         if let Some(last) = self.last_render {
             let gap = duration_ms(now - last);
@@ -322,6 +384,13 @@ impl Metrics {
     fn mark_search(&mut self, now: Instant) {
         self.pending_search = Some(now);
         self.searches += 1;
+    }
+
+    /// A diff open/refresh was just requested; the next render closes the
+    /// "requested → rendered" sample (same contract as `mark_search`).
+    fn mark_diff(&mut self, now: Instant) {
+        self.pending_diff = Some(now);
+        self.diff_opens += 1;
     }
 
     fn cold_start_ms(&self) -> f64 {
@@ -382,11 +451,16 @@ impl Metrics {
         let (compute_count, compute_p50, compute_p95, compute_max) =
             Self::stats(&self.search_compute_ms);
         let (repl_count, repl_p50, repl_p95, repl_max) = Self::stats(&self.replace_all_ms);
+        let (dcompute_count, dcompute_p50, dcompute_p95, dcompute_max) =
+            Self::stats(&self.diff_compute_ms);
+        let (drender_count, drender_p50, drender_p95, drender_max) =
+            Self::stats(&self.diff_render_ms);
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-slice2\",",
                 "\"fixture\":\"{}\",\"lines\":{},\"scenes\":{},\"probe_steps\":{},",
                 "\"find_probe_steps\":{},\"searches\":{},",
+                "\"diff_probe_steps\":{},\"diff_opens\":{},",
                 "\"fixture_read_ms\":{:.3},\"cold_start_ms\":{:.3},\"rss_mb\":{:.1},",
                 "\"renders\":{},\"edits\":{},",
                 "\"frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
@@ -394,7 +468,9 @@ impl Metrics {
                 "\"keystroke_to_frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
                 "\"search_to_frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
                 "\"search_compute_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
-                "\"replace_all_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}}",
+                "\"replace_all_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
+                "\"diff_compute_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
+                "\"diff_render_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}}",
                 "}}"
             ),
             self.fixture,
@@ -403,6 +479,8 @@ impl Metrics {
             self.probe_steps,
             self.find_probe_steps,
             self.searches,
+            self.diff_probe_steps,
+            self.diff_opens,
             self.fixture_read_ms,
             self.cold_start_ms(),
             Self::rss_mb(),
@@ -432,6 +510,14 @@ impl Metrics {
             repl_p50,
             repl_p95,
             repl_max,
+            dcompute_count,
+            dcompute_p50,
+            dcompute_p95,
+            dcompute_max,
+            drender_count,
+            drender_p50,
+            drender_p95,
+            drender_max,
         )
     }
 }
@@ -465,6 +551,8 @@ struct Editor {
     current_scene: usize,
 
     list_state: ListState,
+    /// Scroll state for the diff view (its own list, sized to the rows).
+    diff_list_state: ListState,
     focus_handle: FocusHandle,
     /// Wrap width for non-hot rows, refreshed from the viewport each frame and
     /// read by the `list` render callback (which reaches the editor via the
@@ -481,9 +569,19 @@ struct Editor {
     find_probe_left: usize,
     find_probe_cursor: usize,
 
+    /// Automated diff probe (`--diff-steps`): toggles the diff view through
+    /// the same functions as cmd-d, so the measured path is the shipped one.
+    diff_probe_left: usize,
+    /// Total diff steps requested (detects the seeding first step).
+    diff_probe_total: usize,
+
     /// Find/replace bar (slice 3). While `open`, keystrokes route here
     /// instead of the buffer (single-focus spike compromise).
     find: FindState,
+
+    /// Unified diff view (slice 3, M1-3b). While `open`, it renders instead
+    /// of the buffer rows and the probe/diff navigation takes over.
+    diff: DiffState,
 }
 
 impl Focusable for Editor {
@@ -668,9 +766,46 @@ impl Editor {
         self.probe_cursor += 1;
         self.probe_left = self.probe_left.saturating_sub(1);
 
-        // Quit only when no probe work remains (scroll and find probes may
-        // be combined in one run).
-        let finished = self.probe_left == 0 && self.find_probe_left == 0;
+        // Quit only when no probe work remains (scroll, find and diff probes
+        // may be combined in one run).
+        let finished =
+            self.probe_left == 0 && self.find_probe_left == 0 && self.diff_probe_left == 0;
+        cx.notify();
+        if finished {
+            let report = self.metrics.borrow().report();
+            println!("{report}");
+            cx.defer(|cx| cx.quit());
+        }
+    }
+
+    /// The diff probe exercises the shipped cmd-d path. The first step makes
+    /// one large real edit (replace-all over the whole document) so there is
+    /// a substantial change to diff; every step after that opens the diff
+    /// (recompute + render) and then closes it, yielding one
+    /// "requested → rendered" sample per open.
+    fn advance_diff_probe(&mut self, cx: &mut Context<Self>) {
+        if self.diff_probe_left == self.diff_probe_total {
+            // Seed a large, real change once — the acceptance metric is
+            // "open a diff of a large change", so the diff under measurement
+            // must actually be big. Reuse the shipped find + replace-all
+            // machinery (query a common word, swap every match) rather than a
+            // bespoke edit, so the seeded change is produced by the same code
+            // a user drives. `INT.` matches ~778 scene headings.
+            self.find.query = "INT.".to_string();
+            self.find.replacement = "CENA.".to_string();
+            self.refresh_matches(false);
+            self.replace_all(cx);
+        }
+
+        if self.diff.open {
+            self.close_diff(cx);
+        } else {
+            self.open_diff(cx);
+        }
+
+        self.diff_probe_left = self.diff_probe_left.saturating_sub(1);
+        let finished =
+            self.probe_left == 0 && self.find_probe_left == 0 && self.diff_probe_left == 0;
         cx.notify();
         if finished {
             let report = self.metrics.borrow().report();
@@ -680,7 +815,7 @@ impl Editor {
     }
 
     fn schedule_probe_step(&mut self, window: &Window, cx: &Context<Self>) {
-        let has_probe = self.probe_left > 0 || self.find_probe_left > 0;
+        let has_probe = self.probe_left > 0 || self.find_probe_left > 0 || self.diff_probe_left > 0;
         if !has_probe || self.probe_scheduled {
             return;
         }
@@ -694,7 +829,9 @@ impl Editor {
                 cx.update(|_, cx| {
                     entity.update(cx, |view, cx| {
                         view.probe_scheduled = false;
-                        if view.find_probe_left > 0 {
+                        if view.diff_probe_left > 0 {
+                            view.advance_diff_probe(cx);
+                        } else if view.find_probe_left > 0 {
                             view.advance_find_probe(cx);
                         } else {
                             view.advance_probe(cx);
@@ -756,7 +893,12 @@ impl Editor {
 
     fn next_scene(&mut self, _: &NextScene, _window: &mut Window, cx: &mut Context<Self>) {
         // With the find bar open, cmd-g/shift-g navigate matches (same
-        // shortcuts the scene jump uses when it is closed).
+        // shortcuts the scene jump uses when it is closed); with the diff
+        // view open they walk its hunks.
+        if self.diff.open {
+            self.diff_move_cursor(1, cx);
+            return;
+        }
         if self.find.open {
             self.next_match(cx);
             return;
@@ -766,6 +908,10 @@ impl Editor {
     }
 
     fn prev_scene(&mut self, _: &PrevScene, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff.open {
+            self.diff_move_cursor(-1, cx);
+            return;
+        }
         if self.find.open {
             self.prev_match(cx);
             return;
@@ -1119,6 +1265,149 @@ impl Editor {
         cx.notify();
     }
 
+    // ---- diff view (slice 3, M1-3b) --------------------------------------
+
+    /// Recompute the unified diff rows: `diff.base_lines` (the file as
+    /// loaded) vs. the current buffer. The compute time is recorded into
+    /// `diff_compute_ms`; the caller marks the render sample with
+    /// `mark_diff` so "requested → rendered" is captured separately. The
+    /// correctness contract this surface owes the M4 proposal view is not
+    /// "the diff is empty after an edit" (an edit must show), but that the
+    /// diff **reconstructs the edited document from the base** — pinned by
+    /// `diff_reconstructs_edited_document`.
+    fn recompute_diff(&mut self) {
+        let start = Instant::now();
+        let base = self.diff.base_lines.join("\n");
+        let current = self.buffer.lines().join("\n");
+        let d = similar::TextDiff::from_lines(&base, &current);
+        let mut rows = Vec::new();
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        for change in d.iter_all_changes() {
+            let label = match change.tag() {
+                similar::ChangeTag::Delete => {
+                    removed += 1;
+                    '-'
+                }
+                similar::ChangeTag::Insert => {
+                    added += 1;
+                    '+'
+                }
+                similar::ChangeTag::Equal => ' ',
+            };
+            rows.push(DiffRow {
+                label,
+                text: change.value().trim_end_matches('\n').to_string(),
+            });
+        }
+        self.diff.rows = rows;
+        self.diff.added_total += added;
+        self.diff.removed_total += removed;
+        // Park the cursor on the first hunk so opening the diff shows the
+        // change, not the unchanged head of the file.
+        self.diff.cursor = self
+            .diff
+            .rows
+            .iter()
+            .position(|row| row.label != ' ')
+            .unwrap_or(0);
+        self.metrics
+            .borrow_mut()
+            .diff_compute_ms
+            .push(duration_ms(start.elapsed()));
+    }
+
+    /// Open the diff view (cmd-d). The base is seeded from the loaded file
+    /// the first time; the cursor and scroll reset to the first hunk.
+    fn open_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.diff.open {
+            self.diff.open = true;
+        }
+        self.recompute_diff();
+        self.diff_list_state = ListState::new(
+            self.diff.rows.len(),
+            ListAlignment::Top,
+            px(LINE_HEIGHT * 2.0),
+        );
+        let cursor = self.diff.cursor;
+        self.diff_list_state.scroll_to_reveal_item(cursor);
+        self.metrics.borrow_mut().mark_diff(Instant::now());
+        cx.notify();
+    }
+
+    fn close_diff(&mut self, cx: &mut Context<Self>) {
+        self.diff.open = false;
+        cx.notify();
+    }
+
+    /// Move the diff cursor to the next/previous **hunk** (cmd-g/shift-g).
+    /// A modified line renders as an adjacent delete+insert pair, so a plain
+    /// row step would park between them; instead, leave the current block of
+    /// consecutive change rows and land on the next one, wrapping.
+    fn diff_move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.diff.rows.len();
+        if len == 0 {
+            return;
+        }
+        let step = if delta >= 0 { 1isize } else { -1 };
+        let is_change = |ix: usize| self.diff.rows[ix].label != ' ';
+        let mut ix = self.diff.cursor;
+        // Leave the current change block (the +/− pair of one hunk)…
+        let mut guard = 0usize;
+        while is_change(ix) {
+            ix = (ix as isize + step).rem_euclid(len as isize) as usize;
+            guard += 1;
+            if guard >= len {
+                return; // the whole view is one change block: nowhere to go
+            }
+        }
+        // …then walk through context rows to the next change block.
+        guard = 0;
+        while !is_change(ix) {
+            ix = (ix as isize + step).rem_euclid(len as isize) as usize;
+            guard += 1;
+            if guard >= len {
+                return; // no changes at all (empty diff): stay put
+            }
+        }
+        self.diff.cursor = ix;
+        self.diff_list_state.scroll_to_reveal_item(self.diff.cursor);
+        cx.notify();
+    }
+
+    /// The diff view row: label gutter + line text, colored by tag.
+    fn diff_row(&self, ix: usize) -> gpui::Div {
+        let Some(row) = self.diff.rows.get(ix) else {
+            return div();
+        };
+        let (label_color, bg) = match row.label {
+            '+' => (rgb(DIFF_ADD_LABEL), Some(DIFF_ADD_BG)),
+            '-' => (rgb(DIFF_REMOVE_LABEL), Some(DIFF_REMOVE_BG)),
+            _ => (rgb(DIFF_CONTEXT_LABEL), None),
+        };
+        let mut element = div()
+            .px_2()
+            .h(px(LINE_HEIGHT))
+            .flex()
+            .items_center()
+            .whitespace_nowrap()
+            .font_family(FONT_FAMILY)
+            .text_size(px(TEXT_SIZE));
+        if ix == self.diff.cursor {
+            element = element.bg(rgba(SELECTION_BG));
+        } else if let Some(color) = bg {
+            element = element.bg(rgb(color));
+        }
+        element
+            .child(
+                div()
+                    .w(px(16.0))
+                    .text_color(label_color)
+                    .child(row.label.to_string()),
+            )
+            .child(div().text_color(rgb(STATUS_FG)).child(row.text.clone()))
+    }
+
     // ---- find bar actions ------------------------------------------------
 
     fn on_toggle_find(&mut self, _: &ToggleFind, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1153,6 +1442,16 @@ impl Editor {
     fn on_replace_all(&mut self, _: &ReplaceAll, _window: &mut Window, cx: &mut Context<Self>) {
         if self.find.open {
             self.replace_all(cx);
+        }
+    }
+
+    // ---- diff view actions (slice 3, M1-3b) ------------------------------
+
+    fn on_toggle_diff(&mut self, _: &ToggleDiff, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff.open {
+            self.close_diff(cx);
+        } else {
+            self.open_diff(cx);
         }
     }
 
@@ -1402,6 +1701,22 @@ impl Editor {
         }
         let around = escape_json(&self.buffer.slice(start..end));
 
+        // The diff counts are the ground truth the M4 proposal surface
+        // leans on: every row must be a real change (no phantom EOF line)
+        // and `buffer_hash` lets an external check compare the rendered
+        // buffer against an independently computed expectation.
+        let diff_lines = self.diff.rows.len();
+        let diff_added = self.diff.rows.iter().filter(|row| row.label == '+').count();
+        let diff_removed = self.diff.rows.iter().filter(|row| row.label == '-').count();
+        let buffer_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for line in self.buffer.lines() {
+                line.hash(&mut hasher);
+            }
+            format!("{:016x}", hasher.finish())
+        };
+
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
@@ -1409,7 +1724,9 @@ impl Editor {
                 "\"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],",
                 "\"scenes\":{},\"undo\":{},\"redo\":{},\"around\":\"{}\",",
                 "\"find\":{{\"open\":{},\"query\":\"{}\",\"matches\":{},",
-                "\"current\":{},\"replaced\":{}}}}}"
+                "\"current\":{},\"replaced\":{}}},",
+                "\"diff\":{{\"open\":{},\"lines\":{},\"added\":{},",
+                "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -1427,6 +1744,12 @@ impl Editor {
             self.find.matches.len(),
             self.find.current,
             self.find.replaced_total,
+            self.diff.open,
+            diff_lines,
+            diff_added,
+            diff_removed,
+            self.diff.cursor,
+            buffer_hash,
         )
     }
 
@@ -1649,6 +1972,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_close_find))
             .on_action(cx.listener(Self::on_replace_current))
             .on_action(cx.listener(Self::on_replace_all))
+            .on_action(cx.listener(Self::on_toggle_diff))
             .child(
                 div()
                     .id("status")
@@ -1668,15 +1992,31 @@ impl Render for Editor {
                 div()
                     .flex_1()
                     .relative()
-                    .child(
-                        list(self.list_state.clone(), {
-                            let entity = entity.clone();
-                            move |ix: usize, _window: &mut Window, cx: &mut App| {
-                                entity.read(cx).row(ix).into_any_element()
-                            }
-                        })
-                        .size_full(),
-                    )
+                    // The diff view replaces the buffer rows while open; the
+                    // buffer list keeps its own (idle) scroll state so
+                    // closing the diff restores the caret position.
+                    .when(self.diff.open, |host| {
+                        host.child(
+                            list(self.diff_list_state.clone(), {
+                                let entity = entity.clone();
+                                move |ix: usize, _window: &mut Window, cx: &mut App| {
+                                    entity.read(cx).diff_row(ix).into_any_element()
+                                }
+                            })
+                            .size_full(),
+                        )
+                    })
+                    .when(!self.diff.open, |host| {
+                        host.child(
+                            list(self.list_state.clone(), {
+                                let entity = entity.clone();
+                                move |ix: usize, _window: &mut Window, cx: &mut App| {
+                                    entity.read(cx).row(ix).into_any_element()
+                                }
+                            })
+                            .size_full(),
+                        )
+                    })
                     // Invisible overlay that registers the platform input
                     // handler for this frame: typing and IME flow into
                     // `EntityInputHandler` while the root has focus.
@@ -1709,6 +2049,7 @@ struct Args {
     fixture: String,
     steps: usize,
     find_steps: usize,
+    diff_steps: usize,
     report_after_ms: Option<u64>,
     dump_after_ms: Option<u64>,
 }
@@ -1718,6 +2059,7 @@ fn parse_args() -> Result<Args, String> {
     let mut fixture = "fixtures/screenplay-1000.fountain".to_string();
     let mut steps = 0usize;
     let mut find_steps = 0usize;
+    let mut diff_steps = 0usize;
     let mut report_after_ms = None;
     let mut dump_after_ms = None;
 
@@ -1736,6 +2078,11 @@ fn parse_args() -> Result<Args, String> {
                 find_steps = value
                     .parse()
                     .map_err(|_| format!("--find-steps inválido: {value}"))?
+            }
+            "--diff-steps" => {
+                diff_steps = value
+                    .parse()
+                    .map_err(|_| format!("--diff-steps inválido: {value}"))?
             }
             "--report-after-ms" => {
                 report_after_ms = Some(
@@ -1760,6 +2107,7 @@ fn parse_args() -> Result<Args, String> {
         fixture,
         steps,
         find_steps,
+        diff_steps,
         report_after_ms,
         dump_after_ms,
     })
@@ -1790,12 +2138,16 @@ fn run() -> Result<(), String> {
         fixture_read_ms,
         content.lines().count(),
         scene_count,
-        args.steps,
-        args.find_steps,
+        ProbeSteps {
+            scroll: args.steps,
+            find: args.find_steps,
+            diff: args.diff_steps,
+        },
     )));
 
     let steps = args.steps;
     let find_steps = args.find_steps;
+    let diff_steps = args.diff_steps;
     let report_after_ms = args.report_after_ms;
     let dump_after_ms = args.dump_after_ms;
     Application::new().run(move |cx: &mut App| {
@@ -1835,6 +2187,9 @@ fn run() -> Result<(), String> {
             KeyBinding::new("escape", CloseFind, None),
             KeyBinding::new("cmd-enter", ReplaceCurrent, None),
             KeyBinding::new("cmd-alt-enter", ReplaceAll, None),
+            // diff view (slice 3, M1-3b): cmd-d toggles, cmd-g/shift-g walk
+            // hunks while it is open.
+            KeyBinding::new("cmd-d", ToggleDiff, None),
         ]);
 
         cx.observe_keystrokes({
@@ -1853,6 +2208,12 @@ fn run() -> Result<(), String> {
 
         let buffer = Buffer::new(&content);
         let line_count = buffer.line_count();
+        // Seed the diff base with the same representation `Buffer::new`
+        // uses (`split('\n')`, keeping the final empty line), so the base
+        // matches the buffer byte for byte at load and every diff row after
+        // that is a real change — `str::lines` here would fake a one-line
+        // change at EOF on every diff.
+        let base_lines: Vec<String> = content.split('\n').map(str::to_string).collect();
         let entity = cx.new(|cx| Editor {
             buffer,
             selected: 0..0,
@@ -1864,6 +2225,7 @@ fn run() -> Result<(), String> {
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
+            diff_list_state: ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
             focus_handle: cx.focus_handle(),
             wrap_width: px(800.0),
             metrics: metrics.clone(),
@@ -1872,7 +2234,13 @@ fn run() -> Result<(), String> {
             probe_scheduled: false,
             find_probe_left: find_steps,
             find_probe_cursor: 0,
+            diff_probe_left: diff_steps,
+            diff_probe_total: diff_steps,
             find: FindState::default(),
+            diff: DiffState {
+                base_lines,
+                ..DiffState::default()
+            },
         });
 
         let bounds = Bounds::centered(None, size(px(1100.0), px(780.0)), cx);
