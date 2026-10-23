@@ -7,7 +7,9 @@
 //! against the approved thresholds (PERFORMANCE_BASELINES.md §6).
 //!
 //! Still NOT answered (slice 3 / Spike B): text wrapping, mouse click-to-caret,
-//! full IME verification with a live composition, large-file strategy.
+//! large-file strategy. IME composition IS now verified end-to-end against the
+//! live macOS input context (dead keys → NSTextInputClient → GPUI), including
+//! one-undo-per-session grouping.
 //!
 //! Modes:
 //!   spike-editor --fixture <path>                 interactive
@@ -527,12 +529,15 @@ fn duration_ms(duration: Duration) -> f64 {
 }
 
 /// One reversible edit. `range` is where `new_text` currently sits in the
-/// document; undo replaces it back with `old_text`.
+/// document; undo replaces it back with `old_text`. `composition` marks the
+/// entry that was opened by an IME composition session, so later marked
+/// updates merge into it instead of stacking one undo step per keystroke.
 #[derive(Clone)]
 struct Edit {
     range: Range<usize>,
     new_text: String,
     old_text: String,
+    composition: bool,
 }
 
 struct Editor {
@@ -543,6 +548,10 @@ struct Editor {
     reversed: bool,
     /// IME composition range (doc offsets).
     marked: Option<Range<usize>>,
+    /// True from the first `setMarkedText` of a composition session until
+    /// its commit (`insertText`) or cancellation (`unmarkText`): edits made
+    /// inside this window merge into one undo entry (Spike B undo grouping).
+    composing: bool,
     undo_stack: Vec<Edit>,
     redo_stack: Vec<Edit>,
 
@@ -653,14 +662,19 @@ impl Editor {
     /// text and invalidate the derived scene index.
     fn apply_edit(&mut self, range: Range<usize>, text: &str) -> Range<usize> {
         let start = range.start;
-        let (inserted, deleted) = self.buffer.replace(range, text);
+        let (inserted, deleted) = self.buffer.replace(range.clone(), text);
         self.splice_for_edit(start, &deleted, text);
         self.metrics.borrow_mut().edits += 1;
-        self.undo_stack.push(Edit {
-            range: inserted.clone(),
-            new_text: text.to_string(),
-            old_text: deleted,
-        });
+        // Undo bookkeeping goes through `record_edit` so IME composition
+        // updates collapse into the single open entry (one undo per session).
+        record_edit(
+            &mut self.undo_stack,
+            self.composing,
+            range,
+            inserted.clone(),
+            text,
+            deleted,
+        );
         const MAX_UNDO: usize = 5000;
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);
@@ -683,6 +697,7 @@ impl Editor {
         self.selected = caret..caret;
         self.reversed = false;
         self.marked = None;
+        self.composing = false;
         self.scenes_dirty = true;
         if self.find.open {
             self.refresh_matches(false);
@@ -701,6 +716,7 @@ impl Editor {
             range: restored.clone(),
             new_text: edit.old_text.clone(),
             old_text: deleted,
+            composition: false,
         });
         self.after_history_edit(restored.end);
     }
@@ -717,6 +733,7 @@ impl Editor {
             range: restored.clone(),
             new_text: edit.old_text.clone(),
             old_text: deleted,
+            composition: false,
         });
         self.after_history_edit(restored.end);
     }
@@ -1717,6 +1734,16 @@ impl Editor {
             format!("{:016x}", hasher.finish())
         };
 
+        // Composition state (Spike B): `marked` is the live setMarkedText
+        // range in doc byte offsets (null when no composition is open) and
+        // `composing` is the undo-group session flag. Together they let an
+        // external check observe a composition mid-flight and confirm the
+        // session closed after commit.
+        let marked_dump = match &self.marked {
+            Some(range) => format!("[{},{}]", range.start, range.end),
+            None => "null".to_string(),
+        };
+
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
@@ -1726,7 +1753,8 @@ impl Editor {
                 "\"find\":{{\"open\":{},\"query\":\"{}\",\"matches\":{},",
                 "\"current\":{},\"replaced\":{}}},",
                 "\"diff\":{{\"open\":{},\"lines\":{},\"added\":{},",
-                "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}}}}"
+                "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}},",
+                "\"ime\":{{\"marked\":{},\"composing\":{}}}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -1750,6 +1778,8 @@ impl Editor {
             diff_removed,
             self.diff.cursor,
             buffer_hash,
+            marked_dump,
+            self.composing,
         )
     }
 
@@ -1778,6 +1808,59 @@ fn escape_json(text: &str) -> String {
         }
     }
     out
+}
+
+/// Undo bookkeeping for one applied edit (Spike B undo grouping). While an
+/// IME composition session is open (`composing`), consecutive edits that
+/// replace the composition's own range merge into the single open entry, so
+/// one composition = one undo step no matter how many marked updates the IME
+/// sends. A range that does not line up opens a fresh entry instead of
+/// corrupting the merge.
+fn record_edit(
+    undo_stack: &mut Vec<Edit>,
+    composing: bool,
+    replaced: Range<usize>,
+    inserted: Range<usize>,
+    new_text: &str,
+    old_text: String,
+) {
+    if composing
+        && let Some(prev) = undo_stack.last_mut()
+        && prev.composition
+        && prev.range == replaced
+    {
+        prev.new_text = new_text.to_string();
+        prev.range = inserted;
+        return;
+    }
+    undo_stack.push(Edit {
+        range: inserted,
+        new_text: new_text.to_string(),
+        old_text,
+        composition: composing,
+    });
+}
+
+/// Byte offsets inside `text` for a UTF-16 range expressed **relative to
+/// `text`** — what `setMarkedText:selectedRange:` delivers (the selection
+/// lives inside the marked string, not in document coordinates; treating it
+/// as document UTF-16 drifts as soon as the document head is non-ASCII).
+/// Offsets past the end clamp to `text.len()`, and offsets inside a
+/// surrogate pair clamp to the enclosing character boundary.
+fn utf16_to_byte_in(text: &str, utf16: Range<usize>) -> Range<usize> {
+    let mut units = 0usize;
+    let mut start = None;
+    let mut end = None;
+    for (byte, ch) in text.char_indices() {
+        if start.is_none() && units >= utf16.start {
+            start = Some(byte);
+        }
+        if end.is_none() && units >= utf16.end {
+            end = Some(byte);
+        }
+        units += ch.len_utf16();
+    }
+    start.unwrap_or(text.len())..end.unwrap_or(text.len())
 }
 
 impl EntityInputHandler for Editor {
@@ -1814,7 +1897,11 @@ impl EntityInputHandler for Editor {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        // The system calls this after commit (insertText) or when it drops
+        // the composition; the buffer text was already settled by the
+        // preceding call, so this only ends the session.
         self.marked = None;
+        self.composing = false;
     }
 
     fn replace_text_in_range(
@@ -1845,6 +1932,11 @@ impl EntityInputHandler for Editor {
             range
         };
         self.apply_edit(range, &text);
+        // `insertText` is both plain typing and composition commit; either
+        // way no marked session survives it (the system's later unmarkText
+        // becomes a no-op). This also guarantees a stale `composing` flag
+        // can never swallow the next keystroke into an old entry.
+        self.composing = false;
         cx.notify();
     }
 
@@ -1871,15 +1963,30 @@ impl EntityInputHandler for Editor {
             .unwrap_or_else(|| self.selected.clone());
         let text = normalize_newlines(new_text);
         let range = self.clamp(range);
-        let inserted = self.apply_edit(range.clone(), &text);
+        // First update of a session opens the undo group; subsequent marked
+        // updates merge into that entry inside `record_edit`.
+        self.composing = true;
+        let inserted = self.apply_edit(range, &text);
         self.marked = (!text.is_empty()).then_some(inserted.clone());
-        self.selected = new_selected_range_utf16
+        if text.is_empty() {
+            // An empty setMarkedText is the IME removing the composition
+            // (cancellation): the session ends here even if the system's
+            // unmarkText never follows, so the stale flag can never swallow
+            // the next keystroke into an old entry.
+            self.composing = false;
+        }
+        // `selectedRange` from setMarkedText is relative to the *marked
+        // string*, not to the document: convert it inside `text` (treating it
+        // as document UTF-16 drifts as soon as the document head is
+        // non-ASCII) and anchor the result at the inserted span.
+        let selection = new_selected_range_utf16
             .as_ref()
             .map(|utf16| {
-                let local = self.clamp(self.range_from_utf16(utf16));
-                (range.start + local.start)..(range.start + local.end)
+                let local = utf16_to_byte_in(&text, utf16.clone());
+                (inserted.start + local.start)..(inserted.start + local.end)
             })
             .unwrap_or_else(|| inserted.end..inserted.end);
+        self.selected = self.clamp(selection);
         cx.notify();
     }
 
@@ -2219,6 +2326,7 @@ fn run() -> Result<(), String> {
             selected: 0..0,
             reversed: false,
             marked: None,
+            composing: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             scene_lines: Vec::new(),
@@ -2303,5 +2411,88 @@ fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_edit_pushes_plain_edits_separately() {
+        let mut stack = Vec::new();
+        record_edit(&mut stack, false, 0..0, 0..1, "a", String::new());
+        record_edit(&mut stack, false, 1..1, 1..2, "b", String::new());
+        assert_eq!(stack.len(), 2);
+        assert!(!stack[0].composition && !stack[1].composition);
+        assert_eq!(stack[1].new_text, "b");
+    }
+
+    #[test]
+    fn record_edit_merges_composition_updates_into_one_entry() {
+        let mut stack = Vec::new();
+        // setMarkedText inserts the dead-key base at the caret (5..5).
+        record_edit(&mut stack, true, 5..5, 5..6, "e", String::new());
+        // The IME updates the marked span (5..6) with the composed char (two
+        // UTF-8 bytes), then commits it over the same span.
+        record_edit(&mut stack, true, 5..6, 5..7, "\u{e9}", String::new());
+        record_edit(&mut stack, true, 5..7, 5..7, "\u{e9}", String::new());
+        assert_eq!(stack.len(), 1);
+        let merged = &stack[0];
+        assert!(merged.composition);
+        assert_eq!(merged.range, 5..7);
+        assert_eq!(merged.new_text, "\u{e9}");
+        // One undo restores the full pre-composition state.
+        assert_eq!(merged.old_text, "");
+    }
+
+    #[test]
+    fn record_edit_keeps_pre_composition_text_for_undo() {
+        let mut stack = Vec::new();
+        // Composition over a selection: the marked span started as "old".
+        record_edit(&mut stack, true, 5..8, 5..6, "e", "old".into());
+        record_edit(&mut stack, true, 5..6, 5..7, "\u{e9}", String::new());
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].old_text, "old");
+        assert_eq!(stack[0].new_text, "\u{e9}");
+        assert_eq!(stack[0].range, 5..7);
+    }
+
+    #[test]
+    fn record_edit_does_not_merge_across_ranges() {
+        let mut stack = Vec::new();
+        record_edit(&mut stack, true, 0..0, 0..1, "x", String::new());
+        // A composition edit at a different span opens a fresh entry rather
+        // than corrupting the first one.
+        record_edit(&mut stack, true, 9..9, 9..10, "y", String::new());
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack[0].new_text, "x");
+        assert_eq!(stack[1].new_text, "y");
+    }
+
+    #[test]
+    fn record_edit_stops_merging_after_session_ends() {
+        let mut stack = Vec::new();
+        record_edit(&mut stack, true, 0..0, 0..1, "x", String::new());
+        // After unmark/commit cleared `composing`, the next edit must not
+        // merge even though the last entry is still flagged as composition.
+        record_edit(&mut stack, false, 1..1, 1..2, "y", String::new());
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack[1].new_text, "y");
+    }
+
+    #[test]
+    fn utf16_to_byte_in_maps_relative_offsets() {
+        assert_eq!(utf16_to_byte_in("abc", 0..0), 0..0);
+        assert_eq!(utf16_to_byte_in("abc", 1..3), 1..3);
+        // Decomposed e-acute = two chars (two UTF-16 units) in one
+        // grapheme: offset 2 lands past both, at byte 3.
+        assert_eq!(utf16_to_byte_in("e\u{301}", 2..2), 3..3);
+        // Four units: a(1) + emoji(2) + b(1). Offsets count units, not bytes.
+        assert_eq!(utf16_to_byte_in("a\u{1f600}b", 3..4), 5..6);
+        // An offset inside a surrogate pair clamps to the char boundary.
+        assert_eq!(utf16_to_byte_in("a\u{1f600}b", 2..4), 5..6);
+        // Offsets past the end clamp to the text length.
+        assert_eq!(utf16_to_byte_in("ab", 5..9), 2..2);
     }
 }
