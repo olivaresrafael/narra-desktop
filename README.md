@@ -138,7 +138,7 @@ event and in the final output's `data.tools` audit (decision + outcome),
 including the denials: the model sees why it was refused, and the audit is
 the record of what actually ran — not the model's claims.
 
-### GitHub provider (M5 slices 1–2)
+### GitHub provider (M5 slices 1–3)
 
 Remote provider integration starts with GitHub (D-018). The token is a
 fine-grained PAT that the app stores in the **macOS Keychain** (D-022);
@@ -161,12 +161,31 @@ cargo run -p narra-harness -- provider connect <owner>/<repo>
 
 # Remove the stored token (idempotent).
 cargo run -p narra-harness -- provider logout
+
+# Pull requests (reads need no confirmation; writes require --confirm).
+cargo run -p narra-harness -- pr <owner>/<repo> list --state open|closed|all
+cargo run -p narra-harness -- pr <owner>/<repo> view <número>
+cargo run -p narra-harness -- pr <owner>/<repo> create \
+    --title <texto> --head <rama> --base <rama> [--body <texto>] --confirm
+cargo run -p narra-harness -- pr <owner>/<repo> update <número> \
+    [--title <texto>] [--body <texto>] [--state open|closed] --confirm
+cargo run -p narra-harness -- pr <owner>/<repo> merge <número> \
+    [--title <texto>] [--method merge|squash|rebase] --confirm
+cargo run -p narra-harness -- pr <owner>/<repo> comment <número> \
+    --body <texto> --confirm
 ```
 
 Every command emits one JSON record on stdout. `NARRA_SECRET_STORE=memory`
 switches to an in-memory store for tests and CI. Unsupported operations
 (merge reviews today) are listed as absent by `caps` — the product shows
 capability gaps instead of failing at request time.
+
+**Remote writes are explicit.** `pr create/update/merge/comment` without
+`--confirm` print a `pr_dry_run` record with the exact payload they *would*
+send and exit 1 without any network request — an action is never implicit.
+A merge whose provider verdict is `merged: false` (e.g. the head branch
+moved) exits non-zero and surfaces the provider's message; it is never
+reinterpreted as success.
 
 ### macOS build prerequisite (affects `spike-editor`)
 

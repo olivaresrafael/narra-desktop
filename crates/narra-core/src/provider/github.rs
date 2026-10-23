@@ -130,14 +130,16 @@ pub enum PullRequestState {
 }
 
 impl PullRequestState {
-    fn as_str(self) -> &'static str {
+    /// The wire value (`open`/`closed`) — also what the UI/records show.
+    pub fn as_str(self) -> &'static str {
         match self {
             PullRequestState::Open => "open",
             PullRequestState::Closed => "closed",
         }
     }
 
-    fn parse(raw: &str) -> Result<Self, ProviderError> {
+    /// Parse the wire value; unknown values are a typed error.
+    pub fn parse(raw: &str) -> Result<Self, ProviderError> {
         match raw {
             "open" => Ok(PullRequestState::Open),
             "closed" => Ok(PullRequestState::Closed),

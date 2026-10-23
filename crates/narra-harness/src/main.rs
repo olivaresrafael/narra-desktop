@@ -23,6 +23,15 @@
 //!   narra-harness provider logout
 //!   narra-harness provider whoami [--api-url <url>]
 //!   narra-harness provider connect <owner>/<repo> [--api-url <url>]
+//!   narra-harness pr <owner>/<repo> list [--state open|closed|all]
+//!   narra-harness pr <owner>/<repo> view <número>
+//!   narra-harness pr <owner>/<repo> create --title <t> --head <rama> --base <rama>
+//!       [--body <t>] --confirm
+//!   narra-harness pr <owner>/<repo> update <número> [--title <t>] [--body <t>]
+//!       [--state open|closed] --confirm
+//!   narra-harness pr <owner>/<repo> merge <número> [--title <t>]
+//!       [--method merge|squash|rebase] --confirm
+//!   narra-harness pr <owner>/<repo> comment <número> --body <t> --confirm
 //!
 //! Options:
 //!   --timeout <secs>   task timeout (default 120)
@@ -48,6 +57,12 @@
 //! the token from stdin (or `--from-env`), stores it in the OS keychain and
 //! everything else resolves it from there. `NARRA_SECRET_STORE=memory`
 //! switches the store to in-memory for tests and CI.
+//!
+//! Remote writes (`pr create/update/merge/comment`) additionally require
+//! `--confirm`: without it the harness prints a dry-run record of exactly
+//! what would be sent and exits 1 without touching the network — a remote
+//! action is never implicit. `merged: false` from the provider is surfaced
+//! as a non-zero exit, never reinterpreted as success.
 
 use std::io::Write;
 use std::path::Path;
@@ -83,6 +98,12 @@ fn main() -> ExitCode {
     // never a model adapter.
     if let Command::Provider { action } = &parsed.command {
         return run_provider(action, &parsed.provider, parsed.timeout);
+    }
+
+    // Pull-request commands: same token rules, same no-false-success rule;
+    // writes additionally need `--confirm`.
+    if let Command::Pr { repo, action } = &parsed.command {
+        return run_pr(repo, action, &parsed.provider, parsed.timeout);
     }
 
     let token = CancellationToken::new();
@@ -175,8 +196,8 @@ fn main() -> ExitCode {
             )
         }
         // Handled before the adapter is built.
-        Command::Proposals { .. } | Command::Provider { .. } => {
-            unreachable!("proposals y provider run locally")
+        Command::Proposals { .. } | Command::Provider { .. } | Command::Pr { .. } => {
+            unreachable!("proposals, provider y pr run locally")
         }
     };
 
@@ -235,7 +256,16 @@ const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [
      narra-harness provider login [--from-env] [--api-url <url>]
      narra-harness provider logout
      narra-harness provider whoami [--api-url <url>]
-     narra-harness provider connect <owner>/<repo> [--api-url <url>]";
+     narra-harness provider connect <owner>/<repo> [--api-url <url>]
+     narra-harness pr <owner>/<repo> list [--state open|closed|all] [--api-url <url>]
+     narra-harness pr <owner>/<repo> view <número> [--api-url <url>]
+     narra-harness pr <owner>/<repo> create --title <t> --head <rama> --base <rama>
+         [--body <t>] --confirm [--api-url <url>]
+     narra-harness pr <owner>/<repo> update <número> [--title <t>] [--body <t>]
+         [--state open|closed] --confirm [--api-url <url>]
+     narra-harness pr <owner>/<repo> merge <número> [--title <t>]
+         [--method merge|squash|rebase] --confirm [--api-url <url>]
+     narra-harness pr <owner>/<repo> comment <número> --body <t> --confirm [--api-url <url>]";
 
 #[derive(Debug)]
 struct Parsed {
@@ -286,6 +316,13 @@ enum Command {
     Provider {
         action: ProviderAction,
     },
+    /// Pull-request operations over the provider adapter (M5 slice 3).
+    /// Reads are plain; writes require `--confirm` (explicit confirmation
+    /// for remote actions, AGENTS.md).
+    Pr {
+        repo: String,
+        action: PrAction,
+    },
 }
 
 /// Provider subactions. The token itself is never an argument: `login`
@@ -303,6 +340,106 @@ enum ProviderAction {
     Whoami,
     /// "Connect" a repository: `GET /repos/{owner}/{repo}`.
     Connect { repo: String },
+}
+
+/// Pull-request subactions. Reads (`List`, `View`) need no confirmation;
+/// every write carries a `confirm` flag: without it the harness emits a
+/// dry-run record and exits 1 without any network request (AGENTS.md:
+/// remote actions are explicit, and a remote action is never implicit).
+#[derive(Debug)]
+enum PrAction {
+    /// `GET /repos/{owner}/{repo}/pulls?state=…` (open|closed|all).
+    List { state: String },
+    /// `GET /repos/{owner}/{repo}/pulls/{number}`.
+    View { number: u64 },
+    /// `POST /repos/{owner}/{repo}/pulls` — provider-confirmed creation.
+    Create {
+        title: String,
+        head: String,
+        base: String,
+        body: Option<String>,
+        confirm: bool,
+    },
+    /// `PATCH /repos/{owner}/{repo}/pulls/{number}` — title/body/state.
+    Update {
+        number: u64,
+        title: Option<String>,
+        body: Option<String>,
+        state: Option<String>,
+        confirm: bool,
+    },
+    /// `PUT /repos/{owner}/{repo}/pulls/{number}/merge`. The provider's
+    /// own verdict (`merged: false` on a 200) is surfaced as failure.
+    Merge {
+        number: u64,
+        commit_title: Option<String>,
+        method: Option<String>,
+        confirm: bool,
+    },
+    /// `POST /repos/{owner}/{repo}/issues/{number}/comments`.
+    Comment {
+        number: u64,
+        body: String,
+        confirm: bool,
+    },
+}
+
+impl PrAction {
+    /// The wire action name (dry-run records and error records).
+    fn name(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "list",
+            Self::View { .. } => "view",
+            Self::Create { .. } => "create",
+            Self::Update { .. } => "update",
+            Self::Merge { .. } => "merge",
+            Self::Comment { .. } => "comment",
+        }
+    }
+
+    /// `true` for remote writes (they require `--confirm`).
+    fn is_write(&self) -> bool {
+        matches!(
+            self,
+            Self::Create { .. } | Self::Update { .. } | Self::Merge { .. } | Self::Comment { .. }
+        )
+    }
+
+    /// `true` for a write that was parsed *without* `--confirm`.
+    fn needs_confirmation(&self) -> bool {
+        self.is_write()
+            && !matches!(
+                self,
+                Self::Create { confirm: true, .. }
+                    | Self::Update { confirm: true, .. }
+                    | Self::Merge { confirm: true, .. }
+                    | Self::Comment { confirm: true, .. }
+            )
+    }
+
+    /// The exact payload a dry run would send (JSON), so the user confirms
+    /// what will really be written, never a paraphrase.
+    fn dry_run_payload(&self) -> serde_json::Value {
+        match self {
+            Self::Create {
+                title,
+                head,
+                base,
+                body,
+                ..
+            } => serde_json::json!({ "title": title, "head": head, "base": base, "body": body }),
+            Self::Update {
+                title, body, state, ..
+            } => serde_json::json!({ "title": title, "body": body, "state": state }),
+            Self::Merge {
+                commit_title,
+                method,
+                ..
+            } => serde_json::json!({ "commit_title": commit_title, "merge_method": method }),
+            Self::Comment { body, .. } => serde_json::json!({ "body": body }),
+            Self::List { .. } | Self::View { .. } => serde_json::json!({}),
+        }
+    }
 }
 
 /// Local review operations: no model, no events, JSONL records on stdout.
@@ -368,6 +505,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut allow_destructive: Vec<String> = Vec::new();
     let mut api_url: Option<String> = None;
     let mut from_env = false;
+    // `pr` write/read options.
+    let mut title: Option<String> = None;
+    let mut head: Option<String> = None;
+    let mut base: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut state: Option<String> = None;
+    let mut method: Option<String> = None;
+    let mut confirm = false;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut iter = args.iter();
@@ -450,6 +595,33 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--from-env" => {
                 from_env = true;
             }
+            "--title" => {
+                let value = iter.next().ok_or("--title requiere un valor")?;
+                title = Some((*value).clone());
+            }
+            "--head" => {
+                let value = iter.next().ok_or("--head requiere una rama")?;
+                head = Some((*value).clone());
+            }
+            "--base" => {
+                let value = iter.next().ok_or("--base requiere una rama")?;
+                base = Some((*value).clone());
+            }
+            "--body" => {
+                let value = iter.next().ok_or("--body requiere un texto")?;
+                body = Some((*value).clone());
+            }
+            "--state" => {
+                let value = iter.next().ok_or("--state requiere un valor")?;
+                state = Some((*value).clone());
+            }
+            "--method" => {
+                let value = iter.next().ok_or("--method requiere un valor")?;
+                method = Some((*value).clone());
+            }
+            "--confirm" => {
+                confirm = true;
+            }
             other if other.starts_with('-') => {
                 return Err(format!("opción desconocida: {other}"));
             }
@@ -491,6 +663,13 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let allow_seen = !allow_tool.is_empty() || !allow_destructive.is_empty();
     let api_url_seen = api_url.is_some();
     let from_env_seen = from_env;
+    let title_seen = title.is_some();
+    let head_seen = head.is_some();
+    let base_seen = base.is_some();
+    let body_seen = body.is_some();
+    let state_seen = state.is_some();
+    let method_seen = method.is_some();
+    let confirm_seen = confirm;
 
     let command = match positional.as_slice() {
         ["brief", root] if !root.is_empty() => Command::Brief {
@@ -556,6 +735,86 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 },
             }
         }
+        ["pr", repo, "list"] if !repo.is_empty() && repo.contains('/') => {
+            let state = state.unwrap_or_else(|| "open".to_string());
+            if !matches!(state.as_str(), "open" | "closed" | "all") {
+                return Err(format!(
+                    "--state: «{state}» no es open, closed ni all (pr list)"
+                ));
+            }
+            Command::Pr {
+                repo: (*repo).to_string(),
+                action: PrAction::List { state },
+            }
+        }
+        ["pr", repo, "view", number] if !repo.is_empty() && repo.contains('/') => Command::Pr {
+            repo: (*repo).to_string(),
+            action: PrAction::View {
+                number: parse_pr_number(number)?,
+            },
+        },
+        ["pr", repo, "create"] if !repo.is_empty() && repo.contains('/') => Command::Pr {
+            repo: (*repo).to_string(),
+            action: PrAction::Create {
+                title: title.ok_or("pr create requiere --title <texto>")?,
+                head: head.ok_or("pr create requiere --head <rama>")?,
+                base: base.ok_or("pr create requiere --base <rama>")?,
+                body: body.take(),
+                confirm,
+            },
+        },
+        ["pr", repo, "update", number] if !repo.is_empty() && repo.contains('/') => {
+            let number = parse_pr_number(number)?;
+            if title.is_none() && body.is_none() && state.is_none() {
+                return Err(
+                    "pr update requiere al menos un campo: --title, --body o --state".to_string(),
+                );
+            }
+            if let Some(value) = &state
+                && !matches!(value.as_str(), "open" | "closed")
+            {
+                return Err(format!(
+                    "--state: «{value}» no es open ni closed (pr update)"
+                ));
+            }
+            Command::Pr {
+                repo: (*repo).to_string(),
+                action: PrAction::Update {
+                    number,
+                    title: title.take(),
+                    body: body.take(),
+                    state: state.take(),
+                    confirm,
+                },
+            }
+        }
+        ["pr", repo, "merge", number] if !repo.is_empty() && repo.contains('/') => {
+            let number = parse_pr_number(number)?;
+            if let Some(value) = &method
+                && !matches!(value.as_str(), "merge" | "squash" | "rebase")
+            {
+                return Err(format!(
+                    "--method: «{value}» no es merge, squash ni rebase (pr merge)"
+                ));
+            }
+            Command::Pr {
+                repo: (*repo).to_string(),
+                action: PrAction::Merge {
+                    number,
+                    commit_title: title.take(),
+                    method: method.take(),
+                    confirm,
+                },
+            }
+        }
+        ["pr", repo, "comment", number] if !repo.is_empty() && repo.contains('/') => Command::Pr {
+            repo: (*repo).to_string(),
+            action: PrAction::Comment {
+                number: parse_pr_number(number)?,
+                body: body.ok_or("pr comment requiere --body <texto>")?,
+                confirm,
+            },
+        },
         _ => return Err(USAGE.to_string()),
     };
 
@@ -589,11 +848,11 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 action: ProviderAction::Login { .. }
                     | ProviderAction::Whoami
                     | ProviderAction::Connect { .. }
-            }
+            } | Command::Pr { .. }
         )
     {
         return Err(
-            "--api-url solo se puede usar con provider login, whoami o connect".to_string(),
+            "--api-url solo se puede usar con provider login, whoami, connect o pr".to_string(),
         );
     }
     if from_env_seen
@@ -605,6 +864,47 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         )
     {
         return Err("--from-env solo se puede usar con provider login".to_string());
+    }
+    let pr_flags_seen =
+        title_seen || head_seen || base_seen || body_seen || state_seen || method_seen;
+    if pr_flags_seen && !matches!(command, Command::Pr { .. }) {
+        return Err(
+            "--title/--head/--base/--body/--state/--method solo se pueden usar con la orden pr"
+                .to_string(),
+        );
+    }
+    if (head_seen || base_seen)
+        && !matches!(
+            command,
+            Command::Pr {
+                action: PrAction::Create { .. },
+                ..
+            }
+        )
+    {
+        return Err("--head/--base solo se pueden usar con pr <repo> create".to_string());
+    }
+    if method_seen
+        && !matches!(
+            command,
+            Command::Pr {
+                action: PrAction::Merge { .. },
+                ..
+            }
+        )
+    {
+        return Err("--method solo se puede usar con pr <repo> merge".to_string());
+    }
+    if confirm_seen
+        && !matches!(
+            &command,
+            Command::Pr { action, .. } if action.is_write()
+        )
+    {
+        return Err(
+            "--confirm solo se puede usar con las escrituras pr (create, update, merge, comment)"
+                .to_string(),
+        );
     }
     if model_options_seen && !command.runs_model() {
         return Err(
@@ -636,6 +936,15 @@ fn parse_hunks(value: &str) -> Result<Vec<usize>, String> {
             })
         })
         .collect()
+}
+
+/// Parse a PR number positional (`view`/`update`/`merge`/`comment`).
+fn parse_pr_number(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("«{value}» no es un número de PR positivo"))
 }
 
 /// Emit one JSONL record on stdout (local review operations).
@@ -893,6 +1202,303 @@ o bien --from-env con la variable GITHUB_TOKEN"
                 "html_url": repository.html_url,
                 "private": repository.private,
                 "permissions": permissions,
+            }))
+        }
+    }
+}
+
+/// Pull-request commands (M5 slice 3): JSONL record on stdout, human
+/// summary on stderr, exit 0/1. Writes without `--confirm` print a
+/// dry-run record of the exact payload and exit 1 — no network, no token
+/// lookup, nothing persisted.
+fn run_pr(repo: &str, action: &PrAction, options: &ProviderOptions, timeout: Duration) -> ExitCode {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    // Dry-run before token resolution: confirming what would be sent must
+    // work even without credentials, and must never touch the network.
+    if action.needs_confirmation() {
+        let record = serde_json::json!({
+            "record": "pr_dry_run",
+            "repository": repo,
+            "action": action.name(),
+            "payload": action.dry_run_payload(),
+            "confirm_required": true,
+        });
+        let _ = writeln!(out, "{}", serde_json::to_string(&record).expect("json"));
+        eprintln!(
+            "orden «{}» NO ejecutada: una acción remota requiere confirmación explícita. \
+             Repite la orden añadiendo --confirm para enviar exactamente este payload.",
+            action.name()
+        );
+        return ExitCode::from(1);
+    }
+
+    let store: Box<dyn narra_core::provider::SecretStore> =
+        match std::env::var(SECRET_STORE_ENV).as_deref() {
+            Ok("memory") => Box::new(narra_core::provider::MemorySecretStore::default()),
+            _ => Box::new(narra_core::provider::OsKeychain::new()),
+        };
+
+    match pr_record(repo, action, options, store.as_ref(), timeout) {
+        Ok(record) => {
+            let _ = writeln!(out, "{}", serde_json::to_string(&record).expect("json"));
+            eprintln!("{}", pr_summary(&record));
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "record": "pr_error",
+                    "repository": repo,
+                    "action": action.name(),
+                    "error": message,
+                })
+            );
+            eprintln!("orden fallida: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// One-line human summary for a successful PR record (stderr).
+fn pr_summary(record: &serde_json::Value) -> String {
+    // `as_str` keeps quotes out of the human summary (stderr shows values,
+    // not their JSON encoding).
+    let text = |key: &str| record[key].as_str().unwrap_or_default().to_string();
+    match record["record"].as_str().unwrap_or_default() {
+        "pr_list" => format!(
+            "{} pull requests ({}).",
+            record["count"],
+            text("repository")
+        ),
+        "pr_view" | "pr_updated" => format!(
+            "PR #{} «{}» ({}) en {}: {}.",
+            record["number"],
+            text("title"),
+            text("state"),
+            text("repository"),
+            text("html_url")
+        ),
+        "pr_created" => format!(
+            "PR #{} creado en {}: {}.",
+            record["number"],
+            text("repository"),
+            text("html_url")
+        ),
+        "pr_merge" => format!(
+            "Merge de PR #{} en {}: {}.",
+            record["number"],
+            text("repository"),
+            text("message")
+        ),
+        "pr_comment" => format!(
+            "Comentario {} publicado en PR #{} ({}).",
+            record["id"],
+            record["number"],
+            text("repository")
+        ),
+        other => format!("Operación «{other}» completada."),
+    }
+}
+
+/// The provider-command logic for PRs, separated from I/O. Every result
+/// reflects the provider's own answer: a PR record only exists if the API
+/// returned 2xx with a parseable body, and a `merged: false` merge verdict
+/// is an error, not a success (M5 acceptance: no false successes).
+fn pr_record(
+    repo: &str,
+    action: &PrAction,
+    options: &ProviderOptions,
+    store: &dyn narra_core::provider::SecretStore,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    use narra_core::provider::{
+        GITHUB_API_BASE_URL, GitHubClient, GitHubConfig, MergeMethod, MergeOptions, NewPullRequest,
+        PullRequestState, UpdatePullRequest,
+    };
+
+    let (owner, name) = repo
+        .split_once('/')
+        .filter(|(owner, name)| !owner.is_empty() && !name.is_empty())
+        .ok_or_else(|| format!("«{repo}» no es un repositorio <owner>/<repo>"))?;
+
+    let base_url = options
+        .api_url
+        .clone()
+        .unwrap_or_else(|| GITHUB_API_BASE_URL.to_string());
+    let client_for = |token: String| {
+        GitHubClient::new(
+            GitHubConfig::github_com(token)
+                .with_base_url(base_url.clone())
+                .with_timeout(timeout),
+        )
+    };
+
+    let pr_json = |pr: &narra_core::provider::PullRequest| {
+        serde_json::json!({
+            "record": match action {
+                PrAction::Create { .. } => "pr_created",
+                PrAction::Update { .. } => "pr_updated",
+                _ => "pr_view",
+            },
+            "repository": repo,
+            "number": pr.number,
+            "state": pr.state.as_str(),
+            "merged": pr.merged,
+            "title": pr.title,
+            "html_url": pr.html_url,
+            "head": pr.head_ref,
+            "base": pr.base_ref,
+        })
+    };
+
+    // Reads first: no token dance needed to reach here without --confirm.
+    match action {
+        PrAction::List { state } => {
+            let token = resolve_token(store)?;
+            let pull_requests = client_for(token)
+                .list_pull_requests(owner, name, state, 10)
+                .map_err(|error| format!("GET /repos/{owner}/{name}/pulls falló: {error}"))?;
+            Ok(serde_json::json!({
+                "record": "pr_list",
+                "repository": repo,
+                "count": pull_requests.len(),
+                "pull_requests": pull_requests
+                    .iter()
+                    .map(|pr| serde_json::json!({
+                        "number": pr.number,
+                        "state": pr.state.as_str(),
+                        "merged": pr.merged,
+                        "title": pr.title,
+                        "html_url": pr.html_url,
+                        "head": pr.head_ref,
+                        "base": pr.base_ref,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        PrAction::View { number } => {
+            let token = resolve_token(store)?;
+            let pr = client_for(token)
+                .get_pull_request(owner, name, *number)
+                .map_err(|error| {
+                    format!("GET /repos/{owner}/{name}/pulls/{number} falló: {error}")
+                })?;
+            Ok(pr_json(&pr))
+        }
+        PrAction::Create {
+            title,
+            head,
+            base,
+            body,
+            ..
+        } => {
+            let token = resolve_token(store)?;
+            let pr = client_for(token)
+                .create_pull_request(
+                    owner,
+                    name,
+                    &NewPullRequest {
+                        title: title.clone(),
+                        head: head.clone(),
+                        base: base.clone(),
+                        body: body.clone(),
+                    },
+                )
+                .map_err(|error| format!("POST /repos/{owner}/{name}/pulls falló: {error}"))?;
+            Ok(pr_json(&pr))
+        }
+        PrAction::Update {
+            number,
+            title,
+            body,
+            state,
+            ..
+        } => {
+            let state = state
+                .as_deref()
+                .map(PullRequestState::parse)
+                .transpose()
+                .map_err(|error| format!("--state inválido: {error}"))?;
+            let token = resolve_token(store)?;
+            let pr = client_for(token)
+                .update_pull_request(
+                    owner,
+                    name,
+                    *number,
+                    &UpdatePullRequest {
+                        title: title.clone(),
+                        body: body.clone(),
+                        state,
+                    },
+                )
+                .map_err(|error| {
+                    format!("PATCH /repos/{owner}/{name}/pulls/{number} falló: {error}")
+                })?;
+            Ok(pr_json(&pr))
+        }
+        PrAction::Merge {
+            number,
+            commit_title,
+            method,
+            ..
+        } => {
+            // `--method` was validated at parse time (merge|squash|rebase).
+            let method = match method.as_deref() {
+                Some("squash") => Some(MergeMethod::Squash),
+                Some("rebase") => Some(MergeMethod::Rebase),
+                Some(_) => Some(MergeMethod::Merge),
+                None => None,
+            };
+            let token = resolve_token(store)?;
+            let result = client_for(token)
+                .merge_pull_request(
+                    owner,
+                    name,
+                    *number,
+                    &MergeOptions {
+                        commit_title: commit_title.clone(),
+                        commit_message: None,
+                        merge_method: method,
+                    },
+                )
+                .map_err(|error| {
+                    format!("PUT /repos/{owner}/{name}/pulls/{number}/merge falló: {error}")
+                })?;
+            // The provider's own verdict: `merged: false` on a 200 means
+            // the merge did NOT happen (e.g. head moved). Surface it as a
+            // failure — never reinterpret it as success.
+            if !result.merged {
+                return Err(format!(
+                    "el proveedor respondió merged=false para PR #{number}: {}",
+                    result.message
+                ));
+            }
+            Ok(serde_json::json!({
+                "record": "pr_merge",
+                "repository": repo,
+                "number": number,
+                "merged": result.merged,
+                "sha": result.sha,
+                "message": result.message,
+            }))
+        }
+        PrAction::Comment { number, body, .. } => {
+            let token = resolve_token(store)?;
+            let comment = client_for(token)
+                .create_issue_comment(owner, name, *number, body)
+                .map_err(|error| {
+                    format!("POST /repos/{owner}/{name}/issues/{number}/comments falló: {error}")
+                })?;
+            Ok(serde_json::json!({
+                "record": "pr_comment",
+                "repository": repo,
+                "number": number,
+                "id": comment.id,
+                "html_url": comment.html_url,
             }))
         }
     }
@@ -1159,5 +1765,170 @@ mod tests {
         assert!(error.contains("login"), "{error}");
         // The token is never an argument.
         assert!(parse(&["provider", "login", "ghp_token"]).is_err());
+    }
+
+    #[test]
+    fn pr_reads_parse_without_confirmation() {
+        let parsed = parse(&["pr", "owner/repo", "list"]).expect("list");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                ref action,
+                ..
+            } if matches!(action, PrAction::List { state } if state == "open")
+        ));
+        let parsed = parse(&["pr", "owner/repo", "list", "--state", "all"]).expect("list all");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                action: PrAction::List { ref state },
+                ..
+            } if state == "all"
+        ));
+        let parsed = parse(&["pr", "owner/repo", "view", "42"]).expect("view");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                action: PrAction::View { number: 42 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pr_writes_parse_with_and_without_confirm() {
+        // With --confirm: a real write.
+        let parsed = parse(&[
+            "pr",
+            "owner/repo",
+            "create",
+            "--title",
+            "Revisión M5",
+            "--head",
+            "feature/x",
+            "--base",
+            "main",
+            "--body",
+            "hola",
+            "--confirm",
+        ])
+        .expect("create");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                action: PrAction::Create { confirm: true, .. },
+                ..
+            }
+        ));
+        // Without --confirm it still parses, but needs_confirmation() drives
+        // the dry-run path (no network, exit 1).
+        let parsed = parse(&[
+            "pr",
+            "owner/repo",
+            "merge",
+            "7",
+            "--method",
+            "squash",
+            "--title",
+            "Merge M5",
+        ])
+        .expect("merge dry");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                action: PrAction::Merge {
+                    number: 7,
+                    confirm: false,
+                    ..
+                },
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "pr",
+            "owner/repo",
+            "update",
+            "3",
+            "--state",
+            "closed",
+            "--confirm",
+        ])
+        .expect("update");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                action: PrAction::Update {
+                    number: 3,
+                    confirm: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "pr",
+            "owner/repo",
+            "comment",
+            "9",
+            "--body",
+            "listo",
+            "--confirm",
+        ])
+        .expect("comment");
+        assert!(matches!(
+            parsed.command,
+            Command::Pr {
+                action: PrAction::Comment {
+                    number: 9,
+                    confirm: true,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pr_write_required_fields_are_enforced() {
+        let error = parse(&["pr", "owner/repo", "create", "--confirm"]).expect_err("title");
+        assert!(error.contains("--title"), "{error}");
+        let error =
+            parse(&["pr", "owner/repo", "create", "--title", "t", "--confirm"]).expect_err("head");
+        assert!(error.contains("--head"), "{error}");
+        let error = parse(&["pr", "owner/repo", "update", "3", "--confirm"]).expect_err("a field");
+        assert!(error.contains("--title"), "{error}");
+        let error = parse(&["pr", "owner/repo", "comment", "3", "--confirm"]).expect_err("body");
+        assert!(error.contains("--body"), "{error}");
+    }
+
+    #[test]
+    fn pr_rejects_bad_values_and_stray_flags() {
+        let error = parse(&["pr", "owner/repo", "view", "abc"]).expect_err("number");
+        assert!(error.contains("número"), "{error}");
+        let error = parse(&["pr", "owner/repo", "view", "0"]).expect_err("positive");
+        assert!(error.contains("número"), "{error}");
+        let error = parse(&["pr", "owner/repo", "list", "--state", "merged"]).expect_err("state");
+        assert!(error.contains("--state"), "{error}");
+        let error = parse(&["pr", "owner/repo", "merge", "1", "--method", "fast-forward"])
+            .expect_err("method");
+        assert!(error.contains("--method"), "{error}");
+        // Malformed repository.
+        let error = parse(&["pr", "sin-owner", "list"]).expect_err("owner/repo");
+        assert!(error.contains("uso:"), "{error}");
+        // Stray flags on the wrong command.
+        let error =
+            parse(&["pr", "owner/repo", "list", "--head", "rama"]).expect_err("head on list");
+        assert!(error.contains("--head"), "{error}");
+        let error =
+            parse(&["pr", "owner/repo", "view", "1", "--method", "merge"]).expect_err("method");
+        assert!(error.contains("--method"), "{error}");
+        // --confirm is for writes only.
+        let error =
+            parse(&["pr", "owner/repo", "view", "1", "--confirm"]).expect_err("confirm on read");
+        assert!(error.contains("--confirm"), "{error}");
+        let error = parse(&["brief", "/tmp/p", "--confirm"]).expect_err("confirm on brief");
+        assert!(error.contains("--confirm"), "{error}");
+        let error = parse(&["brief", "/tmp/p", "--title", "t"]).expect_err("title on brief");
+        assert!(error.contains("pr"), "{error}");
     }
 }

@@ -676,6 +676,65 @@ fn provider_env(cmd: &mut Command) {
     cmd.env("NARRA_SECRET_STORE", "memory");
 }
 
+/// One canned reply like `spawn_github_reply`, but the thread also sends
+/// the received request head+body over the returned channel so tests can
+/// assert the exact wire request (method, path, payload).
+fn spawn_github_recording(status: u16, body: &str) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::sync::mpsc;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let body = body.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        request.extend_from_slice(&chunk[..n]);
+                        // Headers done and body complete (or no body)?
+                        if let Some(pos) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&request[..pos]).to_string();
+                            let content_length = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= pos + 4 + content_length {
+                                break;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).to_string());
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (base_url, rx)
+}
+
+/// Parse the JSON body of a recorded wire request (headers end at the
+/// first blank line).
+fn request_body(request: &str) -> serde_json::Value {
+    let raw = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    serde_json::from_str(raw).unwrap_or_else(|error| panic!("body JSON ({error}): {raw}"))
+}
+
 #[test]
 fn provider_caps_lists_the_github_surface() {
     let output = harness().args(["provider", "caps"]).output().expect("run");
@@ -815,6 +874,391 @@ fn provider_connect_rejects_a_malformed_repository() {
     provider_env(&mut cmd);
     let output = cmd
         .args(["provider", "connect", "sin-owner"])
+        .env("GITHUB_TOKEN", "ghp_x")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("owner"), "actionable message: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// `pr` commands (M5 slice 3): reads are plain; writes require --confirm and
+// report only the provider's own answer.
+// ---------------------------------------------------------------------------
+
+const PR_FIXTURE: &str = r#"{"number":42,"state":"open","merged":false,"title":"Revisión M5","html_url":"https://github.com/owner/repo/pull/42","head":{"ref":"feature/x"},"base":{"ref":"main"}}"#;
+
+#[test]
+fn pr_list_reads_pull_requests() {
+    let base = spawn_github_reply(200, &format!("[{PR_FIXTURE}]"));
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "list",
+            "--state",
+            "all",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_list");
+    assert_eq!(record["count"], 1);
+    assert_eq!(record["pull_requests"][0]["number"], 42);
+    assert_eq!(record["pull_requests"][0]["head"], "feature/x");
+    assert_eq!(record["pull_requests"][0]["base"], "main");
+}
+
+#[test]
+fn pr_view_reads_one_pull_request() {
+    let base = spawn_github_reply(200, PR_FIXTURE);
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["pr", "owner/repo", "view", "42", "--api-url", &base])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_view");
+    assert_eq!(record["number"], 42);
+    assert_eq!(record["state"], "open");
+    assert_eq!(record["merged"], false);
+}
+
+#[test]
+fn pr_create_without_confirm_is_a_dry_run_with_no_request() {
+    // A closed port proves nothing was sent: if the harness tried the
+    // network it would fail differently (transport error, not pr_dry_run).
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "create",
+            "--title",
+            "Revisión M5",
+            "--head",
+            "feature/x",
+            "--base",
+            "main",
+            "--api-url",
+            "http://127.0.0.1:1",
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "dry-run exits 1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_dry_run");
+    assert_eq!(record["action"], "create");
+    assert_eq!(record["confirm_required"], true);
+    // The dry run shows the exact payload that --confirm would send.
+    assert_eq!(record["payload"]["title"], "Revisión M5");
+    assert_eq!(record["payload"]["head"], "feature/x");
+    assert_eq!(record["payload"]["base"], "main");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--confirm"), "actionable: {stderr}");
+}
+
+#[test]
+fn pr_create_with_confirm_sends_the_exact_payload() {
+    let (base, received) = spawn_github_recording(201, PR_FIXTURE);
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "create",
+            "--title",
+            "Revisión M5",
+            "--head",
+            "feature/x",
+            "--base",
+            "main",
+            "--body",
+            "propuesta de M5",
+            "--confirm",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("request recorded");
+    assert!(
+        request.starts_with("POST /repos/owner/repo/pulls HTTP/1.1"),
+        "wire request: {request}"
+    );
+    let body = request_body(&request);
+    assert_eq!(body["title"], "Revisión M5");
+    assert_eq!(body["head"], "feature/x");
+    assert_eq!(body["base"], "main");
+    assert_eq!(body["body"], "propuesta de M5");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_created");
+    assert_eq!(record["number"], 42);
+}
+
+#[test]
+fn pr_merge_surfaces_the_provider_merged_false_verdict() {
+    // 200 + merged:false is a real GitHub answer ("head moved"): it must
+    // surface as failure, never as success.
+    let (base, received) = spawn_github_recording(
+        200,
+        r#"{"merged":false,"message":"Head branch was modified"}"#,
+    );
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "merge",
+            "42",
+            "--method",
+            "squash",
+            "--confirm",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "merged:false must not be success: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("request recorded");
+    assert!(
+        request.starts_with("PUT /repos/owner/repo/pulls/42/merge HTTP/1.1"),
+        "wire request: {request}"
+    );
+    let body = request_body(&request);
+    assert_eq!(body["merge_method"], "squash");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_error");
+    let error = record["error"].as_str().expect("error text");
+    assert!(error.contains("merged=false"), "error: {error}");
+    assert!(error.contains("Head branch was modified"), "error: {error}");
+}
+
+#[test]
+fn pr_merge_success_reports_the_provider_verdict() {
+    let base = spawn_github_reply(
+        200,
+        r#"{"merged":true,"sha":"0ff1ce5","message":"Pull Request successfully merged"}"#,
+    );
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "merge",
+            "42",
+            "--confirm",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_merge");
+    assert_eq!(record["merged"], true);
+    assert_eq!(record["sha"], "0ff1ce5");
+}
+
+#[test]
+fn pr_comment_posts_to_the_issues_api() {
+    let (base, received) = spawn_github_recording(
+        201,
+        r#"{"id":987,"html_url":"https://github.com/owner/repo/pull/42#issuecomment-987"}"#,
+    );
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "comment",
+            "42",
+            "--body",
+            "listo para revisar",
+            "--confirm",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("request recorded");
+    // Spike E: PR conversation comments live in the issues API.
+    assert!(
+        request.starts_with("POST /repos/owner/repo/issues/42/comments HTTP/1.1"),
+        "wire request: {request}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_comment");
+    assert_eq!(record["id"], 987);
+}
+
+#[test]
+fn pr_update_with_confirm_patches_and_reports() {
+    let (base, received) = spawn_github_recording(200, PR_FIXTURE);
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "update",
+            "42",
+            "--state",
+            "closed",
+            "--confirm",
+            "--api-url",
+            &base,
+        ])
+        .env("GITHUB_TOKEN", "ghp_envfallback")
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("request recorded");
+    assert!(
+        request.starts_with("PATCH /repos/owner/repo/pulls/42 HTTP/1.1"),
+        "wire request: {request}"
+    );
+    let body = request_body(&request);
+    assert_eq!(body["state"], "closed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON record");
+    assert_eq!(record["record"], "pr_updated");
+    assert_eq!(record["number"], 42);
+}
+
+#[test]
+fn pr_confirmed_write_without_token_fails_actionably() {
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "comment",
+            "42",
+            "--body",
+            "hola",
+            "--confirm",
+            "--api-url",
+            "http://127.0.0.1:1",
+        ])
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("provider login") && stderr.contains("GITHUB_TOKEN"),
+        "actionable guidance: {stderr}"
+    );
+}
+
+#[test]
+fn pr_list_without_token_fails_actionably() {
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args([
+            "pr",
+            "owner/repo",
+            "list",
+            "--api-url",
+            "http://127.0.0.1:1",
+        ])
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("provider login") && stderr.contains("GITHUB_TOKEN"),
+        "actionable guidance: {stderr}"
+    );
+}
+
+#[test]
+fn pr_rejects_a_malformed_repository() {
+    let mut cmd = harness();
+    provider_env(&mut cmd);
+    let output = cmd
+        .args(["pr", "sin-owner", "list"])
         .env("GITHUB_TOKEN", "ghp_x")
         .output()
         .expect("run");
