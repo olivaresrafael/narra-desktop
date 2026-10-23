@@ -127,6 +127,33 @@ impl Buffer {
         (inserted, deleted)
     }
 
+    /// Every non-overlapping occurrence of `query` in the document, as byte
+    /// ranges, in document order (Spike A slice 3 / find bar).
+    ///
+    /// - **Case:** Unicode-simple-lowercase folded per character, so `nOs`
+    ///   matches `NOS` and `ó` matches `Ó` without breaking byte offsets
+    ///   (the fold is applied char-by-char while walking, never on a copied
+    ///   string whose lengths could shift).
+    /// - **Scope:** one line at a time; a query containing `\n` matches
+    ///   nothing. Cross-line queries belong to the production search (Spike
+    ///   B), not to this spike's find bar.
+    /// - **Empty query:** no matches (no highlight-everything surprise).
+    /// - **Complexity:** O(document bytes × query chars) worst case — the
+    ///   documented linear-buffer shortcut; the measurement below is exactly
+    ///   what tells us whether a real index is needed.
+    pub fn find_all(&self, query: &str) -> Vec<Range<usize>> {
+        if query.is_empty() || query.contains('\n') {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        let mut line_start = 0usize;
+        for line in &self.lines {
+            find_in_line(line, query, line_start, &mut matches);
+            line_start += line.len() + 1; // the newline
+        }
+        matches
+    }
+
     /// Previous grapheme boundary before `offset`, stopping at the document
     /// start (crossing line boundaries backwards).
     pub fn prev_boundary(&self, offset: usize) -> usize {
@@ -244,6 +271,57 @@ impl Buffer {
     }
 }
 
+/// Push every non-overlapping occurrence of `query` inside `line` as
+/// document byte ranges into `out`. Matching is case-insensitive via
+/// *simple* per-character lowercase folding (`c.to_lowercase()` compared
+/// char-by-char), so byte offsets are never recomputed from a folded copy —
+/// Turkish dotted-I style length changes can therefore desync the fold from
+/// the source, which degrades to a missed/odd match, never a panic: the
+/// comparison only ever advances by the *source* character's length.
+fn find_in_line(line: &str, query: &str, line_start: usize, out: &mut Vec<Range<usize>>) {
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.is_empty() {
+        return;
+    }
+    let source: Vec<(usize, char)> = line.char_indices().collect();
+    let mut i = 0;
+    while i < source.len() {
+        let mut j = 0;
+        let mut k = i;
+        while j < query_chars.len() && k < source.len() {
+            let mut source_fold = source[k].1.to_lowercase();
+            let mut query_fold = query_chars[j].to_lowercase();
+            let source_cp = source_fold.next();
+            let query_cp = query_fold.next();
+            if source_cp != query_cp {
+                break;
+            }
+            // Multi-char folds must agree on the remainder too (rare; e.g.
+            // a folded source char producing an extra combining mark while
+            // the query char does not). Mismatch = no match here.
+            if source_fold.eq(query_fold) {
+                j += 1;
+                k += 1;
+            } else {
+                break;
+            }
+        }
+        if j == query_chars.len() {
+            let start = source[i].0;
+            // End = start byte of the first source char AFTER the match, or
+            // the line length.
+            let end = source
+                .get(k)
+                .map(|(offset, _)| *offset)
+                .unwrap_or_else(|| line.len());
+            out.push(line_start + start..line_start + end);
+            i = k; // non-overlapping: continue after this match
+        } else {
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +403,48 @@ mod tests {
             buffer.position_at(buffer.vertical(offset, 5)).line,
             buffer.line_count() - 1
         );
+    }
+
+    #[test]
+    fn find_all_finds_case_insensitive_matches_with_doc_offsets() {
+        let buffer = Buffer::new("Noche en la ciudad\nla NOCHE vuelve\nno hay noche");
+        let matches = buffer.find_all("noche");
+        assert_eq!(matches.len(), 3);
+        // Offsets are document byte offsets (newlines included).
+        assert_eq!(&buffer.slice(matches[0].clone()), "Noche");
+        assert_eq!(&buffer.slice(matches[1].clone()), "NOCHE");
+        assert_eq!(&buffer.slice(matches[2].clone()), "noche");
+        // Line 2 starts after "Noche en la ciudad" (18) + newline (1) = 19,
+        // plus "la " (3) → "NOCHE" begins at document byte 22.
+        assert_eq!(matches[1].start, 22);
+    }
+
+    #[test]
+    fn find_all_is_non_overlapping_and_skips_partial_matches() {
+        let buffer = Buffer::new("banana anana");
+        let matches = buffer.find_all("ana");
+        assert_eq!(matches.len(), 2, "non-overlapping: {matches:?}");
+        assert_eq!(matches[0], 1..4);
+        assert_eq!(matches[1], 7..10);
+        // Query longer than the line matches nothing.
+        assert!(buffer.find_all("banana split").is_empty());
+    }
+
+    #[test]
+    fn find_all_handles_accents_and_empty_or_multiline_queries() {
+        let buffer = Buffer::new("Habitación dos\nhabitación tres");
+        let matches = buffer.find_all("HABITACIÓN");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(&buffer.slice(matches[0].clone()), "Habitación");
+        // The fold is per character: both accented case pairs match.
+        let buffer2 = Buffer::new("ÁÉÍÓÚ áéíóú");
+        let m = buffer2.find_all("áÉíÓú");
+        assert_eq!(m.len(), 2, "both case variants match: {m:?}");
+        assert_eq!(&buffer2.slice(m[0].clone()), "ÁÉÍÓÚ");
+        assert_eq!(&buffer2.slice(m[1].clone()), "áéíóú");
+        // Empty query and queries with a newline match nothing by contract.
+        assert!(buffer.find_all("").is_empty());
+        assert!(buffer.find_all("dos\nhabitación").is_empty());
     }
 
     #[test]

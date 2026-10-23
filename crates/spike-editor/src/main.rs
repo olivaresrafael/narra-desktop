@@ -15,12 +15,25 @@
 //!       arrows, shift-arrows, home/end, cmd-a     movement and selection
 //!       cmd-z / cmd-shift-z                       undo / redo
 //!       cmd-c / cmd-x / cmd-v                     clipboard
+//!       cmd-f                                     find bar (type to search)
+//!       enter / cmd-g / cmd-shift-g / cmd-alt-f / cmd-enter / cmd-alt-enter
+//!           next match / next+prev match / focus replacement /
+//!           replace match / replace all
+//!       escape                                     close find bar
 //!       cmd-q                                     quit (prints the JSON report)
 //!   spike-editor --fixture <path> --steps 60      automated scroll probe (slice 1)
+//!   spike-editor --fixture <path> --find-steps 60 automated find probe (slice 3)
 //!   spike-editor --report-after-ms <ms>           print the report and exit
 //!   spike-editor --dump-after-ms <ms>             print a buffer dump and exit
 //!       (used by the scripted typing verification: text, enter, backspace,
 //!        selection and undo are observable without trusting a screenshot)
+//!
+//! Find bar note (spike scope): one focus handle serves both the document
+//! and the find fields — while the bar is open, text input, backspace and
+//! enter are routed to the active find field instead of the buffer (the
+//! documented single-focus compromise; per-field focus/IME is production
+//! work, not a spike question). Arrow keys still move the document caret,
+//! which doubles as a scroll preview while the bar is open.
 //!
 //! Output: JSON lines on stdout starting with `{"kind":"spike-a`.
 
@@ -41,6 +54,7 @@ use gpui::{
     TextRun, Timer, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas, div,
     list, point, prelude::*, px, rgb, rgba, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
     spike_editor,
@@ -73,6 +87,12 @@ actions!(
         CopyText,
         CutText,
         PasteText,
+        // find / replace (slice 3)
+        ToggleFind,
+        FocusReplace,
+        CloseFind,
+        ReplaceCurrent,
+        ReplaceAll,
     ]
 );
 
@@ -103,6 +123,37 @@ const NOTE_FG: u32 = 0xc4b5fd;
 const SECTION_FG: u32 = 0xf9a8d4;
 const CURSOR_FG: u32 = 0xffffff;
 const SELECTION_BG: u32 = 0x3311ff30;
+/// Find-match highlight (all matches) and the current match — slice 3.
+const MATCH_BG: u32 = 0x3366cc40;
+const MATCH_CURRENT_BG: u32 = 0xeab30855;
+/// Find bar background (distinct from the status bar) and text colors.
+const FIND_BG: u32 = 0x252526;
+const FIND_FG: u32 = 0xd4d4d4;
+const FIND_DIM_FG: u32 = 0x808080;
+/// Which find field owns keystrokes while the bar is open (single-focus
+/// spike compromise — see the module header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FindField {
+    #[default]
+    Query,
+    Replacement,
+}
+
+/// Find/replace state (slice 3). `matches` are document byte ranges from
+/// `Buffer::find_all`, recomputed on every query change (the measured
+/// operation) and after edits that touch the document.
+#[derive(Debug, Default)]
+struct FindState {
+    open: bool,
+    field: FindField,
+    query: String,
+    replacement: String,
+    matches: Vec<Range<usize>>,
+    /// Index of the highlighted current match in `matches` (0 when empty).
+    current: usize,
+    /// Replace-all counter for the dump/report (verified evidence).
+    replaced_total: usize,
+}
 
 fn is_scene_heading(line: &str) -> bool {
     let line = line.trim_start();
@@ -185,11 +236,24 @@ struct Metrics {
     first_render: Option<Instant>,
     last_render: Option<Instant>,
     pending_keystroke: Option<Instant>,
+    /// A find query was just submitted; the next render closes the
+    /// "query submitted → results rendered" sample (slice 3 baseline).
+    pending_search: Option<Instant>,
     frame_gaps_ms: Vec<f64>,
     keystroke_to_frame_ms: Vec<f64>,
+    /// Time spent inside `Buffer::find_all` per submission — the cost of
+    /// the search itself, separate from the frame that renders it.
+    search_compute_ms: Vec<f64>,
+    /// Query submitted → next render pass (same method as
+    /// keystroke_to_frame: input → start of render, no vsync term).
+    search_to_frame_ms: Vec<f64>,
+    /// Wall time of each replace-all over the whole document.
+    replace_all_ms: Vec<f64>,
     renders: usize,
     edits: usize,
+    searches: usize,
     probe_steps: usize,
+    find_probe_steps: usize,
 }
 
 impl Metrics {
@@ -200,6 +264,7 @@ impl Metrics {
         lines: usize,
         scenes: usize,
         probe_steps: usize,
+        find_probe_steps: usize,
     ) -> Self {
         Metrics {
             started,
@@ -210,11 +275,17 @@ impl Metrics {
             first_render: None,
             last_render: None,
             pending_keystroke: None,
+            pending_search: None,
             frame_gaps_ms: Vec::new(),
             keystroke_to_frame_ms: Vec::new(),
+            search_compute_ms: Vec::new(),
+            search_to_frame_ms: Vec::new(),
+            replace_all_ms: Vec::new(),
             renders: 0,
             edits: 0,
+            searches: 0,
             probe_steps,
+            find_probe_steps,
         }
     }
 
@@ -225,6 +296,9 @@ impl Metrics {
         }
         if let Some(pending) = self.pending_keystroke.take() {
             self.keystroke_to_frame_ms.push(duration_ms(now - pending));
+        }
+        if let Some(pending) = self.pending_search.take() {
+            self.search_to_frame_ms.push(duration_ms(now - pending));
         }
         if let Some(last) = self.last_render {
             let gap = duration_ms(now - last);
@@ -239,6 +313,15 @@ impl Metrics {
         if self.pending_keystroke.is_none() {
             self.pending_keystroke = Some(now);
         }
+    }
+
+    /// A query was submitted; the next render closes the sample. The latest
+    /// submission wins if several arrive before a frame (interactive typing
+    /// bursts); the automated probe spaces steps by frames, so every step
+    /// yields exactly one sample.
+    fn mark_search(&mut self, now: Instant) {
+        self.pending_search = Some(now);
+        self.searches += 1;
     }
 
     fn cold_start_ms(&self) -> f64 {
@@ -294,21 +377,32 @@ impl Metrics {
         let (frame_count, frame_p50, frame_p95, frame_max) = Self::stats(&self.frame_gaps_ms);
         let (steady_count, steady_p50, steady_p95, steady_max) = Self::stats(self.steady());
         let (key_count, key_p50, key_p95, key_max) = Self::stats(&self.keystroke_to_frame_ms);
+        let (search_count, search_p50, search_p95, search_max) =
+            Self::stats(&self.search_to_frame_ms);
+        let (compute_count, compute_p50, compute_p95, compute_max) =
+            Self::stats(&self.search_compute_ms);
+        let (repl_count, repl_p50, repl_p95, repl_max) = Self::stats(&self.replace_all_ms);
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-slice2\",",
                 "\"fixture\":\"{}\",\"lines\":{},\"scenes\":{},\"probe_steps\":{},",
+                "\"find_probe_steps\":{},\"searches\":{},",
                 "\"fixture_read_ms\":{:.3},\"cold_start_ms\":{:.3},\"rss_mb\":{:.1},",
                 "\"renders\":{},\"edits\":{},",
                 "\"frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
                 "\"steady_frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
-                "\"keystroke_to_frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}}",
+                "\"keystroke_to_frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
+                "\"search_to_frame_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
+                "\"search_compute_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}},",
+                "\"replace_all_ms\":{{\"count\":{},\"p50\":{:.3},\"p95\":{:.3},\"max\":{:.3}}}",
                 "}}"
             ),
             self.fixture,
             self.lines,
             self.scenes,
             self.probe_steps,
+            self.find_probe_steps,
+            self.searches,
             self.fixture_read_ms,
             self.cold_start_ms(),
             Self::rss_mb(),
@@ -326,6 +420,18 @@ impl Metrics {
             key_p50,
             key_p95,
             key_max,
+            search_count,
+            search_p50,
+            search_p95,
+            search_max,
+            compute_count,
+            compute_p50,
+            compute_p95,
+            compute_max,
+            repl_count,
+            repl_p50,
+            repl_p95,
+            repl_max,
         )
     }
 }
@@ -369,6 +475,15 @@ struct Editor {
     probe_left: usize,
     probe_cursor: usize,
     probe_scheduled: bool,
+
+    /// Automated find probe (`--find-steps`): same functions as the
+    /// interactive find bar, driven by the probe timer.
+    find_probe_left: usize,
+    find_probe_cursor: usize,
+
+    /// Find/replace bar (slice 3). While `open`, keystrokes route here
+    /// instead of the buffer (single-focus spike compromise).
+    find: FindState,
 }
 
 impl Focusable for Editor {
@@ -457,6 +572,11 @@ impl Editor {
         self.reversed = false;
         self.marked = None;
         self.scenes_dirty = true;
+        // Offsets shifted: keep find matches valid (silent — edits are not
+        // query submissions and must not pollute the search baseline).
+        if self.find.open {
+            self.refresh_matches(false);
+        }
         inserted
     }
 
@@ -466,6 +586,9 @@ impl Editor {
         self.reversed = false;
         self.marked = None;
         self.scenes_dirty = true;
+        if self.find.open {
+            self.refresh_matches(false);
+        }
     }
 
     fn undo(&mut self) {
@@ -545,7 +668,9 @@ impl Editor {
         self.probe_cursor += 1;
         self.probe_left = self.probe_left.saturating_sub(1);
 
-        let finished = self.probe_left == 0;
+        // Quit only when no probe work remains (scroll and find probes may
+        // be combined in one run).
+        let finished = self.probe_left == 0 && self.find_probe_left == 0;
         cx.notify();
         if finished {
             let report = self.metrics.borrow().report();
@@ -555,7 +680,8 @@ impl Editor {
     }
 
     fn schedule_probe_step(&mut self, window: &Window, cx: &Context<Self>) {
-        if self.probe_left == 0 || self.probe_scheduled {
+        let has_probe = self.probe_left > 0 || self.find_probe_left > 0;
+        if !has_probe || self.probe_scheduled {
             return;
         }
         self.probe_scheduled = true;
@@ -568,7 +694,11 @@ impl Editor {
                 cx.update(|_, cx| {
                     entity.update(cx, |view, cx| {
                         view.probe_scheduled = false;
-                        view.advance_probe(cx);
+                        if view.find_probe_left > 0 {
+                            view.advance_find_probe(cx);
+                        } else {
+                            view.advance_probe(cx);
+                        }
                     });
                 })
                 .ok();
@@ -625,11 +755,21 @@ impl Editor {
     // ---- action handlers -------------------------------------------------
 
     fn next_scene(&mut self, _: &NextScene, _window: &mut Window, cx: &mut Context<Self>) {
+        // With the find bar open, cmd-g/shift-g navigate matches (same
+        // shortcuts the scene jump uses when it is closed).
+        if self.find.open {
+            self.next_match(cx);
+            return;
+        }
         self.jump(1);
         cx.notify();
     }
 
     fn prev_scene(&mut self, _: &PrevScene, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open {
+            self.prev_match(cx);
+            return;
+        }
         self.jump(-1);
         cx.notify();
     }
@@ -712,6 +852,11 @@ impl Editor {
     }
 
     fn on_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open {
+            self.find_backspace();
+            cx.notify();
+            return;
+        }
         if self.selected.is_empty() {
             let caret = self.caret();
             let previous = self.buffer.prev_boundary(caret);
@@ -747,6 +892,19 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // While the find bar owns keystrokes, enter means "next match" in the
+        // query field and "replace current + advance" in the replacement
+        // field (the routing note in the module header).
+        if self.find.open {
+            match self.find.field {
+                FindField::Query => self.next_match(cx),
+                FindField::Replacement => {
+                    self.replace_current(cx);
+                    self.next_match(cx);
+                }
+            }
+            return;
+        }
         let caret = self.caret();
         self.apply_edit(caret..caret, "\n");
         cx.notify();
@@ -788,6 +946,244 @@ impl Editor {
         }
     }
 
+    // ---- find / replace (Spike A slice 3) -------------------------------
+
+    /// Open the find bar (cmd-f) or focus its query field if it is already
+    /// open; cmd-alt-f opens it with the replacement field focused. A
+    /// non-single-line selection prefills the query on first open.
+    fn open_find(&mut self, with_replacement: bool, cx: &mut Context<Self>) {
+        let selection = if self.selected.is_empty() {
+            String::new()
+        } else {
+            self.buffer.slice(self.selected.clone())
+        };
+        let first_open = !self.find.open;
+        self.find.open = true;
+        self.find.field = if with_replacement {
+            FindField::Replacement
+        } else {
+            FindField::Query
+        };
+        if first_open && !selection.is_empty() && !selection.contains('\n') {
+            self.find.query = selection;
+        }
+        self.refresh_matches(true);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find.open = false;
+        self.find.matches.clear();
+        self.find.current = 0;
+        cx.notify();
+    }
+
+    /// Recompute `find.matches` from `find.query`. `measured` records the
+    /// baseline sample (compute time + query→next frame); silent refreshes
+    /// after buffer edits keep the baseline free of maintenance noise.
+    /// An empty query clears matches without recording anything.
+    fn refresh_matches(&mut self, measured: bool) {
+        if self.find.query.is_empty() {
+            self.find.matches.clear();
+            self.find.current = 0;
+            return;
+        }
+        let start = Instant::now();
+        self.find.matches = self.buffer.find_all(&self.find.query);
+        if measured {
+            let mut metrics = self.metrics.borrow_mut();
+            metrics.search_compute_ms.push(duration_ms(start.elapsed()));
+            metrics.mark_search(Instant::now());
+        }
+        if self.find.current >= self.find.matches.len() {
+            self.find.current = 0;
+        }
+    }
+
+    /// Reveal and select the match at `index` (wraps).
+    fn goto_match(&mut self, index: usize) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        self.find.current = index % self.find.matches.len();
+        let range = self.find.matches[self.find.current].clone();
+        let line = self.buffer.position_at(range.start).line;
+        self.selected = range;
+        self.reversed = false;
+        self.marked = None;
+        self.list_state.scroll_to_reveal_item(line);
+    }
+
+    fn next_match(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let next = (self.find.current + 1) % self.find.matches.len();
+        self.goto_match(next);
+        cx.notify();
+    }
+
+    fn prev_match(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let len = self.find.matches.len();
+        let prev = (self.find.current + len - 1) % len;
+        self.goto_match(prev);
+        cx.notify();
+    }
+
+    /// Keystrokes typed while the bar is open go to the active field
+    /// (single-focus spike compromise). Newlines are dropped: fields are
+    /// single-line and `Buffer::find_all` matches nothing for `\n` queries.
+    fn find_input(&mut self, text: &str) {
+        let cleaned: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .collect();
+        match self.find.field {
+            FindField::Query => {
+                self.find.query.push_str(&cleaned);
+                self.refresh_matches(true);
+            }
+            FindField::Replacement => self.find.replacement.push_str(&cleaned),
+        }
+    }
+
+    /// Grapheme-aware backspace for the active find field (same standard as
+    /// the buffer).
+    fn find_backspace(&mut self) {
+        let field = match self.find.field {
+            FindField::Query => &mut self.find.query,
+            FindField::Replacement => &mut self.find.replacement,
+        };
+        let new_len = field
+            .graphemes(true)
+            .next_back()
+            .map(|g| field.len() - g.len());
+        if let Some(len) = new_len {
+            field.truncate(len);
+        }
+        if self.find.field == FindField::Query {
+            self.refresh_matches(true);
+        }
+    }
+
+    /// Replace the current match (cmd-enter, or enter in the replacement
+    /// field) and keep the visual position near where the edit happened.
+    fn replace_current(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let range = self.find.matches[self.find.current].clone();
+        let anchor = range.start;
+        let replacement = self.find.replacement.clone();
+        // apply_edit pushes one undo entry and silently refreshes matches.
+        self.apply_edit(range, &replacement);
+        self.find.replaced_total += 1;
+        if !self.find.matches.is_empty() {
+            let index = self
+                .find
+                .matches
+                .iter()
+                .position(|m| m.start >= anchor)
+                .unwrap_or(0);
+            self.goto_match(index);
+        }
+        cx.notify();
+    }
+
+    /// Replace every match in a single document-wide edit (one undo entry),
+    /// measured as one operation into `replace_all_ms`.
+    fn replace_all(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let start = Instant::now();
+        let count = self.find.matches.len();
+        let mut new_text = String::with_capacity(self.buffer.doc_len());
+        let mut last = 0usize;
+        for range in &self.find.matches {
+            new_text.push_str(&self.buffer.slice(last..range.start));
+            new_text.push_str(&self.find.replacement);
+            last = range.end;
+        }
+        new_text.push_str(&self.buffer.slice(last..self.buffer.doc_len()));
+        let doc_len = self.buffer.doc_len();
+        self.apply_edit(0..doc_len, &new_text);
+        self.find.replaced_total += count;
+        self.metrics
+            .borrow_mut()
+            .replace_all_ms
+            .push(duration_ms(start.elapsed()));
+        cx.notify();
+    }
+
+    // ---- find bar actions ------------------------------------------------
+
+    fn on_toggle_find(&mut self, _: &ToggleFind, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open && self.find.field == FindField::Query {
+            self.close_find(cx);
+        } else {
+            self.open_find(false, cx);
+        }
+    }
+
+    fn on_focus_replace(&mut self, _: &FocusReplace, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(true, cx);
+    }
+
+    fn on_close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open {
+            self.close_find(cx);
+        }
+    }
+
+    fn on_replace_current(
+        &mut self,
+        _: &ReplaceCurrent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open {
+            self.replace_current(cx);
+        }
+    }
+
+    fn on_replace_all(&mut self, _: &ReplaceAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open {
+            self.replace_all(cx);
+        }
+    }
+
+    // ---- find probe (slice 3 measurement) ---------------------------------
+
+    /// Each probe step submits a real query from a fixed list against the
+    /// whole document and reveals the next match — the exact functions the
+    /// interactive bar calls, so the measured path is the shipped path.
+    fn advance_find_probe(&mut self, cx: &mut Context<Self>) {
+        const QUERIES: [&str; 5] = ["noche", "INT.", "toda la noche", "habitación", "escena"];
+        self.find.open = true;
+        self.find.field = FindField::Query;
+        let query = QUERIES[self.find_probe_cursor % QUERIES.len()];
+        self.find.query = query.to_string();
+        self.refresh_matches(true);
+        if !self.find.matches.is_empty() {
+            self.find.current = self.find_probe_cursor % self.find.matches.len();
+            self.goto_match(self.find.current);
+        }
+        self.find_probe_cursor += 1;
+        self.find_probe_left = self.find_probe_left.saturating_sub(1);
+
+        let finished = self.find_probe_left == 0 && self.probe_left == 0;
+        cx.notify();
+        if finished {
+            let report = self.metrics.borrow().report();
+            println!("{report}");
+            cx.defer(|cx| cx.quit());
+        }
+    }
+
     fn status_text(&self) -> String {
         let metrics = self.metrics.borrow();
         let (_, p50, p95, max) = Metrics::stats(&metrics.frame_gaps_ms);
@@ -807,6 +1203,62 @@ impl Editor {
             max,
             self.probe_left,
         )
+    }
+
+    /// The find/replace bar (slice 3). Rendered above the document when
+    /// open; it shows the two fields, which one owns keystrokes (a trailing
+    /// caret marker), the match counter and the key hints. The fields are
+    /// display-only: keystrokes are routed here by the input handler
+    /// (single-focus spike compromise, see the module header).
+    fn find_bar(&self) -> gpui::Div {
+        let total = self.find.matches.len();
+        let counter = if self.find.query.is_empty() {
+            String::new()
+        } else if total == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", self.find.current + 1, total)
+        };
+        let marker = |active: bool| if active { "▌" } else { "" };
+        let field = |label: &str, value: String, active: bool| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().text_color(rgb(FIND_DIM_FG)).child(label.to_string()))
+                .child(
+                    div()
+                        .text_color(rgb(if active { FIND_FG } else { FIND_DIM_FG }))
+                        .child(format!("{value}{}", marker(active))),
+                )
+        };
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_2()
+            .h(px(26.0))
+            .bg(rgb(FIND_BG))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .whitespace_nowrap()
+            .child(field(
+                "Buscar:",
+                self.find.query.clone(),
+                self.find.field == FindField::Query,
+            ))
+            .child(field(
+                "Reemplazar:",
+                self.find.replacement.clone(),
+                self.find.field == FindField::Replacement,
+            ))
+            .child(div().text_color(rgb(FIND_FG)).child(counter))
+            .child(
+                div().text_color(rgb(FIND_DIM_FG)).child(
+                    "enter siguiente · cmd-enter reemplaza · cmd-alt-enter todo · esc cierra",
+                ),
+            )
     }
 
     /// One row of the virtualized list.
@@ -834,13 +1286,34 @@ impl Editor {
         let marked_here = marked.as_ref().filter(|range| intersects(range));
         let caret_here = caret >= doc.start && caret <= doc.end;
 
+        // Find matches intersecting this line. `matches` is sorted and
+        // non-overlapping, so a binary search finds the first candidate and
+        // the scan stops at the first match past the line (bounded work per
+        // visible row even with hundreds of matches).
+        let matches_here: Vec<(Range<usize>, bool)> =
+            if self.find.open && !self.find.matches.is_empty() {
+                let first = self.find.matches.partition_point(|m| m.end <= doc.start);
+                self.find.matches[first..]
+                    .iter()
+                    .enumerate()
+                    .take_while(|(_, m)| m.start < doc.end)
+                    .map(|(offset, m)| (m.clone(), first + offset == self.find.current))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         let base = div()
             .px_2()
             .font_family(FONT_FAMILY)
             .text_size(px(TEXT_SIZE))
             .text_color(line_color(text));
 
-        if selection_here.is_none() && marked_here.is_none() && !caret_here {
+        if selection_here.is_none()
+            && marked_here.is_none()
+            && !caret_here
+            && matches_here.is_empty()
+        {
             return base.w(self.wrap_width).child(text.clone());
         }
 
@@ -859,6 +1332,10 @@ impl Editor {
         if let Some(marked) = marked_here {
             cuts.push((marked.start - doc.start).min(len));
             cuts.push((marked.end - doc.start).min(len));
+        }
+        for (range, _) in &matches_here {
+            cuts.push((range.start - doc.start).min(len));
+            cuts.push((range.end - doc.start).min(len));
         }
         let caret_col = (caret - doc.start).min(len);
         if caret_here {
@@ -881,9 +1358,20 @@ impl Editor {
             let composing = marked_here.is_some_and(|marked| {
                 start >= marked.start - doc.start && end <= marked.end - doc.start
             });
+            let match_state = matches_here.iter().find(|(range, _)| {
+                start >= range.start - doc.start && end <= range.end - doc.start
+            });
             let mut segment = div().whitespace_nowrap();
             if selected {
                 segment = segment.bg(rgba(SELECTION_BG));
+            } else if let Some((_, is_current)) = match_state {
+                // Selection wins over highlight; the current match is louder
+                // than the rest.
+                segment = segment.bg(rgba(if *is_current {
+                    MATCH_CURRENT_BG
+                } else {
+                    MATCH_BG
+                }));
             }
             if composing {
                 segment = segment.underline();
@@ -919,7 +1407,9 @@ impl Editor {
                 "{{\"kind\":\"spike-a-buffer-dump\",",
                 "\"lines\":{},\"doc_len\":{},\"edits\":{},",
                 "\"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],",
-                "\"scenes\":{},\"undo\":{},\"redo\":{},\"around\":\"{}\"}}"
+                "\"scenes\":{},\"undo\":{},\"redo\":{},\"around\":\"{}\",",
+                "\"find\":{{\"open\":{},\"query\":\"{}\",\"matches\":{},",
+                "\"current\":{},\"replaced\":{}}}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -932,6 +1422,11 @@ impl Editor {
             self.undo_stack.len(),
             self.redo_stack.len(),
             around,
+            self.find.open,
+            escape_json(&self.find.query),
+            self.find.matches.len(),
+            self.find.current,
+            self.find.replaced_total,
         )
     }
 
@@ -1006,6 +1501,13 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Find bar owns keystrokes while open: typing, IME commits and
+        // pastes land in the active field, never in the buffer.
+        if self.find.open {
+            self.find_input(new_text);
+            cx.notify();
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -1031,6 +1533,14 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // IME while the find bar is open: commit into the active field with
+        // no marked state (the documented single-focus compromise — live
+        // composition inside the bar is production work).
+        if self.find.open {
+            self.find_input(new_text);
+            cx.notify();
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -1134,6 +1644,11 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
             .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_toggle_find))
+            .on_action(cx.listener(Self::on_focus_replace))
+            .on_action(cx.listener(Self::on_close_find))
+            .on_action(cx.listener(Self::on_replace_current))
+            .on_action(cx.listener(Self::on_replace_all))
             .child(
                 div()
                     .id("status")
@@ -1148,6 +1663,7 @@ impl Render for Editor {
                     .text_color(rgb(STATUS_FG))
                     .child(status),
             )
+            .when(self.find.open, |bar| bar.child(self.find_bar()))
             .child(
                 div()
                     .flex_1()
@@ -1192,6 +1708,7 @@ impl Render for Editor {
 struct Args {
     fixture: String,
     steps: usize,
+    find_steps: usize,
     report_after_ms: Option<u64>,
     dump_after_ms: Option<u64>,
 }
@@ -1200,6 +1717,7 @@ fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut fixture = "fixtures/screenplay-1000.fountain".to_string();
     let mut steps = 0usize;
+    let mut find_steps = 0usize;
     let mut report_after_ms = None;
     let mut dump_after_ms = None;
 
@@ -1213,6 +1731,11 @@ fn parse_args() -> Result<Args, String> {
                 steps = value
                     .parse()
                     .map_err(|_| format!("--steps inválido: {value}"))?
+            }
+            "--find-steps" => {
+                find_steps = value
+                    .parse()
+                    .map_err(|_| format!("--find-steps inválido: {value}"))?
             }
             "--report-after-ms" => {
                 report_after_ms = Some(
@@ -1236,6 +1759,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         fixture,
         steps,
+        find_steps,
         report_after_ms,
         dump_after_ms,
     })
@@ -1267,9 +1791,11 @@ fn run() -> Result<(), String> {
         content.lines().count(),
         scene_count,
         args.steps,
+        args.find_steps,
     )));
 
     let steps = args.steps;
+    let find_steps = args.find_steps;
     let report_after_ms = args.report_after_ms;
     let dump_after_ms = args.dump_after_ms;
     Application::new().run(move |cx: &mut App| {
@@ -1303,6 +1829,12 @@ fn run() -> Result<(), String> {
             KeyBinding::new("cmd-c", CopyText, None),
             KeyBinding::new("cmd-x", CutText, None),
             KeyBinding::new("cmd-v", PasteText, None),
+            // find / replace (slice 3)
+            KeyBinding::new("cmd-f", ToggleFind, None),
+            KeyBinding::new("cmd-alt-f", FocusReplace, None),
+            KeyBinding::new("escape", CloseFind, None),
+            KeyBinding::new("cmd-enter", ReplaceCurrent, None),
+            KeyBinding::new("cmd-alt-enter", ReplaceAll, None),
         ]);
 
         cx.observe_keystrokes({
@@ -1338,6 +1870,9 @@ fn run() -> Result<(), String> {
             probe_left: steps,
             probe_cursor: 1,
             probe_scheduled: false,
+            find_probe_left: find_steps,
+            find_probe_cursor: 0,
+            find: FindState::default(),
         });
 
         let bounds = Bounds::centered(None, size(px(1100.0), px(780.0)), cx);
