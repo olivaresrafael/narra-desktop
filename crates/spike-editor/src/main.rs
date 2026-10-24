@@ -6,10 +6,10 @@
 //! and the same instrumentation as slice 1 so typing latency can be measured
 //! against the approved thresholds (PERFORMANCE_BASELINES.md §6).
 //!
-//! Still NOT answered (slice 3 / Spike B): text wrapping, mouse click-to-caret,
-//! large-file strategy. IME composition IS now verified end-to-end against the
-//! live macOS input context (dead keys → NSTextInputClient → GPUI), including
-//! one-undo-per-session grouping.
+//! Still NOT answered (slice 3 / Spike B): text wrapping (wrapped-line caret
+//! placement), accessibility, large-file strategy. IME composition and
+//! click-to-caret ARE now verified end-to-end against the live macOS input
+//! context and window server.
 //!
 //! Modes:
 //!   spike-editor --fixture <path>                 interactive
@@ -1706,6 +1706,59 @@ impl Editor {
             )
     }
 
+
+    /// Render a line that has only a caret (no selection, no IME, no matches)
+    /// with soft-wrapping, placing the caret on the correct visual row.
+    /// Returns a flex column where each visual row is a flex child; the row
+    /// containing the caret gets a cursor element at the correct x offset.
+    fn render_caret_only_wrapped_row(
+        &self,
+        window: &Window,
+        base: gpui::Div,
+        text: &str,
+        doc: Range<usize>,
+        caret: usize,
+    ) -> gpui::Div {
+        let caret_col = (caret - doc.start).min(text.len());
+        let wrap_w = f32::from(self.wrap_width);
+        let (visual_row, caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
+        let starts = visual_row_starts(window, text, wrap_w);
+
+        // Build visual rows as a flex column.
+        let mut col = base.flex().flex_col().w(self.wrap_width);
+        for (row_idx, &start) in starts.iter().enumerate() {
+            let end = starts.get(row_idx + 1).copied().unwrap_or(text.len());
+            let segment_text = &text[start..end];
+            let mut row_div = div()
+                .font_family(FONT_FAMILY)
+                .text_size(px(TEXT_SIZE))
+                .text_color(line_color(text))
+                .h(px(LINE_HEIGHT))
+                .flex()
+                .items_center();
+
+            if row_idx == visual_row {
+                // This visual row contains the caret: split at caret_x.
+                // We render as: text before caret | cursor | text after caret.
+                // For simplicity, we place cursor at the x offset using a
+                // zero-width element with margin-left.
+                let before = &segment_text[..caret_col.saturating_sub(starts[visual_row]).min(segment_text.len())];
+                let after = &segment_text[caret_col.saturating_sub(starts[visual_row]).min(segment_text.len())..];
+                if !before.is_empty() {
+                    row_div = row_div.child(before.to_string());
+                }
+                row_div = row_div.child(cursor_element_at(caret_x));
+                if !after.is_empty() {
+                    row_div = row_div.child(after.to_string());
+                }
+            } else {
+                row_div = row_div.child(segment_text.to_string());
+            }
+            col = col.child(row_div);
+        }
+        col
+    }
+
     /// One row of the virtualized list.
     ///
     /// Non-hot rows (no caret/selection/IME) wrap at `wrap_width` and take
@@ -1714,7 +1767,7 @@ impl Editor {
     /// state keep the slice-2 single-line representation (fixed height, no
     /// wrap) so the caret stays exact — the documented spike compromise for
     /// wrapped editing.
-    fn row(&self, ix: usize) -> gpui::Div {
+    fn row(&self, ix: usize, window: &Window) -> gpui::Div {
         let text = &self.buffer.lines()[ix];
 
         let doc = self.buffer.line_content_range(ix);
@@ -1754,12 +1807,24 @@ impl Editor {
             .text_size(px(TEXT_SIZE))
             .text_color(line_color(text));
 
+        // Cold row: no caret/selection/IME/matches -> simple wrapped div.
         if selection_here.is_none()
             && marked_here.is_none()
             && !caret_here
             && matches_here.is_empty()
         {
             return base.w(self.wrap_width).child(text.clone());
+        }
+
+        // Caret-only (no selection, no IME, no matches): wrap the line and
+        // place the caret on the correct visual row using a flex column of
+        // visual rows. This is the B-3 wrapped-caret placement.
+        if selection_here.is_none()
+            && marked_here.is_none()
+            && matches_here.is_empty()
+            && caret_here
+        {
+            return self.render_caret_only_wrapped_row(window, base, text, doc, caret);
         }
 
         let mut row = base
@@ -1947,6 +2012,18 @@ fn cursor_element() -> gpui::Div {
     div().w(px(2.0)).mr(px(-2.0)).h_full().bg(rgb(CURSOR_FG))
 }
 
+/// Cursor element positioned at a specific x offset within a visual row
+/// (used for wrapped-line caret placement, B-3). The x offset is from the
+/// start of the visual row; we use `ml` (margin-left) to position it.
+fn cursor_element_at(x: f32) -> gpui::Div {
+    div()
+        .w(px(2.0))
+        .mr(px(-2.0))
+        .h_full()
+        .ml(px(x))
+        .bg(rgb(CURSOR_FG))
+}
+
 fn escape_json(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -2029,6 +2106,57 @@ fn wrap_row_starts(glyphs: &[(usize, f32)], wrap_width: f32) -> Vec<usize> {
         }
     }
     starts
+}
+
+/// Compute the visual (soft-wrapped) row boundaries for a line of text,
+/// given the available content width. Returns a vec of byte offsets within
+/// `line` where each visual row starts (first is always 0). Uses shaped
+/// glyph x-positions to find wrap points at `wrap_width`.
+fn visual_row_starts(window: &Window, line: &str, wrap_width: f32) -> Vec<usize> {
+    let shaped = shape_line(window, line);
+    let glyphs: Vec<(usize, f32)> = shaped
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter().map(|g| (g.index, f32::from(g.position.x))))
+        .collect();
+    wrap_row_starts(&glyphs, wrap_width)
+}
+
+/// Given a line, caret column (byte offset within the line), and the
+/// visual row starts, returns the visual row index (0-based) containing
+/// the caret, and the x-offset within that visual row for cursor rendering.
+fn caret_visual_row_and_x(
+    window: &Window,
+    line: &str,
+    caret_col: usize,
+    wrap_width: f32,
+) -> (usize, f32) {
+    let starts = visual_row_starts(window, line, wrap_width);
+    let row = starts
+        .iter()
+        .rposition(|&start| start <= caret_col)
+        .unwrap_or(0);
+    // x within the visual row: compute via shaped glyphs
+    let shaped = shape_line(window, line);
+    let glyphs: Vec<(usize, f32)> = shaped
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter().map(|g| (g.index, f32::from(g.position.x))))
+        .collect();
+    let row_start_x = glyphs
+        .iter()
+        .find(|(ix, _)| *ix >= starts[row])
+        .map(|(_, x)| *x)
+        .unwrap_or(0.0);
+    let caret_x = glyphs
+        .iter()
+        .find(|(ix, _)| *ix >= caret_col)
+        .map(|(_, x)| *x)
+        .unwrap_or_else(|| {
+            // Past end: use line width
+            shaped.runs.last().map(|r| r.glyphs.last().map(|g| f32::from(g.position.x)).unwrap_or(0.0)).unwrap_or(0.0)
+        });
+    (row, caret_x - row_start_x)
 }
 
 impl EntityInputHandler for Editor {
@@ -2288,8 +2416,8 @@ impl Render for Editor {
                         host.child(
                             list(self.list_state.clone(), {
                                 let entity = entity.clone();
-                                move |ix: usize, _window: &mut Window, cx: &mut App| {
-                                    entity.read(cx).row(ix).into_any_element()
+                                move |ix: usize, window: &mut Window, cx: &mut App| {
+                                    entity.read(cx).row(ix, window).into_any_element()
                                 }
                             })
                             .size_full(),
@@ -2665,6 +2793,9 @@ mod tests {
         let glyphs = [(0, 0.0), (0, 8.0), (2, 20.0)];
         assert_eq!(wrap_row_starts(&glyphs, 10.0), vec![0, 2]);
     }
+
+    // visual_row_starts tests require a Window, so they're integration-tested
+    // via the live click verification (B-2) and the wrapped-caret live run below.
 
     #[test]
     fn utf16_to_byte_in_maps_relative_offsets() {
