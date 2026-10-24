@@ -6,10 +6,12 @@
 //! and the same instrumentation as slice 1 so typing latency can be measured
 //! against the approved thresholds (PERFORMANCE_BASELINES.md §6).
 //!
-//! Still NOT answered (slice 3 / Spike B): text wrapping (wrapped-line caret
-//! placement), accessibility, large-file strategy. IME composition and
-//! click-to-caret ARE now verified end-to-end against the live macOS input
-//! context and window server.
+//! Still NOT answered (slice 3 / Spike B): IME/selection on wrapped lines,
+//! full visual-row navigation chain (limited by test infrastructure focus loss),
+//! accessibility, large-file strategy. IME composition and click-to-caret ARE
+//! now verified end-to-end against the live macOS input context and window
+//! server, including one-undo-per-session grouping and wrapped-line caret
+//! placement with visual-row navigation.
 //!
 //! Modes:
 //!   spike-editor --fixture <path>                 interactive
