@@ -55,9 +55,9 @@ use std::time::{Duration, Instant};
 use buffer::{Buffer, Position};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, Pixels, Point, Rgba, ShapedLine,
-    TextRun, Timer, UTF16Selection, Window, WindowBounds, WindowOptions, actions, canvas, div,
-    list, point, prelude::*, px, rgb, rgba, size,
+    FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection, Window, WindowBounds,
+    WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -114,6 +114,12 @@ const TEXT_SIZE: f32 = 14.0;
 const FONT_FAMILY: &str = "Menlo";
 /// `px_2` on every row.
 const ROW_PADDING_X: f32 = 8.0;
+
+/// Height of the status strip above the buffer list; the only chrome between
+/// the window's content top and the list (the find bar sits below it when
+/// open). Mouse hit-testing subtracts nothing — item bounds are already in
+/// window coordinates — but clicks on this strip must be ignored.
+const STATUS_BAR_H: f32 = 26.0;
 
 /// Gaps longer than this are treated as idle time (user reading) and excluded
 /// from frame statistics, so interactive sessions do not pollute the samples.
@@ -552,6 +558,12 @@ struct Editor {
     /// its commit (`insertText`) or cancellation (`unmarkText`): edits made
     /// inside this window merge into one undo entry (Spike B undo grouping).
     composing: bool,
+    /// Debug for mouse verification (Spike B click-to-caret): last left-click
+    /// position in window coordinates, the resolved line index and its bounds,
+    /// and the doc offset (or None if the click was ignored / above the list).
+    /// (click_x, click_y, line, item_top, item_h, offset)
+    #[allow(clippy::type_complexity)]
+    last_click: Option<(f32, f32, Option<usize>, Option<f32>, f32, Option<usize>)>,
     undo_stack: Vec<Edit>,
     redo_stack: Vec<Edit>,
 
@@ -629,6 +641,123 @@ impl Editor {
             self.selected = target..target;
             self.reversed = false;
         }
+    }
+
+    /// Doc offset under a window-coordinate point (mouse hit-test), or `None`
+    /// when the point is above the list (status/find bar chrome). Item bounds
+    /// come from `ListState::bounds_for_item` — window coordinates with scroll
+    /// already applied, `Some` only for laid-out items — so the scan walks from
+    /// the top and keeps the nearest measured row at or above the point.
+    /// Measured rows are contiguous around the viewport, so the walk is bounded
+    /// by the scroll position; it runs once per click, never per frame.
+    fn offset_for_point(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
+        let mut best: Option<(usize, Bounds<Pixels>)> = None;
+        for ix in 0..self.buffer.line_count() {
+            let Some(bounds) = self.list_state.bounds_for_item(ix) else {
+                continue;
+            };
+            if bounds.top() > position.y {
+                break;
+            }
+            best = Some((ix, bounds));
+            if position.y < bounds.bottom() {
+                break;
+            }
+        }
+        let (line, bounds) = best?;
+        // Below the last measured row: clamp to that row's content end (the
+        // last line's end is the document end).
+        if position.y >= bounds.bottom() {
+            return Some(self.buffer.line_content_range(line).end);
+        }
+        let text = &self.buffer.lines()[line];
+        let start = self.buffer.line_content_range(line).start;
+        if text.is_empty() {
+            return Some(start);
+        }
+        let shaped = shape_line(window, text);
+        let glyphs: Vec<(usize, f32)> = shaped
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(|g| (g.index, f32::from(g.position.x)))
+            })
+            .collect();
+        let wrap_width = f32::from((bounds.size.width - px(ROW_PADDING_X * 2.0)).max(px(0.0)));
+        let rows = wrap_row_starts(&glyphs, wrap_width);
+        let visual_row =
+            (((position.y - bounds.top()) / px(LINE_HEIGHT)).floor() as usize).min(rows.len() - 1);
+        // Glyph x positions are absolute on the un-wrapped line, but wrapping
+        // restarts each visual row at x = 0: shift the probe by the x of the
+        // row's first glyph.
+        let row_start_x = glyphs
+            .iter()
+            .find(|(index, _)| *index >= rows[visual_row])
+            .map(|(_, x)| *x)
+            .unwrap_or(0.0);
+        let x = f32::from(position.x - bounds.left() - px(ROW_PADDING_X)) + row_start_x;
+        let col = shaped.closest_index_for_x(px(x)).min(text.len());
+        // Snap down to a grapheme boundary: a combining mark's glyph index can
+        // land inside one.
+        let offset = start + col;
+        let snapped = self.buffer.prev_boundary(offset);
+        let offset = if self.buffer.next_boundary(snapped) == offset {
+            offset
+        } else {
+            snapped
+        };
+        Some(offset.min(self.buffer.doc_len()))
+    }
+
+    /// Click-to-caret (Spike B): a plain click moves the caret, shift-click
+    /// extends the selection from the active end (`set_caret` handles the
+    /// crossing flip). The diff view is read-only, so clicks there do nothing.
+    fn on_buffer_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Record debug for every left click (even on diff), so the dump shows
+        // what coordinates the handler received and what it resolved.
+        if event.button == MouseButton::Left {
+            self.last_click = Some((
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+                None,
+                0.0,
+                None,
+            ));
+        }
+        if self.diff.open || event.button != MouseButton::Left {
+            return;
+        }
+        let Some(offset) = self.offset_for_point(event.position, window) else {
+            return;
+        };
+        // Update debug with resolved line and bounds.
+        let pos = self.buffer.position_at(offset);
+        let line = pos.line;
+        let bounds = self.list_state.bounds_for_item(line);
+        let (item_top, item_h) = match bounds {
+            Some(b) => (Some(f32::from(b.top())), f32::from(b.size.height)),
+            None => (None, 0.0),
+        };
+        self.last_click = Some((
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+            Some(line),
+            item_top,
+            item_h,
+            Some(offset),
+        ));
+        self.set_caret(offset, event.modifiers.shift);
+        // A click re-targets typing (and IME composition) at the buffer.
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
     }
 
     /// Keep the `list` item count in sync with the buffer after an edit that
@@ -1554,7 +1683,7 @@ impl Editor {
             .items_center()
             .gap_3()
             .px_2()
-            .h(px(26.0))
+            .h(px(STATUS_BAR_H))
             .bg(rgb(FIND_BG))
             .text_sm()
             .font_family(FONT_FAMILY)
@@ -1744,6 +1873,22 @@ impl Editor {
             None => "null".to_string(),
         };
 
+        // Click debug (Spike B): the last left-click's window coordinates,
+        // resolved line, item bounds, and doc offset. `null` when no click
+        // has been recorded or the click was ignored.
+        let (click_x, click_y, click_line, click_top, click_h, click_offset) =
+            self.last_click.unwrap_or((0.0, 0.0, None, None, 0.0, None));
+        let click_line_dump = click_line
+            .map(|l| l.to_string())
+            .unwrap_or("null".to_string());
+        let click_top_dump = click_top
+            .map(|t| format!("{:.1}", t))
+            .unwrap_or("null".to_string());
+        let click_h_dump = format!("{:.1}", click_h);
+        let click_offset_dump = click_offset
+            .map(|o| o.to_string())
+            .unwrap_or("null".to_string());
+
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
@@ -1754,7 +1899,8 @@ impl Editor {
                 "\"current\":{},\"replaced\":{}}},",
                 "\"diff\":{{\"open\":{},\"lines\":{},\"added\":{},",
                 "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}},",
-                "\"ime\":{{\"marked\":{},\"composing\":{}}}}}"
+                "\"ime\":{{\"marked\":{},\"composing\":{}}},",
+                "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -1780,6 +1926,12 @@ impl Editor {
             buffer_hash,
             marked_dump,
             self.composing,
+            click_x,
+            click_y,
+            click_line_dump,
+            click_top_dump,
+            click_h_dump,
+            click_offset_dump,
         )
     }
 
@@ -1861,6 +2013,22 @@ fn utf16_to_byte_in(text: &str, utf16: Range<usize>) -> Range<usize> {
         units += ch.len_utf16();
     }
     start.unwrap_or(text.len())..end.unwrap_or(text.len())
+}
+
+/// Byte columns where each visual (soft-wrapped) row of a line starts,
+/// derived from shaped glyph positions crossing `wrap_width`. Glyph x
+/// positions are absolute on the un-wrapped line, so a glyph past the wrap
+/// width marks the start of the next visual row. Word-wrap edges can differ
+/// by a word between GPUI's div layout and this approximation; the spike
+/// accepts and documents that (mouse caret lands within the same row).
+fn wrap_row_starts(glyphs: &[(usize, f32)], wrap_width: f32) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for &(index, x) in glyphs {
+        if x >= wrap_width && *starts.last().expect("non-empty") < index {
+            starts.push(index);
+        }
+    }
+    starts
 }
 
 impl EntityInputHandler for Editor {
@@ -2016,15 +2184,15 @@ impl EntityInputHandler for Editor {
 
     fn character_index_for_point(
         &mut self,
-        _position: Point<Pixels>,
-        _window: &mut Window,
+        position: Point<Pixels>,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        // Mouse hit-testing needs a point → item → wrapped-visual-row mapping
-        // that the wrapping spike does not implement (mouse caret placement is
-        // slice-3-pending). Returning None keeps IME/text input working; only
-        // platform-driven mouse selection/word-pick is affected.
-        None
+        // NSTextInputClient's `characterIndexForPoint:` uses the same mapping
+        // as a mouse click; the index crosses the Cocoa boundary as UTF-16,
+        // like every other range this handler reports.
+        let offset = self.offset_for_point(position, window)?;
+        Some(self.buffer.offset_to_utf16(offset))
     }
 }
 
@@ -2099,6 +2267,9 @@ impl Render for Editor {
                 div()
                     .flex_1()
                     .relative()
+                    // Click-to-caret for the buffer list (the diff list is
+                    // read-only and ignores clicks in the handler).
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_buffer_click))
                     // The diff view replaces the buffer rows while open; the
                     // buffer list keeps its own (idle) scroll state so
                     // closing the diff restores the caret position.
@@ -2327,6 +2498,7 @@ fn run() -> Result<(), String> {
             reversed: false,
             marked: None,
             composing: false,
+            last_click: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             scene_lines: Vec::new(),
@@ -2479,6 +2651,19 @@ mod tests {
         record_edit(&mut stack, false, 1..1, 1..2, "y", String::new());
         assert_eq!(stack.len(), 2);
         assert_eq!(stack[1].new_text, "y");
+    }
+
+    #[test]
+    fn wrap_row_starts_splits_at_the_wrap_width() {
+        assert_eq!(wrap_row_starts(&[], 100.0), vec![0]);
+        // Everything fits on one row.
+        assert_eq!(wrap_row_starts(&[(0, 0.0), (3, 10.0)], 100.0), vec![0]);
+        // Crossing glyphs open second and third visual rows.
+        let glyphs = [(0, 0.0), (3, 10.0), (6, 20.0), (9, 30.0)];
+        assert_eq!(wrap_row_starts(&glyphs, 15.0), vec![0, 6, 9]);
+        // A repeated glyph index (combining mark) does not open a new row.
+        let glyphs = [(0, 0.0), (0, 8.0), (2, 20.0)];
+        assert_eq!(wrap_row_starts(&glyphs, 10.0), vec![0, 2]);
     }
 
     #[test]
