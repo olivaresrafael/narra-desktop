@@ -1015,8 +1015,89 @@ impl Editor {
         self.set_caret(target, extend);
     }
 
-    fn move_vert(&mut self, delta: i64, extend: bool) {
-        let target = self.buffer.vertical(self.caret(), delta);
+    /// Returns (visual_row, total_visual_rows, caret_x) for the caret position.
+    /// visual_row is 0-based index of the visual row containing the caret.
+    /// total_visual_rows is the number of visual rows the line wraps to.
+    /// caret_x is the x-offset within the visual row where the caret sits.
+    fn caret_visual_info(&self, window: &Window, caret: usize) -> (usize, usize, f32) {
+        let pos = self.buffer.position_at(caret);
+        let line = pos.line;
+        let text = &self.buffer.lines()[line];
+        let caret_col = pos.col;
+        let wrap_w = f32::from(self.wrap_width);
+        let (visual_row, caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
+        let starts = visual_row_starts(window, text, wrap_w);
+        let total_visual_rows = starts.len();
+        (visual_row, total_visual_rows, caret_x)
+    }
+
+    /// Returns the document offset for a given visual row and x-offset within a line.
+    fn offset_in_visual_row(
+        &self,
+        caret: usize,
+        target_visual_row: usize,
+        caret_x: f32,
+        window: &Window,
+    ) -> usize {
+        let pos = self.buffer.position_at(caret);
+        let line = pos.line;
+        let text = &self.buffer.lines()[line];
+        let wrap_w = f32::from(self.wrap_width);
+        let starts = visual_row_starts(window, text, wrap_w);
+        if target_visual_row >= starts.len() {
+            return self.buffer.line_content_range(line).end;
+        }
+        let row_start = starts[target_visual_row];
+        let row_end = starts.get(target_visual_row + 1).copied().unwrap_or(text.len());
+        let row_text = &text[row_start..row_end];
+        // Find the byte offset within the visual row that corresponds to caret_x
+        let shaped = shape_line(window, row_text);
+        let glyphs: Vec<(usize, f32)> = shaped
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|g| (g.index, f32::from(g.position.x))))
+            .collect();
+        // caret_x is relative to the visual row start; we need absolute x
+        let row_start_x = glyphs.first().map(|(_, x)| *x).unwrap_or(0.0);
+        let absolute_x = caret_x + row_start_x;
+        let col = glyphs
+            .iter()
+            .rev()
+            .find(|(_, gx)| *gx <= absolute_x)
+            .map(|(ix, _)| *ix)
+            .unwrap_or(row_text.len())
+            .min(row_text.len());
+        (self.buffer.line_content_range(line).start + starts[target_visual_row] + col).min(self.buffer.doc_len())
+    }
+
+    fn move_vert(&mut self, delta: i64, extend: bool, window: &Window) {
+        let caret = self.caret();
+        let (visual_row, total_visual_rows, caret_x) = self.caret_visual_info(window, caret);
+        
+        // If on a wrapped line (multiple visual rows), navigate visual rows first
+        if total_visual_rows > 1 {
+            if delta < 0 {
+                // Up
+                if visual_row > 0 {
+                    // Move to previous visual row on same line
+                    let target = self.offset_in_visual_row(caret, visual_row - 1, caret_x, window);
+                    self.set_caret(target, extend);
+                    return;
+                }
+                // At visual row 0: fall through to previous logical line
+            } else if delta > 0 {
+                // Down
+                if visual_row < total_visual_rows - 1 {
+                    // Move to next visual row on same line
+                    let target = self.offset_in_visual_row(caret, visual_row + 1, caret_x, window);
+                    self.set_caret(target, extend);
+                    return;
+                }
+                // At last visual row: fall through to next logical line
+            }
+        }
+        // Not on a wrapped line, or at boundary of wrapped line: use logical line navigation
+        let target = self.buffer.vertical(caret, delta);
         self.set_caret(target, extend);
     }
 
@@ -1078,14 +1159,14 @@ impl Editor {
         self.ensure_caret_visible();
     }
 
-    fn on_up(&mut self, _: &MoveUp, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vert(-1, false);
+    fn on_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(-1, false, window);
         cx.notify();
         self.ensure_caret_visible();
     }
 
-    fn on_down(&mut self, _: &MoveDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vert(1, false);
+    fn on_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(1, false, window);
         cx.notify();
         self.ensure_caret_visible();
     }
@@ -1114,14 +1195,14 @@ impl Editor {
         self.ensure_caret_visible();
     }
 
-    fn on_select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vert(-1, true);
+    fn on_select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(-1, true, window);
         cx.notify();
         self.ensure_caret_visible();
     }
 
-    fn on_select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vert(1, true);
+    fn on_select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(1, true, window);
         cx.notify();
         self.ensure_caret_visible();
     }
@@ -2100,9 +2181,13 @@ fn utf16_to_byte_in(text: &str, utf16: Range<usize>) -> Range<usize> {
 /// accepts and documents that (mouse caret lands within the same row).
 fn wrap_row_starts(glyphs: &[(usize, f32)], wrap_width: f32) -> Vec<usize> {
     let mut starts = vec![0usize];
+    let mut current_row_start_x = 0.0;
     for &(index, x) in glyphs {
-        if x >= wrap_width && *starts.last().expect("non-empty") < index {
+        // When the glyph's absolute x minus the current row's start x
+        // exceeds the wrap width, we've wrapped to a new visual row.
+        if x - current_row_start_x >= wrap_width {
             starts.push(index);
+            current_row_start_x = x;
         }
     }
     starts
@@ -2786,9 +2871,14 @@ mod tests {
         assert_eq!(wrap_row_starts(&[], 100.0), vec![0]);
         // Everything fits on one row.
         assert_eq!(wrap_row_starts(&[(0, 0.0), (3, 10.0)], 100.0), vec![0]);
-        // Crossing glyphs open second and third visual rows.
+        // Crossing glyphs open second visual row at wrap boundary.
+        // Glyphs at x=0, 10, 20, 30 with wrap_width=15:
+        // - x=0: row 0 starts at 0
+        // - x=10: still row 0 (10-0 < 15)
+        // - x=20: wraps (20-0 >= 15), new row at index 6
+        // - x=30: same row (30-20 < 15)
         let glyphs = [(0, 0.0), (3, 10.0), (6, 20.0), (9, 30.0)];
-        assert_eq!(wrap_row_starts(&glyphs, 15.0), vec![0, 6, 9]);
+        assert_eq!(wrap_row_starts(&glyphs, 15.0), vec![0, 6]);
         // A repeated glyph index (combining mark) does not open a new row.
         let glyphs = [(0, 0.0), (0, 8.0), (2, 20.0)];
         assert_eq!(wrap_row_starts(&glyphs, 10.0), vec![0, 2]);
