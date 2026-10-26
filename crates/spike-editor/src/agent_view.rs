@@ -24,6 +24,14 @@ pub enum AgentMessage {
     Done(Result<TaskOutput, AgentError>),
 }
 
+/// Scroll by `delta` lines, clamped to the content: a view never shows a
+/// negative offset nor scrolls past the end (delta may overshoot either
+/// way on purpose — callers pass raw key steps).
+pub fn clamp_scroll(scroll: usize, delta: i64, total_lines: usize, visible: usize) -> usize {
+    let max = total_lines.saturating_sub(visible);
+    (scroll as i64 + delta).clamp(0, max as i64) as usize
+}
+
 /// Panel-visible state of one review task.
 #[derive(Debug)]
 pub struct AgentState {
@@ -62,6 +70,9 @@ impl AgentState {
         }
     }
 
+    /// Test-only convenience: the binary matches on `status` directly (and
+    /// clippy keeps the binary free of unused accessors).
+    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.status == AgentStatus::Running
     }
@@ -147,12 +158,11 @@ impl AgentState {
         }
     }
 
-    /// Scroll by `delta` lines, clamped to the content: a view never shows a
-    /// negative offset nor scrolls past the end (delta may overshoot either
-    /// way on purpose — callers pass raw key steps).
+    /// Scroll by `delta` lines, clamped to the content (see
+    /// [`clamp_scroll`]): the panel never shows a negative offset nor
+    /// scrolls past the end.
     pub fn scroll_lines(&mut self, delta: i64, total_lines: usize, visible: usize) {
-        let max = total_lines.saturating_sub(visible);
-        self.scroll = (self.scroll as i64 + delta).clamp(0, max as i64) as usize;
+        self.scroll = clamp_scroll(self.scroll, delta, total_lines, visible);
     }
 
     /// Elapsed milliseconds since the run began, or `None` before any run.
@@ -169,6 +179,202 @@ impl AgentState {
             AgentStatus::Completed => "completed",
             AgentStatus::Failed => "failed",
             AgentStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+// --- Proposal surface (M6 slice 4) ------------------------------------------
+
+/// Lifecycle of the proposal the workspace is working on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeStatus {
+    Idle,
+    /// `scene_edit` is running on a worker thread.
+    Running,
+    /// Proposal persisted, ready for review (apply/reject enabled).
+    Ready,
+    /// Applied to the canonical file through the core (confirmed twice).
+    Applied,
+    /// Rejected: the record says so, no canonical file was touched.
+    Rejected,
+    Failed,
+    Cancelled,
+}
+
+/// What the proposal worker thread sends back: the task output plus the
+/// diff rows pre-rendered from the persisted record (so the UI never
+/// recomputes diffs and the panel shows exactly what would be applied).
+pub struct ProposeResult {
+    pub output: TaskOutput,
+    pub diff_rows: Vec<(char, String)>,
+}
+
+/// Messages flowing from the proposal worker thread into the view state.
+pub enum ProposeMessage {
+    Event(TaskEvent),
+    Done(Result<ProposeResult, AgentError>),
+}
+
+/// Panel-visible state of the proposal flow.
+#[derive(Debug)]
+pub struct ProposeView {
+    pub status: ProposeStatus,
+    pub instruction: String,
+    pub scene_number: usize,
+    /// Persisted proposal id (empty until `ProposalCreated`/`Done`).
+    pub id: String,
+    pub target: String,
+    pub hunks: usize,
+    /// Unified-diff-style rows: ('-', removed), ('+', added), ('#', header).
+    pub diff_rows: Vec<(char, String)>,
+    pub stage: String,
+    pub summary: String,
+    pub error: String,
+    /// Two-step apply confirmation: the first cmd-shift-enter arms, the
+    /// second one applies (writing the canonical file is never one keystroke).
+    pub armed_apply: bool,
+    pub scroll: usize,
+    pub started: Option<Instant>,
+}
+
+impl ProposeView {
+    pub fn new() -> Self {
+        Self {
+            status: ProposeStatus::Idle,
+            instruction: String::new(),
+            scene_number: 0,
+            id: String::new(),
+            target: String::new(),
+            hunks: 0,
+            diff_rows: Vec::new(),
+            stage: String::new(),
+            summary: String::new(),
+            error: String::new(),
+            armed_apply: false,
+            scroll: 0,
+            started: None,
+        }
+    }
+
+    /// Test-only convenience: the binary matches on `status` directly.
+    #[cfg(test)]
+    pub fn is_running(&self) -> bool {
+        self.status == ProposeStatus::Running
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.status != ProposeStatus::Idle
+    }
+
+    /// Whether apply is offered (a reviewable proposal, not yet decided).
+    pub fn can_apply(&self) -> bool {
+        self.status == ProposeStatus::Ready
+    }
+
+    /// Start a new run: everything from the previous proposal is cleared.
+    pub fn begin(&mut self, scene_number: usize, instruction: String) {
+        self.status = ProposeStatus::Running;
+        self.instruction = instruction;
+        self.scene_number = scene_number;
+        self.id = String::new();
+        self.target = String::new();
+        self.hunks = 0;
+        self.diff_rows = Vec::new();
+        self.stage = String::new();
+        self.summary = String::new();
+        self.error = String::new();
+        self.armed_apply = false;
+        self.scroll = 0;
+        self.started = Some(Instant::now());
+    }
+
+    /// Fold one message into the view state.
+    pub fn apply(&mut self, message: ProposeMessage) {
+        match message {
+            ProposeMessage::Event(event) => match event {
+                TaskEvent::Started { .. } => self.stage = "tarea iniciada".to_string(),
+                TaskEvent::Progress { stage, detail } => {
+                    self.stage = format!("{stage}: {detail}");
+                }
+                TaskEvent::ModelResponded {
+                    model,
+                    output_chars,
+                } => {
+                    self.stage = format!("respondió {model} ({output_chars} caracteres)");
+                }
+                TaskEvent::ProposalCreated { id, target, hunks } => {
+                    self.id = id;
+                    self.target = target;
+                    self.hunks = hunks;
+                    self.stage = "propuesta creada (grabada en .narra/proposals)".to_string();
+                }
+                TaskEvent::Completed { summary } => self.summary = summary,
+                TaskEvent::Failed { error } => {
+                    self.status = ProposeStatus::Failed;
+                    self.error = error;
+                    self.stage.clear();
+                }
+                TaskEvent::Cancelled => {
+                    self.status = ProposeStatus::Cancelled;
+                    self.error = "propuesta cancelada".to_string();
+                    self.stage.clear();
+                }
+                // Reviews don't create proposals and the tool loop isn't
+                // wired into this surface: nothing else belongs here.
+                TaskEvent::ContextCollected { .. }
+                | TaskEvent::ModelDelta { .. }
+                | TaskEvent::ToolExecuted { .. } => {}
+            },
+            ProposeMessage::Done(result) => match result {
+                Ok(result) => {
+                    self.status = ProposeStatus::Ready;
+                    if self.id.is_empty()
+                        && let Some(id) = result.output.data["proposal_id"].as_str()
+                    {
+                        self.id = id.to_string();
+                    }
+                    if self.target.is_empty()
+                        && let Some(target) = result.output.data["target"].as_str()
+                    {
+                        self.target = target.to_string();
+                    }
+                    if self.hunks == 0 {
+                        self.hunks = result.output.data["hunks"].as_u64().unwrap_or(0) as usize;
+                    }
+                    self.diff_rows = result.diff_rows;
+                    if !result.output.summary.is_empty() {
+                        self.summary = result.output.summary;
+                    }
+                    self.stage.clear();
+                }
+                Err(AgentError::Cancelled) => {
+                    self.status = ProposeStatus::Cancelled;
+                    self.error = "propuesta cancelada".to_string();
+                    self.stage.clear();
+                }
+                Err(error) => {
+                    self.status = ProposeStatus::Failed;
+                    self.error = error.to_string();
+                    self.stage.clear();
+                }
+            },
+        }
+    }
+
+    pub fn scroll_lines(&mut self, delta: i64, total_lines: usize, visible: usize) {
+        self.scroll = clamp_scroll(self.scroll, delta, total_lines, visible);
+    }
+
+    /// Stable machine-readable status for the dump.
+    pub fn status_key(&self) -> &'static str {
+        match self.status {
+            ProposeStatus::Idle => "idle",
+            ProposeStatus::Running => "running",
+            ProposeStatus::Ready => "ready",
+            ProposeStatus::Applied => "applied",
+            ProposeStatus::Rejected => "rejected",
+            ProposeStatus::Failed => "failed",
+            ProposeStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -291,5 +497,87 @@ mod tests {
         state.apply(AgentMessage::Done(Ok(task_output("r"))));
         assert_eq!(state.sources.len(), 1);
         assert_eq!(state.sources[0].location, "screenplay/main.fountain:L1-L3");
+    }
+
+    // --- Proposal surface (M6 slice 4) ------------------------------------
+
+    fn propose_result(diff_rows: Vec<(char, String)>) -> ProposeResult {
+        ProposeResult {
+            output: TaskOutput {
+                exit: TaskExit::Success,
+                summary: "Propuesta ab12 lista".to_string(),
+                data: serde_json::json!({
+                    "proposal_id": "abcd-1234",
+                    "target": "screenplay/main.fountain",
+                    "hunks": 1,
+                }),
+                sources: Vec::new(),
+            },
+            diff_rows,
+        }
+    }
+
+    #[test]
+    fn proposal_flow_reaches_ready_with_diff_and_record_data() {
+        let mut view = ProposeView::new();
+        view.begin(2, "haz el diálogo más tenso".to_string());
+        assert_eq!(view.status, ProposeStatus::Running);
+        assert_eq!(view.scene_number, 2);
+        assert_eq!(view.instruction, "haz el diálogo más tenso");
+
+        view.apply(ProposeMessage::Event(TaskEvent::ProposalCreated {
+            id: "abcd-1234".to_string(),
+            target: "screenplay/main.fountain".to_string(),
+            hunks: 1,
+        }));
+        assert!(view.is_running());
+        assert_eq!(view.id, "abcd-1234", "id known before the task ends");
+
+        let rows = vec![('#', "@@ L1 @@".to_string()), ('-', "viejo".to_string())];
+        view.apply(ProposeMessage::Done(Ok(propose_result(rows.clone()))));
+        assert_eq!(view.status, ProposeStatus::Ready);
+        assert_eq!(view.id, "abcd-1234");
+        assert_eq!(view.target, "screenplay/main.fountain");
+        assert_eq!(view.hunks, 1);
+        assert_eq!(view.diff_rows, rows);
+        assert!(view.can_apply());
+        assert!(!view.armed_apply, "apply is never armed implicitly");
+        assert!(view.stage.is_empty());
+    }
+
+    #[test]
+    fn proposal_cancelled_and_failed_are_distinct() {
+        let mut view = ProposeView::new();
+        view.begin(1, "x".to_string());
+        view.apply(ProposeMessage::Done(Err(AgentError::Cancelled)));
+        assert_eq!(view.status, ProposeStatus::Cancelled);
+
+        view.begin(1, "x".to_string());
+        view.apply(ProposeMessage::Done(Err(AgentError::Adapter(
+            "sin modelo".into(),
+        ))));
+        assert_eq!(view.status, ProposeStatus::Failed);
+        assert!(view.error.contains("sin modelo"), "{}", view.error);
+        assert!(!view.can_apply(), "a failed run cannot be applied");
+    }
+
+    #[test]
+    fn begin_clears_the_previous_proposal() {
+        let mut view = ProposeView::new();
+        view.begin(1, "primera".to_string());
+        view.apply(ProposeMessage::Done(Ok(propose_result(vec![(
+            '+',
+            "n".into(),
+        )]))));
+        view.armed_apply = true;
+        view.scroll = 3;
+
+        view.begin(4, "segunda".to_string());
+        assert_eq!(view.status, ProposeStatus::Running);
+        assert!(view.id.is_empty());
+        assert!(view.diff_rows.is_empty());
+        assert!(!view.armed_apply);
+        assert_eq!(view.scroll, 0);
+        assert_eq!(view.instruction, "segunda");
     }
 }

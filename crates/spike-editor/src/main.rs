@@ -74,7 +74,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use agent_view::{AgentMessage, AgentState, AgentStatus};
+use agent_view::{
+    AgentMessage, AgentState, AgentStatus, ProposeMessage, ProposeResult, ProposeStatus,
+    ProposeView,
+};
 use buffer::{Buffer, Position};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
@@ -84,7 +87,7 @@ use gpui::{
 };
 use narra_core::agent::{
     AgentError, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter,
-    OpenAiCompatConfig, SceneReviewTask, TaskOptions,
+    OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, proposal,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::{DocumentError, Project, ProjectError, open_project};
@@ -135,6 +138,10 @@ actions!(
         CancelReview,
         ReviewScrollUp,
         ReviewScrollDown,
+        // proposals (M6 slice 4)
+        OpenPropose,
+        ApplyProposal,
+        RejectProposal,
     ]
 );
 
@@ -236,6 +243,15 @@ struct DiffRow {
     text: String,
 }
 
+/// Instruction bar for proposal requests (M6 slice 4). Same single-focus
+/// spike compromise as the find bar: while open, keystrokes route here —
+/// enter submits the instruction, escape closes the bar.
+#[derive(Debug, Default)]
+struct ProposeBar {
+    open: bool,
+    instruction: String,
+}
+
 /// Diff view state (slice 3, M1-3b). The base is a snapshot of the file as
 /// loaded, so the diff stays meaningful while the buffer keeps changing —
 /// the same model the M4 proposal surface needs (canonical file vs. edited
@@ -270,6 +286,34 @@ fn scene_number_at(scene_lines: &[usize], caret_line: usize) -> Option<usize> {
         .iter()
         .rposition(|line| *line <= caret_line)
         .map(|ix| ix + 1)
+}
+
+/// First 8 characters of a proposal id, for display (character-safe; never
+/// panics on short ids).
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Diff rows for the proposal panel: one header per hunk, then removed and
+/// added lines (labels '-', '+', '#'). Pre-rendered once from the persisted
+/// record — the panel shows exactly what apply would write.
+fn diff_rows_from_hunks(hunks: &[proposal::Hunk]) -> Vec<(char, String)> {
+    let mut rows = Vec::new();
+    for (ix, hunk) in hunks.iter().enumerate() {
+        rows.push((
+            '#',
+            format!(
+                "@@ hunk {} · L{} · -{} +{} @@",
+                ix + 1,
+                hunk.old_start + 1,
+                hunk.removed.len(),
+                hunk.added.len()
+            ),
+        ));
+        rows.extend(hunk.removed.iter().map(|line| ('-', line.clone())));
+        rows.extend(hunk.added.iter().map(|line| ('+', line.clone())));
+    }
+    rows
 }
 
 fn is_character_cue(line: &str) -> bool {
@@ -687,10 +731,15 @@ struct Editor {
     notice: Option<String>,
     /// Agent review panel state (M6 slice 3). Pure reducer — see agent_view.
     agent: AgentState,
-    /// Cancellation token for the in-flight review (None when no run active).
+    /// Cancellation token for the in-flight agent task (review or propose;
+    /// one at a time, so cancellation stays unambiguous).
     agent_cancel: Option<CancellationToken>,
-    /// Adapter settings for ⌘R reviews (from the `--agent-*` flags).
+    /// Adapter settings for agent tasks (from the `--agent-*` flags).
     agent_settings: AgentSettings,
+    /// Proposal surface state (M6 slice 4). Pure reducer — see agent_view.
+    propose: ProposeView,
+    /// Instruction bar for ⌘P (M6 slice 4).
+    propose_bar: ProposeBar,
 }
 
 impl Focusable for Editor {
@@ -1326,6 +1375,15 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.propose_bar.open {
+            // Grapheme-aware erase, same standard as the find field.
+            if let Some(last) = self.propose_bar.instruction.chars().last() {
+                let len = self.propose_bar.instruction.len();
+                self.propose_bar.instruction.truncate(len - last.len_utf8());
+            }
+            cx.notify();
+            return;
+        }
         if self.selected.is_empty() {
             let caret = self.caret();
             let previous = self.buffer.prev_boundary(caret);
@@ -1372,6 +1430,12 @@ impl Editor {
                     self.next_match(cx);
                 }
             }
+            return;
+        }
+        // While the instruction bar owns keystrokes, enter submits the
+        // proposal (M6 slice 4).
+        if self.propose_bar.open {
+            self.submit_proposal(cx);
             return;
         }
         let caret = self.caret();
@@ -1746,8 +1810,14 @@ impl Editor {
     }
 
     fn on_close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+        // Escape closes whichever bar owns the keystrokes (single bar model:
+        // find and the instruction bar are never open at the same time).
         if self.find.open {
             self.close_find(cx);
+        } else if self.propose_bar.open {
+            self.propose_bar.open = false;
+            self.propose_bar.instruction.clear();
+            cx.notify();
         }
     }
 
@@ -1926,16 +1996,14 @@ impl Editor {
         cx.notify();
     }
 
-    /// ⌘R: review the scene under the caret, grounded in project material
-    /// (M6 slice 3). The core task runs on a worker thread; the panel shows
-    /// progress, the context sources it read, and the result. Read-only: the
-    /// task never writes, and it reviews the *saved* file — an unsaved
-    /// buffer is refused with an explicit notice instead of being reviewed
-    /// at the wrong version.
-    fn on_review_scene(&mut self, _: &ReviewScene, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent.is_running() {
-            self.notice = Some("ya hay una revisión en curso (⌘. la cancela)".to_string());
-            return;
+    /// Common preamble for agent tasks (M6 slice 3/4): refuse while another
+    /// task runs, resolve the project/screenplay/clean-buffer/caret-scene
+    /// gates, and arm the shared cancellation token. Returns the inputs both
+    /// tasks need, or `None` after setting an explicit notice.
+    fn agent_task_gates(&mut self) -> Option<(String, usize, AgentSettings, CancellationToken)> {
+        if self.agent_cancel.is_some() {
+            self.notice = Some("ya hay una tarea de agente en curso (⌘. la cancela)".to_string());
+            return None;
         }
         // Own the two strings we need so the borrow of `self.project` ends
         // before any mutation below (borrow-checker friendly shape).
@@ -1947,34 +2015,78 @@ impl Editor {
         });
         let Some((root, screenplay)) = project_info else {
             self.notice = Some("modo fixture: sin proyecto abierto (usa --project)".to_string());
-            return;
+            return None;
         };
         if self.doc_path != screenplay {
-            self.notice = Some(format!("abre {screenplay} para revisar una escena"));
-            return;
+            self.notice = Some(format!("abre {screenplay} para trabajar sobre una escena"));
+            return None;
         }
         if self.dirty() {
-            self.notice =
-                Some("cambios sin guardar: la revisión lee el archivo en disco (⌘S)".to_string());
-            return;
+            self.notice = Some(
+                "cambios sin guardar: las tareas de agente leen el archivo en disco (⌘S)"
+                    .to_string(),
+            );
+            return None;
         }
         self.refresh_scenes();
         let caret_line = self.buffer.position_at(self.caret()).line;
         let Some(scene_number) = scene_number_at(&self.scene_lines, caret_line) else {
             self.notice = Some("el caret no está dentro de una escena".to_string());
-            return;
+            return None;
         };
-
         let settings = self.agent_settings.clone();
         let cancel = CancellationToken::new();
         self.agent_cancel = Some(cancel.clone());
+        Some((root, scene_number, settings, cancel))
+    }
+
+    /// Pump task messages into the entity on a short timer: progress stays
+    /// observable, the UI thread never blocks, and `apply` reports whether
+    /// the final message arrived (or the entity/window went away).
+    fn spawn_message_pump<A: 'static>(
+        cx: &mut Context<Self>,
+        rx: mpsc::Receiver<A>,
+        mut apply: impl FnMut(&mut Self, A) -> bool + 'static,
+    ) {
+        cx.spawn(async move |view, cx| {
+            loop {
+                loop {
+                    match rx.try_recv() {
+                        Ok(message) => {
+                            // Entity dropped (window closed) → stop pumping.
+                            let done = view
+                                .update(cx, |view, _| apply(view, message))
+                                .unwrap_or(true);
+                            if done {
+                                return;
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        // The worker died without a final message: stop the
+                        // pump instead of spinning forever.
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+                Timer::after(Duration::from_millis(33)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// ⌘R: review the scene under the caret, grounded in project material
+    /// (M6 slice 3). The core task runs on a worker thread; the panel shows
+    /// progress, the context sources it read, and the result. Read-only: the
+    /// task never writes, and it reviews the *saved* file — an unsaved
+    /// buffer is refused with an explicit notice instead of being reviewed
+    /// at the wrong version.
+    fn on_review_scene(&mut self, _: &ReviewScene, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((root, scene_number, settings, cancel)) = self.agent_task_gates() else {
+            return;
+        };
         self.agent.begin(scene_number);
         self.notice = Some(format!("revisión de la escena {scene_number} en curso"));
         cx.notify();
 
-        // Worker thread (`AGENTS.md`: never block the UI thread with model
-        // calls) plus a timer pump that folds the task's messages into the
-        // entity, so progress stays observable and the task stays cancellable.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let options = TaskOptions {
@@ -1992,33 +2104,11 @@ impl Editor {
             };
             let _ = tx.send(AgentMessage::Done(result));
         });
-        cx.spawn(async move |view, cx| {
-            loop {
-                loop {
-                    match rx.try_recv() {
-                        Ok(message) => {
-                            let done = matches!(message, AgentMessage::Done(_));
-                            // The entity is gone (window closed): stop pumping.
-                            if view
-                                .update(cx, |view, _| view.apply_agent_message(message, done))
-                                .is_err()
-                            {
-                                return;
-                            }
-                            if done {
-                                return;
-                            }
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        // The worker died without a final message: stop the
-                        // pump instead of spinning forever.
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                    }
-                }
-                Timer::after(Duration::from_millis(33)).await;
-            }
-        })
-        .detach();
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let done = matches!(message, AgentMessage::Done(_));
+            view.apply_agent_message(message, done);
+            done
+        });
     }
 
     /// Fold one agent message into the panel state; when the task ends, keep
@@ -2036,6 +2126,224 @@ impl Editor {
                 AgentStatus::Running | AgentStatus::Idle => String::new(),
             });
         }
+    }
+
+    /// ⌘P submit: run `scene_edit` for the caret's scene with the typed
+    /// instruction on a worker thread (same pump as the review). On success
+    /// the worker also loads the persisted record and pre-renders its hunks,
+    /// so the panel shows exactly what apply would write.
+    fn run_propose_task(&mut self, instruction: String, cx: &mut Context<Self>) {
+        let Some((root, scene_number, settings, cancel)) = self.agent_task_gates() else {
+            return;
+        };
+        self.propose.begin(scene_number, instruction.clone());
+        self.notice = Some(format!("propuesta para la escena {scene_number} en curso"));
+        cx.notify();
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = TaskOptions {
+                timeout: AGENT_TIMEOUT,
+                cancel,
+                stream: false,
+            };
+            let result = match settings.build_adapter() {
+                Ok(adapter) => {
+                    let run = SceneEditTask::new(root.clone(), scene_number, instruction).run(
+                        &*adapter,
+                        &options,
+                        |event| {
+                            let _ = tx.send(ProposeMessage::Event(event));
+                        },
+                    );
+                    match run {
+                        Ok(output) => {
+                            // Read back the persisted record and pre-render
+                            // its hunks: the panel shows the stored proposal,
+                            // not a recomputation.
+                            let diff_rows = output.data["proposal_id"]
+                                .as_str()
+                                .and_then(|id| proposal::load(Path::new(&root), id).ok())
+                                .map(|record| diff_rows_from_hunks(&record.hunks))
+                                .unwrap_or_default();
+                            Ok(ProposeResult { output, diff_rows })
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(AgentError::Adapter(error)),
+            };
+            let _ = tx.send(ProposeMessage::Done(result));
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let done = matches!(message, ProposeMessage::Done(_));
+            view.apply_propose_message(message, done);
+            done
+        });
+    }
+
+    /// Fold one proposal message into the view state; when the task ends,
+    /// keep the notice bar in sync with the outcome.
+    fn apply_propose_message(&mut self, message: ProposeMessage, done: bool) {
+        self.propose.apply(message);
+        if done {
+            self.agent_cancel = None;
+            self.notice = Some(match self.propose.status {
+                ProposeStatus::Ready => format!(
+                    "propuesta {} lista (⌘⇧Enter aplica · ⌘⌫ descarta)",
+                    short_id(&self.propose.id)
+                ),
+                ProposeStatus::Cancelled => "propuesta cancelada".to_string(),
+                ProposeStatus::Failed => format!("propuesta fallida: {}", self.propose.error),
+                ProposeStatus::Running | ProposeStatus::Idle => String::new(),
+                ProposeStatus::Applied | ProposeStatus::Rejected => {
+                    format!("propuesta {}", self.propose.status_key())
+                }
+            });
+        }
+    }
+
+    /// ⌘P: toggle the instruction bar (proposal for the caret's scene). The
+    /// bar borrows the single focus (spike compromise): the find bar closes
+    /// when it opens and vice versa.
+    fn on_open_propose(&mut self, _: &OpenPropose, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open {
+            self.close_find(cx);
+        }
+        self.propose_bar.open = !self.propose_bar.open;
+        if !self.propose_bar.open {
+            self.propose_bar.instruction.clear();
+        }
+        cx.notify();
+    }
+
+    /// Enter with the instruction bar open: submit (empty = explicit no-op).
+    fn submit_proposal(&mut self, cx: &mut Context<Self>) {
+        let instruction = self.propose_bar.instruction.trim().to_string();
+        self.propose_bar.open = false;
+        self.propose_bar.instruction.clear();
+        if instruction.is_empty() {
+            self.notice = Some("instrucción vacía: propuesta no iniciada".to_string());
+            cx.notify();
+            return;
+        }
+        self.run_propose_task(instruction, cx);
+    }
+
+    /// ⌘⇧Enter: apply the ready proposal. Two-step by design: the first
+    /// press arms (writing the canonical file is never one keystroke), the
+    /// second one applies through the core (content-hash checked, atomic).
+    fn on_apply_proposal(
+        &mut self,
+        _: &ApplyProposal,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.propose.can_apply() {
+            self.notice = Some("no hay ninguna propuesta lista para aplicar".to_string());
+            cx.notify();
+            return;
+        }
+        if !self.propose.armed_apply {
+            self.propose.armed_apply = true;
+            self.notice = Some(format!(
+                "⌘⇧Enter de nuevo para aplicar {} a {} (escribe en disco) · ⌘⌫ descarta",
+                short_id(&self.propose.id),
+                self.propose.target
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(root) = self
+            .project
+            .as_ref()
+            .map(|project| project.root().to_string_lossy().into_owned())
+        else {
+            self.notice = Some("modo fixture: sin proyecto abierto".to_string());
+            cx.notify();
+            return;
+        };
+        match proposal::apply(Path::new(&root), &self.propose.id, None) {
+            Ok(outcome) => {
+                self.propose.status = ProposeStatus::Applied;
+                self.propose.armed_apply = false;
+                let applied = outcome.applied_hunks.len();
+                let target = outcome.proposal.target.clone();
+                // Reload the buffer when the applied target is the open
+                // document, so the user sees the applied result immediately.
+                let reloaded = self
+                    .project
+                    .as_ref()
+                    .filter(|_| self.doc_path == target)
+                    .map(|project| project.read_document(&self.doc_path));
+                let mut final_notice = format!("propuesta aplicada: {applied} hunk(s) en {target}");
+                match reloaded {
+                    Some(Ok(text)) => {
+                        let path = self.doc_path.clone();
+                        self.load_document(path, text);
+                    }
+                    Some(Err(error)) => {
+                        final_notice = format!("aplicado, pero no se pudo recargar: {error}");
+                    }
+                    None => {}
+                }
+                self.notice = Some(final_notice);
+            }
+            Err(error) => {
+                self.propose.armed_apply = false;
+                self.propose.status = ProposeStatus::Failed;
+                self.propose.error = error.to_string();
+                self.notice = Some(format!("no se pudo aplicar: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌘⌫: reject the proposal. The record says so; no canonical file is
+    /// touched (the core's reject contract).
+    fn on_reject_proposal(
+        &mut self,
+        _: &RejectProposal,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.propose.is_open() || self.propose.id.is_empty() {
+            self.notice = Some("no hay ninguna propuesta que descartar".to_string());
+            cx.notify();
+            return;
+        }
+        if matches!(
+            self.propose.status,
+            ProposeStatus::Applied | ProposeStatus::Rejected
+        ) {
+            self.notice = Some(format!(
+                "la propuesta ya está {}",
+                self.propose.status_key()
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(root) = self
+            .project
+            .as_ref()
+            .map(|project| project.root().to_string_lossy().into_owned())
+        else {
+            self.notice = Some("modo fixture: sin proyecto abierto".to_string());
+            cx.notify();
+            return;
+        };
+        match proposal::reject(Path::new(&root), &self.propose.id) {
+            Ok(_) => {
+                self.propose.status = ProposeStatus::Rejected;
+                self.propose.armed_apply = false;
+                self.notice = Some(format!(
+                    "propuesta {} descartada (archivo intacto)",
+                    short_id(&self.propose.id)
+                ));
+            }
+            Err(error) => self.notice = Some(format!("no se pudo descartar: {error}")),
+        }
+        cx.notify();
     }
 
     /// ⌘.: cancel the in-flight review. Cooperative: the task checks the
@@ -2062,8 +2370,14 @@ impl Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        let total = self.agent.output.lines().count();
-        self.agent.scroll_lines(-3, total, AGENT_VISIBLE_LINES);
+        // M6 slice 4: the arrows scroll whichever panel section is visible.
+        if self.propose.is_open() && !self.agent.is_open() {
+            let total = self.propose.diff_rows.len();
+            self.propose.scroll_lines(-3, total, AGENT_VISIBLE_LINES);
+        } else {
+            let total = self.agent.output.lines().count();
+            self.agent.scroll_lines(-3, total, AGENT_VISIBLE_LINES);
+        }
     }
 
     fn on_review_scroll_down(
@@ -2072,15 +2386,33 @@ impl Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        let total = self.agent.output.lines().count();
-        self.agent.scroll_lines(3, total, AGENT_VISIBLE_LINES);
+        if self.propose.is_open() && !self.agent.is_open() {
+            let total = self.propose.diff_rows.len();
+            self.propose.scroll_lines(3, total, AGENT_VISIBLE_LINES);
+        } else {
+            let total = self.agent.output.lines().count();
+            self.agent.scroll_lines(3, total, AGENT_VISIBLE_LINES);
+        }
     }
 
     /// Agent review panel (M6 slice 3): right-hand column with the run's
     /// status, the context sources the task actually read, and a scrolled
     /// window of the review text. The dump prints the full text, so headless
-    /// verification never depends on what fits on screen.
+    /// verification never depends on what fits on screen. M6 slice 4 adds a
+    /// proposal section (diff + apply/reject hints) rendered when a proposal
+    /// is active; the panel shows the proposal instead of an idle review.
     fn agent_panel(&self) -> impl IntoElement {
+        // Proposal section (M6 slice 4) takes the panel whenever a proposal
+        // flow is active; the review content shows only when a review has
+        // been run and no proposal is open.
+        if self.propose.is_open() {
+            return self.proposal_panel().into_any_element();
+        }
+        self.review_panel().into_any_element()
+    }
+
+    /// The review column (M6 slice 3), unchanged semantics.
+    fn review_panel(&self) -> impl IntoElement {
         let status_label = match self.agent.status {
             AgentStatus::Idle => "inactivo",
             AgentStatus::Running => "en curso",
@@ -2170,6 +2502,91 @@ impl Editor {
         )
     }
 
+    /// Proposal column (M6 slice 4): status, the persisted record (id,
+    /// target, hunks), a scrolled window of the pre-rendered diff and the
+    /// apply/reject hints. The diff shows the stored proposal — exactly
+    /// what ⌘⇧Enter would write — never a recomputation.
+    fn proposal_panel(&self) -> impl IntoElement {
+        let status_label = self.propose.status_key();
+        let mut panel = div()
+            .id("proposal-panel")
+            .w(px(AGENT_PANEL_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(EXPLORER_BG))
+            .border_l_1()
+            .border_color(rgb(EXPLORER_BORDER))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(DEFAULT_FG))
+                    .child(format!(
+                        "Propuesta · escena {} · {status_label}",
+                        self.propose.scene_number
+                    )),
+            );
+        if !self.propose.id.is_empty() {
+            panel = panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(format!(
+                "{} · {} · {} hunk(s)",
+                short_id(&self.propose.id),
+                self.propose.target,
+                self.propose.hunks
+            )));
+        }
+        if !self.propose.stage.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(STATUS_FG))
+                    .child(self.propose.stage.clone()),
+            );
+        }
+        for line in self
+            .propose
+            .diff_rows
+            .iter()
+            .skip(self.propose.scroll)
+            .take(AGENT_VISIBLE_LINES)
+        {
+            let (label, text) = line;
+            let color = match label {
+                '+' => 0x7ecf8f,
+                '-' => AGENT_ERR_FG,
+                _ => STATUS_FG,
+            };
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(rgb(color))
+                    .child(format!("{label}{text}")),
+            );
+        }
+        if matches!(
+            self.propose.status,
+            ProposeStatus::Failed | ProposeStatus::Cancelled
+        ) {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(AGENT_ERR_FG))
+                    .child(self.propose.error.clone()),
+            );
+        }
+        let hint = if self.propose.armed_apply {
+            "⚠︎ cmd-shift-enter APLICA (escribe en disco) · cmd-backspace descarta"
+        } else {
+            "⌘⇧Enter aplica · cmd-backspace descarta · ⌘. cancela · ⌥↑/⌥↓ desplaza"
+        };
+        panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(hint))
+    }
+
     /// Explorer panel (M6 slice 1): one row per project document. Clicking
     /// loads it (`select_doc`); the active document is highlighted to mirror
     /// `doc_path`. Long paths clip at the panel edge (status bar shows the
@@ -2244,8 +2661,31 @@ impl Editor {
             AgentStatus::Failed => " · revisión fallida".to_string(),
             AgentStatus::Cancelled => " · revisión cancelada".to_string(),
         };
+        // M6 slice 4: the proposal's lifecycle at a glance too.
+        let propose = match self.propose.status {
+            ProposeStatus::Idle => String::new(),
+            ProposeStatus::Running => {
+                format!(
+                    " · propuesta en curso (escena {})",
+                    self.propose.scene_number
+                )
+            }
+            ProposeStatus::Ready => format!(
+                " · propuesta lista ({}){}",
+                short_id(&self.propose.id),
+                if self.propose.armed_apply {
+                    " · armada"
+                } else {
+                    ""
+                }
+            ),
+            ProposeStatus::Applied => " · propuesta aplicada".to_string(),
+            ProposeStatus::Rejected => " · propuesta descartada".to_string(),
+            ProposeStatus::Failed => " · propuesta fallida".to_string(),
+            ProposeStatus::Cancelled => " · propuesta cancelada".to_string(),
+        };
         format!(
-            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}{}{}",
+            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}{}{}{}",
             document,
             caret.line + 1,
             caret.col,
@@ -2260,6 +2700,7 @@ impl Editor {
             self.probe_left,
             notice,
             agent,
+            propose,
         )
     }
 
@@ -2317,6 +2758,33 @@ impl Editor {
                     "enter siguiente · cmd-enter reemplaza · cmd-alt-enter todo · esc cierra",
                 ),
             )
+    }
+
+    /// Instruction bar (M6 slice 4): one field, the same single-focus
+    /// compromise as the find bar. Rendered above the document while open;
+    /// keystrokes are routed here by the input handler, enter submits and
+    /// escape closes the bar (never the task — cancel is ⌘.).
+    fn propose_bar(&self) -> gpui::Div {
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_2()
+            .h(px(STATUS_BAR_H))
+            .bg(rgb(FIND_BG))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .whitespace_nowrap()
+            .child(div().text_color(rgb(FIND_DIM_FG)).child("Instrucción:"))
+            .child(
+                div()
+                    .text_color(rgb(FIND_FG))
+                    .child(format!("{}▌", self.propose_bar.instruction)),
+            )
+            .child(div().text_color(rgb(FIND_DIM_FG)).child(
+                "enter propone · esc cierra · cmd-shift-enter aplica · cmd-backspace descarta",
+            ))
     }
 
     /// Render a line that has only a caret (no selection, no IME, no matches)
@@ -2627,6 +3095,48 @@ impl Editor {
             agent_elapsed_dump,
         );
 
+        // M6 slice 4: the proposal surface's full state — status, scene,
+        // instruction, record (id/target/hunks), the *entire* pre-rendered
+        // diff, arming and timing — so apply/reject flows are verified from
+        // the dump, never from a screenshot.
+        let proposal_scene_dump = if self.propose.scene_number > 0 {
+            self.propose.scene_number.to_string()
+        } else {
+            "null".to_string()
+        };
+        let proposal_elapsed_dump = self
+            .propose
+            .started
+            .map(|at| at.elapsed().as_millis() as u64)
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let proposal_diff_dump = self
+            .propose
+            .diff_rows
+            .iter()
+            .map(|(label, text)| format!("[\"{}\",\"{}\"]", label, escape_json(text)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let proposal_dump = format!(
+            "{{\"status\":\"{}\",\"scene\":{},\"instruction\":\"{}\",\"id\":\"{}\",\
+             \"target\":\"{}\",\"hunks\":{},\"armed\":{},\"scroll\":{},\
+             \"stage\":\"{}\",\"summary\":\"{}\",\"error\":\"{}\",\"diff_rows\":[{}],\
+             \"elapsed_ms\":{}}}",
+            self.propose.status_key(),
+            proposal_scene_dump,
+            escape_json(&self.propose.instruction),
+            escape_json(&self.propose.id),
+            escape_json(&self.propose.target),
+            self.propose.hunks,
+            self.propose.armed_apply,
+            self.propose.scroll,
+            escape_json(&self.propose.stage),
+            escape_json(&self.propose.summary),
+            escape_json(&self.propose.error),
+            proposal_diff_dump,
+            proposal_elapsed_dump,
+        );
+
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
@@ -2640,7 +3150,7 @@ impl Editor {
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
-                 \"agent\":{}}}"
+                 \"agent\":{},\"proposal\":{}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -2677,6 +3187,7 @@ impl Editor {
             notice_dump,
             explorer_dump,
             agent_dump,
+            proposal_dump,
         )
     }
 
@@ -2915,6 +3426,17 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
+        // Instruction bar owns keystrokes while open (M6 slice 4): the text
+        // becomes the proposal instruction, single line, control chars out.
+        if self.propose_bar.open {
+            let cleaned: String = new_text
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect();
+            self.propose_bar.instruction.push_str(&cleaned);
+            cx.notify();
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -3043,9 +3565,9 @@ impl Render for Editor {
         } else {
             0.0
         };
-        // The review panel (M6 slice 3) narrows the document area too, so
-        // wrapped rows never hide under it either.
-        let agent_w = if self.agent.is_open() {
+        // The review/proposal panel (M6 slice 3/4) narrows the document
+        // area too, so wrapped rows never hide under it either.
+        let agent_w = if self.agent.is_open() || self.propose.is_open() {
             AGENT_PANEL_W
         } else {
             0.0
@@ -3099,6 +3621,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_cancel_review))
             .on_action(cx.listener(Self::on_review_scroll_up))
             .on_action(cx.listener(Self::on_review_scroll_down))
+            // proposals (M6 slice 4)
+            .on_action(cx.listener(Self::on_open_propose))
+            .on_action(cx.listener(Self::on_apply_proposal))
+            .on_action(cx.listener(Self::on_reject_proposal))
             .child(
                 div()
                     .id("status")
@@ -3114,6 +3640,7 @@ impl Render for Editor {
                     .child(status),
             )
             .when(self.find.open, |bar| bar.child(self.find_bar()))
+            .when(self.propose_bar.open, |bar| bar.child(self.propose_bar()))
             .child(
                 div()
                     .flex_1()
@@ -3183,9 +3710,12 @@ impl Render for Editor {
                                 .size_full(),
                             ),
                     )
-                    // Review panel (M6 slice 3): right column of the body
-                    // row, visible whenever a review has been requested.
-                    .when(self.agent.is_open(), |body| body.child(self.agent_panel())),
+                    // Review/proposal panel (M6 slice 3/4): right column of
+                    // the body row, visible whenever a review or proposal
+                    // has been requested.
+                    .when(self.agent.is_open() || self.propose.is_open(), |body| {
+                        body.child(self.agent_panel())
+                    }),
             )
     }
 }
@@ -3493,6 +4023,12 @@ fn run() -> Result<(), String> {
             KeyBinding::new("cmd-.", CancelReview, None),
             KeyBinding::new("alt-up", ReviewScrollUp, None),
             KeyBinding::new("alt-down", ReviewScrollDown, None),
+            // proposals (M6 slice 4): cmd-p opens the instruction bar,
+            // cmd-shift-enter applies the ready proposal (two-step: arm,
+            // then apply), cmd-backspace rejects it.
+            KeyBinding::new("cmd-p", OpenPropose, None),
+            KeyBinding::new("cmd-shift-enter", ApplyProposal, None),
+            KeyBinding::new("cmd-backspace", RejectProposal, None),
         ]);
 
         cx.observe_keystrokes({
@@ -3528,6 +4064,8 @@ fn run() -> Result<(), String> {
             agent: AgentState::new(),
             agent_cancel: None,
             agent_settings: agent_settings.clone(),
+            propose: ProposeView::new(),
+            propose_bar: ProposeBar::default(),
             selected: 0..0,
             reversed: false,
             marked: None,
