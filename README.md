@@ -30,7 +30,7 @@ narra-desktop/
     │   │                        + OpenAI-compatible model adapter (D-018)
     │   └── src/cancel.rs       # shared cooperative cancellation
     ├── narra-harness/          # headless agent runner: JSONL events, exit codes (Spike F)
-    ├── spike-editor/           # GPUI editor spike (Milestone 1 evidence)
+    ├── narra-app/              # desktop app: writing + agent workspaces (M6)
     └── fixture-gen/            # deterministic Fountain fixture generator
 ```
 
@@ -187,7 +187,7 @@ A merge whose provider verdict is `merged: false` (e.g. the head branch
 moved) exits non-zero and surfaces the provider's message; it is never
 reinterpreted as success.
 
-### macOS build prerequisite (affects `spike-editor`)
+### macOS build prerequisite (affects `narra-app`)
 
 GPUI compiles Metal shaders at build time. If you see
 `cannot execute tool 'metal' due to missing Metal Toolchain`:

@@ -1,3 +1,10 @@
+//! narra-app — the Narra desktop application (writing and agent
+//! workspaces, M6). Formerly the `spike-editor` Spike A/B driver: the
+//! verified editing core it grew (buffer, IME, wrapping, click-to-caret)
+//! and its measurement instrumentation ship unchanged; the spike
+//! provenance and verdicts live in PERFORMANCE_BASELINES.md and
+//! TECHNICAL_SPIKES.md. Spike framing below is kept for history.
+//!
 //! Spike A — slice 2: is GPUI a viable *editing* surface?
 //!
 //! Slice 1 answered rendering/navigation; this slice adds a real editing core:
@@ -14,7 +21,7 @@
 //! placement with visual-row navigation.
 //!
 //! Modes:
-//!   spike-editor --fixture <path>                 interactive
+//!   narra-app --fixture <path>                 interactive
 //!       cmd-g / cmd-shift-g  next/previous scene
 //!       arrows, shift-arrows, home/end, cmd-a     movement and selection
 //!       cmd-z / cmd-shift-z                       undo / redo
@@ -27,21 +34,21 @@
 //!       cmd-d                                     diff view (toggle)
 //!       cmd-g / cmd-shift-g (diff open)           next/previous hunk
 //!       cmd-q                                     quit (prints the JSON report)
-//!   spike-editor --fixture <path> --steps 60      automated scroll probe (slice 1)
-//!   spike-editor --fixture <path> --find-steps 60 automated find probe (slice 3)
-//!   spike-editor --fixture <path> --diff-steps 30 automated diff probe (M1-3b)
-//!   spike-editor --report-after-ms <ms>           print the report and exit
-//!   spike-editor --dump-after-ms <ms>             print a buffer dump and exit
+//!   narra-app --fixture <path> --steps 60      automated scroll probe (slice 1)
+//!   narra-app --fixture <path> --find-steps 60 automated find probe (slice 3)
+//!   narra-app --fixture <path> --diff-steps 30 automated diff probe (M1-3b)
+//!   narra-app --report-after-ms <ms>           print the report and exit
+//!   narra-app --dump-after-ms <ms>             print a buffer dump and exit
 //!       (used by the scripted typing verification: text, enter, backspace,
 //!        selection and undo are observable without trusting a screenshot)
-//!   spike-editor --project <root>                 M6 slice 1: Narra project
+//!   narra-app --project <root>                 M6 slice 1: Narra project
 //!       (mutually exclusive with --fixture) opens a real project through
 //!       narra-core; the left panel lists its documents (hidden state like
 //!       .git/.narra excluded), clicking one loads it into the buffer, ⌘S
 //!       saves through the boundary-checked document IO, and switching
 //!       documents with unsaved changes is refused explicitly — the status
 //!       bar shows the document, a dirty marker and the last outcome.
-//!   spike-editor --project <root>                 M6 slice 3: agent review
+//!   narra-app --project <root>                 M6 slice 3: agent review
 //!       ⌘R reviews the scene under the caret grounded in project material
 //!       (scene_review task on a worker thread); the right panel shows the
 //!       run's status, the context sources read and a scrolled window of
@@ -111,7 +118,7 @@ use narra_core::{DocumentError, Project, ProjectError, open_project};
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
-    spike_editor,
+    narra_app,
     [
         // windows and navigation
         Quit,
@@ -4754,7 +4761,7 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!(
-                "uso: spike-editor [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]\n      [--agent-adapter mock|openai-compat] [--agent-model <nombre>] [--agent-base-url <url>] [--agent-latency <ms>]"
+                "uso: narra-app [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]\n      [--agent-adapter mock|openai-compat] [--agent-model <nombre>] [--agent-base-url <url>] [--agent-latency <ms>]"
             );
             ExitCode::FAILURE
         }

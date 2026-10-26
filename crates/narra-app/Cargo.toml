@@ -1,16 +1,17 @@
 [package]
-name = "spike-editor"
+name = "narra-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Spike A: native editor framework assessment (temporary, deleted after the spike)"
+description = "Narra desktop application: writing and agent workspaces (M6)"
 publish = false
 
-# Spike-only dependency (D-003 / Spike A). License: Apache-2.0, verified
-# compatible with GPL-3.0 (D-015). Candidate status: not approved for the
-# product until the spike report records a verdict in PERFORMANCE_BASELINES.md.
+# Editing framework (D-003, selected from Spike A). License: Apache-2.0,
+# verified compatible with GPL-3.0 (D-015). Candidate status: not approved
+# for the product until the spike report records a verdict in
+# PERFORMANCE_BASELINES.md.
 [dependencies]
 gpui = "0.2"
 # Application core (M6 slice 1): the shell opens and saves documents through
