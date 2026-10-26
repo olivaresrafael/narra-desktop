@@ -458,6 +458,34 @@ impl ProposeView {
     }
 }
 
+/// Which flow ⌘⌥R retries (M6 slice 8): the review or the proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryTarget {
+    Review,
+    Propose,
+}
+
+/// What ⌘⌥R re-runs given the visible flows (M6 slice 8). The proposal
+/// panel wins when it is open — the same precedence as the render — and
+/// only a failed or cancelled run is retryable; anything else (idle,
+/// running, ready, applied, rejected) needs its own action instead.
+pub fn retry_target(
+    propose_open: bool,
+    propose_status: ProposeStatus,
+    agent_status: AgentStatus,
+) -> Option<RetryTarget> {
+    if propose_open {
+        matches!(
+            propose_status,
+            ProposeStatus::Failed | ProposeStatus::Cancelled
+        )
+        .then_some(RetryTarget::Propose)
+    } else {
+        matches!(agent_status, AgentStatus::Failed | AgentStatus::Cancelled)
+            .then_some(RetryTarget::Review)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,5 +794,59 @@ mod tests {
         view.begin(2, "otra".to_string());
         assert!(view.selected.is_empty());
         assert_eq!(view.hunk_cursor, 0);
+    }
+
+    #[test]
+    fn retry_only_applies_to_failed_or_cancelled_runs() {
+        // Review flow (proposal panel closed).
+        assert_eq!(
+            retry_target(false, ProposeStatus::Idle, AgentStatus::Failed),
+            Some(RetryTarget::Review)
+        );
+        assert_eq!(
+            retry_target(false, ProposeStatus::Idle, AgentStatus::Cancelled),
+            Some(RetryTarget::Review)
+        );
+        // Completed/running/idle reviews are not retryable.
+        assert_eq!(
+            retry_target(false, ProposeStatus::Idle, AgentStatus::Completed),
+            None
+        );
+        assert_eq!(
+            retry_target(false, ProposeStatus::Idle, AgentStatus::Running),
+            None
+        );
+        assert_eq!(
+            retry_target(false, ProposeStatus::Idle, AgentStatus::Idle),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_follows_the_visible_panel_proposal_first() {
+        // Open proposal panel decides the target (render precedence), even
+        // when the review behind it failed.
+        assert_eq!(
+            retry_target(true, ProposeStatus::Failed, AgentStatus::Failed),
+            Some(RetryTarget::Propose)
+        );
+        assert_eq!(
+            retry_target(true, ProposeStatus::Cancelled, AgentStatus::Idle),
+            Some(RetryTarget::Propose)
+        );
+        // An open-but-actionable proposal (ready) is not retried, and the
+        // hidden failed review is not retried either.
+        assert_eq!(
+            retry_target(true, ProposeStatus::Ready, AgentStatus::Failed),
+            None
+        );
+        assert_eq!(
+            retry_target(true, ProposeStatus::Applied, AgentStatus::Idle),
+            None
+        );
+        assert_eq!(
+            retry_target(true, ProposeStatus::Running, AgentStatus::Idle),
+            None
+        );
     }
 }

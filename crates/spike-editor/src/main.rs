@@ -59,6 +59,9 @@
 //!       M6 slice 6 (hunk selection): ⌥←/⌥→ walk the proposal's hunks,
 //!       ⌥Enter toggles the one under the cursor and ⌘⇧Enter applies
 //!       exactly the selected subset (empty selection is refused).
+//!       M6 slice 8 (retry): ⌘⌥R re-runs the visible flow's failed or
+//!       cancelled run with its own stored inputs (same scene, focus or
+//!       instruction — never retyped).
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -85,7 +88,7 @@ use std::time::{Duration, Instant};
 
 use agent_view::{
     AgentMessage, AgentState, AgentStatus, ProposeMessage, ProposeResult, ProposeStatus,
-    ProposeView,
+    ProposeView, RetryTarget, retry_target,
 };
 use buffer::{Buffer, Position};
 use gpui::{
@@ -157,6 +160,8 @@ actions!(
         HunkPrev,
         HunkNext,
         ToggleHunk,
+        // retry (M6 slice 8)
+        RetryAgent,
     ]
 );
 
@@ -2057,11 +2062,11 @@ impl Editor {
         cx.notify();
     }
 
-    /// Common preamble for agent tasks (M6 slice 3/4): refuse while another
-    /// task runs, resolve the project/screenplay/clean-buffer/caret-scene
-    /// gates, and arm the shared cancellation token. Returns the inputs both
-    /// tasks need, or `None` after setting an explicit notice.
-    fn agent_task_gates(&mut self) -> Option<(String, usize, AgentSettings, CancellationToken)> {
+    /// Common gates for agent tasks (M6 slice 3/4/8): refuse while another
+    /// task runs, and resolve the project/screenplay/clean-buffer checks.
+    /// The caller adds its own last check and arms the shared cancellation
+    /// token, so a refused run never leaves the token registered.
+    fn agent_task_base_gates(&mut self) -> Option<(String, AgentSettings, CancellationToken)> {
         if self.agent_cancel.is_some() {
             self.notice = Some("ya hay una tarea de agente en curso (⌘. la cancela)".to_string());
             return None;
@@ -2089,14 +2094,21 @@ impl Editor {
             );
             return None;
         }
+        let settings = self.agent_settings.clone();
+        let cancel = CancellationToken::new();
+        Some((root, settings, cancel))
+    }
+
+    /// Fresh-run preamble (M6 slice 3/4): the shared gates plus the
+    /// caret-in-scene requirement; arms the cancellation token last.
+    fn agent_task_gates(&mut self) -> Option<(String, usize, AgentSettings, CancellationToken)> {
+        let (root, settings, cancel) = self.agent_task_base_gates()?;
         self.refresh_scenes();
         let caret_line = self.buffer.position_at(self.caret()).line;
         let Some(scene_number) = scene_number_at(&self.scene_lines, caret_line) else {
             self.notice = Some("el caret no está dentro de una escena".to_string());
             return None;
         };
-        let settings = self.agent_settings.clone();
-        let cancel = CancellationToken::new();
         self.agent_cancel = Some(cancel.clone());
         Some((root, scene_number, settings, cancel))
     }
@@ -2152,6 +2164,34 @@ impl Editor {
         // The committed focus (M6 slice 5): ⌘R reuses the last one; the
         // focus bar (⌘⇧R) commits a new one before running.
         let focus = self.review_focus.clone();
+        self.launch_review(root, scene_number, focus, settings, cancel, cx);
+    }
+
+    /// ⌘⌥R (M6 slice 8): re-run the failed/cancelled review with its own
+    /// stored inputs — same scene, same focus, never retyped. The shared
+    /// gates still apply (dirty buffer or a running task refuses first).
+    fn retry_review(&mut self, cx: &mut Context<Self>) {
+        let scene_number = self.agent.scene_number;
+        let focus = self.agent.focus.clone();
+        let Some((root, settings, cancel)) = self.agent_task_base_gates() else {
+            return;
+        };
+        self.agent_cancel = Some(cancel.clone());
+        self.launch_review(root, scene_number, focus, settings, cancel, cx);
+    }
+
+    /// Start a review run with explicit inputs: the caret scene + committed
+    /// focus for a fresh ⌘R, the stored ones for a ⌘⌥R retry. Resolves the
+    /// configured role, begins the panel state and spawns the worker.
+    fn launch_review(
+        &mut self,
+        root: String,
+        scene_number: usize,
+        focus: String,
+        settings: AgentSettings,
+        cancel: CancellationToken,
+        cx: &mut Context<Self>,
+    ) {
         let focus_note = if focus.is_empty() {
             String::new()
         } else {
@@ -2227,6 +2267,34 @@ impl Editor {
         let Some((root, scene_number, settings, cancel)) = self.agent_task_gates() else {
             return;
         };
+        self.launch_propose(root, scene_number, instruction, settings, cancel, cx);
+    }
+
+    /// ⌘⌥R (M6 slice 8): re-run the failed/cancelled proposal with its own
+    /// stored inputs — same scene, same instruction, never retyped. The
+    /// shared gates still apply (dirty buffer or running task refuses).
+    fn retry_propose(&mut self, cx: &mut Context<Self>) {
+        let scene_number = self.propose.scene_number;
+        let instruction = self.propose.instruction.clone();
+        let Some((root, settings, cancel)) = self.agent_task_base_gates() else {
+            return;
+        };
+        self.agent_cancel = Some(cancel.clone());
+        self.launch_propose(root, scene_number, instruction, settings, cancel, cx);
+    }
+
+    /// Start a `scene_edit` run with explicit inputs (fresh ⌘P or ⌘⌥R
+    /// retry): resolve the configured role, begin the proposal state and
+    /// spawn the worker; on success the worker loads the persisted record.
+    fn launch_propose(
+        &mut self,
+        root: String,
+        scene_number: usize,
+        instruction: String,
+        settings: AgentSettings,
+        cancel: CancellationToken,
+        cx: &mut Context<Self>,
+    ) {
         // The configured role (M6 slice 7): edits run under the writer
         // role as configured in `agents.yaml`; a broken config refuses the
         // run explicitly instead of silently changing the persona.
@@ -2285,6 +2353,25 @@ impl Editor {
             view.apply_propose_message(message, done);
             done
         });
+    }
+
+    /// ⌘⌥R (M6 slice 8): retry the visible flow's last run with its stored
+    /// inputs. Only a failed or cancelled run is retryable, and only the
+    /// flow whose panel is visible (the proposal panel wins when open —
+    /// the same rule as the render); nothing to retry says so explicitly.
+    fn on_retry_agent(&mut self, _: &RetryAgent, _window: &mut Window, cx: &mut Context<Self>) {
+        match retry_target(
+            self.propose.is_open(),
+            self.propose.status,
+            self.agent.status,
+        ) {
+            Some(RetryTarget::Propose) => self.retry_propose(cx),
+            Some(RetryTarget::Review) => self.retry_review(cx),
+            None => {
+                self.notice = Some("nada que reintentar (⌘R revisa · ⌘P propone)".to_string());
+                cx.notify();
+            }
+        }
     }
 
     /// Fold one proposal message into the view state; when the task ends,
@@ -2722,12 +2809,16 @@ impl Editor {
                     .child(self.agent.error.clone()),
             );
         }
-        panel.child(
-            div()
-                .px_2()
-                .text_color(rgb(STATUS_FG))
-                .child("⌘R revisa · ⌘. cancela · ⌥↑/⌥↓ desplaza"),
-        )
+        panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(
+            if matches!(
+                self.agent.status,
+                AgentStatus::Failed | AgentStatus::Cancelled
+            ) {
+                "⌘⌥R reintenta · ⌘R revisa de nuevo · ⌥↑/⌥↓ desplaza"
+            } else {
+                "⌘R revisa · ⌘. cancela · ⌥↑/⌥↓ desplaza"
+            },
+        ))
     }
 
     /// Proposal column (M6 slice 4): status, the persisted record (id,
@@ -2846,6 +2937,11 @@ impl Editor {
         }
         let hint = if self.propose.armed_apply {
             "⚠︎ cmd-shift-enter APLICA (escribe en disco) · cmd-backspace descarta"
+        } else if matches!(
+            self.propose.status,
+            ProposeStatus::Failed | ProposeStatus::Cancelled
+        ) {
+            "⌘⌥R reintenta · ⌘P propone otra vez · ⌘⌫ descarta"
         } else {
             "⌘⇧Enter aplica · ⌥←/⌥→ hunks · ⌥Enter alterna · ⌘⌫ descarta · ⌥↑/⌥↓ desplaza"
         };
@@ -3963,6 +4059,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_hunk_prev))
             .on_action(cx.listener(Self::on_hunk_next))
             .on_action(cx.listener(Self::on_toggle_hunk))
+            // retry (M6 slice 8)
+            .on_action(cx.listener(Self::on_retry_agent))
             .child(
                 div()
                     .id("status")
@@ -4377,6 +4475,10 @@ fn run() -> Result<(), String> {
             KeyBinding::new("alt-left", HunkPrev, None),
             KeyBinding::new("alt-right", HunkNext, None),
             KeyBinding::new("alt-enter", ToggleHunk, None),
+            // retry (M6 slice 8): cmd-alt-r re-runs the visible flow's last
+            // task with the same stored inputs (only if it failed or was
+            // cancelled).
+            KeyBinding::new("cmd-alt-r", RetryAgent, None),
         ]);
 
         cx.observe_keystrokes({
