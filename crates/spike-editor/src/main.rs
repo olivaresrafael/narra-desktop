@@ -34,6 +34,13 @@
 //!   spike-editor --dump-after-ms <ms>             print a buffer dump and exit
 //!       (used by the scripted typing verification: text, enter, backspace,
 //!        selection and undo are observable without trusting a screenshot)
+//!   spike-editor --project <root>                 M6 slice 1: Narra project
+//!       (mutually exclusive with --fixture) opens a real project through
+//!       narra-core; the left panel lists its documents (hidden state like
+//!       .git/.narra excluded), clicking one loads it into the buffer, ⌘S
+//!       saves through the boundary-checked document IO, and switching
+//!       documents with unsaved changes is refused explicitly — the status
+//!       bar shows the document, a dirty marker and the last outcome.
 //!
 //! Find bar note (spike scope): one focus handle serves both the document
 //! and the find fields — while the bar is open, text input, backspace and
@@ -50,6 +57,7 @@ use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::ops::Range;
+use std::path::Path;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -61,6 +69,7 @@ use gpui::{
     Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection, Window, WindowBounds,
     WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size,
 };
+use narra_core::{DocumentError, Project, ProjectError, open_project};
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
@@ -89,6 +98,7 @@ actions!(
         Backspace,
         DeleteText,
         InsertNewline,
+        Save,
         Undo,
         Redo,
         CopyText,
@@ -145,6 +155,13 @@ const MATCH_CURRENT_BG: u32 = 0xeab30855;
 const FIND_BG: u32 = 0x252526;
 const FIND_FG: u32 = 0xd4d4d4;
 const FIND_DIM_FG: u32 = 0x808080;
+/// Explorer panel (M6 slice 1): width and colors. The panel renders only in
+/// `--project` mode, so fixture-mode geometry — the verified spike driver —
+/// stays byte-for-byte unchanged.
+const EXPLORER_W: f32 = 220.0;
+const EXPLORER_BG: u32 = 0x252526;
+const EXPLORER_BORDER: u32 = 0x3c3c3c;
+const DOC_SELECTED_BG: u32 = 0x37373d;
 /// Diff view colors (slice 3, M1-3b): added/removed row backgrounds and the
 /// line-label gutter text.
 const DIFF_ADD_BG: u32 = 0x16321f;
@@ -605,6 +622,24 @@ struct Editor {
     /// Unified diff view (slice 3, M1-3b). While `open`, it renders instead
     /// of the buffer rows and the probe/diff navigation takes over.
     diff: DiffState,
+
+    /// Open Narra project (M6 slice 1). `None` in `--fixture` spike mode,
+    /// which keeps the verified spike surface unchanged.
+    project: Option<Project>,
+    /// Documents offered by the explorer panel (project-relative paths).
+    explorer: Vec<String>,
+    /// Document this buffer represents: project-relative path in project
+    /// mode, fixture path in spike mode. The status bar shows it.
+    doc_path: String,
+    /// File text as last loaded or saved. The dirty flag compares the edit
+    /// generation instead of scanning the document, because the status bar
+    /// reads it every frame (O(1), no per-frame allocation).
+    base_text: String,
+    /// Value of `metrics.edits` at the last load/save: `edits != saved_edits`
+    /// means the buffer diverged (every mutation path bumps `metrics.edits`).
+    saved_edits: usize,
+    /// Last user-visible outcome (save/open/blocked switch). Display only.
+    notice: Option<String>,
 }
 
 impl Focusable for Editor {
@@ -1050,14 +1085,21 @@ impl Editor {
             return self.buffer.line_content_range(line).end;
         }
         let row_start = starts[target_visual_row];
-        let row_end = starts.get(target_visual_row + 1).copied().unwrap_or(text.len());
+        let row_end = starts
+            .get(target_visual_row + 1)
+            .copied()
+            .unwrap_or(text.len());
         let row_text = &text[row_start..row_end];
         // Find the byte offset within the visual row that corresponds to caret_x
         let shaped = shape_line(window, row_text);
         let glyphs: Vec<(usize, f32)> = shaped
             .runs
             .iter()
-            .flat_map(|run| run.glyphs.iter().map(|g| (g.index, f32::from(g.position.x))))
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(|g| (g.index, f32::from(g.position.x)))
+            })
             .collect();
         // caret_x is relative to the visual row start; we need absolute x
         let row_start_x = glyphs.first().map(|(_, x)| *x).unwrap_or(0.0);
@@ -1069,13 +1111,14 @@ impl Editor {
             .map(|(ix, _)| *ix)
             .unwrap_or(row_text.len())
             .min(row_text.len());
-        (self.buffer.line_content_range(line).start + starts[target_visual_row] + col).min(self.buffer.doc_len())
+        (self.buffer.line_content_range(line).start + starts[target_visual_row] + col)
+            .min(self.buffer.doc_len())
     }
 
     fn move_vert(&mut self, delta: i64, extend: bool, window: &Window) {
         let caret = self.caret();
         let (visual_row, total_visual_rows, caret_x) = self.caret_visual_info(window, caret);
-        
+
         // If on a wrapped line (multiple visual rows), navigate visual rows first
         if total_visual_rows > 1 {
             if delta < 0 {
@@ -1712,13 +1755,190 @@ impl Editor {
         }
     }
 
+    // ---- project workspace (M6 slice 1) ----------------------------------
+
+    /// Full buffer text. Round-trips what was loaded: `Buffer::new` splits
+    /// on `\n` and `slice(0..doc_len)` joins the same lines back.
+    fn full_text(&self) -> String {
+        self.buffer.slice(0..self.buffer.doc_len())
+    }
+
+    /// True when the buffer diverged from the last loaded/saved text.
+    /// Generation-based (O(1)): every mutation path bumps `metrics.edits`.
+    fn dirty(&self) -> bool {
+        self.metrics.borrow().edits != self.saved_edits
+    }
+
+    /// Replace the buffer with a freshly loaded document, resetting all
+    /// per-document state (selection, undo, find, diff, scene cache). Scroll
+    /// starts at the top: this is an explicit document switch, not a jump the
+    /// user must recover from. `base_text` becomes the new diff/save base.
+    fn load_document(&mut self, path: String, text: String) {
+        self.buffer = Buffer::new(&text);
+        self.base_text = text.clone();
+        self.doc_path = path;
+        self.selected = 0..0;
+        self.reversed = false;
+        self.marked = None;
+        self.composing = false;
+        self.last_click = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.scene_lines.clear();
+        self.scenes_dirty = true;
+        self.current_scene = 0;
+        self.list_state = ListState::new(
+            self.buffer.line_count(),
+            ListAlignment::Top,
+            px(LINE_HEIGHT * 2.0),
+        );
+        self.find = FindState::default();
+        self.diff = DiffState {
+            base_lines: text.split('\n').map(str::to_string).collect(),
+            ..DiffState::default()
+        };
+        self.diff_list_state = ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0));
+        self.saved_edits = self.metrics.borrow().edits;
+        self.notice = None;
+    }
+
+    /// Explorer click: load the selected document. Unsaved changes block the
+    /// switch explicitly (save with ⌘S first) — editor state is never dropped
+    /// silently, which is the M6 acceptance rule.
+    fn select_doc(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let Some(path) = self.explorer.get(ix).cloned() else {
+            return;
+        };
+        if path == self.doc_path {
+            return;
+        }
+        if self.dirty() {
+            self.notice = Some(
+                "cambios sin guardar: guarda con ⌘S antes de cambiar de documento".to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        match project.read_document(&path) {
+            Ok(text) => {
+                self.load_document(path, text);
+                // A click re-targets typing (and IME composition) at the buffer.
+                window.focus(&self.focus_handle(cx));
+            }
+            Err(error) => self.notice = Some(format!("no se pudo abrir {path}: {error}")),
+        }
+        cx.notify();
+    }
+
+    /// ⌘S: write the buffer through the boundary-checked project IO. The
+    /// canonical file changes only here, on an explicit save — never by an
+    /// agent action and never as a side effect of switching documents.
+    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            self.notice = Some("modo fixture: no hay proyecto abierto (usa --project)".to_string());
+            cx.notify();
+            return;
+        };
+        let text = self.full_text();
+        let edits = self.metrics.borrow().edits;
+        if text == self.base_text {
+            // Converged back (e.g. undo to the original): clear the dirty
+            // flag without touching the file.
+            self.saved_edits = edits;
+            self.notice = Some("sin cambios que guardar".to_string());
+            cx.notify();
+            return;
+        }
+        match project.write_document(&self.doc_path, &text) {
+            Ok(()) => {
+                self.base_text = text.clone();
+                self.saved_edits = edits;
+                // The saved file becomes the diff base (same model as the M4
+                // proposal surface: canonical file vs. edited buffer).
+                self.diff.base_lines = text.split('\n').map(str::to_string).collect();
+                if self.diff.open {
+                    // Recompute and resize the rows list in one step.
+                    self.open_diff(cx);
+                } else {
+                    // Keep the dump honest; opening the diff rebuilds rows.
+                    self.recompute_diff();
+                }
+                self.notice = Some(format!("guardado: {}", self.doc_path));
+            }
+            Err(error) => {
+                self.notice = Some(format!("error al guardar {}: {error}", self.doc_path));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Explorer panel (M6 slice 1): one row per project document. Clicking
+    /// loads it (`select_doc`); the active document is highlighted to mirror
+    /// `doc_path`. Long paths clip at the panel edge (status bar shows the
+    /// full path).
+    fn explorer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self
+            .project
+            .as_ref()
+            .map(|project| project.manifest().title.clone())
+            .unwrap_or_default();
+        let mut panel = div()
+            .id("explorer")
+            .w(px(EXPLORER_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(EXPLORER_BG))
+            .border_r_1()
+            .border_color(rgb(EXPLORER_BORDER))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgb(STATUS_FG))
+                    .child(title),
+            );
+        for (ix, path) in self.explorer.iter().enumerate() {
+            let selected = *path == self.doc_path;
+            panel = panel.child(
+                div()
+                    .id(("doc", ix))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .cursor_pointer()
+                    .child(path.clone())
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.select_doc(ix, window, cx)),
+                    ),
+            );
+        }
+        panel
+    }
+
     fn status_text(&self) -> String {
         let metrics = self.metrics.borrow();
         let (_, p50, p95, max) = Metrics::stats(&metrics.frame_gaps_ms);
         let caret = self.buffer.position_at(self.caret());
+        // M6 slice 1: show the document (not just the run's fixture path) with
+        // a dirty marker, plus the last outcome (save/open/blocked switch).
+        let document = format!("{}{}", self.doc_path, if self.dirty() { " •" } else { "" });
+        let notice = self
+            .notice
+            .as_ref()
+            .map(|text| format!(" · {text}"))
+            .unwrap_or_default();
         format!(
-            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}",
-            metrics.fixture,
+            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}{}",
+            document,
             caret.line + 1,
             caret.col,
             metrics.edits,
@@ -1730,6 +1950,7 @@ impl Editor {
             p95,
             max,
             self.probe_left,
+            notice,
         )
     }
 
@@ -1789,7 +2010,6 @@ impl Editor {
             )
     }
 
-
     /// Render a line that has only a caret (no selection, no IME, no matches)
     /// with soft-wrapping, placing the caret on the correct visual row.
     /// Returns a flex column where each visual row is a flex child; the row
@@ -1825,8 +2045,12 @@ impl Editor {
                 // We render as: text before caret | cursor | text after caret.
                 // For simplicity, we place cursor at the x offset using a
                 // zero-width element with margin-left.
-                let before = &segment_text[..caret_col.saturating_sub(starts[visual_row]).min(segment_text.len())];
-                let after = &segment_text[caret_col.saturating_sub(starts[visual_row]).min(segment_text.len())..];
+                let before = &segment_text[..caret_col
+                    .saturating_sub(starts[visual_row])
+                    .min(segment_text.len())];
+                let after = &segment_text[caret_col
+                    .saturating_sub(starts[visual_row])
+                    .min(segment_text.len())..];
                 if !before.is_empty() {
                     row_div = row_div.child(before.to_string());
                 }
@@ -2037,6 +2261,21 @@ impl Editor {
             .map(|o| o.to_string())
             .unwrap_or("null".to_string());
 
+        // M6 slice 1: which document the buffer represents, whether it
+        // diverged from the last load/save, the last user-visible outcome
+        // (save/open/blocked switch) and the explorer's document list — all
+        // observable in the dump without trusting a screenshot.
+        let notice_dump = match &self.notice {
+            Some(text) => format!("\"{}\"", escape_json(text)),
+            None => "null".to_string(),
+        };
+        let explorer_dump = self
+            .explorer
+            .iter()
+            .map(|path| format!("\"{}\"", escape_json(path)))
+            .collect::<Vec<_>>()
+            .join(",");
+
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
@@ -2048,7 +2287,8 @@ impl Editor {
                 "\"diff\":{{\"open\":{},\"lines\":{},\"added\":{},",
                 "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}},",
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
-                "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}}}}"
+                "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
+                "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}]}}"
             ),
             self.buffer.line_count(),
             len,
@@ -2080,6 +2320,10 @@ impl Editor {
             click_top_dump,
             click_h_dump,
             click_offset_dump,
+            escape_json(&self.doc_path),
+            self.dirty(),
+            notice_dump,
+            explorer_dump,
         )
     }
 
@@ -2204,7 +2448,11 @@ fn visual_row_starts(window: &Window, line: &str, wrap_width: f32) -> Vec<usize>
     let glyphs: Vec<(usize, f32)> = shaped
         .runs
         .iter()
-        .flat_map(|run| run.glyphs.iter().map(|g| (g.index, f32::from(g.position.x))))
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|g| (g.index, f32::from(g.position.x)))
+        })
         .collect();
     wrap_row_starts(&glyphs, wrap_width)
 }
@@ -2228,7 +2476,11 @@ fn caret_visual_row_and_x(
     let glyphs: Vec<(usize, f32)> = shaped
         .runs
         .iter()
-        .flat_map(|run| run.glyphs.iter().map(|g| (g.index, f32::from(g.position.x))))
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|g| (g.index, f32::from(g.position.x)))
+        })
         .collect();
     let row_start_x = glyphs
         .iter()
@@ -2241,7 +2493,16 @@ fn caret_visual_row_and_x(
         .map(|(_, x)| *x)
         .unwrap_or_else(|| {
             // Past end: use line width
-            shaped.runs.last().map(|r| r.glyphs.last().map(|g| f32::from(g.position.x)).unwrap_or(0.0)).unwrap_or(0.0)
+            shaped
+                .runs
+                .last()
+                .map(|r| {
+                    r.glyphs
+                        .last()
+                        .map(|g| f32::from(g.position.x))
+                        .unwrap_or(0.0)
+                })
+                .unwrap_or(0.0)
         });
     (row, caret_x - row_start_x)
 }
@@ -2421,8 +2682,16 @@ impl Render for Editor {
         self.schedule_probe_step(window, cx);
 
         // Wrap width for non-hot rows, refreshed from the viewport each frame.
-        // The `list` render callback reads it back through the entity.
-        self.wrap_width = (window.viewport_size().width - px(ROW_PADDING_X * 2.0)).max(px(200.0));
+        // The `list` render callback reads it back through the entity. With
+        // the explorer panel open (project mode) the document area is narrower
+        // by exactly the panel width, so wrapped rows never hide under it.
+        let explorer_w = if self.project.is_some() {
+            EXPLORER_W
+        } else {
+            0.0
+        };
+        self.wrap_width =
+            (window.viewport_size().width - px(explorer_w + ROW_PADDING_X * 2.0)).max(px(200.0));
 
         let status = self.status_text();
         let focus = self.focus_handle.clone();
@@ -2457,6 +2726,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
             .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_find))
             .on_action(cx.listener(Self::on_focus_replace))
             .on_action(cx.listener(Self::on_close_find))
@@ -2481,58 +2751,71 @@ impl Render for Editor {
             .child(
                 div()
                     .flex_1()
-                    .relative()
-                    // Click-to-caret for the buffer list (the diff list is
-                    // read-only and ignores clicks in the handler).
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_buffer_click))
-                    // The diff view replaces the buffer rows while open; the
-                    // buffer list keeps its own (idle) scroll state so
-                    // closing the diff restores the caret position.
-                    .when(self.diff.open, |host| {
-                        host.child(
-                            list(self.diff_list_state.clone(), {
-                                let entity = entity.clone();
-                                move |ix: usize, _window: &mut Window, cx: &mut App| {
-                                    entity.read(cx).diff_row(ix).into_any_element()
-                                }
-                            })
-                            .size_full(),
-                        )
+                    .flex()
+                    // Body row (M6 slice 1): explorer panel (project mode
+                    // only) + document area. Fixture mode has no panel, so
+                    // the verified full-width spike geometry is unchanged.
+                    .when(self.project.is_some(), |body| {
+                        body.child(self.explorer_panel(cx))
                     })
-                    .when(!self.diff.open, |host| {
-                        host.child(
-                            list(self.list_state.clone(), {
-                                let entity = entity.clone();
-                                move |ix: usize, window: &mut Window, cx: &mut App| {
-                                    entity.read(cx).row(ix, window).into_any_element()
-                                }
-                            })
-                            .size_full(),
-                        )
-                    })
-                    // Invisible overlay that registers the platform input
-                    // handler for this frame: typing and IME flow into
-                    // `EntityInputHandler` while the root has focus.
                     .child(
-                        canvas(
-                            |_bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| (),
-                            {
-                                let entity = entity.clone();
-                                let focus = focus.clone();
-                                move |bounds: Bounds<Pixels>,
-                                      _: (),
-                                      window: &mut Window,
-                                      cx: &mut App| {
-                                    window.handle_input(
-                                        &focus,
-                                        ElementInputHandler::new(bounds, entity.clone()),
-                                        cx,
-                                    );
-                                }
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
+                        div()
+                            .flex_1()
+                            .relative()
+                            // Click-to-caret for the buffer list (the diff list is
+                            // read-only and ignores clicks in the handler).
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_buffer_click))
+                            // The diff view replaces the buffer rows while open; the
+                            // buffer list keeps its own (idle) scroll state so
+                            // closing the diff restores the caret position.
+                            .when(self.diff.open, |host| {
+                                host.child(
+                                    list(self.diff_list_state.clone(), {
+                                        let entity = entity.clone();
+                                        move |ix: usize, _window: &mut Window, cx: &mut App| {
+                                            entity.read(cx).diff_row(ix).into_any_element()
+                                        }
+                                    })
+                                    .size_full(),
+                                )
+                            })
+                            .when(!self.diff.open, |host| {
+                                host.child(
+                                    list(self.list_state.clone(), {
+                                        let entity = entity.clone();
+                                        move |ix: usize, window: &mut Window, cx: &mut App| {
+                                            entity.read(cx).row(ix, window).into_any_element()
+                                        }
+                                    })
+                                    .size_full(),
+                                )
+                            })
+                            // Invisible overlay that registers the platform input
+                            // handler for this frame: typing and IME flow into
+                            // `EntityInputHandler` while the root has focus.
+                            .child(
+                                canvas(
+                                    |_bounds: Bounds<Pixels>,
+                                     _window: &mut Window,
+                                     _cx: &mut App| (),
+                                    {
+                                        let entity = entity.clone();
+                                        let focus = focus.clone();
+                                        move |bounds: Bounds<Pixels>,
+                                              _: (),
+                                              window: &mut Window,
+                                              cx: &mut App| {
+                                            window.handle_input(
+                                                &focus,
+                                                ElementInputHandler::new(bounds, entity.clone()),
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            ),
                     ),
             )
     }
@@ -2540,6 +2823,9 @@ impl Render for Editor {
 
 struct Args {
     fixture: String,
+    /// Narra project root (`--project`); mutually exclusive with an explicit
+    /// `--fixture`. The default fixture stays valid when neither is given.
+    project: Option<String>,
     steps: usize,
     find_steps: usize,
     diff_steps: usize,
@@ -2550,6 +2836,8 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut fixture = "fixtures/screenplay-1000.fountain".to_string();
+    let mut fixture_given = false;
+    let mut project: Option<String> = None;
     let mut steps = 0usize;
     let mut find_steps = 0usize;
     let mut diff_steps = 0usize;
@@ -2561,7 +2849,15 @@ fn parse_args() -> Result<Args, String> {
         let key = args[i].as_str();
         let value = args.get(i + 1).ok_or(format!("{key} requiere un valor"))?;
         match key {
-            "--fixture" => fixture = value.clone(),
+            "--fixture" => {
+                fixture = value.clone();
+                fixture_given = true;
+            }
+            // M6 slice 1: open a real Narra project through narra-core
+            // (explorer panel, ⌘S save). Mutually exclusive with --fixture so
+            // the verified spike driver can never run against a project by
+            // accident (and vice versa).
+            "--project" => project = Some(value.clone()),
             "--steps" => {
                 steps = value
                     .parse()
@@ -2596,8 +2892,13 @@ fn parse_args() -> Result<Args, String> {
         i += 2;
     }
 
+    if project.is_some() && fixture_given {
+        return Err("usa --fixture o --project, no ambos".to_string());
+    }
+
     Ok(Args {
         fixture,
+        project,
         steps,
         find_steps,
         diff_steps,
@@ -2610,24 +2911,70 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let started = Instant::now();
 
-    let content = fs::read_to_string(&args.fixture)
-        .map_err(|e| format!("no se pudo leer {}: {e}", args.fixture))?;
+    // M6 slice 1: `--project` goes through narra-core (validated manifest,
+    // boundary-checked IO); `--fixture` is the untouched spike path.
+    let project = match &args.project {
+        Some(root) => Some(
+            open_project(Path::new(root))
+                .map_err(|error| format!("no se pudo abrir el proyecto {root}: {error}"))?,
+        ),
+        None => None,
+    };
+
+    let (content, doc_path) = match &project {
+        Some(project) => {
+            let path = project.manifest().default_screenplay_path.clone();
+            let text = match project.read_document(&path) {
+                Ok(text) => text,
+                // A project created without a screenplay opens as a blank
+                // document; ⌘S creates it through the same safe IO.
+                Err(ProjectError::Document(DocumentError::Io { source, .. }))
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    String::new()
+                }
+                Err(error) => return Err(format!("no se pudo leer {path}: {error}")),
+            };
+            (text, path)
+        }
+        None => (
+            fs::read_to_string(&args.fixture)
+                .map_err(|e| format!("no se pudo leer {}: {e}", args.fixture))?,
+            args.fixture.clone(),
+        ),
+    };
     let fixture_read_ms = duration_ms(started.elapsed());
+
+    // The explorer's document list comes from the core: sorted, hidden state
+    // (.git/.narra/dot-files) excluded, symlinks not followed.
+    let explorer = match &project {
+        Some(project) => project
+            .list_documents()
+            .map_err(|error| format!("no se pudo listar el proyecto: {error}"))?,
+        None => Vec::new(),
+    };
 
     let scene_count = content
         .lines()
         .filter(|line| is_scene_heading(line))
         .count();
-    if scene_count == 0 {
+    // The scene gate is fixture-specific (the spike measures scene
+    // navigation); a real project may legitimately start with a blank
+    // screenplay, so it must not block opening the workspace.
+    if scene_count == 0 && project.is_none() {
         return Err(format!(
             "no se detectaron escenas en {} (¿es un Fountain?)",
             args.fixture
         ));
     }
 
+    // Fixture mode must keep reporting exactly `args.fixture` (existing
+    // scripts parse it); project mode reports the project root.
+    let metrics_label = args.project.clone().unwrap_or_else(|| args.fixture.clone());
+
     let metrics = Rc::new(RefCell::new(Metrics::new(
         started,
-        &args.fixture,
+        &metrics_label,
         fixture_read_ms,
         content.lines().count(),
         scene_count,
@@ -2674,6 +3021,9 @@ fn run() -> Result<(), String> {
             KeyBinding::new("cmd-c", CopyText, None),
             KeyBinding::new("cmd-x", CutText, None),
             KeyBinding::new("cmd-v", PasteText, None),
+            // save through the project IO (M6 slice 1; no-op notice in
+            // fixture mode, where there is no project to write to)
+            KeyBinding::new("cmd-s", Save, None),
             // find / replace (slice 3)
             KeyBinding::new("cmd-f", ToggleFind, None),
             KeyBinding::new("cmd-alt-f", FocusReplace, None),
@@ -2709,6 +3059,12 @@ fn run() -> Result<(), String> {
         let base_lines: Vec<String> = content.split('\n').map(str::to_string).collect();
         let entity = cx.new(|cx| Editor {
             buffer,
+            project,
+            explorer,
+            doc_path,
+            base_text: content.clone(),
+            saved_edits: 0,
+            notice: None,
             selected: 0..0,
             reversed: false,
             marked: None,
@@ -2794,7 +3150,7 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!(
-                "uso: spike-editor [--fixture <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]"
+                "uso: spike-editor [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]"
             );
             ExitCode::FAILURE
         }

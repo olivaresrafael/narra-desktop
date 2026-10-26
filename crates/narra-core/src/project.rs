@@ -31,6 +31,14 @@ pub const TEMPLATE_DIRS: &[&str] = &[
 pub const MANIFEST_FILE: &str = "project.yaml";
 pub const DEFAULT_SCREENPLAY: &str = "screenplay/main.fountain";
 
+/// Maximum directory depth scanned by [`Project::list_documents`].
+const MAX_DOC_DEPTH: usize = 8;
+/// Upper bound on listed documents (M6 slice 1): after sorting, the cut is
+/// deterministic — the lexicographically first paths win — so a pathological
+/// tree cannot stall the file explorer, and canonical files (which sort near
+/// the top of their directories) are never the ones dropped.
+const MAX_LISTED_DOCUMENTS: usize = 10_000;
+
 /// Errors from project lifecycle operations.
 #[derive(Debug, Error)]
 pub enum ProjectError {
@@ -119,6 +127,72 @@ impl Project {
         }
         Ok(index)
     }
+
+    /// List the project's documents for a file explorer (M6 slice 1).
+    ///
+    /// Project-relative paths (`/`-separated) in sorted order so the UI can
+    /// render a stable tree. Hidden entries (`.git`, `.narra`, dot-files and
+    /// editor temp files) are excluded: they are state, not narrative
+    /// content, and the explorer must never offer them. Symlinks are neither
+    /// followed nor listed (the boundary check in `document.rs` rejects
+    /// escapes anyway), and a non-UTF-8 name is skipped because it can never
+    /// pass the boundary-checked document IO.
+    pub fn list_documents(&self) -> Result<Vec<String>, ProjectError> {
+        let mut documents = Vec::new();
+        walk_documents(&self.root, "", 0, &mut documents)?;
+        documents.sort();
+        documents.truncate(MAX_LISTED_DOCUMENTS);
+        Ok(documents)
+    }
+}
+
+/// Depth-first collection for [`Project::list_documents`]; `prefix` is the
+/// project-relative path of `dir` (`""` at the root).
+fn walk_documents(
+    dir: &Path,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), ProjectError> {
+    if depth > MAX_DOC_DEPTH {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|source| ProjectError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ProjectError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        // Non-UTF-8 names can never be addressed by document IO: skip them.
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // Hidden entries are state, not content (`.git`, `.narra`, temp files).
+        if name.starts_with('.') {
+            continue;
+        }
+        let relative = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let file_type = entry.file_type().map_err(|source| ProjectError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            walk_documents(&entry.path(), &relative, depth + 1, out)?;
+        } else if file_type.is_file() {
+            out.push(relative);
+        }
+        // Symlinks report neither `is_dir` nor `is_file` on the DirEntry
+        // type (which does not follow links), so they fall through here by
+        // design: following one could escape the project or duplicate content.
+    }
+    Ok(())
 }
 
 /// Derived, disposable scan results (`DATA_MODEL.md` §1).
@@ -359,5 +433,52 @@ mod tests {
             .write_document("../escape.md", "x")
             .expect_err("escape");
         assert!(matches!(error, ProjectError::Document(_)));
+    }
+
+    #[test]
+    fn list_documents_excludes_hidden_state_and_sorts() {
+        let root = temp_root();
+        let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
+
+        // State that must never show up in the file explorer.
+        fs::create_dir_all(root.join(".git")).expect("git dir");
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("git head");
+        fs::create_dir_all(root.join(".narra/proposals")).expect("narra dir");
+        fs::write(root.join(".narra/proposals/draft.diff"), "x\n").expect("proposal");
+        fs::write(root.join(".env"), "NOPE=1\n").expect("dotfile");
+
+        // Narrative content, nested and unsorted on purpose.
+        fs::create_dir_all(root.join("bible/characters")).expect("chars");
+        fs::write(root.join("bible/characters/marta.md"), "# Marta\n").expect("marta");
+
+        let listed = project.list_documents().expect("list");
+        assert_eq!(
+            listed,
+            vec![
+                "bible/characters/marta.md",
+                "notes/decisions.md",
+                "notes/open-questions.md",
+                "project.yaml",
+                "screenplay/main.fountain",
+            ],
+            "sorted, nested, no hidden entries"
+        );
+        assert!(listed.len() <= MAX_LISTED_DOCUMENTS);
+    }
+
+    #[test]
+    fn list_documents_does_not_follow_symlinks() {
+        let root = temp_root();
+        let outside = temp_root();
+        fs::write(outside.join("secret.md"), "fuera del proyecto\n").expect("outside file");
+        let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
+        std::os::unix::fs::symlink(outside.join("secret.md"), root.join("leak.md"))
+            .expect("symlink");
+
+        let listed = project.list_documents().expect("list");
+        assert!(
+            !listed.iter().any(|path| path == "leak.md"),
+            "a symlink out of the project must not be listed: {listed:?}"
+        );
     }
 }

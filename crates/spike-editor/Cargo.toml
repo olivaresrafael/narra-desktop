@@ -13,6 +13,10 @@ publish = false
 # product until the spike report records a verdict in PERFORMANCE_BASELINES.md.
 [dependencies]
 gpui = "0.2"
+# Application core (M6 slice 1): the shell opens and saves documents through
+# the boundary-checked project IO instead of raw `fs` calls. Same workspace,
+# GPL-3.0, no new supply-chain surface.
+narra-core = { path = "../narra-core" }
 # Grapheme-correct cursor movement (Spike B requirement). MIT/Apache-2.0, and
 # already present in the GPUI dependency tree, so no new supply-chain surface.
 unicode-segmentation = "1"
