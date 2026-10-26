@@ -51,13 +51,19 @@
 //!         --agent-model <nombre>              (required for openai-compat)
 //!         --agent-base-url <url>              (default: local Ollama)
 //!         --agent-latency <ms>                (simulated mock latency)
+//!       M6 slice 4 (proposals): ⌘P opens the instruction bar, enter runs
+//!       scene_edit for the caret's scene and the panel shows the stored
+//!       proposal's diff; ⌘⇧Enter applies (two-step: arm, then apply),
+//!       ⌘⌫ rejects. M6 slice 5 (review focus): ⌘⇧R opens the focus bar,
+//!      enter commits the focus and reviews, ⌘R reuses the last focus.
 //!
-//! Find bar note (spike scope): one focus handle serves both the document
-//! and the find fields — while the bar is open, text input, backspace and
-//! enter are routed to the active find field instead of the buffer (the
-//! documented single-focus compromise; per-field focus/IME is production
-//! work, not a spike question). Arrow keys still move the document caret,
-//! which doubles as a scroll preview while the bar is open.
+//! Bar note (spike scope): one focus handle serves the document and the
+//! single-line bars (find, propose instruction, review focus) — while a
+//! bar is open, text input, backspace and enter are routed to it instead
+//! of the buffer (the documented single-focus compromise; per-field
+//! focus/IME is production work, not a spike question). Only one bar can
+//! be open at a time. Arrow keys still move the document caret, which
+//! doubles as a scroll preview while the bar is open.
 //!
 //! Output: JSON lines on stdout starting with `{"kind":"spike-a`.
 
@@ -142,6 +148,8 @@ actions!(
         OpenPropose,
         ApplyProposal,
         RejectProposal,
+        // review focus (M6 slice 5)
+        OpenFocusBar,
     ]
 );
 
@@ -250,6 +258,17 @@ struct DiffRow {
 struct ProposeBar {
     open: bool,
     instruction: String,
+}
+
+/// Reviewer-focus bar (M6 slice 5). Same single-focus compromise: while
+/// open, keystrokes route here — enter commits the focus and runs the
+/// review, escape closes the bar without running anything. The committed
+/// focus lives in `AgentState::focus` (input for the run), so ⌘R with the
+/// bar closed reuses the last focus.
+#[derive(Debug, Default)]
+struct FocusBar {
+    open: bool,
+    focus: String,
 }
 
 /// Diff view state (slice 3, M1-3b). The base is a snapshot of the file as
@@ -740,6 +759,11 @@ struct Editor {
     propose: ProposeView,
     /// Instruction bar for ⌘P (M6 slice 4).
     propose_bar: ProposeBar,
+    /// Reviewer-focus bar for ⌘⇧R (M6 slice 5).
+    focus_bar: FocusBar,
+    /// Last committed reviewer focus: what ⌘R uses when the bar is closed.
+    /// Cleared only by committing an empty focus, never by closing the bar.
+    review_focus: String,
 }
 
 impl Focusable for Editor {
@@ -1384,6 +1408,14 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.focus_bar.open {
+            if let Some(last) = self.focus_bar.focus.chars().last() {
+                let len = self.focus_bar.focus.len();
+                self.focus_bar.focus.truncate(len - last.len_utf8());
+            }
+            cx.notify();
+            return;
+        }
         if self.selected.is_empty() {
             let caret = self.caret();
             let previous = self.buffer.prev_boundary(caret);
@@ -1436,6 +1468,12 @@ impl Editor {
         // proposal (M6 slice 4).
         if self.propose_bar.open {
             self.submit_proposal(cx);
+            return;
+        }
+        // While the focus bar owns keystrokes, enter commits the focus and
+        // runs the review (M6 slice 5).
+        if self.focus_bar.open {
+            self.submit_focus(cx);
             return;
         }
         let caret = self.caret();
@@ -1811,12 +1849,19 @@ impl Editor {
 
     fn on_close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
         // Escape closes whichever bar owns the keystrokes (single bar model:
-        // find and the instruction bar are never open at the same time).
+        // find, the instruction bar and the focus bar are never open at the
+        // same time).
         if self.find.open {
             self.close_find(cx);
         } else if self.propose_bar.open {
             self.propose_bar.open = false;
             self.propose_bar.instruction.clear();
+            cx.notify();
+        } else if self.focus_bar.open {
+            // Closing the focus bar discards the typed (uncommitted) focus;
+            // the last committed one in `agent.focus` stays in effect.
+            self.focus_bar.open = false;
+            self.focus_bar.focus.clear();
             cx.notify();
         }
     }
@@ -2073,18 +2118,33 @@ impl Editor {
         .detach();
     }
 
-    /// ⌘R: review the scene under the caret, grounded in project material
-    /// (M6 slice 3). The core task runs on a worker thread; the panel shows
-    /// progress, the context sources it read, and the result. Read-only: the
+    /// ⌘R and the focus bar's enter both land here: run the review for the
+    /// caret's scene with the committed focus (M6 slice 3/5). Read-only: the
     /// task never writes, and it reviews the *saved* file — an unsaved
     /// buffer is refused with an explicit notice instead of being reviewed
     /// at the wrong version.
     fn on_review_scene(&mut self, _: &ReviewScene, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_review(cx);
+    }
+
+    /// Run the review task for the caret's scene on a worker thread (M6
+    /// slice 3); the committed focus (slice 5) rides along as input.
+    fn run_review(&mut self, cx: &mut Context<Self>) {
         let Some((root, scene_number, settings, cancel)) = self.agent_task_gates() else {
             return;
         };
-        self.agent.begin(scene_number);
-        self.notice = Some(format!("revisión de la escena {scene_number} en curso"));
+        // The committed focus (M6 slice 5): ⌘R reuses the last one; the
+        // focus bar (⌘⇧R) commits a new one before running.
+        let focus = self.review_focus.clone();
+        let focus_note = if focus.is_empty() {
+            String::new()
+        } else {
+            format!(" · foco: {focus}")
+        };
+        self.agent.begin(scene_number, focus.clone());
+        self.notice = Some(format!(
+            "revisión de la escena {scene_number} en curso{focus_note}"
+        ));
         cx.notify();
 
         let (tx, rx) = mpsc::channel();
@@ -2095,11 +2155,13 @@ impl Editor {
                 stream: false,
             };
             let result = match settings.build_adapter() {
-                Ok(adapter) => {
-                    SceneReviewTask::new(root, scene_number, "").run(&*adapter, &options, |event| {
+                Ok(adapter) => SceneReviewTask::new(root, scene_number, focus).run(
+                    &*adapter,
+                    &options,
+                    |event| {
                         let _ = tx.send(AgentMessage::Event(event));
-                    })
-                }
+                    },
+                ),
                 Err(error) => Err(AgentError::Adapter(error)),
             };
             let _ = tx.send(AgentMessage::Done(result));
@@ -2210,11 +2272,49 @@ impl Editor {
         if self.find.open {
             self.close_find(cx);
         }
+        if self.focus_bar.open {
+            self.focus_bar.open = false;
+            self.focus_bar.focus.clear();
+        }
         self.propose_bar.open = !self.propose_bar.open;
         if !self.propose_bar.open {
             self.propose_bar.instruction.clear();
         }
         cx.notify();
+    }
+
+    /// ⌘⇧R: toggle the reviewer-focus bar. It opens pre-filled with the
+    /// last committed focus (so tweaking it is one edit, not a rewrite) and
+    /// owns keystrokes until enter (commit + review) or escape (discard).
+    fn on_open_focus_bar(
+        &mut self,
+        _: &OpenFocusBar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open {
+            self.close_find(cx);
+        }
+        if self.propose_bar.open {
+            self.propose_bar.open = false;
+            self.propose_bar.instruction.clear();
+        }
+        self.focus_bar.open = !self.focus_bar.open;
+        if self.focus_bar.open {
+            self.focus_bar.focus = self.review_focus.clone();
+        } else {
+            self.focus_bar.focus.clear();
+        }
+        cx.notify();
+    }
+
+    /// Enter with the focus bar open: commit the focus (empty = general
+    /// review) and run the review for the caret's scene.
+    fn submit_focus(&mut self, cx: &mut Context<Self>) {
+        self.review_focus = self.focus_bar.focus.trim().to_string();
+        self.focus_bar.open = false;
+        self.focus_bar.focus.clear();
+        self.run_review(cx);
     }
 
     /// Enter with the instruction bar open: submit (empty = explicit no-op).
@@ -2442,6 +2542,15 @@ impl Editor {
                         self.agent.scene_number
                     )),
             );
+        // The reviewer focus (M6 slice 5): what was asked, always visible.
+        if !self.agent.focus.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(FIND_FG))
+                    .child(format!("Foco: {}", self.agent.focus)),
+            );
+        }
         if !self.agent.stage.is_empty() {
             panel = panel.child(
                 div()
@@ -2787,6 +2896,35 @@ impl Editor {
             ))
     }
 
+    /// Reviewer-focus bar (M6 slice 5): one field, same single-focus
+    /// compromise. Enter commits the focus and runs the review; escape
+    /// discards the typed text (the last committed focus stays in effect).
+    fn focus_bar(&self) -> gpui::Div {
+        let hint = if self.focus_bar.focus.is_empty() {
+            "enter revisa (general) · esc cierra"
+        } else {
+            "enter revisa con foco · esc cierra (el foco anterior sigue activo)"
+        };
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_2()
+            .h(px(STATUS_BAR_H))
+            .bg(rgb(FIND_BG))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .whitespace_nowrap()
+            .child(div().text_color(rgb(FIND_DIM_FG)).child("Foco:"))
+            .child(
+                div()
+                    .text_color(rgb(FIND_FG))
+                    .child(format!("{}▌", self.focus_bar.focus)),
+            )
+            .child(div().text_color(rgb(FIND_DIM_FG)).child(hint))
+    }
+
     /// Render a line that has only a caret (no selection, no IME, no matches)
     /// with soft-wrapping, placing the caret on the correct visual row.
     /// Returns a flex column where each visual row is a flex child; the row
@@ -3081,11 +3219,12 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let agent_dump = format!(
-            "{{\"status\":\"{}\",\"scene\":{},\"stage\":\"{}\",\"sources\":[{}],\
+            "{{\"status\":\"{}\",\"scene\":{},\"focus\":\"{}\",\"stage\":\"{}\",\"sources\":[{}],\
              \"output\":\"{}\",\"summary\":\"{}\",\"error\":\"{}\",\"scroll\":{},\
              \"elapsed_ms\":{}}}",
             self.agent.status_key(),
             agent_scene_dump,
+            escape_json(&self.agent.focus),
             escape_json(&self.agent.stage),
             agent_sources_dump,
             escape_json(&self.agent.output),
@@ -3093,6 +3232,15 @@ impl Editor {
             escape_json(&self.agent.error),
             self.agent.scroll,
             agent_elapsed_dump,
+        );
+
+        // M6 slice 5: the focus bar's own state — open/typed/committed — so
+        // the bar routing and the focus persistence are verifiable headless.
+        let focus_bar_dump = format!(
+            "{{\"open\":{},\"typed\":\"{}\",\"committed\":\"{}\"}}",
+            self.focus_bar.open,
+            escape_json(&self.focus_bar.focus),
+            escape_json(&self.review_focus),
         );
 
         // M6 slice 4: the proposal surface's full state — status, scene,
@@ -3150,7 +3298,7 @@ impl Editor {
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
-                 \"agent\":{},\"proposal\":{}}}"
+                 \"agent\":{},\"focus_bar\":{},\"proposal\":{}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -3187,6 +3335,7 @@ impl Editor {
             notice_dump,
             explorer_dump,
             agent_dump,
+            focus_bar_dump,
             proposal_dump,
         )
     }
@@ -3437,6 +3586,16 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
+        // Focus bar owns keystrokes while open (M6 slice 5): same rules.
+        if self.focus_bar.open {
+            let cleaned: String = new_text
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect();
+            self.focus_bar.focus.push_str(&cleaned);
+            cx.notify();
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -3625,6 +3784,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_open_propose))
             .on_action(cx.listener(Self::on_apply_proposal))
             .on_action(cx.listener(Self::on_reject_proposal))
+            // review focus (M6 slice 5)
+            .on_action(cx.listener(Self::on_open_focus_bar))
             .child(
                 div()
                     .id("status")
@@ -3641,6 +3802,7 @@ impl Render for Editor {
             )
             .when(self.find.open, |bar| bar.child(self.find_bar()))
             .when(self.propose_bar.open, |bar| bar.child(self.propose_bar()))
+            .when(self.focus_bar.open, |bar| bar.child(self.focus_bar()))
             .child(
                 div()
                     .flex_1()
@@ -4029,6 +4191,9 @@ fn run() -> Result<(), String> {
             KeyBinding::new("cmd-p", OpenPropose, None),
             KeyBinding::new("cmd-shift-enter", ApplyProposal, None),
             KeyBinding::new("cmd-backspace", RejectProposal, None),
+            // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
+            // enter commits the focus and runs the review.
+            KeyBinding::new("cmd-shift-r", OpenFocusBar, None),
         ]);
 
         cx.observe_keystrokes({
@@ -4066,6 +4231,8 @@ fn run() -> Result<(), String> {
             agent_settings: agent_settings.clone(),
             propose: ProposeView::new(),
             propose_bar: ProposeBar::default(),
+            focus_bar: FocusBar::default(),
+            review_focus: String::new(),
             selected: 0..0,
             reversed: false,
             marked: None,

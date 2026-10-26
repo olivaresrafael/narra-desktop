@@ -38,6 +38,10 @@ pub struct AgentState {
     pub status: AgentStatus,
     /// Scene the running/last review targeted (0 = none yet).
     pub scene_number: usize,
+    /// Reviewer focus for the running/last review (empty = general review).
+    /// Kept in the state (not just the bar) so the panel and the dump can
+    /// show what was asked, and so ⌘R reuses the last committed focus.
+    pub focus: String,
     /// Last progress stage shown while running (cleared on terminal states).
     pub stage: String,
     /// Context sources the task reported — the user can audit exactly what
@@ -60,6 +64,7 @@ impl AgentState {
         Self {
             status: AgentStatus::Idle,
             scene_number: 0,
+            focus: String::new(),
             stage: String::new(),
             sources: Vec::new(),
             output: String::new(),
@@ -83,10 +88,13 @@ impl AgentState {
         self.status != AgentStatus::Idle
     }
 
-    /// Start a new run: everything from the previous one is cleared.
-    pub fn begin(&mut self, scene_number: usize) {
+    /// Start a new run: everything from the previous one is cleared. The
+    /// focus is an input (what the user asked to review), so it is set here
+    /// rather than cleared.
+    pub fn begin(&mut self, scene_number: usize, focus: String) {
         self.status = AgentStatus::Running;
         self.scene_number = scene_number;
+        self.focus = focus;
         self.stage = String::new();
         self.sources = Vec::new();
         self.output = String::new();
@@ -404,7 +412,7 @@ mod tests {
     #[test]
     fn flow_events_then_done_completes_with_output_and_sources() {
         let mut state = AgentState::new();
-        state.begin(2);
+        state.begin(2, String::new());
         assert_eq!(state.status, AgentStatus::Running);
         assert_eq!(state.scene_number, 2);
 
@@ -437,7 +445,7 @@ mod tests {
     #[test]
     fn cancelled_result_marks_the_state_cancelled() {
         let mut state = AgentState::new();
-        state.begin(1);
+        state.begin(1, String::new());
         state.apply(AgentMessage::Done(Err(AgentError::Cancelled)));
         assert_eq!(state.status, AgentStatus::Cancelled);
         assert!(!state.error.is_empty());
@@ -447,7 +455,7 @@ mod tests {
     #[test]
     fn adapter_error_marks_the_state_failed_with_the_message() {
         let mut state = AgentState::new();
-        state.begin(1);
+        state.begin(1, String::new());
         state.apply(AgentMessage::Done(Err(AgentError::Adapter(
             "sin conexión".to_string(),
         ))));
@@ -458,20 +466,34 @@ mod tests {
     #[test]
     fn begin_clears_everything_from_the_previous_run() {
         let mut state = AgentState::new();
-        state.begin(1);
+        state.begin(1, "diálogos tensos".to_string());
         state.apply(AgentMessage::Event(TaskEvent::ContextCollected {
             sources: vec![source("notes", "notes/decisions.md")],
         }));
         state.apply(AgentMessage::Done(Ok(task_output("review previa"))));
         state.scroll = 4;
 
-        state.begin(3);
+        state.begin(3, String::new());
         assert_eq!(state.status, AgentStatus::Running);
         assert_eq!(state.scene_number, 3);
         assert!(state.sources.is_empty());
         assert!(state.output.is_empty());
         assert!(state.error.is_empty());
         assert_eq!(state.scroll, 0);
+        // The focus is an input, not run output: a new run without focus
+        // replaces the previous one (no stale focus is ever shown).
+        assert!(state.focus.is_empty());
+    }
+
+    #[test]
+    fn begin_sets_the_focus_for_the_run() {
+        let mut state = AgentState::new();
+        state.begin(2, "coherencia del arco de Marta".to_string());
+        assert_eq!(state.focus, "coherencia del arco de Marta");
+        assert_eq!(state.scene_number, 2);
+        // A general review (no focus) replaces a focused one.
+        state.begin(2, String::new());
+        assert!(state.focus.is_empty());
     }
 
     #[test]
@@ -492,7 +514,7 @@ mod tests {
     #[test]
     fn task_output_without_event_sources_fills_them_from_the_result() {
         let mut state = AgentState::new();
-        state.begin(1);
+        state.begin(1, String::new());
         // A task that skipped the event (defensive): sources still shown.
         state.apply(AgentMessage::Done(Ok(task_output("r"))));
         assert_eq!(state.sources.len(), 1);
