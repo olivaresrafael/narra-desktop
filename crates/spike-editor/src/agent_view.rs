@@ -42,6 +42,11 @@ pub struct AgentState {
     /// Kept in the state (not just the bar) so the panel and the dump can
     /// show what was asked, and so ⌘R reuses the last committed focus.
     pub focus: String,
+    /// Configured role running the review (M6 slice 7): an input resolved
+    /// before the run, like `focus` (set right after `begin`, empty until).
+    pub role: String,
+    /// Where the role comes from: `"builtin"` or `"project"`.
+    pub role_source: String,
     /// Last progress stage shown while running (cleared on terminal states).
     pub stage: String,
     /// Context sources the task reported — the user can audit exactly what
@@ -65,6 +70,8 @@ impl AgentState {
             status: AgentStatus::Idle,
             scene_number: 0,
             focus: String::new(),
+            role: String::new(),
+            role_source: String::new(),
             stage: String::new(),
             sources: Vec::new(),
             output: String::new(),
@@ -95,6 +102,8 @@ impl AgentState {
         self.status = AgentStatus::Running;
         self.scene_number = scene_number;
         self.focus = focus;
+        self.role = String::new();
+        self.role_source = String::new();
         self.stage = String::new();
         self.sources = Vec::new();
         self.output = String::new();
@@ -229,6 +238,11 @@ pub struct ProposeView {
     pub status: ProposeStatus,
     pub instruction: String,
     pub scene_number: usize,
+    /// Configured role running `scene_edit` (M6 slice 7): an input
+    /// resolved before the run (set right after `begin`, empty until).
+    pub role: String,
+    /// Where the role comes from: `"builtin"` or `"project"`.
+    pub role_source: String,
     /// Persisted proposal id (empty until `ProposalCreated`/`Done`).
     pub id: String,
     pub target: String,
@@ -257,6 +271,8 @@ impl ProposeView {
             status: ProposeStatus::Idle,
             instruction: String::new(),
             scene_number: 0,
+            role: String::new(),
+            role_source: String::new(),
             id: String::new(),
             target: String::new(),
             hunks: 0,
@@ -292,6 +308,8 @@ impl ProposeView {
         self.status = ProposeStatus::Running;
         self.instruction = instruction;
         self.scene_number = scene_number;
+        self.role = String::new();
+        self.role_source = String::new();
         self.id = String::new();
         self.target = String::new();
         self.hunks = 0;
@@ -547,6 +565,27 @@ mod tests {
         // A general review (no focus) replaces a focused one.
         state.begin(2, String::new());
         assert!(state.focus.is_empty());
+    }
+
+    #[test]
+    fn role_is_an_input_cleared_on_begin() {
+        let mut state = AgentState::new();
+        state.begin(1, String::new());
+        state.role = "editor-reviewer".to_string();
+        state.role_source = "project".to_string();
+        // A new run clears the previous role: the caller sets the freshly
+        // resolved one right after begin (no stale role is ever shown).
+        state.begin(1, String::new());
+        assert!(state.role.is_empty());
+        assert!(state.role_source.is_empty());
+
+        let mut view = ProposeView::new();
+        view.begin(1, "x".to_string());
+        view.role = "writer".to_string();
+        view.role_source = "builtin".to_string();
+        view.begin(1, "y".to_string());
+        assert!(view.role.is_empty());
+        assert!(view.role_source.is_empty());
     }
 
     #[test]

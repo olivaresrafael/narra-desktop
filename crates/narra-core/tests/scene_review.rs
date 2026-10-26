@@ -355,3 +355,47 @@ fn pre_cancelled_task_stops_before_any_work() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert!(matches!(events[0], TaskEvent::Started { .. }));
 }
+
+#[test]
+fn review_runs_under_the_configured_role_and_refuses_foreign_profiles() {
+    use narra_core::agent::roles;
+
+    let root = sample_project();
+    let builtins = roles::builtin_roles();
+    let role = roles::role_by_id(&builtins, "editor-reviewer")
+        .expect("editor-reviewer")
+        .clone();
+    let adapter = RecordingAdapter::new();
+    let output = SceneReviewTask::new(root.to_str().expect("utf8"), 1, "")
+        .with_role(role)
+        .run(&adapter, &review_options(), |_| {})
+        .expect("review");
+    let request = adapter.request.borrow().clone().expect("recorded request");
+    assert!(
+        request
+            .system
+            .contains("PERFIL (rol `editor-reviewer`, builtin)"),
+        "the role persona rides in the system prompt"
+    );
+    assert_eq!(output.data["role"], "editor-reviewer");
+    assert_eq!(output.data["role_source"], "builtin");
+
+    // A role whose profile does not grant scene_review is refused before
+    // any model call (M6 slice 7 permission profile).
+    let writer = roles::role_by_id(&builtins, "writer")
+        .expect("writer")
+        .clone();
+    let denied = RecordingAdapter::new();
+    let error = SceneReviewTask::new(root.to_str().expect("utf8"), 1, "")
+        .with_role(writer)
+        .run(&denied, &review_options(), |_| {})
+        .expect_err("denied");
+    assert!(
+        matches!(
+            &error,
+            AgentError::RoleDenied { role, task } if role == "writer" && task == "scene_review"
+        ),
+        "{error:?}"
+    );
+    assert!(denied.request.borrow().is_none(), "no model call happened");
+}

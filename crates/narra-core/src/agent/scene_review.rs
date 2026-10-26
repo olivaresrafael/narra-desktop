@@ -17,12 +17,18 @@ use std::time::Instant;
 use serde_json::json;
 
 use super::adapter::{ModelAdapter, ModelRequest};
+use super::roles::Role;
 use super::scene::{SceneLookup, scene_block};
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::project::open_project;
 
 /// Hard cap on model output tokens for a review.
 const REVIEW_MAX_TOKENS: u32 = 1400;
+/// Fixed base system prompt: the hard review constraints. The role persona
+/// (M6 slice 7) is appended on top, never replacing this.
+const BASE_SYSTEM: &str = "Eres un editor de guion profesional. Respondes en el idioma \
+     primario del proyecto, en prosa clara y concreta. Tu trabajo es \
+     revisar y fundamentar la revisión en el material entregado.";
 /// Directories whose documents ground a scene review (`DATA_MODEL.md` §2:
 /// bible, structure, research; `notes/` holds decisions and open questions).
 const MATERIAL_DIRS: &[&str] = &["bible", "structure", "research", "notes"];
@@ -44,6 +50,9 @@ pub struct SceneReviewTask {
     pub scene_number: usize,
     /// Optional question/focus for the review; empty = general review.
     pub focus: String,
+    /// Configured role running the review (M6 slice 7); `None` = the task
+    /// runs with its fixed base prompt only.
+    pub role: Option<Role>,
 }
 
 impl SceneReviewTask {
@@ -56,7 +65,16 @@ impl SceneReviewTask {
             project_root: project_root.into(),
             scene_number,
             focus: focus.into(),
+            role: None,
         }
+    }
+
+    /// Run under a configured role (M6 slice 7): the role's persona is
+    /// appended to the fixed system prompt and its permission profile is
+    /// checked before anything else runs.
+    pub fn with_role(mut self, role: Role) -> Self {
+        self.role = Some(role);
+        self
     }
 
     /// Human-readable task kind for events and provenance.
@@ -75,6 +93,14 @@ impl SceneReviewTask {
         let started = Instant::now();
         let root = Path::new(&self.project_root);
         self.validate()?;
+        if let Some(role) = &self.role
+            && !role.allows(Self::KIND)
+        {
+            return Err(AgentError::RoleDenied {
+                role: role.id.clone(),
+                task: Self::KIND.to_string(),
+            });
+        }
 
         emit(TaskEvent::Started {
             task: Self::KIND.to_string(),
@@ -213,10 +239,10 @@ impl SceneReviewTask {
             self.scene_number, screenplay_path, block.start_line, block.end_line, block.text,
         ));
         let request = ModelRequest {
-            system: "Eres un editor de guion profesional. Respondes en el idioma \
-                     primario del proyecto, en prosa clara y concreta. Tu trabajo es \
-                     revisar y fundamentar la revisión en el material entregado."
-                .to_string(),
+            system: self.role.as_ref().map_or_else(
+                || BASE_SYSTEM.to_string(),
+                |role| role.system_with(BASE_SYSTEM),
+            ),
             prompt,
             max_output_tokens: REVIEW_MAX_TOKENS,
             tools: Vec::new(),
@@ -252,6 +278,8 @@ impl SceneReviewTask {
             "scene_heading": block.heading,
             "scene_range": format!("L{}-L{}", block.start_line, block.end_line),
             "focus": focus,
+            "role": self.role.as_ref().map(|role| role.id.as_str()),
+            "role_source": self.role.as_ref().map(|role| role.origin_key()),
             "material_docs": material.iter().map(|(path, _)| path).collect::<Vec<_>>(),
             "adapter": adapter.name(),
             "model": response.model,

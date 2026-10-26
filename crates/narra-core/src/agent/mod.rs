@@ -17,6 +17,7 @@ pub mod brief;
 pub mod mock;
 pub mod openai_compat;
 pub mod proposal;
+pub mod roles;
 mod scene;
 pub mod scene_edit;
 pub mod scene_review;
@@ -28,6 +29,7 @@ pub use brief::ProjectBriefTask;
 pub use mock::MockAdapter;
 pub use openai_compat::{LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig};
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
+pub use roles::{Role, RoleOrigin, RolesError};
 pub use scene_edit::SceneEditTask;
 pub use scene_review::SceneReviewTask;
 pub use tool_loop::ToolLoopTask;
@@ -179,4 +181,8 @@ pub enum AgentError {
     SceneNumber { number: usize, total: usize },
     #[error("proposal: {0}")]
     Proposal(#[from] proposal::ProposalError),
+    #[error("role `{role}` cannot run task `{task}`: its permission profile does not grant it")]
+    RoleDenied { role: String, task: String },
+    #[error("roles: {0}")]
+    Roles(#[from] roles::RolesError),
 }

@@ -391,3 +391,51 @@ fn adapter_failure_produces_no_proposal_and_no_writes() {
         "no proposal persisted on failure"
     );
 }
+
+#[test]
+fn proposals_record_the_role_and_refuse_foreign_profiles() {
+    use narra_core::agent::roles;
+
+    let root = sample_project();
+    let builtins = roles::builtin_roles();
+    let writer = roles::role_by_id(&builtins, "writer")
+        .expect("writer")
+        .clone();
+
+    let output = SceneEditTask::new(root.to_str().expect("utf8"), 1, "más tensión")
+        .with_role(writer)
+        .run(&MockAdapter::new(), &task_options(), |_| {})
+        .expect("propose");
+    assert_eq!(output.data["role"], "writer");
+    assert_eq!(output.data["role_source"], "builtin");
+
+    // Provenance: the persisted record names the role that wrote it...
+    let id = output.data["proposal_id"].as_str().expect("proposal id");
+    let record = proposal::load(&root, id).expect("record");
+    assert_eq!(record.origin.task_input["role"], "writer");
+    assert_eq!(record.origin.task_input["role_source"], "builtin");
+
+    // ...and renew rebuilds the same task, persona included (M6 slice 7).
+    let renewed =
+        SceneEditTask::from_proposal(root.to_str().expect("utf8"), &record).expect("renew");
+    assert_eq!(
+        renewed.role.as_ref().map(|role| role.id.as_str()),
+        Some("writer")
+    );
+
+    // A role without scene_edit never reaches the model.
+    let reviewer = roles::role_by_id(&builtins, "editor-reviewer")
+        .expect("editor-reviewer")
+        .clone();
+    let error = SceneEditTask::new(root.to_str().expect("utf8"), 1, "más tensión")
+        .with_role(reviewer)
+        .run(&MockAdapter::new(), &task_options(), |_| {})
+        .expect_err("denied");
+    assert!(
+        matches!(
+            &error,
+            AgentError::RoleDenied { role, task } if role == "editor-reviewer" && task == "scene_edit"
+        ),
+        "{error:?}"
+    );
+}

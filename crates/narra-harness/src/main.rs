@@ -14,6 +14,7 @@
 //!   narra-harness brief <project-root> [options]
 //!   narra-harness propose <project-root> --scene <n> --instruction <texto> [options]
 //!   narra-harness review <project-root> --scene <n> [--focus <texto>] [options]
+//!   narra-harness roles <project-root>
 //!   narra-harness proposals <project-root> [list]
 //!   narra-harness proposals <project-root> show <proposal-id>
 //!   narra-harness proposals <project-root> apply <proposal-id> [--hunks 0,2]
@@ -46,6 +47,8 @@
 //!   --scene <n>        1-based scene number (propose and review)
 //!   --instruction <t>  writer's instruction (propose only)
 //!   --focus <t>        reviewer focus/question (review only)
+//!   --role <id>        configured role for the task (default: the task
+//!                      kind's built-in role; see `roles` for the list)
 //!   --hunks <a,b>      0-based hunk indices to accept (apply only; default all)
 //!
 //! `apply` refuses a stale proposal (the file changed after it was created)
@@ -76,7 +79,8 @@ use std::time::Duration;
 use narra_core::agent::proposal;
 use narra_core::agent::{
     AgentError, GrantPolicy, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
-    ProjectBriefTask, SceneEditTask, SceneReviewTask, TaskEvent, TaskOptions, ToolLoopTask,
+    ProjectBriefTask, Role, SceneEditTask, SceneReviewTask, TaskEvent, TaskOptions, ToolLoopTask,
+    roles,
 };
 use narra_core::cancel::CancellationToken;
 
@@ -94,6 +98,11 @@ fn main() -> ExitCode {
     // Local review operations never touch the network or a model.
     if let Command::Proposals { root, action } = &parsed.command {
         return run_proposals(root, action);
+    }
+
+    // Role listing: local config only, no adapter, no network.
+    if let Command::Roles { root } = &parsed.command {
+        return run_roles(root);
     }
 
     // Provider commands use the token store and (some) the REST API, but
@@ -160,19 +169,39 @@ fn main() -> ExitCode {
     };
 
     let result = match parsed.command {
-        Command::Brief { root } => {
-            ProjectBriefTask::new(root).run(adapter.as_ref(), &options, &mut emit)
+        Command::Brief { root, role } => {
+            match resolve_task_role(&root, role.as_deref(), ProjectBriefTask::KIND) {
+                Ok(role) => ProjectBriefTask::new(root).with_role(role).run(
+                    adapter.as_ref(),
+                    &options,
+                    &mut emit,
+                ),
+                Err(error) => Err(error),
+            }
         }
         Command::Propose {
             root,
             scene,
             instruction,
-        } => {
-            SceneEditTask::new(root, scene, instruction).run(adapter.as_ref(), &options, &mut emit)
-        }
-        Command::Review { root, scene, focus } => {
-            SceneReviewTask::new(root, scene, focus).run(adapter.as_ref(), &options, &mut emit)
-        }
+            role,
+        } => match resolve_task_role(&root, role.as_deref(), SceneEditTask::KIND) {
+            Ok(role) => SceneEditTask::new(root, scene, instruction)
+                .with_role(role)
+                .run(adapter.as_ref(), &options, &mut emit),
+            Err(error) => Err(error),
+        },
+        Command::Review {
+            root,
+            scene,
+            focus,
+            role,
+        } => match resolve_task_role(&root, role.as_deref(), SceneReviewTask::KIND) {
+            Ok(role) => SceneReviewTask::new(root, scene, focus)
+                .with_role(role)
+                .run(adapter.as_ref(), &options, &mut emit),
+            Err(error) => Err(error),
+        },
+        Command::Roles { .. } => unreachable!("roles runs before the adapter is built"),
         Command::Renew { root, id } => proposal::load(Path::new(&root), &id)
             .map_err(AgentError::Proposal)
             .and_then(|record| SceneEditTask::from_proposal(root, &record))
@@ -247,10 +276,11 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [--latency <ms>]
+const USAGE: &str = "uso: narra-harness brief <project-root> [--role <id>] [--timeout <seg>] [--latency <ms>]
        [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>] [--stream]
-     narra-harness propose <project-root> --scene <n> --instruction <texto> [mismas opciones]
-     narra-harness review <project-root> --scene <n> [--focus <texto>] [mismas opciones]
+     narra-harness propose <project-root> --scene <n> --instruction <texto> [--role <id>] [mismas opciones]
+     narra-harness review <project-root> --scene <n> [--focus <texto>] [--role <id>] [mismas opciones]
+     narra-harness roles <project-root>
      narra-harness proposals <project-root> [list]
      narra-harness proposals <project-root> show <id>
      narra-harness proposals <project-root> apply <id> [--hunks 0,2]
@@ -295,16 +325,25 @@ struct ProviderOptions {
 enum Command {
     Brief {
         root: String,
+        /// Selected role id (`None` = the task kind's default role).
+        role: Option<String>,
     },
     Propose {
         root: String,
         scene: usize,
         instruction: String,
+        role: Option<String>,
     },
     Review {
         root: String,
         scene: usize,
         focus: String,
+        role: Option<String>,
+    },
+    /// Effective roles of a project: built-ins plus `agents.yaml` (M6
+    /// slice 7), printed as JSON for headless verification.
+    Roles {
+        root: String,
     },
     Renew {
         root: String,
@@ -468,7 +507,11 @@ impl Command {
     fn runs_model(&self) -> bool {
         matches!(
             self,
-            Self::Brief { .. } | Self::Propose { .. } | Self::Renew { .. } | Self::Loop { .. }
+            Self::Brief { .. }
+                | Self::Propose { .. }
+                | Self::Review { .. }
+                | Self::Renew { .. }
+                | Self::Loop { .. }
         )
     }
 }
@@ -510,6 +553,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut scene: Option<usize> = None;
     let mut instruction: Option<String> = None;
     let mut focus: Option<String> = None;
+    let mut role: Option<String> = None;
     let mut hunks: Option<Vec<usize>> = None;
     let mut model_options_seen = false;
     let mut stream = false;
@@ -600,6 +644,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 let value = iter.next().ok_or("--focus requiere un valor")?;
                 focus = Some((*value).clone());
             }
+            "--role" => {
+                let value = iter.next().ok_or("--role requiere un valor")?;
+                role = Some((*value).clone());
+            }
             "--hunks" => {
                 let value = iter.next().ok_or("--hunks requiere un valor")?;
                 hunks = Some(parse_hunks(value)?);
@@ -676,6 +724,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let scene_seen = scene.is_some();
     let instruction_seen = instruction.is_some();
     let focus_seen = focus.is_some();
+    let role_seen = role.is_some();
     let hunks_seen = hunks.is_some();
     let allow_seen = !allow_tool.is_empty() || !allow_destructive.is_empty();
     let api_url_seen = api_url.is_some();
@@ -691,16 +740,22 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let command = match positional.as_slice() {
         ["brief", root] if !root.is_empty() => Command::Brief {
             root: (*root).to_string(),
+            role,
         },
         ["propose", root] if !root.is_empty() => Command::Propose {
             root: (*root).to_string(),
             scene: scene.ok_or("--propose requiere --scene <número>")?,
             instruction: instruction.ok_or("--propose requiere --instruction <texto>")?,
+            role,
         },
         ["review", root] if !root.is_empty() => Command::Review {
             root: (*root).to_string(),
             scene: scene.ok_or("--review requiere --scene <número>")?,
             focus: focus.unwrap_or_default(),
+            role,
+        },
+        ["roles", root] if !root.is_empty() => Command::Roles {
+            root: (*root).to_string(),
         },
         ["proposals", root] | ["proposals", root, "list"] if !root.is_empty() => {
             Command::Proposals {
@@ -850,6 +905,16 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     if focus_seen && !matches!(command, Command::Review { .. }) {
         return Err("--focus solo se puede usar con la orden review".to_string());
     }
+    if role_seen
+        && !matches!(
+            command,
+            Command::Brief { .. } | Command::Propose { .. } | Command::Review { .. }
+        )
+    {
+        return Err(
+            "--role solo se puede usar con las órdenes brief, propose y review".to_string(),
+        );
+    }
     if allow_seen && !matches!(command, Command::Loop { .. }) {
         return Err(
             "--allow-tool/--allow-destructive solo se pueden usar con la orden loop".to_string(),
@@ -985,6 +1050,42 @@ fn emit_line(value: &serde_json::Value) {
 
 /// Run a local proposal review operation (list/show/apply/reject): JSONL on
 /// stdout, human summary on stderr, exit 0/1.
+/// Resolve the role a task runs under: `requested` (`--role <id>`) when
+/// given, else the task kind's default role — both as configured in
+/// `<root>/agents.yaml`. Config problems are explicit task errors.
+fn resolve_task_role(
+    root: &str,
+    requested: Option<&str>,
+    task_kind: &str,
+) -> Result<Role, AgentError> {
+    let resolved = match requested {
+        Some(id) => roles::resolve_role(Path::new(root), id),
+        None => roles::resolve_default(Path::new(root), task_kind),
+    };
+    resolved.map_err(AgentError::Roles)
+}
+
+/// `roles <root>`: print the effective roles (built-ins + project config)
+/// as JSON so the configured workspace is verifiable headless.
+fn run_roles(root: &str) -> ExitCode {
+    match roles::load_roles(Path::new(root)) {
+        Ok(effective) => match serde_json::to_string_pretty(&effective) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("roles: no se pudo serializar: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            eprintln!("roles fallidos: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn run_proposals(root: &str, action: &ProposalsAction) -> ExitCode {
     let path = Path::new(root);
     let action_name = match action {
@@ -1556,7 +1657,7 @@ mod tests {
     fn parses_brief_task_with_options() {
         let parsed =
             parse(&["brief", "/tmp/p", "--timeout", "5", "--latency", "10"]).expect("parse");
-        assert!(matches!(parsed.command, Command::Brief { ref root } if root == "/tmp/p"));
+        assert!(matches!(parsed.command, Command::Brief { ref root, .. } if root == "/tmp/p"));
         assert_eq!(parsed.timeout, Duration::from_secs(5));
         assert_eq!(parsed.latency, Duration::from_millis(10));
     }
@@ -1648,13 +1749,41 @@ mod tests {
                 ref root,
                 scene,
                 ref instruction,
+                ref role,
             } => {
                 assert_eq!(root, "/tmp/p");
                 assert_eq!(scene, 3);
                 assert_eq!(instruction, "haz el diálogo más tenso");
+                assert_eq!(role.as_deref(), None, "role defaults to the task kind's");
             }
             other => panic!("expected propose, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn brief_propose_and_review_accept_a_role_override() {
+        let parsed = parse(&["brief", "/tmp/p", "--role", "coordinator"]).expect("parse");
+        match parsed.command {
+            Command::Brief { role, .. } => assert_eq!(role.as_deref(), Some("coordinator")),
+            other => panic!("expected brief, got {other:?}"),
+        }
+        let parsed =
+            parse(&["review", "/tmp/p", "--scene", "1", "--role", "researcher"]).expect("parse");
+        match parsed.command {
+            Command::Review { role, .. } => assert_eq!(role.as_deref(), Some("researcher")),
+            other => panic!("expected review, got {other:?}"),
+        }
+        // The roles listing takes no role flag (it lists them all).
+        let error = parse(&["roles", "/tmp/p", "--role", "x"]).expect_err("role flag");
+        assert!(error.contains("--role"), "{error}");
+    }
+
+    #[test]
+    fn review_takes_model_options() {
+        // Regression: `review` runs a model, so --latency/--adapter parse.
+        let parsed = parse(&["review", "/tmp/p", "--scene", "1", "--latency", "5"])
+            .expect("review with model options");
+        assert_eq!(parsed.latency, Duration::from_millis(5));
     }
 
     #[test]
@@ -1686,6 +1815,7 @@ mod tests {
                 ref root,
                 scene,
                 ref focus,
+                ..
             } => {
                 assert_eq!(root, "/tmp/p");
                 assert_eq!(scene, 2);

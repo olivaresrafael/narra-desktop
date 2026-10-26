@@ -96,7 +96,7 @@ use gpui::{
 };
 use narra_core::agent::{
     AgentError, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter,
-    OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, proposal,
+    OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, proposal, roles,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::{DocumentError, Project, ProjectError, open_project};
@@ -318,6 +318,15 @@ fn scene_number_at(scene_lines: &[usize], caret_line: usize) -> Option<usize> {
 /// panics on short ids).
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// Localizable label for a role's origin; the dump keeps the raw key
+/// (`"builtin"`/`"project"`) so machine checks never depend on wording.
+fn role_source_label(source: &str) -> &'static str {
+    match source {
+        "project" => "proyecto",
+        _ => "integrado",
+    }
 }
 
 /// Diff rows for the proposal panel: one header per hunk, then removed and
@@ -2148,9 +2157,24 @@ impl Editor {
         } else {
             format!(" · foco: {focus}")
         };
+        // The configured role (M6 slice 7): reviews run under the
+        // editor-reviewer role as configured in `agents.yaml`. A broken
+        // role config refuses the run explicitly — never a silent
+        // fallback to the built-in persona.
+        let role = match roles::resolve_default(Path::new(&root), SceneReviewTask::KIND) {
+            Ok(role) => role,
+            Err(error) => {
+                self.notice = Some(format!("roles del proyecto inválidos: {error}"));
+                cx.notify();
+                return;
+            }
+        };
         self.agent.begin(scene_number, focus.clone());
+        self.agent.role = role.id.clone();
+        self.agent.role_source = role.origin_key().to_string();
         self.notice = Some(format!(
-            "revisión de la escena {scene_number} en curso{focus_note}"
+            "revisión de la escena {scene_number} en curso ({}){focus_note}",
+            self.agent.role
         ));
         cx.notify();
 
@@ -2162,13 +2186,11 @@ impl Editor {
                 stream: false,
             };
             let result = match settings.build_adapter() {
-                Ok(adapter) => SceneReviewTask::new(root, scene_number, focus).run(
-                    &*adapter,
-                    &options,
-                    |event| {
+                Ok(adapter) => SceneReviewTask::new(root, scene_number, focus)
+                    .with_role(role)
+                    .run(&*adapter, &options, |event| {
                         let _ = tx.send(AgentMessage::Event(event));
-                    },
-                ),
+                    }),
                 Err(error) => Err(AgentError::Adapter(error)),
             };
             let _ = tx.send(AgentMessage::Done(result));
@@ -2205,8 +2227,24 @@ impl Editor {
         let Some((root, scene_number, settings, cancel)) = self.agent_task_gates() else {
             return;
         };
+        // The configured role (M6 slice 7): edits run under the writer
+        // role as configured in `agents.yaml`; a broken config refuses the
+        // run explicitly instead of silently changing the persona.
+        let role = match roles::resolve_default(Path::new(&root), SceneEditTask::KIND) {
+            Ok(role) => role,
+            Err(error) => {
+                self.notice = Some(format!("roles del proyecto inválidos: {error}"));
+                cx.notify();
+                return;
+            }
+        };
         self.propose.begin(scene_number, instruction.clone());
-        self.notice = Some(format!("propuesta para la escena {scene_number} en curso"));
+        self.propose.role = role.id.clone();
+        self.propose.role_source = role.origin_key().to_string();
+        self.notice = Some(format!(
+            "propuesta para la escena {scene_number} en curso ({})",
+            self.propose.role
+        ));
         cx.notify();
 
         let (tx, rx) = mpsc::channel();
@@ -2218,13 +2256,11 @@ impl Editor {
             };
             let result = match settings.build_adapter() {
                 Ok(adapter) => {
-                    let run = SceneEditTask::new(root.clone(), scene_number, instruction).run(
-                        &*adapter,
-                        &options,
-                        |event| {
+                    let run = SceneEditTask::new(root.clone(), scene_number, instruction)
+                        .with_role(role)
+                        .run(&*adapter, &options, |event| {
                             let _ = tx.send(ProposeMessage::Event(event));
-                        },
-                    );
+                        });
                     match run {
                         Ok(output) => {
                             // Read back the persisted record and pre-render
@@ -2625,6 +2661,15 @@ impl Editor {
                     .child(format!("Foco: {}", self.agent.focus)),
             );
         }
+        // The configured role (M6 slice 7): which persona reviewed and
+        // where that configuration came from.
+        if !self.agent.role.is_empty() {
+            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(format!(
+                "Rol: {} · {}",
+                self.agent.role,
+                role_source_label(&self.agent.role_source)
+            )));
+        }
         if !self.agent.stage.is_empty() {
             panel = panel.child(
                 div()
@@ -2719,6 +2764,14 @@ impl Editor {
                 short_id(&self.propose.id),
                 self.propose.target,
                 self.propose.hunks
+            )));
+        }
+        // The configured role (M6 slice 7): which persona proposed.
+        if !self.propose.role.is_empty() {
+            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(format!(
+                "Rol: {} · {}",
+                self.propose.role,
+                role_source_label(&self.propose.role_source)
             )));
         }
         if !self.propose.stage.is_empty() {
@@ -3322,12 +3375,15 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let agent_dump = format!(
-            "{{\"status\":\"{}\",\"scene\":{},\"focus\":\"{}\",\"stage\":\"{}\",\"sources\":[{}],\
+            "{{\"status\":\"{}\",\"scene\":{},\"focus\":\"{}\",\"role\":\"{}\",\
+             \"role_source\":\"{}\",\"stage\":\"{}\",\"sources\":[{}],\
              \"output\":\"{}\",\"summary\":\"{}\",\"error\":\"{}\",\"scroll\":{},\
              \"elapsed_ms\":{}}}",
             self.agent.status_key(),
             agent_scene_dump,
             escape_json(&self.agent.focus),
+            escape_json(&self.agent.role),
+            escape_json(&self.agent.role_source),
             escape_json(&self.agent.stage),
             agent_sources_dump,
             escape_json(&self.agent.output),
@@ -3377,7 +3433,8 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let proposal_dump = format!(
-            "{{\"status\":\"{}\",\"scene\":{},\"instruction\":\"{}\",\"id\":\"{}\",\
+            "{{\"status\":\"{}\",\"scene\":{},\"instruction\":\"{}\",\"role\":\"{}\",\
+             \"role_source\":\"{}\",\"id\":\"{}\",\
              \"target\":\"{}\",\"hunks\":{},\"armed\":{},\"scroll\":{},\
              \"hunk_cursor\":{},\"selected\":[{}],\
              \"stage\":\"{}\",\"summary\":\"{}\",\"error\":\"{}\",\"diff_rows\":[{}],\
@@ -3385,6 +3442,8 @@ impl Editor {
             self.propose.status_key(),
             proposal_scene_dump,
             escape_json(&self.propose.instruction),
+            escape_json(&self.propose.role),
+            escape_json(&self.propose.role_source),
             escape_json(&self.propose.id),
             escape_json(&self.propose.target),
             self.propose.hunks,

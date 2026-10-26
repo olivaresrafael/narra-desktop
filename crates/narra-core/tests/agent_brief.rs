@@ -283,3 +283,35 @@ fn streaming_emits_deltas_and_identical_output() {
         "no deltas without stream: true"
     );
 }
+
+#[test]
+fn brief_runs_under_the_configured_role_and_refuses_foreign_profiles() {
+    use narra_core::agent::roles;
+
+    let root = sample_project();
+    let builtins = roles::builtin_roles();
+    let coordinator = roles::role_by_id(&builtins, "coordinator")
+        .expect("coordinator")
+        .clone();
+    let output = ProjectBriefTask::new(root.to_str().expect("utf8"))
+        .with_role(coordinator)
+        .run(&MockAdapter::new(), &brief_options(), |_| {})
+        .expect("brief");
+    assert_eq!(output.data["role"], "coordinator");
+    assert_eq!(output.data["role_source"], "builtin");
+
+    let writer = roles::role_by_id(&builtins, "writer")
+        .expect("writer")
+        .clone();
+    let error = ProjectBriefTask::new(root.to_str().expect("utf8"))
+        .with_role(writer)
+        .run(&MockAdapter::new(), &brief_options(), |_| {})
+        .expect_err("denied");
+    assert!(
+        matches!(
+            &error,
+            AgentError::RoleDenied { role, task } if role == "writer" && task == "project_brief"
+        ),
+        "{error:?}"
+    );
+}

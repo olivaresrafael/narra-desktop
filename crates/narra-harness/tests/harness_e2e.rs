@@ -1328,3 +1328,120 @@ fn pr_rejects_a_malformed_repository() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("owner"), "actionable message: {stderr}");
 }
+
+#[test]
+fn roles_lists_the_builtins_and_labels_project_overrides() {
+    let root = sample_project();
+
+    // No config file: the four built-in roles, in spec order.
+    let output = harness()
+        .args(["roles", root.to_str().expect("utf8")])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(0), "roles exits 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let roles: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("roles json");
+    let ids: Vec<&str> = roles
+        .iter()
+        .map(|role| role["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["coordinator", "writer", "researcher", "editor-reviewer"]
+    );
+    assert!(
+        roles.iter().all(|role| role["origin"] == "builtin"),
+        "{roles:?}"
+    );
+
+    // A project override wins and is labeled as such (M6 slice 7).
+    fs::write(
+        root.join("agents.yaml"),
+        "roles:\n  - id: editor-reviewer\n    name: Revisor del proyecto\n    instructions: \
+         Revisa citando la biblia.\n",
+    )
+    .expect("role config");
+    let output = harness()
+        .args(["roles", root.to_str().expect("utf8")])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(0));
+    let roles: Vec<serde_json::Value> =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("roles json");
+    let reviewer = roles
+        .iter()
+        .find(|role| role["id"] == "editor-reviewer")
+        .expect("editor-reviewer present");
+    assert_eq!(reviewer["origin"], "project", "{reviewer:?}");
+    assert_eq!(reviewer["name"], "Revisor del proyecto");
+    assert!(
+        reviewer["instructions"]
+            .as_str()
+            .expect("instructions")
+            .contains("biblia"),
+        "{reviewer:?}"
+    );
+}
+
+#[test]
+fn review_under_an_explicit_role_records_it_in_the_output() {
+    let root = sample_with_scenes();
+    let output = harness()
+        .args([
+            "review",
+            root.to_str().expect("utf8"),
+            "--scene",
+            "1",
+            "--role",
+            "researcher",
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(0), "researcher may review");
+
+    let records = jsonl(&output.stdout);
+    let record = records.last().expect("task output record");
+    assert_eq!(record["record"], "task_output", "{record:?}");
+    assert_eq!(record["data"]["role"], "researcher", "{record:?}");
+    assert_eq!(record["data"]["role_source"], "builtin", "{record:?}");
+}
+
+#[test]
+fn a_role_outside_its_permission_profile_fails_before_the_model() {
+    let root = sample_with_scenes();
+    let output = harness()
+        .args([
+            "review",
+            root.to_str().expect("utf8"),
+            "--scene",
+            "1",
+            "--role",
+            "writer",
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1), "denied profile is a failure");
+
+    let records = jsonl(&output.stdout);
+    let record = records.last().expect("task output record");
+    assert_eq!(record["exit"], "failure", "{record:?}");
+    let error = record["error"].as_str().expect("error message");
+    assert!(error.contains("`writer`"), "{error}");
+    assert!(error.contains("`scene_review`"), "{error}");
+}
+
+#[test]
+fn broken_role_config_is_an_explicit_failure_not_a_silent_fallback() {
+    let root = sample_with_scenes();
+    fs::write(root.join("agents.yaml"), "roles: {}\n").expect("role config");
+    let output = harness()
+        .args(["review", root.to_str().expect("utf8"), "--scene", "1"])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1), "broken config fails");
+
+    let records = jsonl(&output.stdout);
+    let record = records.last().expect("task output record");
+    let error = record["error"].as_str().expect("error message");
+    assert!(error.contains("agents.yaml"), "{error}");
+}

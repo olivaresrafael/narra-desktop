@@ -15,6 +15,7 @@ use serde_json::json;
 
 use super::adapter::{ModelAdapter, ModelRequest};
 use super::proposal::{self, FileProposal, Origin};
+use super::roles;
 use super::scene::{SceneLookup, scene_block};
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::git::{self, OpOptions};
@@ -24,6 +25,13 @@ use crate::project::open_project;
 const SCENE_EDIT_MAX_TOKENS: u32 = 4000;
 /// Longest instruction shown in a context source detail (display only).
 const MAX_INSTRUCTION_CHARS: usize = 160;
+/// Fixed base system prompt: the hard rewrite constraints (the answer must
+/// be the scene alone). The role persona (M6 slice 7) is appended on top,
+/// never replacing this.
+const BASE_SYSTEM: &str = "Eres un editor de guion profesional. Respondes en el \
+     idioma primario del proyecto. Devuelves exclusivamente \
+     el texto solicitado, sin comentarios, sin explicaciones \
+     y sin bloques de código.";
 
 /// The `scene_edit` task: input is explicit and serializable — project root,
 /// 1-based scene number and the writer's instruction.
@@ -33,6 +41,9 @@ pub struct SceneEditTask {
     /// 1-based scene number as counted by the derived scene index.
     pub scene_number: usize,
     pub instruction: String,
+    /// Configured role running the edit (M6 slice 7); `None` = the task
+    /// runs with its fixed base prompt only.
+    pub role: Option<roles::Role>,
 }
 
 impl SceneEditTask {
@@ -45,7 +56,16 @@ impl SceneEditTask {
             project_root: project_root.into(),
             scene_number,
             instruction: instruction.into(),
+            role: None,
         }
+    }
+
+    /// Run under a configured role (M6 slice 7): the role's persona is
+    /// appended to the fixed system prompt and its permission profile is
+    /// checked before anything else runs.
+    pub fn with_role(mut self, role: roles::Role) -> Self {
+        self.role = Some(role);
+        self
     }
 
     /// Human-readable task kind for events and provenance.
@@ -77,7 +97,16 @@ impl SceneEditTask {
                 .ok_or(AgentError::InvalidInput(
                     "proposal is missing its instruction input",
                 ))?;
-        Ok(Self::new(project_root, scene_number, instruction))
+        let project_root = project_root.into();
+        let mut task = Self::new(project_root.clone(), scene_number, instruction);
+        // Restore the configured role the proposal was created under (M6
+        // slice 7): renew re-runs the same request, persona included. A
+        // broken `agents.yaml` or a vanished role id is an explicit error,
+        // never a silent persona change.
+        if let Some(role_id) = proposal.origin.task_input["role"].as_str() {
+            task = task.with_role(roles::resolve_role(Path::new(&project_root), role_id)?);
+        }
+        Ok(task)
     }
 
     /// Run the task headless: no window, no UI framework. `emit` receives
@@ -92,6 +121,14 @@ impl SceneEditTask {
         let started = Instant::now();
         let root = Path::new(&self.project_root);
         self.validate()?;
+        if let Some(role) = &self.role
+            && !role.allows(Self::KIND)
+        {
+            return Err(AgentError::RoleDenied {
+                role: role.id.clone(),
+                task: Self::KIND.to_string(),
+            });
+        }
 
         emit(TaskEvent::Started {
             task: Self::KIND.to_string(),
@@ -167,11 +204,10 @@ impl SceneEditTask {
             detail: format!("Reescribiendo «{heading}»"),
         });
         let request = ModelRequest {
-            system: "Eres un editor de guion profesional. Respondes en el \
-                     idioma primario del proyecto. Devuelves exclusivamente \
-                     el texto solicitado, sin comentarios, sin explicaciones \
-                     y sin bloques de código."
-                .to_string(),
+            system: self.role.as_ref().map_or_else(
+                || BASE_SYSTEM.to_string(),
+                |role| role.system_with(BASE_SYSTEM),
+            ),
             prompt: format!(
                 "PROYECTO: {}\n\
                  INSTRUCCIÓN:\n{}\n\n\
@@ -234,6 +270,8 @@ impl SceneEditTask {
             task_input: json!({
                 "scene_number": self.scene_number,
                 "instruction": self.instruction,
+                "role": self.role.as_ref().map(|role| role.id.as_str()),
+                "role_source": self.role.as_ref().map(|role| role.origin_key()),
             }),
         };
         let record = FileProposal::new(
@@ -260,6 +298,8 @@ impl SceneEditTask {
             "scene_heading": heading,
             "scene_range": format!("L{}-L{region_end}", start + 1),
             "hunks": record.hunks.len(),
+            "role": self.role.as_ref().map(|role| role.id.as_str()),
+            "role_source": self.role.as_ref().map(|role| role.origin_key()),
             "base_revision": record.base_revision,
             "base_sha256": record.base_sha256,
             "adapter": adapter.name(),

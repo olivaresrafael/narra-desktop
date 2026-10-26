@@ -10,6 +10,7 @@ use std::time::Instant;
 use serde_json::json;
 
 use super::adapter::{ModelAdapter, ModelRequest};
+use super::roles;
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::git::{self, OpOptions};
 use crate::manifest::ProjectType;
@@ -19,19 +20,35 @@ use crate::project::open_project;
 const MAX_SCENES_IN_CONTEXT: usize = 30;
 /// Hard cap on model output tokens for the brief.
 const BRIEF_MAX_TOKENS: u32 = 800;
+/// Fixed base system prompt. The role persona (M6 slice 7) is appended on
+/// top, never replacing this.
+const BASE_SYSTEM: &str = "Eres un asistente de guion. Respondes en el idioma \
+     primario del proyecto, en prosa breve y concreta.";
 
 /// The `project_brief` task: input is explicit and serializable — a project
 /// root path — and the run is driven by [`ProjectBriefTask::run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectBriefTask {
     pub project_root: String,
+    /// Configured role running the brief (M6 slice 7); `None` = the task
+    /// runs with its fixed base prompt only.
+    pub role: Option<roles::Role>,
 }
 
 impl ProjectBriefTask {
     pub fn new(project_root: impl Into<String>) -> Self {
         Self {
             project_root: project_root.into(),
+            role: None,
         }
+    }
+
+    /// Run under a configured role (M6 slice 7): the role's persona is
+    /// appended to the fixed system prompt and its permission profile is
+    /// checked before anything else runs.
+    pub fn with_role(mut self, role: roles::Role) -> Self {
+        self.role = Some(role);
+        self
     }
 
     /// Human-readable task kind for events and provenance.
@@ -50,6 +67,14 @@ impl ProjectBriefTask {
         let root = Path::new(&self.project_root);
         if self.project_root.trim().is_empty() {
             return Err(AgentError::InvalidInput("project root must not be empty"));
+        }
+        if let Some(role) = &self.role
+            && !role.allows(Self::KIND)
+        {
+            return Err(AgentError::RoleDenied {
+                role: role.id.clone(),
+                task: Self::KIND.to_string(),
+            });
         }
 
         emit(TaskEvent::Started {
@@ -116,9 +141,10 @@ impl ProjectBriefTask {
         // --- Model call --------------------------------------------------
         self.check_cancel(options)?;
         let request = ModelRequest {
-            system: "Eres un asistente de guion. Respondes en el idioma \
-                     primario del proyecto, en prosa breve y concreta."
-                .to_string(),
+            system: self.role.as_ref().map_or_else(
+                || BASE_SYSTEM.to_string(),
+                |role| role.system_with(BASE_SYSTEM),
+            ),
             prompt: format!(
                 "{context}\nEscribe un resumen de una página como máximo \
                  sobre este proyecto: premisa, escala y estado actual."
@@ -148,6 +174,8 @@ impl ProjectBriefTask {
             "primary_language": manifest.primary_language,
             "project_type": project_type_label(manifest.project_type),
             "total_scenes": total_scenes,
+            "role": self.role.as_ref().map(|role| role.id.as_str()),
+            "role_source": self.role.as_ref().map(|role| role.origin_key()),
             "git": git_summary,
             "adapter": adapter.name(),
             "model": response.model,
