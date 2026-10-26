@@ -41,6 +41,16 @@
 //!       saves through the boundary-checked document IO, and switching
 //!       documents with unsaved changes is refused explicitly — the status
 //!       bar shows the document, a dirty marker and the last outcome.
+//!   spike-editor --project <root>                 M6 slice 3: agent review
+//!       ⌘R reviews the scene under the caret grounded in project material
+//!       (scene_review task on a worker thread); the right panel shows the
+//!       run's status, the context sources read and a scrolled window of
+//!       the review; ⌘. cancels; ⌥↑/⌥↓ scroll. Adapter flags (key never
+//!       from argv, only from OPENAI_API_KEY):
+//!         --agent-adapter mock|openai-compat  (default: mock, offline)
+//!         --agent-model <nombre>              (required for openai-compat)
+//!         --agent-base-url <url>              (default: local Ollama)
+//!         --agent-latency <ms>                (simulated mock latency)
 //!
 //! Find bar note (spike scope): one focus handle serves both the document
 //! and the find fields — while the bar is open, text input, backspace and
@@ -51,6 +61,7 @@
 //!
 //! Output: JSON lines on stdout starting with `{"kind":"spike-a`.
 
+mod agent_view;
 mod buffer;
 
 use std::cell::RefCell;
@@ -60,8 +71,10 @@ use std::ops::Range;
 use std::path::Path;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use agent_view::{AgentMessage, AgentState, AgentStatus};
 use buffer::{Buffer, Position};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
@@ -69,6 +82,11 @@ use gpui::{
     Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection, Window, WindowBounds,
     WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size,
 };
+use narra_core::agent::{
+    AgentError, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter,
+    OpenAiCompatConfig, SceneReviewTask, TaskOptions,
+};
+use narra_core::cancel::CancellationToken;
 use narra_core::{DocumentError, Project, ProjectError, open_project};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -112,6 +130,11 @@ actions!(
         ReplaceAll,
         // diff view (slice 3, M1-3b)
         ToggleDiff,
+        // agent review (M6 slice 3)
+        ReviewScene,
+        CancelReview,
+        ReviewScrollUp,
+        ReviewScrollDown,
     ]
 );
 
@@ -162,6 +185,17 @@ const EXPLORER_W: f32 = 220.0;
 const EXPLORER_BG: u32 = 0x252526;
 const EXPLORER_BORDER: u32 = 0x3c3c3c;
 const DOC_SELECTED_BG: u32 = 0x37373d;
+/// Agent review panel (M6 slice 3): right-hand column with status, context
+/// sources and a scrolled window of the review text.
+const AGENT_PANEL_W: f32 = 380.0;
+/// Review lines visible in the panel at once; `⌥↑/⌥↓` scrolls by 3 lines.
+/// Approximate chrome-free budget (the panel also shows header, sources and
+/// hints); the dump always carries the full text, so this is display-only.
+const AGENT_VISIBLE_LINES: usize = 20;
+/// Hard cap on one review task (`scene_review`): model latency included.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Error/cancelled text in the agent panel.
+const AGENT_ERR_FG: u32 = 0xf48771;
 /// Diff view colors (slice 3, M1-3b): added/removed row backgrounds and the
 /// line-label gutter text.
 const DIFF_ADD_BG: u32 = 0x16321f;
@@ -225,6 +259,17 @@ fn is_scene_heading(line: &str) -> bool {
         || line.starts_with("EXT. ")
         || line.starts_with("I/E. ")
         || line.starts_with("EXT./INT. ")
+}
+
+/// 1-based scene under a caret line (M6 slice 3): the scene whose heading is
+/// the last one at or above the caret. `None` when the caret sits before the
+/// first heading — outside every scene, which the UI reports explicitly
+/// instead of guessing.
+fn scene_number_at(scene_lines: &[usize], caret_line: usize) -> Option<usize> {
+    scene_lines
+        .iter()
+        .rposition(|line| *line <= caret_line)
+        .map(|ix| ix + 1)
 }
 
 fn is_character_cue(line: &str) -> bool {
@@ -640,6 +685,12 @@ struct Editor {
     saved_edits: usize,
     /// Last user-visible outcome (save/open/blocked switch). Display only.
     notice: Option<String>,
+    /// Agent review panel state (M6 slice 3). Pure reducer — see agent_view.
+    agent: AgentState,
+    /// Cancellation token for the in-flight review (None when no run active).
+    agent_cancel: Option<CancellationToken>,
+    /// Adapter settings for ⌘R reviews (from the `--agent-*` flags).
+    agent_settings: AgentSettings,
 }
 
 impl Focusable for Editor {
@@ -1875,6 +1926,250 @@ impl Editor {
         cx.notify();
     }
 
+    /// ⌘R: review the scene under the caret, grounded in project material
+    /// (M6 slice 3). The core task runs on a worker thread; the panel shows
+    /// progress, the context sources it read, and the result. Read-only: the
+    /// task never writes, and it reviews the *saved* file — an unsaved
+    /// buffer is refused with an explicit notice instead of being reviewed
+    /// at the wrong version.
+    fn on_review_scene(&mut self, _: &ReviewScene, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent.is_running() {
+            self.notice = Some("ya hay una revisión en curso (⌘. la cancela)".to_string());
+            return;
+        }
+        // Own the two strings we need so the borrow of `self.project` ends
+        // before any mutation below (borrow-checker friendly shape).
+        let project_info = self.project.as_ref().map(|project| {
+            (
+                project.root().to_string_lossy().into_owned(),
+                project.manifest().default_screenplay_path.clone(),
+            )
+        });
+        let Some((root, screenplay)) = project_info else {
+            self.notice = Some("modo fixture: sin proyecto abierto (usa --project)".to_string());
+            return;
+        };
+        if self.doc_path != screenplay {
+            self.notice = Some(format!("abre {screenplay} para revisar una escena"));
+            return;
+        }
+        if self.dirty() {
+            self.notice =
+                Some("cambios sin guardar: la revisión lee el archivo en disco (⌘S)".to_string());
+            return;
+        }
+        self.refresh_scenes();
+        let caret_line = self.buffer.position_at(self.caret()).line;
+        let Some(scene_number) = scene_number_at(&self.scene_lines, caret_line) else {
+            self.notice = Some("el caret no está dentro de una escena".to_string());
+            return;
+        };
+
+        let settings = self.agent_settings.clone();
+        let cancel = CancellationToken::new();
+        self.agent_cancel = Some(cancel.clone());
+        self.agent.begin(scene_number);
+        self.notice = Some(format!("revisión de la escena {scene_number} en curso"));
+        cx.notify();
+
+        // Worker thread (`AGENTS.md`: never block the UI thread with model
+        // calls) plus a timer pump that folds the task's messages into the
+        // entity, so progress stays observable and the task stays cancellable.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = TaskOptions {
+                timeout: AGENT_TIMEOUT,
+                cancel,
+                stream: false,
+            };
+            let result = match settings.build_adapter() {
+                Ok(adapter) => {
+                    SceneReviewTask::new(root, scene_number, "").run(&*adapter, &options, |event| {
+                        let _ = tx.send(AgentMessage::Event(event));
+                    })
+                }
+                Err(error) => Err(AgentError::Adapter(error)),
+            };
+            let _ = tx.send(AgentMessage::Done(result));
+        });
+        cx.spawn(async move |view, cx| {
+            loop {
+                loop {
+                    match rx.try_recv() {
+                        Ok(message) => {
+                            let done = matches!(message, AgentMessage::Done(_));
+                            // The entity is gone (window closed): stop pumping.
+                            if view
+                                .update(cx, |view, _| view.apply_agent_message(message, done))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if done {
+                                return;
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        // The worker died without a final message: stop the
+                        // pump instead of spinning forever.
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+                Timer::after(Duration::from_millis(33)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Fold one agent message into the panel state; when the task ends, keep
+    /// the notice bar in sync with the outcome.
+    fn apply_agent_message(&mut self, message: AgentMessage, done: bool) {
+        self.agent.apply(message);
+        if done {
+            self.agent_cancel = None;
+            self.notice = Some(match self.agent.status {
+                AgentStatus::Completed => {
+                    format!("revisión de la escena {} lista", self.agent.scene_number)
+                }
+                AgentStatus::Cancelled => "revisión cancelada".to_string(),
+                AgentStatus::Failed => format!("revisión fallida: {}", self.agent.error),
+                AgentStatus::Running | AgentStatus::Idle => String::new(),
+            });
+        }
+    }
+
+    /// ⌘.: cancel the in-flight review. Cooperative: the task checks the
+    /// token between steps, so a model call already in flight finishes but
+    /// no further work happens.
+    fn on_cancel_review(
+        &mut self,
+        _: &CancelReview,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if let Some(token) = self.agent_cancel.take() {
+            token.cancel();
+            self.notice = Some("cancelando la revisión…".to_string());
+        } else {
+            self.notice = Some("no hay ninguna revisión en curso".to_string());
+        }
+    }
+
+    /// ⌥↑/⌥↓: scroll the review text inside the agent panel.
+    fn on_review_scroll_up(
+        &mut self,
+        _: &ReviewScrollUp,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let total = self.agent.output.lines().count();
+        self.agent.scroll_lines(-3, total, AGENT_VISIBLE_LINES);
+    }
+
+    fn on_review_scroll_down(
+        &mut self,
+        _: &ReviewScrollDown,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let total = self.agent.output.lines().count();
+        self.agent.scroll_lines(3, total, AGENT_VISIBLE_LINES);
+    }
+
+    /// Agent review panel (M6 slice 3): right-hand column with the run's
+    /// status, the context sources the task actually read, and a scrolled
+    /// window of the review text. The dump prints the full text, so headless
+    /// verification never depends on what fits on screen.
+    fn agent_panel(&self) -> impl IntoElement {
+        let status_label = match self.agent.status {
+            AgentStatus::Idle => "inactivo",
+            AgentStatus::Running => "en curso",
+            AgentStatus::Completed => "completada",
+            AgentStatus::Failed => "fallida",
+            AgentStatus::Cancelled => "cancelada",
+        };
+        let mut panel = div()
+            .id("agent-panel")
+            .w(px(AGENT_PANEL_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(EXPLORER_BG))
+            .border_l_1()
+            .border_color(rgb(EXPLORER_BORDER))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(DEFAULT_FG))
+                    .child(format!(
+                        "Revisión · escena {} · {status_label}",
+                        self.agent.scene_number
+                    )),
+            );
+        if !self.agent.stage.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(STATUS_FG))
+                    .child(self.agent.stage.clone()),
+            );
+        }
+        panel = panel.child(
+            div()
+                .px_2()
+                .text_color(rgb(STATUS_FG))
+                .child(format!("Fuentes ({})", self.agent.sources.len())),
+        );
+        for (ix, source) in self.agent.sources.iter().enumerate() {
+            panel = panel.child(
+                div()
+                    .id(("agent-source", ix))
+                    .px_2()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(rgb(STATUS_FG))
+                    .child(format!("{} · {}", source.kind, source.location)),
+            );
+        }
+        for line in self
+            .agent
+            .output
+            .lines()
+            .skip(self.agent.scroll)
+            .take(AGENT_VISIBLE_LINES)
+        {
+            // Empty lines keep their height so paragraph breaks survive.
+            let text = if line.is_empty() { " " } else { line };
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(DEFAULT_FG))
+                    .child(text.to_string()),
+            );
+        }
+        if matches!(
+            self.agent.status,
+            AgentStatus::Failed | AgentStatus::Cancelled
+        ) {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(AGENT_ERR_FG))
+                    .child(self.agent.error.clone()),
+            );
+        }
+        panel.child(
+            div()
+                .px_2()
+                .text_color(rgb(STATUS_FG))
+                .child("⌘R revisa · ⌘. cancela · ⌥↑/⌥↓ desplaza"),
+        )
+    }
+
     /// Explorer panel (M6 slice 1): one row per project document. Clicking
     /// loads it (`select_doc`); the active document is highlighted to mirror
     /// `doc_path`. Long paths clip at the panel edge (status bar shows the
@@ -1936,8 +2231,21 @@ impl Editor {
             .as_ref()
             .map(|text| format!(" · {text}"))
             .unwrap_or_default();
+        // M6 slice 3: the review's lifecycle at a glance next to the rest of
+        // the workspace state.
+        let agent = match self.agent.status {
+            AgentStatus::Idle => String::new(),
+            AgentStatus::Running => {
+                format!(" · revisión en curso (escena {})", self.agent.scene_number)
+            }
+            AgentStatus::Completed => {
+                format!(" · revisión lista (escena {})", self.agent.scene_number)
+            }
+            AgentStatus::Failed => " · revisión fallida".to_string(),
+            AgentStatus::Cancelled => " · revisión cancelada".to_string(),
+        };
         format!(
-            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}{}",
+            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}{}{}",
             document,
             caret.line + 1,
             caret.col,
@@ -1951,6 +2259,7 @@ impl Editor {
             max,
             self.probe_left,
             notice,
+            agent,
         )
     }
 
@@ -2276,6 +2585,48 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
 
+        // M6 slice 3: the review panel's full state — status, scene, sources
+        // audited, the *entire* review text, summary, error and timing — so
+        // headless verification never depends on what a screenshot shows.
+        let agent_scene_dump = if self.agent.scene_number > 0 {
+            self.agent.scene_number.to_string()
+        } else {
+            "null".to_string()
+        };
+        let agent_elapsed_dump = self
+            .agent
+            .elapsed_ms()
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let agent_sources_dump = self
+            .agent
+            .sources
+            .iter()
+            .map(|source| {
+                format!(
+                    "{{\"kind\":\"{}\",\"location\":\"{}\",\"detail\":\"{}\"}}",
+                    escape_json(&source.kind),
+                    escape_json(&source.location),
+                    escape_json(&source.detail)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let agent_dump = format!(
+            "{{\"status\":\"{}\",\"scene\":{},\"stage\":\"{}\",\"sources\":[{}],\
+             \"output\":\"{}\",\"summary\":\"{}\",\"error\":\"{}\",\"scroll\":{},\
+             \"elapsed_ms\":{}}}",
+            self.agent.status_key(),
+            agent_scene_dump,
+            escape_json(&self.agent.stage),
+            agent_sources_dump,
+            escape_json(&self.agent.output),
+            escape_json(&self.agent.summary),
+            escape_json(&self.agent.error),
+            self.agent.scroll,
+            agent_elapsed_dump,
+        );
+
         format!(
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
@@ -2288,7 +2639,8 @@ impl Editor {
                 "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}},",
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
-                "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}]}}"
+                "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
+                 \"agent\":{}}}"
             ),
             self.buffer.line_count(),
             len,
@@ -2324,6 +2676,7 @@ impl Editor {
             self.dirty(),
             notice_dump,
             explorer_dump,
+            agent_dump,
         )
     }
 
@@ -2690,8 +3043,16 @@ impl Render for Editor {
         } else {
             0.0
         };
-        self.wrap_width =
-            (window.viewport_size().width - px(explorer_w + ROW_PADDING_X * 2.0)).max(px(200.0));
+        // The review panel (M6 slice 3) narrows the document area too, so
+        // wrapped rows never hide under it either.
+        let agent_w = if self.agent.is_open() {
+            AGENT_PANEL_W
+        } else {
+            0.0
+        };
+        self.wrap_width = (window.viewport_size().width
+            - px(explorer_w + agent_w + ROW_PADDING_X * 2.0))
+        .max(px(200.0));
 
         let status = self.status_text();
         let focus = self.focus_handle.clone();
@@ -2733,6 +3094,11 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_replace_current))
             .on_action(cx.listener(Self::on_replace_all))
             .on_action(cx.listener(Self::on_toggle_diff))
+            // agent review (M6 slice 3)
+            .on_action(cx.listener(Self::on_review_scene))
+            .on_action(cx.listener(Self::on_cancel_review))
+            .on_action(cx.listener(Self::on_review_scroll_up))
+            .on_action(cx.listener(Self::on_review_scroll_down))
             .child(
                 div()
                     .id("status")
@@ -2816,8 +3182,73 @@ impl Render for Editor {
                                 .absolute()
                                 .size_full(),
                             ),
-                    ),
+                    )
+                    // Review panel (M6 slice 3): right column of the body
+                    // row, visible whenever a review has been requested.
+                    .when(self.agent.is_open(), |body| body.child(self.agent_panel())),
             )
+    }
+}
+
+/// Which model adapter feeds ⌘R reviews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentKind {
+    /// Deterministic local provider (no network, no credentials): the
+    /// default, so the workspace is verifiable offline.
+    Mock,
+    /// OpenAI-compatible HTTP API (local Ollama or a cloud provider).
+    OpenAiCompat,
+}
+
+/// Adapter settings for agent reviews (`--agent-*` flags). The API key is
+/// never an argument — it is read from the environment at build time, same
+/// rule as `narra-harness` (argv would expose it in `ps`).
+#[derive(Clone, Debug)]
+struct AgentSettings {
+    kind: AgentKind,
+    base_url: String,
+    model: Option<String>,
+    /// Simulated mock latency in ms (lets a driver observe the running
+    /// state; real providers ignore it).
+    latency_ms: u64,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            kind: AgentKind::Mock,
+            base_url: LOCAL_DEFAULT_BASE_URL.to_string(),
+            model: None,
+            latency_ms: 0,
+        }
+    }
+}
+
+impl AgentSettings {
+    /// Build the adapter for one run. Missing key for a remote provider is
+    /// not an error here: local OpenAI-compatible servers (Ollama) need none.
+    fn build_adapter(&self) -> Result<Box<dyn ModelAdapter>, String> {
+        match self.kind {
+            AgentKind::Mock => Ok(Box::new(MockAdapter::with_latency(Duration::from_millis(
+                self.latency_ms,
+            )))),
+            AgentKind::OpenAiCompat => {
+                let model = self
+                    .model
+                    .clone()
+                    .ok_or("--agent-adapter openai-compat requiere --agent-model <nombre>")?;
+                let api_key = env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|key| !key.is_empty());
+                Ok(Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig {
+                    base_url: self.base_url.clone(),
+                    api_key,
+                    model,
+                    timeout: AGENT_TIMEOUT,
+                    extra_headers: Vec::new(),
+                })))
+            }
+        }
     }
 }
 
@@ -2831,6 +3262,7 @@ struct Args {
     diff_steps: usize,
     report_after_ms: Option<u64>,
     dump_after_ms: Option<u64>,
+    agent: AgentSettings,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -2843,6 +3275,7 @@ fn parse_args() -> Result<Args, String> {
     let mut diff_steps = 0usize;
     let mut report_after_ms = None;
     let mut dump_after_ms = None;
+    let mut agent = AgentSettings::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -2887,6 +3320,25 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| format!("--dump-after-ms inválido: {value}"))?,
                 )
             }
+            // Agent review adapter (M6 slice 3). Key never from argv.
+            "--agent-adapter" => {
+                agent.kind = match value.as_str() {
+                    "mock" => AgentKind::Mock,
+                    "openai-compat" => AgentKind::OpenAiCompat,
+                    other => {
+                        return Err(format!(
+                            "--agent-adapter inválido: {other} (mock|openai-compat)"
+                        ));
+                    }
+                }
+            }
+            "--agent-base-url" => agent.base_url = value.clone(),
+            "--agent-model" => agent.model = Some(value.clone()),
+            "--agent-latency" => {
+                agent.latency_ms = value
+                    .parse()
+                    .map_err(|_| format!("--agent-latency inválido: {value}"))?
+            }
             other => return Err(format!("argumento desconocido: {other}")),
         }
         i += 2;
@@ -2904,6 +3356,7 @@ fn parse_args() -> Result<Args, String> {
         diff_steps,
         report_after_ms,
         dump_after_ms,
+        agent,
     })
 }
 
@@ -2990,6 +3443,7 @@ fn run() -> Result<(), String> {
     let diff_steps = args.diff_steps;
     let report_after_ms = args.report_after_ms;
     let dump_after_ms = args.dump_after_ms;
+    let agent_settings = args.agent;
     Application::new().run(move |cx: &mut App| {
         cx.activate(true);
         cx.bind_keys([
@@ -3033,6 +3487,12 @@ fn run() -> Result<(), String> {
             // diff view (slice 3, M1-3b): cmd-d toggles, cmd-g/shift-g walk
             // hunks while it is open.
             KeyBinding::new("cmd-d", ToggleDiff, None),
+            // agent review (M6 slice 3): cmd-r reviews the caret's scene,
+            // cmd-. cancels the run, alt-up/down scroll the review text.
+            KeyBinding::new("cmd-r", ReviewScene, None),
+            KeyBinding::new("cmd-.", CancelReview, None),
+            KeyBinding::new("alt-up", ReviewScrollUp, None),
+            KeyBinding::new("alt-down", ReviewScrollDown, None),
         ]);
 
         cx.observe_keystrokes({
@@ -3065,6 +3525,9 @@ fn run() -> Result<(), String> {
             base_text: content.clone(),
             saved_edits: 0,
             notice: None,
+            agent: AgentState::new(),
+            agent_cancel: None,
+            agent_settings: agent_settings.clone(),
             selected: 0..0,
             reversed: false,
             marked: None,
@@ -3150,7 +3613,7 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!(
-                "uso: spike-editor [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]"
+                "uso: spike-editor [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]\n      [--agent-adapter mock|openai-compat] [--agent-model <nombre>] [--agent-base-url <url>] [--agent-latency <ms>]"
             );
             ExitCode::FAILURE
         }
@@ -3160,6 +3623,23 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_number_at_finds_the_scene_under_the_caret() {
+        let scenes = vec![2, 7, 11];
+        // On or after a heading, up to the line before the next heading.
+        assert_eq!(scene_number_at(&scenes, 0), None, "before every scene");
+        assert_eq!(
+            scene_number_at(&scenes, 1),
+            None,
+            "before the first heading"
+        );
+        assert_eq!(scene_number_at(&scenes, 2), Some(1));
+        assert_eq!(scene_number_at(&scenes, 6), Some(1));
+        assert_eq!(scene_number_at(&scenes, 7), Some(2));
+        assert_eq!(scene_number_at(&scenes, 100), Some(3), "past the last");
+        assert_eq!(scene_number_at(&[], 4), None, "no scenes at all");
+    }
 
     #[test]
     fn record_edit_pushes_plain_edits_separately() {

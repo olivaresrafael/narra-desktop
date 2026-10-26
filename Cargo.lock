@@ -5285,6 +5285,7 @@ version = "0.0.0"
 dependencies = [
  "gpui",
  "narra-core",
+ "serde_json",
  "similar 3.2.0",
  "unicode-segmentation",
 ]

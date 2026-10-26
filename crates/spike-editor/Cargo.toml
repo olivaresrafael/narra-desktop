@@ -20,6 +20,10 @@ narra-core = { path = "../narra-core" }
 # Grapheme-correct cursor movement (Spike B requirement). MIT/Apache-2.0, and
 # already present in the GPUI dependency tree, so no new supply-chain surface.
 unicode-segmentation = "1"
+# JSON payloads in the agent panel tests (M6 slice 3). Already in the
+# dependency tree through narra-core, so no new supply-chain surface;
+# serde (MIT/Apache-2.0) is license-compatible with GPL-3.0 (D-015).
+serde_json = "1"
 # Unified/side-by-side diff engine (Spike A slice 3, M1-3b). A hand-rolled
 # Myers would be a correctness risk for the one surface whose whole job is
 # reviewing AI-authored changes (M4 proposals); a wrong diff is a safety bug,
