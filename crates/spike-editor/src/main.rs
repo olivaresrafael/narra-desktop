@@ -55,7 +55,10 @@
 //!       scene_edit for the caret's scene and the panel shows the stored
 //!       proposal's diff; ⌘⇧Enter applies (two-step: arm, then apply),
 //!       ⌘⌫ rejects. M6 slice 5 (review focus): ⌘⇧R opens the focus bar,
-//!      enter commits the focus and reviews, ⌘R reuses the last focus.
+//!       enter commits the focus and reviews, ⌘R reuses the last focus.
+//!       M6 slice 6 (hunk selection): ⌥←/⌥→ walk the proposal's hunks,
+//!       ⌥Enter toggles the one under the cursor and ⌘⇧Enter applies
+//!       exactly the selected subset (empty selection is refused).
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -150,6 +153,10 @@ actions!(
         RejectProposal,
         // review focus (M6 slice 5)
         OpenFocusBar,
+        // hunk selection (M6 slice 6)
+        HunkPrev,
+        HunkNext,
+        ToggleHunk,
     ]
 );
 
@@ -2330,6 +2337,35 @@ impl Editor {
         self.run_propose_task(instruction, cx);
     }
 
+    /// ⌘⌥← / ⌘⌥→: walk the record's hunks (M6 slice 6). Only meaningful
+    /// once the record's hunk count is known; otherwise a no-op (the panel
+    /// isn't showing a proposal).
+    fn on_hunk_prev(&mut self, _: &HunkPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.propose.is_open() && self.propose.hunks > 0 {
+            self.propose.move_hunk_cursor(-1);
+            cx.notify();
+        }
+    }
+
+    fn on_hunk_next(&mut self, _: &HunkNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.propose.is_open() && self.propose.hunks > 0 {
+            self.propose.move_hunk_cursor(1);
+            cx.notify();
+        }
+    }
+
+    /// ⌥Enter: toggle the hunk under the cursor (M6 slice 6). Arming is
+    /// cleared: changing the selection invalidates a pending confirmation.
+    fn on_toggle_hunk(&mut self, _: &ToggleHunk, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.propose.is_open() && self.propose.hunks > 0 {
+            self.propose.toggle_hunk();
+            // A pending "apply" confirmation referenced the previous
+            // selection; drop it rather than apply a different set.
+            self.propose.armed_apply = false;
+            cx.notify();
+        }
+    }
+
     /// ⌘⇧Enter: apply the ready proposal. Two-step by design: the first
     /// press arms (writing the canonical file is never one keystroke), the
     /// second one applies through the core (content-hash checked, atomic).
@@ -2346,8 +2382,23 @@ impl Editor {
         }
         if !self.propose.armed_apply {
             self.propose.armed_apply = true;
+            let selection = if self.propose.all_selected() {
+                format!("{} hunk(s)", self.propose.hunks)
+            } else {
+                format!(
+                    "{}/{} hunk(s) [{}]",
+                    self.propose.selected_hunks().len(),
+                    self.propose.hunks,
+                    self.propose
+                        .selected_hunks()
+                        .iter()
+                        .map(|ix| (ix + 1).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
             self.notice = Some(format!(
-                "⌘⇧Enter de nuevo para aplicar {} a {} (escribe en disco) · ⌘⌫ descarta",
+                "⌘⇧Enter de nuevo para aplicar {selection} de {} a {} (escribe en disco) · ⌘⌫ descarta",
                 short_id(&self.propose.id),
                 self.propose.target
             ));
@@ -2363,11 +2414,28 @@ impl Editor {
             cx.notify();
             return;
         };
-        match proposal::apply(Path::new(&root), &self.propose.id, None) {
+        // The selected subset (M6 slice 6): all selected → None (apply-all,
+        // the core's canonical path); a subset → Some(indices); nothing
+        // selected → explicit refusal (applying nothing would rewrite the
+        // file for no change and mark the record applied).
+        let accepted: Option<Vec<usize>> = if self.propose.all_selected() {
+            None
+        } else {
+            let selected = self.propose.selected_hunks();
+            if selected.is_empty() {
+                self.notice =
+                    Some("sin hunks seleccionados: ⌥Enter selecciona al menos uno".to_string());
+                cx.notify();
+                return;
+            }
+            Some(selected)
+        };
+        match proposal::apply(Path::new(&root), &self.propose.id, accepted.as_deref()) {
             Ok(outcome) => {
                 self.propose.status = ProposeStatus::Applied;
                 self.propose.armed_apply = false;
                 let applied = outcome.applied_hunks.len();
+                let skipped = outcome.skipped_hunks.len();
                 let target = outcome.proposal.target.clone();
                 // Reload the buffer when the applied target is the open
                 // document, so the user sees the applied result immediately.
@@ -2376,7 +2444,13 @@ impl Editor {
                     .as_ref()
                     .filter(|_| self.doc_path == target)
                     .map(|project| project.read_document(&self.doc_path));
-                let mut final_notice = format!("propuesta aplicada: {applied} hunk(s) en {target}");
+                let mut final_notice = if skipped > 0 {
+                    format!(
+                        "propuesta aplicada: {applied} hunk(s) en {target} · {skipped} omitido(s) por selección"
+                    )
+                } else {
+                    format!("propuesta aplicada: {applied} hunk(s) en {target}")
+                };
                 match reloaded {
                     Some(Ok(text)) => {
                         let path = self.doc_path.clone();
@@ -2655,6 +2729,10 @@ impl Editor {
                     .child(self.propose.stage.clone()),
             );
         }
+        // Diff rows with the hunk selection overlay (M6 slice 6): each '#'
+        // header row carries the checkbox ([x]/[ ]) and the cursor (▸);
+        // rows of a deselected hunk are dimmed — they won't be applied.
+        let mut hunk_ix: Option<usize> = None;
         for line in self
             .propose
             .diff_rows
@@ -2663,18 +2741,43 @@ impl Editor {
             .take(AGENT_VISIBLE_LINES)
         {
             let (label, text) = line;
-            let color = match label {
+            let mut color = match label {
                 '+' => 0x7ecf8f,
                 '-' => AGENT_ERR_FG,
                 _ => STATUS_FG,
             };
+            let mut prefix = format!("{label}");
+            if *label == '#' {
+                let ix = hunk_ix.map_or(0, |prev| prev + 1);
+                hunk_ix = Some(ix);
+                let checked = self.propose.selected.get(ix).copied().unwrap_or(true);
+                let cursor = if ix == self.propose.hunk_cursor {
+                    "▸"
+                } else {
+                    " "
+                };
+                prefix = format!("{cursor}[{}] ", if checked { "x" } else { " " });
+                // The cursor row is highlighted so ⌥←/⌥→/⌥Enter have a
+                // visible target.
+                color = if ix == self.propose.hunk_cursor {
+                    DEFAULT_FG
+                } else {
+                    STATUS_FG
+                };
+            } else if !hunk_ix
+                .and_then(|ix| self.propose.selected.get(ix).copied())
+                .unwrap_or(true)
+            {
+                // Deselected hunk body: dimmed, it will not be applied.
+                color = 0x6a6a6a;
+            }
             panel = panel.child(
                 div()
                     .px_2()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_color(rgb(color))
-                    .child(format!("{label}{text}")),
+                    .child(format!("{prefix}{text}")),
             );
         }
         if matches!(
@@ -2691,7 +2794,7 @@ impl Editor {
         let hint = if self.propose.armed_apply {
             "⚠︎ cmd-shift-enter APLICA (escribe en disco) · cmd-backspace descarta"
         } else {
-            "⌘⇧Enter aplica · cmd-backspace descarta · ⌘. cancela · ⌥↑/⌥↓ desplaza"
+            "⌘⇧Enter aplica · ⌥←/⌥→ hunks · ⌥Enter alterna · ⌘⌫ descarta · ⌥↑/⌥↓ desplaza"
         };
         panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(hint))
     }
@@ -2892,7 +2995,7 @@ impl Editor {
                     .child(format!("{}▌", self.propose_bar.instruction)),
             )
             .child(div().text_color(rgb(FIND_DIM_FG)).child(
-                "enter propone · esc cierra · cmd-shift-enter aplica · cmd-backspace descarta",
+                "enter propone · esc cierra · ⌘⇧Enter aplica · ⌥←/⌥→ hunks · ⌥Enter alterna",
             ))
     }
 
@@ -3265,9 +3368,18 @@ impl Editor {
             .map(|(label, text)| format!("[\"{}\",\"{}\"]", label, escape_json(text)))
             .collect::<Vec<_>>()
             .join(",");
+        // M6 slice 6: the hunk selection — which hunks ⌘⇧Enter would apply.
+        let proposal_selected_dump = self
+            .propose
+            .selected
+            .iter()
+            .map(|on| on.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let proposal_dump = format!(
             "{{\"status\":\"{}\",\"scene\":{},\"instruction\":\"{}\",\"id\":\"{}\",\
              \"target\":\"{}\",\"hunks\":{},\"armed\":{},\"scroll\":{},\
+             \"hunk_cursor\":{},\"selected\":[{}],\
              \"stage\":\"{}\",\"summary\":\"{}\",\"error\":\"{}\",\"diff_rows\":[{}],\
              \"elapsed_ms\":{}}}",
             self.propose.status_key(),
@@ -3278,6 +3390,8 @@ impl Editor {
             self.propose.hunks,
             self.propose.armed_apply,
             self.propose.scroll,
+            self.propose.hunk_cursor,
+            proposal_selected_dump,
             escape_json(&self.propose.stage),
             escape_json(&self.propose.summary),
             escape_json(&self.propose.error),
@@ -3786,6 +3900,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_reject_proposal))
             // review focus (M6 slice 5)
             .on_action(cx.listener(Self::on_open_focus_bar))
+            // hunk selection (M6 slice 6)
+            .on_action(cx.listener(Self::on_hunk_prev))
+            .on_action(cx.listener(Self::on_hunk_next))
+            .on_action(cx.listener(Self::on_toggle_hunk))
             .child(
                 div()
                     .id("status")
@@ -4194,6 +4312,12 @@ fn run() -> Result<(), String> {
             // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
             // enter commits the focus and runs the review.
             KeyBinding::new("cmd-shift-r", OpenFocusBar, None),
+            // hunk selection (M6 slice 6): alt-left/right walk the record's
+            // hunks, alt-enter toggles the one under the cursor; apply gets
+            // exactly the selected subset.
+            KeyBinding::new("alt-left", HunkPrev, None),
+            KeyBinding::new("alt-right", HunkNext, None),
+            KeyBinding::new("alt-enter", ToggleHunk, None),
         ]);
 
         cx.observe_keystrokes({

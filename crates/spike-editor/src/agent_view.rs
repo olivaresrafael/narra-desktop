@@ -235,6 +235,12 @@ pub struct ProposeView {
     pub hunks: usize,
     /// Unified-diff-style rows: ('-', removed), ('+', added), ('#', header).
     pub diff_rows: Vec<(char, String)>,
+    /// Hunk selection (M6 slice 6): which hunks ⌘⇧Enter will apply, index
+    /// parallel to the record's hunks (all selected by default). Empty
+    /// until the record's hunk count is known.
+    pub selected: Vec<bool>,
+    /// Which hunk the cursor points at (⌥←/⌥→ move it, ⌥Enter toggles it).
+    pub hunk_cursor: usize,
     pub stage: String,
     pub summary: String,
     pub error: String,
@@ -255,6 +261,8 @@ impl ProposeView {
             target: String::new(),
             hunks: 0,
             diff_rows: Vec::new(),
+            selected: Vec::new(),
+            hunk_cursor: 0,
             stage: String::new(),
             summary: String::new(),
             error: String::new(),
@@ -293,7 +301,50 @@ impl ProposeView {
         self.error = String::new();
         self.armed_apply = false;
         self.scroll = 0;
+        self.selected = Vec::new();
+        self.hunk_cursor = 0;
         self.started = Some(Instant::now());
+    }
+
+    /// Move the hunk cursor by `delta` (clamped): ⌥←/⌥→ walk the record's
+    /// hunks so ⌥Enter toggles a known target.
+    pub fn move_hunk_cursor(&mut self, delta: i64) {
+        let max = self.hunks.saturating_sub(1) as i64;
+        self.hunk_cursor = (self.hunk_cursor as i64 + delta).clamp(0, max) as usize;
+    }
+
+    /// Toggle the hunk under the cursor (⌥Enter). A selection with zero
+    /// hunks is refused at apply time with an explicit notice — toggling
+    /// itself is always allowed, so the user can walk the decision.
+    pub fn toggle_hunk(&mut self) {
+        if let Some(selected) = self.selected.get_mut(self.hunk_cursor) {
+            *selected = !*selected;
+        }
+    }
+
+    /// Indices of the selected hunks, ascending (what apply receives).
+    pub fn selected_hunks(&self) -> Vec<usize> {
+        self.selected
+            .iter()
+            .enumerate()
+            .filter(|(_, on)| **on)
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// Whether every hunk is selected (apply-all, the default).
+    pub fn all_selected(&self) -> bool {
+        !self.selected.is_empty() && self.selected.iter().all(|on| *on)
+    }
+
+    /// Keep the selection parallel to the record's hunk count: all
+    /// selected by default; a length change (shouldn't happen mid-run)
+    /// resets rather than reinterprets indices.
+    fn ensure_selection(&mut self) {
+        if self.selected.len() != self.hunks {
+            self.selected = vec![true; self.hunks];
+            self.hunk_cursor = 0;
+        }
     }
 
     /// Fold one message into the view state.
@@ -314,6 +365,7 @@ impl ProposeView {
                     self.id = id;
                     self.target = target;
                     self.hunks = hunks;
+                    self.ensure_selection();
                     self.stage = "propuesta creada (grabada en .narra/proposals)".to_string();
                 }
                 TaskEvent::Completed { summary } => self.summary = summary,
@@ -349,6 +401,7 @@ impl ProposeView {
                     if self.hunks == 0 {
                         self.hunks = result.output.data["hunks"].as_u64().unwrap_or(0) as usize;
                     }
+                    self.ensure_selection();
                     self.diff_rows = result.diff_rows;
                     if !result.output.summary.is_empty() {
                         self.summary = result.output.summary;
@@ -601,5 +654,78 @@ mod tests {
         assert!(!view.armed_apply);
         assert_eq!(view.scroll, 0);
         assert_eq!(view.instruction, "segunda");
+    }
+
+    // --- Hunk selection (M6 slice 6) ------------------------------------
+
+    /// A ready proposal with `hunks` hunks (via ProposalCreated, which is
+    /// where the count first becomes known).
+    fn ready_with_hunks(hunks: usize) -> ProposeView {
+        let mut view = ProposeView::new();
+        view.begin(1, "reescribe".to_string());
+        view.apply(ProposeMessage::Event(TaskEvent::ProposalCreated {
+            id: "abcd-1234".to_string(),
+            target: "screenplay/main.fountain".to_string(),
+            hunks,
+        }));
+        view.apply(ProposeMessage::Done(Ok(propose_result(Vec::new()))));
+        view
+    }
+
+    #[test]
+    fn selection_is_all_by_default_and_parallel_to_hunks() {
+        let view = ready_with_hunks(3);
+        assert_eq!(view.hunks, 3);
+        assert_eq!(view.selected, vec![true, true, true]);
+        assert!(view.all_selected());
+        assert_eq!(view.selected_hunks(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cursor_walks_clamped_and_toggle_flips_only_the_cursor_hunk() {
+        let mut view = ready_with_hunks(3);
+        view.move_hunk_cursor(1);
+        assert_eq!(view.hunk_cursor, 1);
+        view.toggle_hunk();
+        assert_eq!(view.selected, vec![true, false, true]);
+        assert!(!view.all_selected());
+        assert_eq!(view.selected_hunks(), vec![0, 2]);
+
+        // Clamped at both ends; toggling past the end is a no-op.
+        view.move_hunk_cursor(-5);
+        assert_eq!(view.hunk_cursor, 0);
+        view.move_hunk_cursor(5);
+        assert_eq!(view.hunk_cursor, 2);
+    }
+
+    #[test]
+    fn zero_hunks_has_nothing_to_toggle_and_empty_selection() {
+        let mut view = ProposeView::new();
+        view.begin(1, "x".to_string());
+        view.toggle_hunk();
+        view.move_hunk_cursor(1);
+        assert_eq!(view.hunk_cursor, 0);
+        assert!(view.selected_hunks().is_empty());
+        assert!(!view.all_selected(), "empty selection is not all-selected");
+    }
+
+    #[test]
+    fn deselecting_everything_yields_an_empty_selection() {
+        let mut view = ready_with_hunks(2);
+        view.toggle_hunk();
+        view.move_hunk_cursor(1);
+        view.toggle_hunk();
+        assert!(view.selected_hunks().is_empty());
+        assert!(!view.all_selected());
+    }
+
+    #[test]
+    fn begin_resets_selection_and_cursor() {
+        let mut view = ready_with_hunks(3);
+        view.move_hunk_cursor(2);
+        view.toggle_hunk();
+        view.begin(2, "otra".to_string());
+        assert!(view.selected.is_empty());
+        assert_eq!(view.hunk_cursor, 0);
     }
 }
