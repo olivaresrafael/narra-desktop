@@ -8,6 +8,8 @@ use std::time::Instant;
 
 use narra_core::agent::{AgentError, ContextSource, TaskEvent, TaskOutput};
 
+use crate::i18n::{Lang, tf, tr};
+
 /// Review-panel status. `Idle` = no review has been requested this session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -47,6 +49,9 @@ pub struct AgentState {
     pub role: String,
     /// Where the role comes from: `"builtin"` or `"project"`.
     pub role_source: String,
+    /// UI language for the strings this reducer produces (M6 slice 9) — a
+    /// standing preference set by the workspace, not a per-run input.
+    pub lang: Lang,
     /// Last progress stage shown while running (cleared on terminal states).
     pub stage: String,
     /// Context sources the task reported — the user can audit exactly what
@@ -72,6 +77,7 @@ impl AgentState {
             focus: String::new(),
             role: String::new(),
             role_source: String::new(),
+            lang: Lang::default(),
             stage: String::new(),
             sources: Vec::new(),
             output: String::new(),
@@ -117,19 +123,28 @@ impl AgentState {
     pub fn apply(&mut self, message: AgentMessage) {
         match message {
             AgentMessage::Event(event) => match event {
-                TaskEvent::Started { .. } => self.stage = "tarea iniciada".to_string(),
+                TaskEvent::Started { .. } => {
+                    self.stage = tr(self.lang, "stage.started").to_string()
+                }
                 TaskEvent::Progress { stage, detail } => {
                     self.stage = format!("{stage}: {detail}");
                 }
                 TaskEvent::ContextCollected { sources } => {
                     self.sources = sources;
-                    self.stage = "contexto recogido".to_string();
+                    self.stage = tr(self.lang, "stage.context_collected").to_string();
                 }
                 TaskEvent::ModelResponded {
                     model,
                     output_chars,
                 } => {
-                    self.stage = format!("respondió {model} ({output_chars} caracteres)");
+                    self.stage = tf(
+                        self.lang,
+                        "stage.model_responded",
+                        &[
+                            ("model", model.as_str()),
+                            ("chars", &output_chars.to_string()),
+                        ],
+                    );
                 }
                 TaskEvent::ModelDelta { text } => self.output.push_str(&text),
                 TaskEvent::Completed { summary } => self.summary = summary,
@@ -140,7 +155,7 @@ impl AgentState {
                 }
                 TaskEvent::Cancelled => {
                     self.status = AgentStatus::Cancelled;
-                    self.error = "revisión cancelada".to_string();
+                    self.error = tr(self.lang, "error.review_cancelled").to_string();
                     self.stage.clear();
                 }
                 // Proposals and tool calls belong to other tasks (scene_edit,
@@ -163,7 +178,7 @@ impl AgentState {
                 }
                 Err(AgentError::Cancelled) => {
                     self.status = AgentStatus::Cancelled;
-                    self.error = "revisión cancelada".to_string();
+                    self.error = tr(self.lang, "error.review_cancelled").to_string();
                     self.stage.clear();
                 }
                 Err(error) => {
@@ -243,6 +258,9 @@ pub struct ProposeView {
     pub role: String,
     /// Where the role comes from: `"builtin"` or `"project"`.
     pub role_source: String,
+    /// UI language for the strings this reducer produces (M6 slice 9) — a
+    /// standing preference set by the workspace, not a per-run input.
+    pub lang: Lang,
     /// Persisted proposal id (empty until `ProposalCreated`/`Done`).
     pub id: String,
     pub target: String,
@@ -273,6 +291,7 @@ impl ProposeView {
             scene_number: 0,
             role: String::new(),
             role_source: String::new(),
+            lang: Lang::default(),
             id: String::new(),
             target: String::new(),
             hunks: 0,
@@ -369,7 +388,9 @@ impl ProposeView {
     pub fn apply(&mut self, message: ProposeMessage) {
         match message {
             ProposeMessage::Event(event) => match event {
-                TaskEvent::Started { .. } => self.stage = "tarea iniciada".to_string(),
+                TaskEvent::Started { .. } => {
+                    self.stage = tr(self.lang, "stage.started").to_string()
+                }
                 TaskEvent::Progress { stage, detail } => {
                     self.stage = format!("{stage}: {detail}");
                 }
@@ -377,14 +398,21 @@ impl ProposeView {
                     model,
                     output_chars,
                 } => {
-                    self.stage = format!("respondió {model} ({output_chars} caracteres)");
+                    self.stage = tf(
+                        self.lang,
+                        "stage.model_responded",
+                        &[
+                            ("model", model.as_str()),
+                            ("chars", &output_chars.to_string()),
+                        ],
+                    );
                 }
                 TaskEvent::ProposalCreated { id, target, hunks } => {
                     self.id = id;
                     self.target = target;
                     self.hunks = hunks;
                     self.ensure_selection();
-                    self.stage = "propuesta creada (grabada en .narra/proposals)".to_string();
+                    self.stage = tr(self.lang, "stage.proposal_persisted").to_string();
                 }
                 TaskEvent::Completed { summary } => self.summary = summary,
                 TaskEvent::Failed { error } => {
@@ -394,7 +422,7 @@ impl ProposeView {
                 }
                 TaskEvent::Cancelled => {
                     self.status = ProposeStatus::Cancelled;
-                    self.error = "propuesta cancelada".to_string();
+                    self.error = tr(self.lang, "error.propose_cancelled").to_string();
                     self.stage.clear();
                 }
                 // Reviews don't create proposals and the tool loop isn't
@@ -428,7 +456,7 @@ impl ProposeView {
                 }
                 Err(AgentError::Cancelled) => {
                     self.status = ProposeStatus::Cancelled;
-                    self.error = "propuesta cancelada".to_string();
+                    self.error = tr(self.lang, "error.propose_cancelled").to_string();
                     self.stage.clear();
                 }
                 Err(error) => {
@@ -848,5 +876,31 @@ mod tests {
             retry_target(true, ProposeStatus::Running, AgentStatus::Idle),
             None
         );
+    }
+
+    #[test]
+    fn reducer_strings_follow_the_state_language() {
+        let started = || {
+            AgentMessage::Event(TaskEvent::Started {
+                task: "scene_review".to_string(),
+                project: "/tmp/p".to_string(),
+            })
+        };
+        // English state → English stage/error.
+        let mut en = AgentState::new();
+        en.lang = Lang::En;
+        en.apply(started());
+        assert_eq!(en.stage, "task started");
+        en.apply(AgentMessage::Event(TaskEvent::Cancelled));
+        assert_eq!(en.error, "review cancelled");
+        // Default state keeps the previous Spanish behavior.
+        let mut es = AgentState::new();
+        es.apply(started());
+        assert_eq!(es.stage, "tarea iniciada");
+        // Proposal reducer follows the same rule.
+        let mut proposal = ProposeView::new();
+        proposal.lang = Lang::En;
+        proposal.apply(ProposeMessage::Event(TaskEvent::Cancelled));
+        assert_eq!(proposal.error, "proposal cancelled");
     }
 }

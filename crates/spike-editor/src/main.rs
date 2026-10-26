@@ -62,6 +62,9 @@
 //!       M6 slice 8 (retry): ⌘⌥R re-runs the visible flow's failed or
 //!       cancelled run with its own stored inputs (same scene, focus or
 //!       instruction — never retyped).
+//!       M6 slice 9 (i18n): `--lang en|es` (default from the environment)
+//!       and ⌘⌥L localize every workspace string (i18n table with
+//!       completeness/parity tests); the dump reports `lang`.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -75,6 +78,7 @@
 
 mod agent_view;
 mod buffer;
+mod i18n;
 
 use std::cell::RefCell;
 use std::env;
@@ -97,6 +101,7 @@ use gpui::{
     Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection, Window, WindowBounds,
     WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size,
 };
+use i18n::Lang;
 use narra_core::agent::{
     AgentError, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter,
     OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, proposal, roles,
@@ -162,6 +167,8 @@ actions!(
         ToggleHunk,
         // retry (M6 slice 8)
         RetryAgent,
+        // language (M6 slice 9)
+        ToggleLang,
     ]
 );
 
@@ -327,10 +334,10 @@ fn short_id(id: &str) -> String {
 
 /// Localizable label for a role's origin; the dump keeps the raw key
 /// (`"builtin"`/`"project"`) so machine checks never depend on wording.
-fn role_source_label(source: &str) -> &'static str {
+fn role_source_label(lang: Lang, source: &str) -> &'static str {
     match source {
-        "project" => "proyecto",
-        _ => "integrado",
+        "project" => i18n::tr(lang, "role.project"),
+        _ => i18n::tr(lang, "role.builtin"),
     }
 }
 
@@ -769,6 +776,9 @@ struct Editor {
     saved_edits: usize,
     /// Last user-visible outcome (save/open/blocked switch). Display only.
     notice: Option<String>,
+    /// UI language (M6 slice 9): every string the workspace displays is
+    /// looked up through `i18n` with this; toggled live with ⌘⌥L.
+    lang: Lang,
     /// Agent review panel state (M6 slice 3). Pure reducer — see agent_view.
     agent: AgentState,
     /// Cancellation token for the in-flight agent task (review or propose;
@@ -2003,9 +2013,7 @@ impl Editor {
             return;
         }
         if self.dirty() {
-            self.notice = Some(
-                "cambios sin guardar: guarda con ⌘S antes de cambiar de documento".to_string(),
-            );
+            self.notice = Some(self.t("notice.dirty_switch").to_string());
             cx.notify();
             return;
         }
@@ -2015,7 +2023,12 @@ impl Editor {
                 // A click re-targets typing (and IME composition) at the buffer.
                 window.focus(&self.focus_handle(cx));
             }
-            Err(error) => self.notice = Some(format!("no se pudo abrir {path}: {error}")),
+            Err(error) => {
+                self.notice = Some(self.tf(
+                    "notice.open_failed",
+                    &[("path", &path), ("error", &error.to_string())],
+                ));
+            }
         }
         cx.notify();
     }
@@ -2025,7 +2038,7 @@ impl Editor {
     /// agent action and never as a side effect of switching documents.
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project.clone() else {
-            self.notice = Some("modo fixture: no hay proyecto abierto (usa --project)".to_string());
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
             cx.notify();
             return;
         };
@@ -2035,7 +2048,7 @@ impl Editor {
             // Converged back (e.g. undo to the original): clear the dirty
             // flag without touching the file.
             self.saved_edits = edits;
-            self.notice = Some("sin cambios que guardar".to_string());
+            self.notice = Some(self.t("notice.no_changes").to_string());
             cx.notify();
             return;
         }
@@ -2053,13 +2066,50 @@ impl Editor {
                     // Keep the dump honest; opening the diff rebuilds rows.
                     self.recompute_diff();
                 }
-                self.notice = Some(format!("guardado: {}", self.doc_path));
+                self.notice = Some(self.tf("notice.saved", &[("path", &self.doc_path)]));
             }
             Err(error) => {
-                self.notice = Some(format!("error al guardar {}: {error}", self.doc_path));
+                self.notice = Some(self.tf(
+                    "notice.save_failed",
+                    &[("path", &self.doc_path), ("error", &error.to_string())],
+                ));
             }
         }
         cx.notify();
+    }
+
+    /// Localized string (M6 slice 9): every workspace-visible label and
+    /// notice goes through this (agent output and core errors excepted —
+    /// they are producer text, not UI chrome).
+    fn t(&self, key: &str) -> &'static str {
+        i18n::tr(self.lang, key)
+    }
+
+    /// Localized template with `{name}` substitutions.
+    fn tf(&self, key: &str, params: &[(&str, &str)]) -> String {
+        i18n::tf(self.lang, key, params)
+    }
+
+    /// Localized word for a terminal proposal state in notices (the dump
+    /// keeps machine-oriented English `status_key` values).
+    fn propose_status_word(&self, status: ProposeStatus) -> &'static str {
+        match status {
+            ProposeStatus::Applied => self.t("status.applied"),
+            _ => self.t("status.rejected"),
+        }
+    }
+
+    /// Localized proposal status label for the panel title.
+    fn propose_status_label(&self) -> &'static str {
+        match self.propose.status {
+            ProposeStatus::Idle => self.t("status.idle"),
+            ProposeStatus::Running => self.t("status.running"),
+            ProposeStatus::Ready => self.t("status.ready"),
+            ProposeStatus::Applied => self.t("status.applied"),
+            ProposeStatus::Rejected => self.t("status.rejected"),
+            ProposeStatus::Failed => self.t("status.failed"),
+            ProposeStatus::Cancelled => self.t("status.cancelled"),
+        }
     }
 
     /// Common gates for agent tasks (M6 slice 3/4/8): refuse while another
@@ -2068,7 +2118,7 @@ impl Editor {
     /// token, so a refused run never leaves the token registered.
     fn agent_task_base_gates(&mut self) -> Option<(String, AgentSettings, CancellationToken)> {
         if self.agent_cancel.is_some() {
-            self.notice = Some("ya hay una tarea de agente en curso (⌘. la cancela)".to_string());
+            self.notice = Some(self.t("notice.agent_running").to_string());
             return None;
         }
         // Own the two strings we need so the borrow of `self.project` ends
@@ -2080,18 +2130,15 @@ impl Editor {
             )
         });
         let Some((root, screenplay)) = project_info else {
-            self.notice = Some("modo fixture: sin proyecto abierto (usa --project)".to_string());
+            self.notice = Some(self.t("notice.fixture_no_project_agent").to_string());
             return None;
         };
         if self.doc_path != screenplay {
-            self.notice = Some(format!("abre {screenplay} para trabajar sobre una escena"));
+            self.notice = Some(self.tf("notice.open_screenplay", &[("path", &screenplay)]));
             return None;
         }
         if self.dirty() {
-            self.notice = Some(
-                "cambios sin guardar: las tareas de agente leen el archivo en disco (⌘S)"
-                    .to_string(),
-            );
+            self.notice = Some(self.t("notice.dirty_agent").to_string());
             return None;
         }
         let settings = self.agent_settings.clone();
@@ -2106,7 +2153,7 @@ impl Editor {
         self.refresh_scenes();
         let caret_line = self.buffer.position_at(self.caret()).line;
         let Some(scene_number) = scene_number_at(&self.scene_lines, caret_line) else {
-            self.notice = Some("el caret no está dentro de una escena".to_string());
+            self.notice = Some(self.t("notice.caret_outside_scene").to_string());
             return None;
         };
         self.agent_cancel = Some(cancel.clone());
@@ -2195,7 +2242,7 @@ impl Editor {
         let focus_note = if focus.is_empty() {
             String::new()
         } else {
-            format!(" · foco: {focus}")
+            self.tf("notice.focus_suffix", &[("focus", &focus)])
         };
         // The configured role (M6 slice 7): reviews run under the
         // editor-reviewer role as configured in `agents.yaml`. A broken
@@ -2204,7 +2251,8 @@ impl Editor {
         let role = match roles::resolve_default(Path::new(&root), SceneReviewTask::KIND) {
             Ok(role) => role,
             Err(error) => {
-                self.notice = Some(format!("roles del proyecto inválidos: {error}"));
+                self.notice =
+                    Some(self.tf("notice.roles_invalid", &[("error", &error.to_string())]));
                 cx.notify();
                 return;
             }
@@ -2212,10 +2260,15 @@ impl Editor {
         self.agent.begin(scene_number, focus.clone());
         self.agent.role = role.id.clone();
         self.agent.role_source = role.origin_key().to_string();
-        self.notice = Some(format!(
-            "revisión de la escena {scene_number} en curso ({}){focus_note}",
-            self.agent.role
-        ));
+        let mut notice = self.tf(
+            "notice.review_running",
+            &[
+                ("scene", &scene_number.to_string()),
+                ("role", &self.agent.role),
+            ],
+        );
+        notice.push_str(&focus_note);
+        self.notice = Some(notice);
         cx.notify();
 
         let (tx, rx) = mpsc::channel();
@@ -2249,11 +2302,14 @@ impl Editor {
         if done {
             self.agent_cancel = None;
             self.notice = Some(match self.agent.status {
-                AgentStatus::Completed => {
-                    format!("revisión de la escena {} lista", self.agent.scene_number)
+                AgentStatus::Completed => self.tf(
+                    "notice.review_done",
+                    &[("scene", &self.agent.scene_number.to_string())],
+                ),
+                AgentStatus::Cancelled => self.t("notice.review_cancelled").to_string(),
+                AgentStatus::Failed => {
+                    self.tf("notice.review_failed", &[("error", &self.agent.error)])
                 }
-                AgentStatus::Cancelled => "revisión cancelada".to_string(),
-                AgentStatus::Failed => format!("revisión fallida: {}", self.agent.error),
                 AgentStatus::Running | AgentStatus::Idle => String::new(),
             });
         }
@@ -2301,7 +2357,8 @@ impl Editor {
         let role = match roles::resolve_default(Path::new(&root), SceneEditTask::KIND) {
             Ok(role) => role,
             Err(error) => {
-                self.notice = Some(format!("roles del proyecto inválidos: {error}"));
+                self.notice =
+                    Some(self.tf("notice.roles_invalid", &[("error", &error.to_string())]));
                 cx.notify();
                 return;
             }
@@ -2309,9 +2366,12 @@ impl Editor {
         self.propose.begin(scene_number, instruction.clone());
         self.propose.role = role.id.clone();
         self.propose.role_source = role.origin_key().to_string();
-        self.notice = Some(format!(
-            "propuesta para la escena {scene_number} en curso ({})",
-            self.propose.role
+        self.notice = Some(self.tf(
+            "notice.propose_running",
+            &[
+                ("scene", &scene_number.to_string()),
+                ("role", &self.propose.role),
+            ],
         ));
         cx.notify();
 
@@ -2368,10 +2428,25 @@ impl Editor {
             Some(RetryTarget::Propose) => self.retry_propose(cx),
             Some(RetryTarget::Review) => self.retry_review(cx),
             None => {
-                self.notice = Some("nada que reintentar (⌘R revisa · ⌘P propone)".to_string());
+                self.notice = Some(self.t("notice.no_retry").to_string());
                 cx.notify();
             }
         }
+    }
+
+    /// ⌘⌥L (M6 slice 9): toggle EN/ES live. New events and rendered labels
+    /// follow immediately; stage/error text already on screen keeps the
+    /// language it was generated in until the next event.
+    fn on_toggle_lang(&mut self, _: &ToggleLang, _window: &mut Window, cx: &mut Context<Self>) {
+        self.lang = match self.lang {
+            Lang::En => Lang::Es,
+            Lang::Es => Lang::En,
+        };
+        // The reducers speak the new language for everything they generate.
+        self.agent.lang = self.lang;
+        self.propose.lang = self.lang;
+        self.notice = Some(self.tf("notice.lang", &[("lang", self.lang.name())]));
+        cx.notify();
     }
 
     /// Fold one proposal message into the view state; when the task ends,
@@ -2381,16 +2456,19 @@ impl Editor {
         if done {
             self.agent_cancel = None;
             self.notice = Some(match self.propose.status {
-                ProposeStatus::Ready => format!(
-                    "propuesta {} lista (⌘⇧Enter aplica · ⌘⌫ descarta)",
-                    short_id(&self.propose.id)
+                ProposeStatus::Ready => self.tf(
+                    "notice.propose_ready",
+                    &[("id", &short_id(&self.propose.id))],
                 ),
-                ProposeStatus::Cancelled => "propuesta cancelada".to_string(),
-                ProposeStatus::Failed => format!("propuesta fallida: {}", self.propose.error),
-                ProposeStatus::Running | ProposeStatus::Idle => String::new(),
-                ProposeStatus::Applied | ProposeStatus::Rejected => {
-                    format!("propuesta {}", self.propose.status_key())
+                ProposeStatus::Cancelled => self.t("notice.propose_cancelled").to_string(),
+                ProposeStatus::Failed => {
+                    self.tf("notice.propose_failed", &[("error", &self.propose.error)])
                 }
+                ProposeStatus::Running | ProposeStatus::Idle => String::new(),
+                ProposeStatus::Applied | ProposeStatus::Rejected => self.tf(
+                    "notice.propose_status",
+                    &[("status", self.propose_status_word(self.propose.status))],
+                ),
             });
         }
     }
@@ -2453,7 +2531,7 @@ impl Editor {
         self.propose_bar.open = false;
         self.propose_bar.instruction.clear();
         if instruction.is_empty() {
-            self.notice = Some("instrucción vacía: propuesta no iniciada".to_string());
+            self.notice = Some(self.t("notice.empty_instruction").to_string());
             cx.notify();
             return;
         }
@@ -2499,31 +2577,44 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if !self.propose.can_apply() {
-            self.notice = Some("no hay ninguna propuesta lista para aplicar".to_string());
+            self.notice = Some(self.t("notice.nothing_to_apply").to_string());
             cx.notify();
             return;
         }
         if !self.propose.armed_apply {
             self.propose.armed_apply = true;
             let selection = if self.propose.all_selected() {
-                format!("{} hunk(s)", self.propose.hunks)
+                self.tf("notice.hunks_n", &[("n", &self.propose.hunks.to_string())])
             } else {
+                let indices = self
+                    .propose
+                    .selected_hunks()
+                    .iter()
+                    .map(|ix| (ix + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 format!(
-                    "{}/{} hunk(s) [{}]",
-                    self.propose.selected_hunks().len(),
-                    self.propose.hunks,
-                    self.propose
-                        .selected_hunks()
-                        .iter()
-                        .map(|ix| (ix + 1).to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    "{} [{indices}]",
+                    self.tf(
+                        "notice.hunks_n",
+                        &[(
+                            "n",
+                            &format!(
+                                "{}/{}",
+                                self.propose.selected_hunks().len(),
+                                self.propose.hunks
+                            )
+                        )],
+                    )
                 )
             };
-            self.notice = Some(format!(
-                "⌘⇧Enter de nuevo para aplicar {selection} de {} a {} (escribe en disco) · ⌘⌫ descarta",
-                short_id(&self.propose.id),
-                self.propose.target
+            self.notice = Some(self.tf(
+                "notice.apply_arm",
+                &[
+                    ("selection", &selection),
+                    ("id", &short_id(&self.propose.id)),
+                    ("target", &self.propose.target),
+                ],
             ));
             cx.notify();
             return;
@@ -2533,7 +2624,7 @@ impl Editor {
             .as_ref()
             .map(|project| project.root().to_string_lossy().into_owned())
         else {
-            self.notice = Some("modo fixture: sin proyecto abierto".to_string());
+            self.notice = Some(self.t("notice.fixture_no_project_short").to_string());
             cx.notify();
             return;
         };
@@ -2568,11 +2659,19 @@ impl Editor {
                     .filter(|_| self.doc_path == target)
                     .map(|project| project.read_document(&self.doc_path));
                 let mut final_notice = if skipped > 0 {
-                    format!(
-                        "propuesta aplicada: {applied} hunk(s) en {target} · {skipped} omitido(s) por selección"
+                    self.tf(
+                        "notice.applied_skipped",
+                        &[
+                            ("applied", &applied.to_string()),
+                            ("target", &target),
+                            ("skipped", &skipped.to_string()),
+                        ],
                     )
                 } else {
-                    format!("propuesta aplicada: {applied} hunk(s) en {target}")
+                    self.tf(
+                        "notice.applied",
+                        &[("applied", &applied.to_string()), ("target", &target)],
+                    )
                 };
                 match reloaded {
                     Some(Ok(text)) => {
@@ -2580,7 +2679,10 @@ impl Editor {
                         self.load_document(path, text);
                     }
                     Some(Err(error)) => {
-                        final_notice = format!("aplicado, pero no se pudo recargar: {error}");
+                        final_notice = self.tf(
+                            "notice.apply_reload_failed",
+                            &[("error", &error.to_string())],
+                        );
                     }
                     None => {}
                 }
@@ -2590,7 +2692,8 @@ impl Editor {
                 self.propose.armed_apply = false;
                 self.propose.status = ProposeStatus::Failed;
                 self.propose.error = error.to_string();
-                self.notice = Some(format!("no se pudo aplicar: {error}"));
+                self.notice =
+                    Some(self.tf("notice.apply_failed", &[("error", &error.to_string())]));
             }
         }
         cx.notify();
@@ -2605,7 +2708,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if !self.propose.is_open() || self.propose.id.is_empty() {
-            self.notice = Some("no hay ninguna propuesta que descartar".to_string());
+            self.notice = Some(self.t("notice.nothing_to_reject").to_string());
             cx.notify();
             return;
         }
@@ -2613,9 +2716,9 @@ impl Editor {
             self.propose.status,
             ProposeStatus::Applied | ProposeStatus::Rejected
         ) {
-            self.notice = Some(format!(
-                "la propuesta ya está {}",
-                self.propose.status_key()
+            self.notice = Some(self.tf(
+                "notice.already_status",
+                &[("status", self.propose_status_word(self.propose.status))],
             ));
             cx.notify();
             return;
@@ -2625,7 +2728,7 @@ impl Editor {
             .as_ref()
             .map(|project| project.root().to_string_lossy().into_owned())
         else {
-            self.notice = Some("modo fixture: sin proyecto abierto".to_string());
+            self.notice = Some(self.t("notice.fixture_no_project_short").to_string());
             cx.notify();
             return;
         };
@@ -2633,12 +2736,13 @@ impl Editor {
             Ok(_) => {
                 self.propose.status = ProposeStatus::Rejected;
                 self.propose.armed_apply = false;
-                self.notice = Some(format!(
-                    "propuesta {} descartada (archivo intacto)",
-                    short_id(&self.propose.id)
-                ));
+                self.notice =
+                    Some(self.tf("notice.rejected", &[("id", &short_id(&self.propose.id))]));
             }
-            Err(error) => self.notice = Some(format!("no se pudo descartar: {error}")),
+            Err(error) => {
+                self.notice =
+                    Some(self.tf("notice.reject_failed", &[("error", &error.to_string())]));
+            }
         }
         cx.notify();
     }
@@ -2654,9 +2758,9 @@ impl Editor {
     ) {
         if let Some(token) = self.agent_cancel.take() {
             token.cancel();
-            self.notice = Some("cancelando la revisión…".to_string());
+            self.notice = Some(self.t("notice.cancelling_review").to_string());
         } else {
-            self.notice = Some("no hay ninguna revisión en curso".to_string());
+            self.notice = Some(self.t("notice.no_review_running").to_string());
         }
     }
 
@@ -2711,11 +2815,11 @@ impl Editor {
     /// The review column (M6 slice 3), unchanged semantics.
     fn review_panel(&self) -> impl IntoElement {
         let status_label = match self.agent.status {
-            AgentStatus::Idle => "inactivo",
-            AgentStatus::Running => "en curso",
-            AgentStatus::Completed => "completada",
-            AgentStatus::Failed => "fallida",
-            AgentStatus::Cancelled => "cancelada",
+            AgentStatus::Idle => self.t("status.idle"),
+            AgentStatus::Running => self.t("status.running"),
+            AgentStatus::Completed => self.t("status.completed"),
+            AgentStatus::Failed => self.t("status.failed"),
+            AgentStatus::Cancelled => self.t("status.cancelled"),
         };
         let mut panel = div()
             .id("agent-panel")
@@ -2734,9 +2838,12 @@ impl Editor {
                     .px_2()
                     .py_1()
                     .text_color(rgb(DEFAULT_FG))
-                    .child(format!(
-                        "Revisión · escena {} · {status_label}",
-                        self.agent.scene_number
+                    .child(self.tf(
+                        "panel.review_title",
+                        &[
+                            ("scene", &self.agent.scene_number.to_string()),
+                            ("status", status_label),
+                        ],
                     )),
             );
         // The reviewer focus (M6 slice 5): what was asked, always visible.
@@ -2745,16 +2852,21 @@ impl Editor {
                 div()
                     .px_2()
                     .text_color(rgb(FIND_FG))
-                    .child(format!("Foco: {}", self.agent.focus)),
+                    .child(self.tf("panel.focus", &[("focus", &self.agent.focus)])),
             );
         }
         // The configured role (M6 slice 7): which persona reviewed and
         // where that configuration came from.
         if !self.agent.role.is_empty() {
-            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(format!(
-                "Rol: {} · {}",
-                self.agent.role,
-                role_source_label(&self.agent.role_source)
+            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(self.tf(
+                "panel.role",
+                &[
+                    ("role", &self.agent.role),
+                    (
+                        "source",
+                        role_source_label(self.lang, &self.agent.role_source),
+                    ),
+                ],
             )));
         }
         if !self.agent.stage.is_empty() {
@@ -2765,12 +2877,10 @@ impl Editor {
                     .child(self.agent.stage.clone()),
             );
         }
-        panel = panel.child(
-            div()
-                .px_2()
-                .text_color(rgb(STATUS_FG))
-                .child(format!("Fuentes ({})", self.agent.sources.len())),
-        );
+        panel = panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(self.tf(
+            "panel.sources",
+            &[("n", &self.agent.sources.len().to_string())],
+        )));
         for (ix, source) in self.agent.sources.iter().enumerate() {
             panel = panel.child(
                 div()
@@ -2814,9 +2924,9 @@ impl Editor {
                 self.agent.status,
                 AgentStatus::Failed | AgentStatus::Cancelled
             ) {
-                "⌘⌥R reintenta · ⌘R revisa de nuevo · ⌥↑/⌥↓ desplaza"
+                self.t("panel.review_hint_retry")
             } else {
-                "⌘R revisa · ⌘. cancela · ⌥↑/⌥↓ desplaza"
+                self.t("panel.review_hint")
             },
         ))
     }
@@ -2826,7 +2936,7 @@ impl Editor {
     /// apply/reject hints. The diff shows the stored proposal — exactly
     /// what ⌘⇧Enter would write — never a recomputation.
     fn proposal_panel(&self) -> impl IntoElement {
-        let status_label = self.propose.status_key();
+        let status_label = self.propose_status_label();
         let mut panel = div()
             .id("proposal-panel")
             .w(px(AGENT_PANEL_W))
@@ -2844,25 +2954,35 @@ impl Editor {
                     .px_2()
                     .py_1()
                     .text_color(rgb(DEFAULT_FG))
-                    .child(format!(
-                        "Propuesta · escena {} · {status_label}",
-                        self.propose.scene_number
+                    .child(self.tf(
+                        "panel.proposal_title",
+                        &[
+                            ("scene", &self.propose.scene_number.to_string()),
+                            ("status", status_label),
+                        ],
                     )),
             );
         if !self.propose.id.is_empty() {
-            panel = panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(format!(
-                "{} · {} · {} hunk(s)",
-                short_id(&self.propose.id),
-                self.propose.target,
-                self.propose.hunks
+            panel = panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(self.tf(
+                "panel.proposal_meta",
+                &[
+                    ("id", &short_id(&self.propose.id)),
+                    ("target", &self.propose.target),
+                    ("n", &self.propose.hunks.to_string()),
+                ],
             )));
         }
         // The configured role (M6 slice 7): which persona proposed.
         if !self.propose.role.is_empty() {
-            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(format!(
-                "Rol: {} · {}",
-                self.propose.role,
-                role_source_label(&self.propose.role_source)
+            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(self.tf(
+                "panel.role",
+                &[
+                    ("role", &self.propose.role),
+                    (
+                        "source",
+                        role_source_label(self.lang, &self.propose.role_source),
+                    ),
+                ],
             )));
         }
         if !self.propose.stage.is_empty() {
@@ -2936,14 +3056,14 @@ impl Editor {
             );
         }
         let hint = if self.propose.armed_apply {
-            "⚠︎ cmd-shift-enter APLICA (escribe en disco) · cmd-backspace descarta"
+            self.t("panel.proposal_hint_armed")
         } else if matches!(
             self.propose.status,
             ProposeStatus::Failed | ProposeStatus::Cancelled
         ) {
-            "⌘⌥R reintenta · ⌘P propone otra vez · ⌘⌫ descarta"
+            self.t("panel.proposal_hint_retry")
         } else {
-            "⌘⇧Enter aplica · ⌥←/⌥→ hunks · ⌥Enter alterna · ⌘⌫ descarta · ⌥↑/⌥↓ desplaza"
+            self.t("panel.proposal_hint")
         };
         panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(hint))
     }
@@ -3013,55 +3133,57 @@ impl Editor {
         // the workspace state.
         let agent = match self.agent.status {
             AgentStatus::Idle => String::new(),
-            AgentStatus::Running => {
-                format!(" · revisión en curso (escena {})", self.agent.scene_number)
-            }
-            AgentStatus::Completed => {
-                format!(" · revisión lista (escena {})", self.agent.scene_number)
-            }
-            AgentStatus::Failed => " · revisión fallida".to_string(),
-            AgentStatus::Cancelled => " · revisión cancelada".to_string(),
+            AgentStatus::Running => self.tf(
+                "bar.review_running",
+                &[("scene", &self.agent.scene_number.to_string())],
+            ),
+            AgentStatus::Completed => self.tf(
+                "bar.review_done",
+                &[("scene", &self.agent.scene_number.to_string())],
+            ),
+            AgentStatus::Failed => self.t("bar.review_failed").to_string(),
+            AgentStatus::Cancelled => self.t("bar.review_cancelled").to_string(),
         };
         // M6 slice 4: the proposal's lifecycle at a glance too.
         let propose = match self.propose.status {
             ProposeStatus::Idle => String::new(),
-            ProposeStatus::Running => {
-                format!(
-                    " · propuesta en curso (escena {})",
-                    self.propose.scene_number
-                )
-            }
+            ProposeStatus::Running => self.tf(
+                "bar.propose_running",
+                &[("scene", &self.propose.scene_number.to_string())],
+            ),
             ProposeStatus::Ready => format!(
-                " · propuesta lista ({}){}",
-                short_id(&self.propose.id),
+                "{}{}",
+                self.tf("bar.propose_ready", &[("id", &short_id(&self.propose.id))]),
                 if self.propose.armed_apply {
-                    " · armada"
+                    self.t("bar.armed")
                 } else {
                     ""
                 }
             ),
-            ProposeStatus::Applied => " · propuesta aplicada".to_string(),
-            ProposeStatus::Rejected => " · propuesta descartada".to_string(),
-            ProposeStatus::Failed => " · propuesta fallida".to_string(),
-            ProposeStatus::Cancelled => " · propuesta cancelada".to_string(),
+            ProposeStatus::Applied => self.t("bar.propose_applied").to_string(),
+            ProposeStatus::Rejected => self.t("bar.propose_rejected").to_string(),
+            ProposeStatus::Failed => self.t("bar.propose_failed").to_string(),
+            ProposeStatus::Cancelled => self.t("bar.propose_cancelled").to_string(),
         };
-        format!(
-            "{} · L{}:C{} · ediciones {} · tecla→frame {} · {} líneas · {} escenas · frames {} · gap ms p50 {:.2} / p95 {:.2} / max {:.2} · probe {}{}{}{}",
-            document,
-            caret.line + 1,
-            caret.col,
-            metrics.edits,
-            metrics.keystroke_to_frame_ms.len(),
-            metrics.lines,
-            metrics.scenes,
-            metrics.renders,
-            p50,
-            p95,
-            max,
-            self.probe_left,
-            notice,
-            agent,
-            propose,
+        self.tf(
+            "bar.metrics",
+            &[
+                ("doc", &document),
+                ("line", &(caret.line + 1).to_string()),
+                ("col", &caret.col.to_string()),
+                ("edits", &metrics.edits.to_string()),
+                ("keys", &metrics.keystroke_to_frame_ms.len().to_string()),
+                ("lines", &metrics.lines.to_string()),
+                ("scenes", &metrics.scenes.to_string()),
+                ("frames", &metrics.renders.to_string()),
+                ("p50", &format!("{p50:.2}")),
+                ("p95", &format!("{p95:.2}")),
+                ("max", &format!("{max:.2}")),
+                ("probe", &self.probe_left.to_string()),
+                ("notice", &notice),
+                ("agent", &agent),
+                ("propose", &propose),
+            ],
         )
     }
 
@@ -3104,20 +3226,20 @@ impl Editor {
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
             .child(field(
-                "Buscar:",
+                self.t("find.query_label"),
                 self.find.query.clone(),
                 self.find.field == FindField::Query,
             ))
             .child(field(
-                "Reemplazar:",
+                self.t("find.replace_label"),
                 self.find.replacement.clone(),
                 self.find.field == FindField::Replacement,
             ))
             .child(div().text_color(rgb(FIND_FG)).child(counter))
             .child(
-                div().text_color(rgb(FIND_DIM_FG)).child(
-                    "enter siguiente · cmd-enter reemplaza · cmd-alt-enter todo · esc cierra",
-                ),
+                div()
+                    .text_color(rgb(FIND_DIM_FG))
+                    .child(self.t("find.hint")),
             )
     }
 
@@ -3137,15 +3259,21 @@ impl Editor {
             .text_sm()
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
-            .child(div().text_color(rgb(FIND_DIM_FG)).child("Instrucción:"))
+            .child(
+                div()
+                    .text_color(rgb(FIND_DIM_FG))
+                    .child(self.t("proposebar.label")),
+            )
             .child(
                 div()
                     .text_color(rgb(FIND_FG))
                     .child(format!("{}▌", self.propose_bar.instruction)),
             )
-            .child(div().text_color(rgb(FIND_DIM_FG)).child(
-                "enter propone · esc cierra · ⌘⇧Enter aplica · ⌥←/⌥→ hunks · ⌥Enter alterna",
-            ))
+            .child(
+                div()
+                    .text_color(rgb(FIND_DIM_FG))
+                    .child(self.t("proposebar.hint")),
+            )
     }
 
     /// Reviewer-focus bar (M6 slice 5): one field, same single-focus
@@ -3153,9 +3281,9 @@ impl Editor {
     /// discards the typed text (the last committed focus stays in effect).
     fn focus_bar(&self) -> gpui::Div {
         let hint = if self.focus_bar.focus.is_empty() {
-            "enter revisa (general) · esc cierra"
+            self.t("focusbar.hint_general")
         } else {
-            "enter revisa con foco · esc cierra (el foco anterior sigue activo)"
+            self.t("focusbar.hint_focus")
         };
         div()
             .w_full()
@@ -3168,7 +3296,11 @@ impl Editor {
             .text_sm()
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
-            .child(div().text_color(rgb(FIND_DIM_FG)).child("Foco:"))
+            .child(
+                div()
+                    .text_color(rgb(FIND_DIM_FG))
+                    .child(self.t("focusbar.label")),
+            )
             .child(
                 div()
                     .text_color(rgb(FIND_FG))
@@ -3567,7 +3699,7 @@ impl Editor {
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
-                 \"agent\":{},\"focus_bar\":{},\"proposal\":{}}}"
+                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"lang\":\"{}\"}}"
             ),
             self.buffer.line_count(),
             len,
@@ -3606,6 +3738,7 @@ impl Editor {
             agent_dump,
             focus_bar_dump,
             proposal_dump,
+            self.lang.key(),
         )
     }
 
@@ -4061,6 +4194,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_toggle_hunk))
             // retry (M6 slice 8)
             .on_action(cx.listener(Self::on_retry_agent))
+            // language (M6 slice 9)
+            .on_action(cx.listener(Self::on_toggle_lang))
             .child(
                 div()
                     .id("status")
@@ -4230,6 +4365,9 @@ struct Args {
     report_after_ms: Option<u64>,
     dump_after_ms: Option<u64>,
     agent: AgentSettings,
+    /// UI language (M6 slice 9): `--lang en|es`; default from the
+    /// environment (`LC_ALL`/`LANG`), English when undeterminable.
+    lang: Lang,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -4243,6 +4381,7 @@ fn parse_args() -> Result<Args, String> {
     let mut report_after_ms = None;
     let mut dump_after_ms = None;
     let mut agent = AgentSettings::default();
+    let mut lang = Lang::detect();
 
     let mut i = 0;
     while i < args.len() {
@@ -4306,6 +4445,10 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("--agent-latency inválido: {value}"))?
             }
+            "--lang" => {
+                lang = Lang::from_key(value)
+                    .ok_or_else(|| format!("--lang inválido: {value} (en|es)"))?
+            }
             other => return Err(format!("argumento desconocido: {other}")),
         }
         i += 2;
@@ -4324,6 +4467,7 @@ fn parse_args() -> Result<Args, String> {
         report_after_ms,
         dump_after_ms,
         agent,
+        lang,
     })
 }
 
@@ -4411,6 +4555,7 @@ fn run() -> Result<(), String> {
     let report_after_ms = args.report_after_ms;
     let dump_after_ms = args.dump_after_ms;
     let agent_settings = args.agent;
+    let lang = args.lang;
     Application::new().run(move |cx: &mut App| {
         cx.activate(true);
         cx.bind_keys([
@@ -4479,6 +4624,8 @@ fn run() -> Result<(), String> {
             // task with the same stored inputs (only if it failed or was
             // cancelled).
             KeyBinding::new("cmd-alt-r", RetryAgent, None),
+            // language (M6 slice 9): cmd-alt-l toggles EN/ES live.
+            KeyBinding::new("cmd-alt-l", ToggleLang, None),
         ]);
 
         cx.observe_keystrokes({
@@ -4511,6 +4658,7 @@ fn run() -> Result<(), String> {
             base_text: content.clone(),
             saved_edits: 0,
             notice: None,
+            lang,
             agent: AgentState::new(),
             agent_cancel: None,
             agent_settings: agent_settings.clone(),
@@ -4564,6 +4712,9 @@ fn run() -> Result<(), String> {
 
         window
             .update(cx, |view, window, cx| {
+                // M6 slice 9: the reducers follow the startup language.
+                view.agent.lang = lang;
+                view.propose.lang = lang;
                 window.focus(&view.focus_handle(cx));
             })
             .ok();
