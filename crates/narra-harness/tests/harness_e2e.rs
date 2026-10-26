@@ -272,6 +272,68 @@ fn harness_never_writes_to_the_project() {
     let _ = screenplay; // snapshot covers the whole tree
 }
 
+#[test]
+fn review_succeeds_read_only_with_shown_material_sources() {
+    let root = sample_with_scenes();
+    let project = narra_core::project::open_project(&root).expect("open");
+    project
+        .write_document(
+            "bible/characters/elena.md",
+            "# Elena\nArtesana del taller.\n",
+        )
+        .expect("material");
+    let before = snapshot(&root);
+
+    let output = harness()
+        .args([
+            "review",
+            root.to_str().expect("utf8"),
+            "--scene",
+            "1",
+            "--focus",
+            "¿respeta la continuidad?",
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    // Same JSONL contract as every other task.
+    let records = jsonl(&output.stdout);
+    assert!(records.len() >= 4, "events: {records:?}");
+    assert_eq!(records[0]["event"], "started", "{records:?}");
+    let last = records.last().expect("task_output record");
+    assert_eq!(last["record"], "task_output", "{last:?}");
+    assert_eq!(last["exit"], "success", "{last:?}");
+    assert_eq!(last["data"]["scene_heading"], "INT. TALLER - NOCHE");
+    assert_eq!(last["data"]["focus"], "¿respeta la continuidad?");
+
+    // The material document informed the review and is shown as a source.
+    let docs = last["data"]["material_docs"].as_array().expect("docs");
+    assert!(
+        docs.iter().any(|doc| doc == "bible/characters/elena.md"),
+        "{last:?}"
+    );
+    let sources = last["sources"].as_array().expect("sources");
+    assert!(
+        sources
+            .iter()
+            .any(|source| source["location"] == "bible/characters/elena.md"),
+        "{sources:?}"
+    );
+    assert!(
+        sources.iter().any(|source| source["kind"] == "scene"),
+        "{sources:?}"
+    );
+
+    // Summary goes to stderr; the project bytes never change.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Revisión de la escena 1"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(snapshot(&root), before, "review must not touch the project");
+}
+
 fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut entries = Vec::new();
     fn walk(dir: &Path, root: &Path, entries: &mut Vec<(PathBuf, Vec<u8>)>) {

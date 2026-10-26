@@ -13,6 +13,7 @@
 //! Usage:
 //!   narra-harness brief <project-root> [options]
 //!   narra-harness propose <project-root> --scene <n> --instruction <texto> [options]
+//!   narra-harness review <project-root> --scene <n> [--focus <texto>] [options]
 //!   narra-harness proposals <project-root> [list]
 //!   narra-harness proposals <project-root> show <proposal-id>
 //!   narra-harness proposals <project-root> apply <proposal-id> [--hunks 0,2]
@@ -42,8 +43,9 @@
 //!   --stream           stream text deltas (JSONL `model_delta` events)
 //!   --allow-tool <n>     (loop) grant a propose-write tool by name
 //!   --allow-destructive <n> (loop) grant a destructive tool by name
-//!   --scene <n>        1-based scene number (propose only)
+//!   --scene <n>        1-based scene number (propose and review)
 //!   --instruction <t>  writer's instruction (propose only)
+//!   --focus <t>        reviewer focus/question (review only)
 //!   --hunks <a,b>      0-based hunk indices to accept (apply only; default all)
 //!
 //! `apply` refuses a stale proposal (the file changed after it was created)
@@ -74,7 +76,7 @@ use std::time::Duration;
 use narra_core::agent::proposal;
 use narra_core::agent::{
     AgentError, GrantPolicy, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
-    ProjectBriefTask, SceneEditTask, TaskEvent, TaskOptions, ToolLoopTask,
+    ProjectBriefTask, SceneEditTask, SceneReviewTask, TaskEvent, TaskOptions, ToolLoopTask,
 };
 use narra_core::cancel::CancellationToken;
 
@@ -168,6 +170,9 @@ fn main() -> ExitCode {
         } => {
             SceneEditTask::new(root, scene, instruction).run(adapter.as_ref(), &options, &mut emit)
         }
+        Command::Review { root, scene, focus } => {
+            SceneReviewTask::new(root, scene, focus).run(adapter.as_ref(), &options, &mut emit)
+        }
         Command::Renew { root, id } => proposal::load(Path::new(&root), &id)
             .map_err(AgentError::Proposal)
             .and_then(|record| SceneEditTask::from_proposal(root, &record))
@@ -245,6 +250,7 @@ fn main() -> ExitCode {
 const USAGE: &str = "uso: narra-harness brief <project-root> [--timeout <seg>] [--latency <ms>]
        [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>] [--stream]
      narra-harness propose <project-root> --scene <n> --instruction <texto> [mismas opciones]
+     narra-harness review <project-root> --scene <n> [--focus <texto>] [mismas opciones]
      narra-harness proposals <project-root> [list]
      narra-harness proposals <project-root> show <id>
      narra-harness proposals <project-root> apply <id> [--hunks 0,2]
@@ -294,6 +300,11 @@ enum Command {
         root: String,
         scene: usize,
         instruction: String,
+    },
+    Review {
+        root: String,
+        scene: usize,
+        focus: String,
     },
     Renew {
         root: String,
@@ -498,6 +509,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut model: Option<String> = None;
     let mut scene: Option<usize> = None;
     let mut instruction: Option<String> = None;
+    let mut focus: Option<String> = None;
     let mut hunks: Option<Vec<usize>> = None;
     let mut model_options_seen = false;
     let mut stream = false;
@@ -584,6 +596,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 let value = iter.next().ok_or("--instruction requiere un valor")?;
                 instruction = Some((*value).clone());
             }
+            "--focus" => {
+                let value = iter.next().ok_or("--focus requiere un valor")?;
+                focus = Some((*value).clone());
+            }
             "--hunks" => {
                 let value = iter.next().ok_or("--hunks requiere un valor")?;
                 hunks = Some(parse_hunks(value)?);
@@ -659,6 +675,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     // Capture presence before the match consumes the options.
     let scene_seen = scene.is_some();
     let instruction_seen = instruction.is_some();
+    let focus_seen = focus.is_some();
     let hunks_seen = hunks.is_some();
     let allow_seen = !allow_tool.is_empty() || !allow_destructive.is_empty();
     let api_url_seen = api_url.is_some();
@@ -679,6 +696,11 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             root: (*root).to_string(),
             scene: scene.ok_or("--propose requiere --scene <número>")?,
             instruction: instruction.ok_or("--propose requiere --instruction <texto>")?,
+        },
+        ["review", root] if !root.is_empty() => Command::Review {
+            root: (*root).to_string(),
+            scene: scene.ok_or("--review requiere --scene <número>")?,
+            focus: focus.unwrap_or_default(),
         },
         ["proposals", root] | ["proposals", root, "list"] if !root.is_empty() => {
             Command::Proposals {
@@ -819,11 +841,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     };
 
     // Per-command flags: a stray flag is an explicit error, not a silence.
-    if scene_seen && !matches!(command, Command::Propose { .. }) {
-        return Err("--scene solo se puede usar con la orden propose".to_string());
+    if scene_seen && !matches!(command, Command::Propose { .. } | Command::Review { .. }) {
+        return Err("--scene solo se puede usar con las órdenes propose y review".to_string());
     }
     if instruction_seen && !matches!(command, Command::Propose { .. } | Command::Loop { .. }) {
         return Err("--instruction solo se puede usar con las órdenes propose y loop".to_string());
+    }
+    if focus_seen && !matches!(command, Command::Review { .. }) {
+        return Err("--focus solo se puede usar con la orden review".to_string());
     }
     if allow_seen && !matches!(command, Command::Loop { .. }) {
         return Err(
@@ -1643,6 +1668,48 @@ mod tests {
         let error = parse(&["propose", "/tmp/p", "--scene", "una", "--instruction", "x"])
             .expect_err("not a number");
         assert!(error.contains("--scene"), "{error}");
+    }
+
+    #[test]
+    fn parses_review_with_scene_and_optional_focus() {
+        let parsed = parse(&[
+            "review",
+            "/tmp/p",
+            "--scene",
+            "2",
+            "--focus",
+            "¿respeta la continuidad?",
+        ])
+        .expect("parse");
+        match parsed.command {
+            Command::Review {
+                ref root,
+                scene,
+                ref focus,
+            } => {
+                assert_eq!(root, "/tmp/p");
+                assert_eq!(scene, 2);
+                assert_eq!(focus, "¿respeta la continuidad?");
+            }
+            other => panic!("expected review, got {other:?}"),
+        }
+        // Focus is optional (general review); scene is required like propose.
+        let parsed = parse(&["review", "/tmp/p", "--scene", "1"]).expect("parse without focus");
+        assert!(
+            matches!(parsed.command, Command::Review { ref focus, .. } if focus.is_empty()),
+            "empty focus by default"
+        );
+        let error = parse(&["review", "/tmp/p"]).expect_err("scene required");
+        assert!(error.contains("--scene"), "{error}");
+    }
+
+    #[test]
+    fn focus_flag_is_review_only() {
+        let error = parse(&["brief", "/tmp/p", "--focus", "x"]).expect_err("review only");
+        assert!(error.contains("review"), "{error}");
+        let error = parse(&["loop", "/tmp/p", "--instruction", "x", "--focus", "y"])
+            .expect_err("review only");
+        assert!(error.contains("review"), "{error}");
     }
 
     #[test]

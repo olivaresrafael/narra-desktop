@@ -15,8 +15,8 @@ use serde_json::json;
 
 use super::adapter::{ModelAdapter, ModelRequest};
 use super::proposal::{self, FileProposal, Origin};
+use super::scene::{SceneLookup, scene_block};
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
-use crate::fountain;
 use crate::git::{self, OpOptions};
 use crate::project::open_project;
 
@@ -113,39 +113,31 @@ impl SceneEditTask {
             detail: format!("Extrayendo la escena {}", self.scene_number),
         });
         let base = project.read_document(&screenplay_path)?;
-        let scenes = fountain::parse(&base)
-            .iter()
-            .filter(|element| element.kind == fountain::ElementKind::SceneHeading)
-            .map(|element| (element.line_number, element.text.clone()))
-            .collect::<Vec<_>>();
-        if scenes.is_empty() {
-            return Err(AgentError::InvalidInput(
-                "the screenplay has no scenes to edit",
-            ));
-        }
-        if self.scene_number > scenes.len() {
-            return Err(AgentError::SceneNumber {
-                number: self.scene_number,
-                total: scenes.len(),
-            });
-        }
-
-        // Scene region: its heading line up to (excluding) the next heading.
+        // Shared extraction (`agent::scene`, M6): `scene_review` reads the
+        // same block, so the two tasks can never disagree about where a
+        // scene starts or ends.
+        let block = match scene_block(&base, self.scene_number) {
+            SceneLookup::Found(block) => block,
+            SceneLookup::NoScenes => {
+                return Err(AgentError::InvalidInput(
+                    "the screenplay has no scenes to edit",
+                ));
+            }
+            SceneLookup::OutOfRange { total } => {
+                return Err(AgentError::SceneNumber {
+                    number: self.scene_number,
+                    total,
+                });
+            }
+        };
+        // Keep the 0-based exclusive indices the rest of this task (splice,
+        // ranges, events) already uses: `start_line` is 1-based and
+        // `end_line` is numerically the 0-based exclusive end.
+        let start = block.start_line - 1;
+        let region_end = block.end_line;
+        let heading = block.heading;
+        let scene_text = block.text;
         let base_lines: Vec<&str> = base.lines().collect();
-        let (heading_line, heading) = &scenes[self.scene_number - 1];
-        let start = heading_line - 1;
-        let end = scenes
-            .get(self.scene_number)
-            .map(|(line, _)| line - 1)
-            .unwrap_or(base_lines.len());
-        // The blank line(s) separating this scene from the next are part of
-        // the *separator*, not of the scene: the model reply is trimmed, so
-        // they stay outside the replaced region and can never be lost.
-        let mut region_end = end;
-        while region_end > start && base_lines[region_end - 1].is_empty() {
-            region_end -= 1;
-        }
-        let scene_text = base_lines[start..region_end].join("\n");
 
         let sources = vec![
             ContextSource {

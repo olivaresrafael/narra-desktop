@@ -17,7 +17,9 @@ pub mod brief;
 pub mod mock;
 pub mod openai_compat;
 pub mod proposal;
+mod scene;
 pub mod scene_edit;
+pub mod scene_review;
 pub mod tool_loop;
 pub mod tools;
 
@@ -27,6 +29,7 @@ pub use mock::MockAdapter;
 pub use openai_compat::{LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig};
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use scene_edit::SceneEditTask;
+pub use scene_review::SceneReviewTask;
 pub use tool_loop::ToolLoopTask;
 pub use tools::{
     ChatMessage, ChatRole, GrantPolicy, PermissionDecision, PermissionPolicy, ToolCall,
