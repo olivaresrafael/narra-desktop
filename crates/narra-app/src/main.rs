@@ -82,6 +82,9 @@
 //!       M8 slice 3 (outline): the explorer lists the open document's
 //!       scene headings below the file list; clicking one jumps to the
 //!       scene and the caret's scene is highlighted. Dump: `outline`.
+//!       M9 slice 1 (mouse selection): dragging selects from the anchor,
+//!       double click selects the word, triple click the line; the list
+//!       auto-scrolls at the edges. Dump: `selected_text`.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -115,8 +118,9 @@ use buffer::{Buffer, Position};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection, Window, WindowBounds,
-    WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection,
+    Window, WindowBounds, WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb,
+    rgba, size,
 };
 use i18n::Lang;
 use narra_core::agent::{
@@ -787,6 +791,9 @@ struct Editor {
     /// its commit (`insertText`) or cancellation (`unmarkText`): edits made
     /// inside this window merge into one undo entry (Spike B undo grouping).
     composing: bool,
+    /// Drag-selection anchor (M9 slice 1): the offset where the current
+    /// mouse drag started, kept fixed while the pointer moves.
+    dragging: Option<usize>,
     /// Debug for mouse verification (Spike B click-to-caret): last left-click
     /// position in window coordinates, the resolved line index and its bounds,
     /// and the doc offset (or None if the click was ignored / above the list).
@@ -1027,10 +1034,77 @@ impl Editor {
             item_h,
             Some(offset),
         ));
-        self.set_caret(offset, event.modifiers.shift);
+        // Double click selects the word, triple click the line (M9 slice 1);
+        // a plain click moves the caret and arms the drag anchor.
+        match event.click_count {
+            2 => {
+                self.selected = self.buffer.word_range_at(offset);
+                self.reversed = false;
+                self.dragging = Some(offset);
+            }
+            count if count >= 3 => {
+                self.selected = self.buffer.line_range_at(offset);
+                self.reversed = false;
+                self.dragging = Some(offset);
+            }
+            _ => {
+                self.set_caret(offset, event.modifiers.shift);
+                self.dragging = if event.modifiers.shift {
+                    None
+                } else {
+                    Some(offset)
+                };
+            }
+        }
         // A click re-targets typing (and IME composition) at the buffer.
         window.focus(&self.focus_handle(cx));
         cx.notify();
+    }
+
+    /// Drag selection (M9 slice 1): while the left button is held, the
+    /// selection runs from the mouse-down anchor to the current point (the
+    /// caret stays at the moving end). The list auto-scrolls one line when
+    /// the pointer reaches the top/bottom edge so a drag can cross pages.
+    fn on_mouse_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff.open || event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        let Some(anchor) = self.dragging else {
+            return;
+        };
+        let viewport = self.list_state.viewport_bounds();
+        let edge = px(LINE_HEIGHT);
+        if event.position.y < viewport.top() + edge {
+            self.list_state.scroll_by(px(-LINE_HEIGHT));
+        } else if event.position.y > viewport.bottom() - edge {
+            self.list_state.scroll_by(px(LINE_HEIGHT));
+        }
+        let Some(offset) = self.offset_for_point(event.position, window) else {
+            return;
+        };
+        if offset >= anchor {
+            self.selected = anchor..offset;
+            self.reversed = false;
+        } else {
+            self.selected = offset..anchor;
+            self.reversed = true;
+        }
+        cx.notify();
+    }
+
+    /// End a drag selection: the anchor is cleared, the selection stays.
+    fn on_mouse_release(
+        &mut self,
+        _: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.dragging = None;
     }
 
     /// Keep the `list` item count in sync with the buffer after an edit that
@@ -2081,6 +2155,7 @@ impl Editor {
         self.reversed = false;
         self.marked = None;
         self.composing = false;
+        self.dragging = None;
         self.last_click = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -4046,6 +4121,16 @@ impl Editor {
             end -= 1;
         }
         let around = escape_json(&self.buffer.slice(start..end));
+        // The selected text travels in the dump so drag/double/triple-click
+        // verification compares the actual selection (capped to stay small).
+        let selected_text = {
+            let text = self.buffer.slice(self.selected.clone());
+            let mut capped: String = text.chars().take(200).collect();
+            if text.chars().count() > 200 {
+                capped.push('…');
+            }
+            escape_json(&capped)
+        };
 
         // The diff counts are the ground truth the M4 proposal surface
         // leans on: every row must be a real change (no phantom EOF line)
@@ -4265,7 +4350,7 @@ impl Editor {
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
                 "\"lines\":{},\"doc_len\":{},\"edits\":{},",
-                "\"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],",
+                "\"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],\"selected_text\":\"{}\",",
                 "\"scenes\":{},\"undo\":{},\"redo\":{},\"around\":\"{}\",",
                 "\"find\":{{\"open\":{},\"query\":\"{}\",\"matches\":{},",
                 "\"current\":{},\"replaced\":{}}},",
@@ -4284,6 +4369,7 @@ impl Editor {
             position.col,
             self.selected.start,
             self.selected.end,
+            selected_text,
             self.scene_lines.len(),
             self.undo_stack.len(),
             self.redo_stack.len(),
@@ -4818,6 +4904,8 @@ impl Render for Editor {
                             // Click-to-caret for the buffer list (the diff list is
                             // read-only and ignores clicks in the handler).
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_buffer_click))
+                            .on_mouse_move(cx.listener(Self::on_mouse_drag))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_release))
                             // The diff view replaces the buffer rows while open; the
                             // buffer list keeps its own (idle) scroll state so
                             // closing the diff restores the caret position.
@@ -5267,6 +5355,7 @@ fn run() -> Result<(), String> {
             reversed: false,
             marked: None,
             composing: false,
+            dragging: None,
             last_click: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),

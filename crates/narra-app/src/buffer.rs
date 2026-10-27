@@ -224,6 +224,54 @@ impl Buffer {
         })
     }
 
+    /// Character range of the word under `offset` (M9 slice 1): letters,
+    /// digits, `_`, and apostrophes *between* word characters (`don't`).
+    /// A caret on a non-word character returns an empty range at `offset`
+    /// (double-click there selects nothing).
+    pub fn word_range_at(&self, offset: usize) -> Range<usize> {
+        let position = self.position_at(offset);
+        let line = &self.lines[position.line];
+        let chars: Vec<char> = line.chars().collect();
+        let caret_chars = line[..position.col.min(line.len())].chars().count();
+        let is_word = |index: usize| {
+            let c = chars[index];
+            c.is_alphanumeric()
+                || c == '_'
+                || (matches!(c, '\'' | '\u{2019}')
+                    && index > 0
+                    && index + 1 < chars.len()
+                    && chars[index - 1].is_alphanumeric()
+                    && chars[index + 1].is_alphanumeric())
+        };
+        // Double-click resolves to the boundary after the clicked glyph, so
+        // prefer the character before the caret when it is a word char.
+        let anchor = if caret_chars < chars.len() && is_word(caret_chars) {
+            caret_chars
+        } else if caret_chars > 0 && is_word(caret_chars - 1) {
+            caret_chars - 1
+        } else {
+            return offset..offset;
+        };
+        let mut start = anchor;
+        while start > 0 && is_word(start - 1) {
+            start -= 1;
+        }
+        let mut end = anchor + 1;
+        while end < chars.len() && is_word(end) {
+            end += 1;
+        }
+        let byte_of = |index: usize| -> usize { chars[..index].iter().map(|c| c.len_utf8()).sum() };
+        let line_start = self.line_content_range(position.line).start;
+        (line_start + byte_of(start))..(line_start + byte_of(end))
+    }
+
+    /// Content range of the line under `offset` (triple-click selection):
+    /// the line's text without its trailing newline.
+    pub fn line_range_at(&self, offset: usize) -> Range<usize> {
+        let position = self.position_at(offset);
+        self.line_content_range(position.line)
+    }
+
     /// Move `offset` up/down by `delta` lines, clamping the column to the
     /// target line. Columns are byte-based: exact visual-column tracking
     /// across lines with different encodings is out of scope for the spike
@@ -567,5 +615,45 @@ mod tests {
                 "base seeding diverged for {base:?}"
             );
         }
+    }
+
+    #[test]
+    fn word_range_covers_letters_digits_underscores_and_inner_apostrophes() {
+        let buffer = Buffer::new("Marta dijo: don't stop, 3 veces.\n");
+        // Inside `Marta` (offset over `r`): the whole word.
+        assert_eq!(&buffer.slice(buffer.word_range_at(2)), "Marta");
+        // `don't` is one word (inner apostrophe).
+        let at = "Marta dijo: ".len() + 2;
+        assert_eq!(&buffer.slice(buffer.word_range_at(at)), "don't");
+        // Digits are word characters.
+        let at = "Marta dijo: don't stop, ".len();
+        assert_eq!(&buffer.slice(buffer.word_range_at(at)), "3");
+        // The caret just after `Marta` (on the space) selects the word the
+        // click resolved to, matching the boundary the platform reports.
+        let at = "Marta".len();
+        assert_eq!(&buffer.slice(buffer.word_range_at(at)), "Marta");
+        // Inside a multi-space gap (no adjacent word char before) selects
+        // nothing.
+        let gap = Buffer::new("a   b\n");
+        assert_eq!(gap.word_range_at(2), 2..2);
+    }
+
+    #[test]
+    fn word_range_keeps_accented_words_whole() {
+        let buffer = Buffer::new("INT. OFICINA - DÍA\n");
+        let at = "INT. OFICINA - ".len() + 1;
+        assert_eq!(&buffer.slice(buffer.word_range_at(at)), "DÍA");
+    }
+
+    #[test]
+    fn line_range_is_the_line_content() {
+        let buffer = Buffer::new("primera línea\nsegunda\n");
+        assert_eq!(&buffer.slice(buffer.line_range_at(3)), "primera línea");
+        let second = "primera línea\n".len() + 2;
+        assert_eq!(&buffer.slice(buffer.line_range_at(second)), "segunda");
+        // Empty lines select an empty range at the line start.
+        let empty = Buffer::new("a\n\nb\n");
+        let at = 2;
+        assert_eq!(empty.line_range_at(at), 2..2);
     }
 }
