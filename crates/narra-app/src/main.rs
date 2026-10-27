@@ -72,6 +72,9 @@
 //!       M6 slice 9 (i18n): `--lang en|es` (default from the environment)
 //!       and ⌘⌥L localize every workspace string (i18n table with
 //!       completeness/parity tests); the dump reports `lang`.
+//!       M7 slice 4 (export): ⌘E writes the current buffer as a PDF to
+//!       `<root>/exports/<screenplay>.pdf` through the core layout engine
+//!       (worker thread; the dump reports `export`).
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -114,6 +117,7 @@ use narra_core::agent::{
     OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, proposal, roles,
 };
 use narra_core::cancel::CancellationToken;
+use narra_core::export;
 use narra_core::{DocumentError, Project, ProjectError, open_project};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -176,6 +180,8 @@ actions!(
         RetryAgent,
         // language (M6 slice 9)
         ToggleLang,
+        // export (M7 slice 4)
+        ExportPdf,
     ]
 );
 
@@ -295,6 +301,29 @@ struct ProposeBar {
 struct FocusBar {
     open: bool,
     focus: String,
+}
+
+/// Outcome of the last PDF export (M7 slice 4), shown in the dump so
+/// verification never depends on pixels.
+#[derive(Debug, Default)]
+struct ExportState {
+    /// Written path, empty until a successful run.
+    out: String,
+    bytes: usize,
+    pages: usize,
+    /// Explicit failure text (empty on success).
+    error: String,
+}
+
+/// Message from the export worker thread into the view.
+enum ExportMessage {
+    Done(Result<ExportOutcome, String>),
+}
+
+struct ExportOutcome {
+    out: String,
+    bytes: usize,
+    pages: usize,
 }
 
 /// Diff view state (slice 3, M1-3b). The base is a snapshot of the file as
@@ -786,6 +815,8 @@ struct Editor {
     /// UI language (M6 slice 9): every string the workspace displays is
     /// looked up through `i18n` with this; toggled live with ⌘⌥L.
     lang: Lang,
+    /// Last PDF export outcome (M7 slice 4).
+    export: ExportState,
     /// Agent review panel state (M6 slice 3). Pure reducer — see agent_view.
     agent: AgentState,
     /// Cancellation token for the in-flight agent task (review or propose;
@@ -2456,6 +2487,74 @@ impl Editor {
         cx.notify();
     }
 
+    /// ⌘E (M7 slice 4): export the current buffer as PDF into
+    /// `<root>/exports/<screenplay-stem>.pdf` on a worker thread — the UI
+    /// thread never blocks on layout, serialization or IO. The buffer (what
+    /// the user sees) is exported, never a silent disk re-read; the PDF is
+    /// an artifact and no canonical file changes.
+    fn on_export_pdf(&mut self, _: &ExportPdf, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        let root = project.root().to_string_lossy().into_owned();
+        let manifest = project.manifest().clone();
+        let stem = Path::new(&manifest.default_screenplay_path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "screenplay".to_string());
+        let text = self.full_text();
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let body = export::pdf::layout(&text).pages.len();
+            let bytes = export::pdf::export(&manifest, &text);
+            let dir = Path::new(&root).join(narra_core::project::EXPORTS_DIR);
+            let path = dir.join(format!("{stem}.pdf"));
+            let result = (|| {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|error| format!("{}: {error}", dir.display()))?;
+                std::fs::write(&path, &bytes)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                Ok(ExportOutcome {
+                    out: path.display().to_string(),
+                    bytes: bytes.len(),
+                    pages: body + 1,
+                })
+            })();
+            let _ = tx.send(ExportMessage::Done(result));
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let ExportMessage::Done(result) = message;
+            match result {
+                Ok(outcome) => {
+                    view.export = ExportState {
+                        out: outcome.out.clone(),
+                        bytes: outcome.bytes,
+                        pages: outcome.pages,
+                        error: String::new(),
+                    };
+                    view.notice = Some(view.tf(
+                        "notice.exported",
+                        &[
+                            ("path", &outcome.out),
+                            ("pages", &outcome.pages.to_string()),
+                        ],
+                    ));
+                }
+                Err(error) => {
+                    view.export = ExportState {
+                        error: error.clone(),
+                        ..ExportState::default()
+                    };
+                    view.notice = Some(view.tf("notice.export_failed", &[("error", &error)]));
+                }
+            }
+            true
+        });
+    }
+
     /// Fold one proposal message into the view state; when the task ends,
     /// keep the notice bar in sync with the outcome.
     fn apply_propose_message(&mut self, message: ProposeMessage, done: bool) {
@@ -3609,6 +3708,13 @@ impl Editor {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let export_dump = format!(
+            "{{\"out\":\"{}\",\"bytes\":{},\"pages\":{},\"error\":\"{}\"}}",
+            escape_json(&self.export.out),
+            self.export.bytes,
+            self.export.pages,
+            escape_json(&self.export.error),
+        );
         let agent_dump = format!(
             "{{\"status\":\"{}\",\"scene\":{},\"focus\":\"{}\",\"role\":\"{}\",\
              \"role_source\":\"{}\",\"stage\":\"{}\",\"sources\":[{}],\
@@ -3706,7 +3812,7 @@ impl Editor {
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
-                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"lang\":\"{}\"}}"
+                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"lang\":\"{}\"}}"
             ),
             self.buffer.line_count(),
             len,
@@ -3745,6 +3851,7 @@ impl Editor {
             agent_dump,
             focus_bar_dump,
             proposal_dump,
+            export_dump,
             self.lang.key(),
         )
     }
@@ -4203,6 +4310,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_retry_agent))
             // language (M6 slice 9)
             .on_action(cx.listener(Self::on_toggle_lang))
+            // export (M7 slice 4)
+            .on_action(cx.listener(Self::on_export_pdf))
             .child(
                 div()
                     .id("status")
@@ -4633,6 +4742,8 @@ fn run() -> Result<(), String> {
             KeyBinding::new("cmd-alt-r", RetryAgent, None),
             // language (M6 slice 9): cmd-alt-l toggles EN/ES live.
             KeyBinding::new("cmd-alt-l", ToggleLang, None),
+            // export (M7 slice 4): cmd-e writes exports/<screenplay>.pdf.
+            KeyBinding::new("cmd-e", ExportPdf, None),
         ]);
 
         cx.observe_keystrokes({
@@ -4666,6 +4777,7 @@ fn run() -> Result<(), String> {
             saved_edits: 0,
             notice: None,
             lang,
+            export: ExportState::default(),
             agent: AgentState::new(),
             agent_cancel: None,
             agent_settings: agent_settings.clone(),

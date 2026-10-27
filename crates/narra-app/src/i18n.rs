@@ -251,6 +251,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "no review is running",
         "no hay ninguna revisión en curso",
     ),
+    (
+        "notice.exported",
+        "PDF exported: {path} ({pages} pages)",
+        "PDF exportado: {path} ({pages} páginas)",
+    ),
+    (
+        "notice.export_failed",
+        "export failed: {error}",
+        "export fallido: {error}",
+    ),
     ("notice.lang", "language: {lang}", "idioma: {lang}"),
     // --- shared status words --------------------------------------------
     ("status.idle", "idle", "inactivo"),

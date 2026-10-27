@@ -30,6 +30,10 @@ pub const TEMPLATE_DIRS: &[&str] = &[
 /// Files created by `create_project`.
 pub const MANIFEST_FILE: &str = "project.yaml";
 pub const DEFAULT_SCREENPLAY: &str = "screenplay/main.fountain";
+/// Export artifacts (M7): written by `narra-harness export` and the app's
+/// ⌘E, and excluded from the document scan — they are outputs, never
+/// canonical content.
+pub const EXPORTS_DIR: &str = "exports";
 
 /// Maximum directory depth scanned by [`Project::list_documents`].
 const MAX_DOC_DEPTH: usize = 8;
@@ -172,6 +176,11 @@ fn walk_documents(
         };
         // Hidden entries are state, not content (`.git`, `.narra`, temp files).
         if name.starts_with('.') {
+            continue;
+        }
+        // Exports are artifacts, not canonical documents (M7): the editor
+        // never lists them, so a binary PDF can never be opened as text.
+        if prefix.is_empty() && name == EXPORTS_DIR {
             continue;
         }
         let relative = if prefix.is_empty() {
@@ -446,6 +455,9 @@ mod tests {
         fs::create_dir_all(root.join(".narra/proposals")).expect("narra dir");
         fs::write(root.join(".narra/proposals/draft.diff"), "x\n").expect("proposal");
         fs::write(root.join(".env"), "NOPE=1\n").expect("dotfile");
+        // Export artifacts are outputs, never documents (M7).
+        fs::create_dir_all(root.join("exports")).expect("exports dir");
+        fs::write(root.join("exports/main.pdf"), "%PDF-1.7\n").expect("pdf");
 
         // Narrative content, nested and unsorted on purpose.
         fs::create_dir_all(root.join("bible/characters")).expect("chars");
