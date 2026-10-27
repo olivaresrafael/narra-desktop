@@ -80,6 +80,9 @@ struct Palette {
     diff_remove_bg: u32,
     diff_remove_label: u32,
     diff_context_label: u32,
+    mention_character_bg: u32,
+    mention_location_bg: u32,
+    mention_object_bg: u32,
 }
 
 const DARK: Palette = Palette {
@@ -116,6 +119,9 @@ const DARK: Palette = Palette {
     diff_remove_bg: 0x3a1a1f,
     diff_remove_label: 0xe08a95,
     diff_context_label: 0x606060,
+    mention_character_bg: 0x3b82f644,
+    mention_location_bg: 0x22c55e44,
+    mention_object_bg: 0xf59e0b44,
 };
 
 const LIGHT: Palette = Palette {
@@ -152,6 +158,9 @@ const LIGHT: Palette = Palette {
     diff_remove_bg: 0xfde8e8,
     diff_remove_label: 0x991b1b,
     diff_context_label: 0x8a8a80,
+    mention_character_bg: 0x3b82f633,
+    mention_location_bg: 0x22c55e33,
+    mention_object_bg: 0xf59e0b44,
 };
 
 const SYSTEM: u8 = 0;
@@ -237,6 +246,9 @@ color_getter!(diff_add_label, diff_add_label);
 color_getter!(diff_remove_bg, diff_remove_bg);
 color_getter!(diff_remove_label, diff_remove_label);
 color_getter!(diff_context_label, diff_context_label);
+color_getter!(mention_character_bg, mention_character_bg);
+color_getter!(mention_location_bg, mention_location_bg);
+color_getter!(mention_object_bg, mention_object_bg);
 
 /// Editor font size in points (12–24, clamped).
 pub fn set_font_size(size: u16) {

@@ -151,9 +151,9 @@ use git_status::GitStatus;
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection,
-    Window, WindowAppearance, WindowBounds, WindowOptions, actions, canvas, div, list, point,
-    prelude::*, px, rgb, rgba, size, svg,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ShapedLine, StyledText, TextRun, Timer,
+    UTF16Selection, Window, WindowAppearance, WindowBounds, WindowOptions, actions, canvas, div,
+    list, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use i18n::Lang;
 use narra_core::agent::{
@@ -162,6 +162,7 @@ use narra_core::agent::{
     roles,
 };
 use narra_core::cancel::CancellationToken;
+use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::git::WorktreeStatus;
@@ -864,6 +865,40 @@ fn shape_line(window: &Window, text: &str) -> ShapedLine {
     )
 }
 
+/// Background tint for an entity category (D-029). Foreground syntax colors
+/// stay untouched, so a character cue still reads as a cue while “Marta” gets
+/// a subtle mention tint.
+fn mention_bg(category: EntityCategory) -> u32 {
+    match category {
+        EntityCategory::Character => theme::mention_character_bg(),
+        EntityCategory::Location => theme::mention_location_bg(),
+        EntityCategory::Object => theme::mention_object_bg(),
+    }
+}
+
+/// Build styled runs for a cold (non-caret) line with entity mentions.
+/// Wrapping stays with `StyledText`, so mention backgrounds do not change the
+/// line's geometry.
+fn mention_runs(
+    text: &str,
+    mentions: &[Mention],
+    entities: &EntityIndex,
+    color: Rgba,
+) -> Vec<TextRun> {
+    split_by_mentions(text, mentions)
+        .into_iter()
+        .map(|(range, entity)| TextRun {
+            len: range.len(),
+            font: gpui::font(FONT_FAMILY),
+            color: color.into(),
+            background_color: entity
+                .map(|index| rgba(mention_bg(entities.entities()[index].category)).into()),
+            underline: None,
+            strikethrough: None,
+        })
+        .collect()
+}
+
 fn x_for_index(window: &Window, text: &str, col: usize) -> Pixels {
     shape_line(window, text).x_for_index(col)
 }
@@ -1383,6 +1418,8 @@ struct Editor {
     project: Option<Project>,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
+    /// Derived bible entities and mention matcher (M11).
+    entities: EntityIndex,
     /// Folders the user collapsed in the explorer tree (M9 slice 4);
     /// persists across document switches for the session.
     collapsed: HashSet<String>,
@@ -1605,6 +1642,17 @@ impl Editor {
             self.refresh_git_now(cx);
         }
         cx.notify();
+    }
+
+    /// Rebuild the derived bible entity index from the current project.
+    /// Failures are non-fatal: the editor keeps working without mentions,
+    /// and the next explicit refresh can recover.
+    fn refresh_entities(&mut self) {
+        self.entities = self
+            .project
+            .as_ref()
+            .and_then(|project| EntityIndex::build(project).ok())
+            .unwrap_or_default();
     }
 
     /// Open the Git panel and force a refresh (explicit user action).
@@ -3602,6 +3650,7 @@ impl Editor {
         {
             self.explorer = paths;
         }
+        self.refresh_entities();
         if let Err(error) = self.open_document_path(&path) {
             self.notice = Some(error);
             cx.notify();
@@ -3890,6 +3939,32 @@ impl Editor {
         let Some(offset) = self.offset_for_point(event.position, window) else {
             return;
         };
+        // ⌘-click on a bible mention opens its dossier (M11). A click that
+        // misses an entity keeps the normal caret behavior below.
+        if event.modifiers.platform {
+            let pos = self.doc.buffer.position_at(offset);
+            let line = self.doc.buffer.lines()[pos.line].clone();
+            if let Some(mention) = self
+                .entities
+                .mentions(&line)
+                .into_iter()
+                .find(|mention| pos.col >= mention.start && pos.col <= mention.end)
+            {
+                let document = mention.document(&self.entities).to_string();
+                let name = mention.name(&self.entities).to_string();
+                if let Err(error) = self.open_document_path(&document) {
+                    self.notice = Some(error);
+                } else {
+                    self.notice = Some(self.tf(
+                        "notice.entity_clicked",
+                        &[("name", &name), ("path", &document)],
+                    ));
+                }
+                window.focus(&self.focus_handle(cx));
+                cx.notify();
+                return;
+            }
+        }
         // Update debug with resolved line and bounds.
         let pos = self.doc.buffer.position_at(offset);
         let line = pos.line;
@@ -4969,6 +5044,7 @@ impl Editor {
             Ok(()) => {
                 self.new_file = None;
                 self.explorer = project.list_documents().unwrap_or_default();
+                self.refresh_entities();
                 let created = self.tf("notice.created", &[("path", &path)]);
                 match project.read_document(&path) {
                     Ok(text) => {
@@ -5298,6 +5374,7 @@ impl Editor {
         self.git_refreshed_at = None;
         self.project = Some(project);
         self.explorer = explorer;
+        self.refresh_entities();
         self.collapsed.clear();
         // Project-level surfaces never carry over: a review, proposal,
         // search result or export belongs to the project that produced it.
@@ -7206,6 +7283,9 @@ impl Editor {
                 self.doc.backup_error = None;
                 self.notice = Some(self.tf("notice.saved", &[("path", &self.doc.path)]));
                 self.git_refreshed_at = None;
+                if self.doc.path.starts_with("bible/") {
+                    self.refresh_entities();
+                }
             }
             Err(error) => {
                 self.notice = Some(self.tf(
@@ -9469,6 +9549,7 @@ impl Editor {
         // between the caret and the rest of the line.
         let (visual_row, _caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
         let starts = visual_row_starts(window, text, wrap_w);
+        let mentions = self.entities.mentions(text);
 
         // Build visual rows as a column inside the gutter row.
         let mut col = div().flex().flex_col().w(self.wrap_width);
@@ -9487,27 +9568,71 @@ impl Editor {
                 .items_center();
 
             if row_idx == visual_row {
-                // This visual row contains the caret: render it in flow
-                // between the text before and after it.
-                let before = &segment_text[..caret_col
-                    .saturating_sub(starts[visual_row])
-                    .min(segment_text.len())];
-                let after = &segment_text[caret_col
-                    .saturating_sub(starts[visual_row])
-                    .min(segment_text.len())..];
-                if !before.is_empty() {
-                    row_div = row_div.child(before.to_string());
-                }
-                row_div = row_div.child(cursor_element());
-                if !after.is_empty() {
-                    row_div = row_div.child(after.to_string());
-                }
-            } else {
+                let caret_local = caret_col.clamp(start, end);
+                row_div = row_div.child(self.mention_segments(
+                    text,
+                    start,
+                    end,
+                    Some(caret_local),
+                    &mentions,
+                ));
+            } else if mentions.is_empty() {
                 row_div = row_div.child(segment_text.to_string());
+            } else {
+                row_div = row_div.child(self.mention_segments(text, start, end, None, &mentions));
             }
             col = col.child(row_div);
         }
         base.flex().child(gutter_element(ix, active)).child(col)
+    }
+
+    /// Render one visual row as text segments, optionally with the caret and
+    /// entity mention backgrounds. Used by the wrapped caret row so mentions
+    /// stay visible on the line that owns the caret.
+    fn mention_segments(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        caret: Option<usize>,
+        mentions: &[Mention],
+    ) -> gpui::Div {
+        let mut cuts = vec![start, end];
+        if let Some(caret) = caret {
+            cuts.push(caret.clamp(start, end));
+        }
+        for mention in mentions {
+            if mention.end > start && mention.start < end {
+                cuts.push(mention.start.clamp(start, end));
+                cuts.push(mention.end.clamp(start, end));
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut row = div().flex().items_center();
+        for pair in cuts.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if caret == Some(a) {
+                row = row.child(cursor_element());
+            }
+            if a == b {
+                continue;
+            }
+            let mut segment = div().whitespace_nowrap();
+            if let Some(mention) = mentions
+                .iter()
+                .find(|mention| a >= mention.start && b <= mention.end)
+            {
+                segment = segment.bg(rgba(mention_bg(
+                    self.entities.entities()[mention.entity].category,
+                )));
+            }
+            row = row.child(segment.child(text[a..b].to_string()));
+        }
+        if caret == Some(end) {
+            row = row.child(cursor_element());
+        }
+        row
     }
 
     /// One row of the virtualized list.
@@ -9557,6 +9682,8 @@ impl Editor {
                 Vec::new()
             };
 
+        let mentions_here = self.entities.mentions(text);
+
         let base = div()
             .px_2()
             .font_family(FONT_FAMILY)
@@ -9568,15 +9695,30 @@ impl Editor {
             .when(ix == caret_line, |row| row.bg(rgb(theme::active_line_bg())));
 
         // Cold row: no caret/selection/IME/matches -> gutter + wrapped text.
+        // With entity mentions the text is rendered as styled runs so each
+        // category gets its background tint without losing soft wrapping.
         if selection_here.is_none()
             && marked_here.is_none()
             && !caret_here
             && matches_here.is_empty()
         {
+            let body = if !mentions_here.is_empty() {
+                let color = self.element_color(ix, text);
+                div().w(self.wrap_width).child(
+                    StyledText::new(text.clone()).with_runs(mention_runs(
+                        text,
+                        &mentions_here,
+                        &self.entities,
+                        color,
+                    )),
+                )
+            } else {
+                div().w(self.wrap_width).child(text.clone())
+            };
             return base
                 .flex()
                 .child(gutter_element(ix, ix == caret_line))
-                .child(div().w(self.wrap_width).child(text.clone()));
+                .child(body);
         }
 
         // Caret-only (no selection, no IME, no matches): wrap the line and
@@ -9611,6 +9753,10 @@ impl Editor {
             cuts.push((range.start - doc.start).min(len));
             cuts.push((range.end - doc.start).min(len));
         }
+        for mention in &mentions_here {
+            cuts.push(mention.start.min(len));
+            cuts.push(mention.end.min(len));
+        }
         let caret_col = (caret - doc.start).min(len);
         if caret_here {
             cuts.push(caret_col);
@@ -9635,6 +9781,9 @@ impl Editor {
             let match_state = matches_here.iter().find(|(range, _)| {
                 start >= range.start - doc.start && end <= range.end - doc.start
             });
+            let mention_state = mentions_here
+                .iter()
+                .find(|mention| start >= mention.start && end <= mention.end);
             let mut segment = div().whitespace_nowrap();
             if selected {
                 segment = segment.bg(rgba(theme::selection_bg()));
@@ -9646,6 +9795,10 @@ impl Editor {
                 } else {
                     theme::match_bg()
                 }));
+            } else if let Some(mention) = mention_state {
+                segment = segment.bg(rgba(mention_bg(
+                    self.entities.entities()[mention.entity].category,
+                )));
             }
             if composing {
                 segment = segment.underline();
@@ -10023,6 +10176,7 @@ impl Editor {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let entities_dump = self.entities.dump_json(200);
         let tree_rows: Vec<String> = explorer::build_rows(
             &explorer::visible_paths(&self.explorer, self.show_config_files),
             &self.collapsed,
@@ -10167,7 +10321,7 @@ impl Editor {
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"language\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
-                 \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
+                 \"outline\":[{}],\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
                  \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
@@ -10220,6 +10374,7 @@ impl Editor {
             search_dump,
             outline_dump.join(","),
             tree_rows.join(","),
+            entities_dump,
             self.doc
                 .page_count
                 .map(|pages| pages.to_string())
@@ -11536,6 +11691,10 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("no se pudo listar el proyecto: {error}"))?,
         None => Vec::new(),
     };
+    let entities = project
+        .as_ref()
+        .and_then(|project| EntityIndex::build(project).ok())
+        .unwrap_or_default();
 
     let scene_count = content
         .lines()
@@ -11772,6 +11931,7 @@ fn run() -> Result<(), String> {
                 diff_probe_total: diff_steps,
                 project,
                 explorer,
+                entities,
                 collapsed: HashSet::new(),
                 notice: None,
                 lang,

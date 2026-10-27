@@ -540,6 +540,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "ficha de {kind} lista: {path}",
     ),
     (
+        "notice.entity_clicked",
+        "opened dossier for {name}: {path}",
+        "ficha de {name} abierta: {path}",
+    ),
+    (
         "notice.element_applied",
         "screenplay element updated",
         "elemento de guion actualizado",

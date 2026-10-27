@@ -28,6 +28,7 @@ pub mod agent;
 pub mod backup;
 pub mod cancel;
 pub mod document;
+pub mod entities;
 pub mod export;
 pub mod fountain;
 pub mod git;
