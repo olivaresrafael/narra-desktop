@@ -24,6 +24,16 @@ pub enum ContextAction {
     Propose,
     Convert(new_file::Kind),
     SetElement(screenplay::ElementType),
+    FileNew,
+    FileRename,
+    FileDuplicate,
+    FileDelete,
+    FileReveal,
+    FileCopyPath,
+    TabClose,
+    TabCloseOthers,
+    TabCopyPath,
+    TabReveal,
 }
 
 /// One rendered row: an action, or a divider when `action` is `None`.

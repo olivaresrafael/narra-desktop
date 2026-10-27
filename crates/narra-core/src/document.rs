@@ -127,6 +127,51 @@ pub fn create_document(root: &Path, relative: &str, contents: &str) -> Result<()
     Ok(())
 }
 
+/// Rename a document inside the project without overwriting an existing path.
+/// The destination's parent directory must already exist: renaming never
+/// creates folders implicitly, so a typo cannot silently produce a new tree.
+pub fn rename_document(root: &Path, from: &str, to: &str) -> Result<(), DocumentError> {
+    if from == to {
+        return Ok(());
+    }
+    let from_path = resolve_within(root, from)?;
+    let to_path = resolve_within(root, to)?;
+    if !from_path.is_file() {
+        return Err(DocumentError::Io {
+            path: from_path,
+            source: io::Error::new(io::ErrorKind::NotFound, "document does not exist"),
+        });
+    }
+    if to_path.exists() {
+        return Err(DocumentError::AlreadyExists(to.to_string()));
+    }
+    if let Some(parent) = to_path.parent()
+        && !parent.is_dir()
+    {
+        return Err(DocumentError::Io {
+            path: parent.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::NotFound, "destination folder does not exist"),
+        });
+    }
+    fs::rename(&from_path, &to_path).map_err(|source| DocumentError::Io {
+        path: to_path,
+        source,
+    })
+}
+
+/// Delete one document inside the project. Folders are never removed by this
+/// helper; the caller must confirm the destructive action first.
+pub fn delete_document(root: &Path, relative: &str) -> Result<(), DocumentError> {
+    let path = resolve_within(root, relative)?;
+    if !path.is_file() {
+        return Err(DocumentError::Io {
+            path,
+            source: io::Error::new(io::ErrorKind::NotFound, "document does not exist"),
+        });
+    }
+    fs::remove_file(&path).map_err(|source| DocumentError::Io { path, source })
+}
+
 /// Write a document inside the project atomically (temp file + rename).
 ///
 /// The temp file lives in the destination directory so the rename stays on the

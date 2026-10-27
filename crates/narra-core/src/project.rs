@@ -67,6 +67,9 @@ pub enum ProjectError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("the default screenplay cannot be deleted; choose another default screenplay first")]
+    CannotDeleteDefaultScreenplay,
 }
 
 /// An opened project: validated manifest plus its root on disk.
@@ -111,6 +114,38 @@ impl Project {
         document::write_document(&self.root, MANIFEST_FILE, &text)?;
         self.manifest = manifest;
         Ok(())
+    }
+
+    /// Rename a document and, when it is the default screenplay, update the
+    /// manifest atomically after the file move. A manifest failure rolls the
+    /// file rename back so the project never points at a missing screenplay.
+    pub fn rename_document(&mut self, from: &str, to: &str) -> Result<(), ProjectError> {
+        document::rename_document(&self.root, from, to)?;
+        if self.manifest.default_screenplay_path == from {
+            let mut manifest = self.manifest.clone();
+            manifest.default_screenplay_path = to.to_string();
+            if let Err(error) = self.update_manifest(manifest) {
+                let _ = document::rename_document(&self.root, to, from);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Duplicate a document to a new project-relative path. Never overwrites
+    /// and never follows a path outside the project.
+    pub fn duplicate_document(&self, from: &str, to: &str) -> Result<(), ProjectError> {
+        let text = self.read_document(from)?;
+        self.create_document(to, &text)
+    }
+
+    /// Delete a document. The default screenplay is protected because losing
+    /// it would leave the project opening into a missing path.
+    pub fn delete_document(&self, relative: &str) -> Result<(), ProjectError> {
+        if relative == self.manifest.default_screenplay_path {
+            return Err(ProjectError::CannotDeleteDefaultScreenplay);
+        }
+        Ok(document::delete_document(&self.root, relative)?)
     }
 
     /// Scan the canonical narrative sources and rebuild the derived index.
@@ -385,6 +420,82 @@ mod tests {
         assert!(project.update_manifest(invalid).is_err());
         let again = open_project(&root).expect("reopen after rejection");
         assert_eq!(again.manifest().title, "Después");
+    }
+
+    #[test]
+    fn rename_updates_the_default_screenplay_and_never_overwrites() {
+        let root = temp_root();
+        let mut project =
+            create_project(&root, "Serie", ProjectType::Series, "es").expect("create");
+        project
+            .write_document("screenplay/S01E01.fountain", "INT. CASA - DÍA\n")
+            .expect("write");
+        let mut manifest = project.manifest().clone();
+        manifest.default_screenplay_path = "screenplay/S01E01.fountain".to_string();
+        project.update_manifest(manifest).expect("manifest");
+        project
+            .rename_document(
+                "screenplay/S01E01.fountain",
+                "screenplay/S01E01 Piloto.fountain",
+            )
+            .expect("rename");
+        assert_eq!(
+            project.manifest().default_screenplay_path,
+            "screenplay/S01E01 Piloto.fountain"
+        );
+        assert!(root.join("screenplay/S01E01 Piloto.fountain").is_file());
+        assert!(!root.join("screenplay/S01E01.fountain").exists());
+        let reopened = open_project(&root).expect("reopen");
+        assert_eq!(
+            reopened.manifest().default_screenplay_path,
+            "screenplay/S01E01 Piloto.fountain"
+        );
+
+        project
+            .write_document("screenplay/other.fountain", "")
+            .expect("other");
+        assert!(
+            project
+                .rename_document(
+                    "screenplay/S01E01 Piloto.fountain",
+                    "screenplay/other.fountain"
+                )
+                .is_err()
+        );
+        assert!(root.join("screenplay/S01E01 Piloto.fountain").is_file());
+    }
+
+    #[test]
+    fn duplicate_and_delete_are_bounded_and_protect_the_default_screenplay() {
+        let root = temp_root();
+        let project = create_project(&root, "Serie", ProjectType::Series, "es").expect("create");
+        project
+            .write_document("notes/idea.md", "hola\n")
+            .expect("write");
+        project
+            .duplicate_document("notes/idea.md", "notes/idea copia.md")
+            .expect("duplicate");
+        assert_eq!(
+            project.read_document("notes/idea copia.md").expect("read"),
+            "hola\n"
+        );
+        assert!(
+            project
+                .duplicate_document("notes/idea.md", "notes/idea copia.md")
+                .is_err(),
+            "duplicate never overwrites"
+        );
+        assert!(
+            project
+                .delete_document(project.manifest().default_screenplay_path.as_str())
+                .is_err(),
+            "the default screenplay is protected"
+        );
+        project
+            .delete_document("notes/idea copia.md")
+            .expect("delete");
+        assert!(!root.join("notes/idea copia.md").exists());
+        assert!(root.join("notes/idea.md").is_file());
     }
 
     #[test]

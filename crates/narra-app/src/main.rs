@@ -695,6 +695,33 @@ impl PaletteCommand {
     }
 }
 
+/// What the open menu acts on. Editor menus do not need a path; explorer and
+/// tab menus resolve their target when an action is chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextTarget {
+    Editor,
+    File(String),
+    Dir(String),
+    Tab(usize),
+}
+
+/// Rename dialog state (M11 slice 3). The extension is preserved by the
+/// caller; the user edits only the stem.
+#[derive(Debug, Clone)]
+struct FilePromptState {
+    path: String,
+    name: String,
+    error: String,
+}
+
+/// Destructive confirmation for deleting a document.
+#[derive(Debug, Clone)]
+struct DeletePromptState {
+    path: String,
+    name: String,
+    error: String,
+}
+
 /// What to do once the unsaved-changes prompt is resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingUnsaved {
@@ -1454,6 +1481,12 @@ struct Editor {
     palette: Option<PaletteState>,
     /// Editor right-click menu (M11 slice 1), when open.
     context_menu: Option<ContextMenuState>,
+    /// What the open context menu acts on (editor, explorer file/folder, tab).
+    context_target: Option<ContextTarget>,
+    /// Rename dialog, when open.
+    rename: Option<FilePromptState>,
+    /// Delete confirmation, when open.
+    delete_prompt: Option<DeletePromptState>,
     /// Show `project.yaml`/`AGENTS.md`/`agents.yaml` in the explorer (S4c).
     show_config_files: bool,
     /// Soft-wrap long lines (S4c); the geometry still uses `wrap_width`.
@@ -1524,6 +1557,8 @@ impl Editor {
             || self.settings.is_some()
             || self.project_settings.is_some()
             || self.palette.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
             || index == self.active_tab
             || index >= self.tabs.len()
         {
@@ -1679,6 +1714,8 @@ impl Editor {
             || self.project_settings.is_some()
             || self.palette.is_some()
             || self.context_menu.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
         {
             return;
         }
@@ -2701,6 +2738,8 @@ impl Editor {
             || self.new_project.is_some()
             || self.palette.is_some()
             || self.context_menu.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
         {
             return;
         }
@@ -3119,6 +3158,8 @@ impl Editor {
             || self.new_file.is_some()
             || self.new_project.is_some()
             || self.context_menu.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
         {
             return;
         }
@@ -3537,9 +3578,22 @@ impl Editor {
                 true,
             ));
         }
+        self.show_context_menu(position, items, ContextTarget::Editor, window, cx);
+    }
+
+    /// Clamp a menu to the viewport and make it visible for a target.
+    fn show_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        items: Vec<ContextMenuItem>,
+        target: ContextTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let viewport = window.viewport_size();
         let x = f32::from(position.x).min((f32::from(viewport.width) - 290.0).max(8.0));
         let y = f32::from(position.y).min((f32::from(viewport.height) - 560.0).max(8.0));
+        self.context_target = Some(target);
         self.context_menu = Some(ContextMenuState::new(x, y, items));
         window.focus(&self.focus_handle(cx));
         cx.notify();
@@ -3566,6 +3620,415 @@ impl Editor {
         let x = f32::from(bounds.left()) + 80.0;
         let y = f32::from(bounds.top()) + 6.0;
         self.open_editor_context_menu_at(caret, point(px(x), px(y)), window, cx);
+    }
+
+    /// Right-click on an explorer row: create, rename, duplicate, delete,
+    /// reveal or copy the path. Folders only expose safe actions.
+    fn open_explorer_context_menu(
+        &mut self,
+        path: String,
+        is_dir: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.new_file.is_some()
+            || self.new_project.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
+        {
+            return;
+        }
+        let t = |key: &str| self.t(key).to_string();
+        let mut items = vec![ContextMenuItem::action(
+            ContextAction::FileNew,
+            t("context.file.new"),
+            "⌘N",
+            true,
+        )];
+        if is_dir {
+            items.push(ContextMenuItem::separator());
+            items.push(ContextMenuItem::action(
+                ContextAction::FileCopyPath,
+                t("context.file.copy_path"),
+                "",
+                true,
+            ));
+            items.push(ContextMenuItem::action(
+                ContextAction::FileReveal,
+                t("context.file.reveal"),
+                "",
+                true,
+            ));
+        } else {
+            items.push(ContextMenuItem::separator());
+            items.push(ContextMenuItem::action(
+                ContextAction::FileRename,
+                t("context.file.rename"),
+                "",
+                true,
+            ));
+            items.push(ContextMenuItem::action(
+                ContextAction::FileDuplicate,
+                t("context.file.duplicate"),
+                "",
+                true,
+            ));
+            items.push(ContextMenuItem::action(
+                ContextAction::FileCopyPath,
+                t("context.file.copy_path"),
+                "",
+                true,
+            ));
+            items.push(ContextMenuItem::action(
+                ContextAction::FileReveal,
+                t("context.file.reveal"),
+                "",
+                true,
+            ));
+            items.push(ContextMenuItem::separator());
+            items.push(ContextMenuItem::action(
+                ContextAction::FileDelete,
+                t("context.file.delete"),
+                "",
+                true,
+            ));
+        }
+        let target = if is_dir {
+            ContextTarget::Dir(path)
+        } else {
+            ContextTarget::File(path)
+        };
+        self.show_context_menu(position, items, target, window, cx);
+    }
+
+    /// Right-click on a tab: close, close others, copy its path or reveal it.
+    fn open_tab_context_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.tabs.len()
+            || self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
+        {
+            return;
+        }
+        let t = |key: &str| self.t(key).to_string();
+        let items = vec![
+            ContextMenuItem::action(ContextAction::TabClose, t("context.tab.close"), "⌘W", true),
+            ContextMenuItem::action(
+                ContextAction::TabCloseOthers,
+                t("context.tab.close_others"),
+                "",
+                self.tabs.len() > 1,
+            ),
+            ContextMenuItem::separator(),
+            ContextMenuItem::action(
+                ContextAction::TabCopyPath,
+                t("context.file.copy_path"),
+                "",
+                true,
+            ),
+            ContextMenuItem::action(ContextAction::TabReveal, t("context.file.reveal"), "", true),
+        ];
+        self.show_context_menu(position, items, ContextTarget::Tab(index), window, cx);
+    }
+
+    fn target_path(&self) -> Option<String> {
+        match self.context_target.as_ref()? {
+            ContextTarget::File(path) | ContextTarget::Dir(path) => Some(path.clone()),
+            ContextTarget::Tab(index) => Some(self.tab_path(*index).to_string()),
+            ContextTarget::Editor => None,
+        }
+    }
+
+    fn begin_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.target_path() else {
+            return;
+        };
+        if matches!(self.context_target, Some(ContextTarget::Dir(_))) {
+            return;
+        }
+        let (_, stem, _) = split_path_name(&path);
+        let name = stem.to_string();
+        self.rename = Some(FilePromptState {
+            path,
+            name,
+            error: String::new(),
+        });
+        cx.notify();
+    }
+
+    fn begin_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.target_path() else {
+            return;
+        };
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        self.delete_prompt = Some(DeletePromptState {
+            path,
+            name,
+            error: String::new(),
+        });
+        cx.notify();
+    }
+
+    fn rename_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.rename.as_mut() {
+            let cleaned: String = text
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect();
+            state.name.push_str(&cleaned);
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn rename_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.rename.as_mut() {
+            if let Some(last) = state.name.chars().last() {
+                let len = state.name.len();
+                state.name.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn rename_save(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.rename.clone() else {
+            return;
+        };
+        let Some(project) = self.project.clone() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        let (parent, stem, ext) = split_path_name(&state.path);
+        let Some(new_stem) = new_file::file_stem(&state.name) else {
+            let message = self.t("rename.invalid").to_string();
+            if let Some(state) = self.rename.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        };
+        if new_stem == stem {
+            self.rename = None;
+            cx.notify();
+            return;
+        }
+        let target = if parent.is_empty() {
+            format!("{new_stem}{ext}")
+        } else {
+            format!("{parent}/{new_stem}{ext}")
+        };
+        let mut project = project;
+        match project.rename_document(&state.path, &target) {
+            Ok(()) => {
+                self.project = Some(project);
+                self.rewrite_open_paths(&state.path, &target);
+                self.rename = None;
+                if let Some(project) = self.project.as_ref()
+                    && let Ok(paths) = project.list_documents()
+                {
+                    self.explorer = paths;
+                }
+                self.refresh_entities();
+                self.git_refreshed_at = None;
+                self.notice =
+                    Some(self.tf("notice.renamed", &[("from", &state.path), ("to", &target)]));
+            }
+            Err(error) => {
+                let message = self.tf("notice.file_op_failed", &[("error", &error.to_string())]);
+                if let Some(state) = self.rename.as_mut() {
+                    state.error = message;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn duplicate_target_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.target_path() else {
+            return;
+        };
+        let Some(target) = self.duplicate_path(&path) else {
+            self.notice = Some(self.t("notice.file_op_failed_no_name").to_string());
+            cx.notify();
+            return;
+        };
+        let Some(project) = self.project.clone() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        match project.duplicate_document(&path, &target) {
+            Ok(()) => {
+                if let Some(project) = self.project.as_ref()
+                    && let Ok(paths) = project.list_documents()
+                {
+                    self.explorer = paths;
+                }
+                self.refresh_entities();
+                self.git_refreshed_at = None;
+                self.notice =
+                    Some(self.tf("notice.duplicated", &[("from", &path), ("to", &target)]));
+            }
+            Err(error) => {
+                self.notice =
+                    Some(self.tf("notice.file_op_failed", &[("error", &error.to_string())]));
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.delete_prompt.clone() else {
+            return;
+        };
+        if self
+            .find_tab(&prompt.path)
+            .is_some_and(|index| self.tab_is_dirty(index))
+        {
+            let message = self.t("delete.dirty").to_string();
+            if let Some(prompt) = self.delete_prompt.as_mut() {
+                prompt.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        match project.delete_document(&prompt.path) {
+            Ok(()) => {
+                // Close every clean tab that referenced the deleted file,
+                // without selecting a different document for the user.
+                while let Some(index) = self.find_tab(&prompt.path) {
+                    self.close_tab_at(index);
+                }
+                self.delete_prompt = None;
+                if let Some(project) = self.project.as_ref()
+                    && let Ok(paths) = project.list_documents()
+                {
+                    self.explorer = paths;
+                }
+                self.refresh_entities();
+                self.git_refreshed_at = None;
+                self.notice = Some(self.tf("notice.deleted", &[("path", &prompt.path)]));
+            }
+            Err(error) => {
+                let message = self.tf("notice.file_op_failed", &[("error", &error.to_string())]);
+                if let Some(prompt) = self.delete_prompt.as_mut() {
+                    prompt.error = message;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_other_tabs(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let dirty_other = (0..self.tabs.len())
+            .filter(|candidate| *candidate != index)
+            .any(|candidate| self.tab_is_dirty(candidate));
+        if dirty_other {
+            self.notice = Some(self.t("notice.close_others_dirty").to_string());
+            cx.notify();
+            return;
+        }
+        if index != self.active_tab && !self.activate_tab(index) {
+            return;
+        }
+        while self.tabs.len() > 1 {
+            let victim = if self.active_tab == 0 { 1 } else { 0 };
+            self.close_tab_at(victim);
+        }
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn reveal_target(&mut self) {
+        let Some(path) = self.target_path() else {
+            return;
+        };
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            return;
+        };
+        let absolute = project.root().join(&path);
+        match std::process::Command::new("open")
+            .arg("-R")
+            .arg(&absolute)
+            .spawn()
+        {
+            Ok(_) => {
+                self.notice = Some(self.tf("notice.revealed", &[("path", &path)]));
+            }
+            Err(error) => {
+                self.notice =
+                    Some(self.tf("notice.reveal_failed", &[("error", &error.to_string())]));
+            }
+        }
+    }
+
+    fn copy_target_path(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.target_path() {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            self.notice = Some(self.tf("notice.path_copied", &[("path", &path)]));
+            cx.notify();
+        }
+    }
+
+    /// Rewrite the active buffer and every inactive tab when a rename changes
+    /// their path. Content and dirty state are unchanged.
+    fn rewrite_open_paths(&mut self, from: &str, to: &str) {
+        if self.doc.path == from {
+            self.doc.path = to.to_string();
+        }
+        for tab in &mut self.tabs {
+            if let Some(doc) = tab.document.as_mut()
+                && doc.path == from
+            {
+                doc.path = to.to_string();
+            }
+        }
+    }
+
+    fn duplicate_path(&self, path: &str) -> Option<String> {
+        let (parent, stem, ext) = split_path_name(path);
+        for copy in 0..100 {
+            let suffix = if copy == 0 {
+                " copia".to_string()
+            } else {
+                format!(" copia {}", copy + 1)
+            };
+            let candidate = if parent.is_empty() {
+                format!("{stem}{suffix}{ext}")
+            } else {
+                format!("{parent}/{stem}{suffix}{ext}")
+            };
+            if !self.explorer.iter().any(|existing| existing == &candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     fn context_menu_move(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -3603,7 +4066,26 @@ impl Editor {
             ContextAction::Propose => self.on_open_propose(&OpenPropose, window, cx),
             ContextAction::Convert(kind) => self.context_convert_entity(kind, cx),
             ContextAction::SetElement(kind) => self.context_set_element(kind, cx),
+            ContextAction::FileNew => self.open_new_file(cx),
+            ContextAction::FileRename => self.begin_rename(cx),
+            ContextAction::FileDuplicate => self.duplicate_target_file(cx),
+            ContextAction::FileDelete => self.begin_delete(cx),
+            ContextAction::FileReveal => self.reveal_target(),
+            ContextAction::FileCopyPath => self.copy_target_path(cx),
+            ContextAction::TabClose => {
+                if let Some(ContextTarget::Tab(index)) = self.context_target.clone() {
+                    self.request_close_tab(index, window, cx);
+                }
+            }
+            ContextAction::TabCloseOthers => {
+                if let Some(ContextTarget::Tab(index)) = self.context_target.clone() {
+                    self.close_other_tabs(index, window, cx);
+                }
+            }
+            ContextAction::TabCopyPath => self.copy_target_path(cx),
+            ContextAction::TabReveal => self.reveal_target(),
         }
+        self.context_target = None;
     }
 
     /// Convert the selected word/selection into a bible dossier. Creating a
@@ -3802,6 +4284,189 @@ impl Editor {
                     .border_1()
                     .border_color(rgb(theme::explorer_border()))
                     .child(rows),
+            )
+    }
+
+    fn rename_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.rename.as_ref().expect("overlay only when open");
+        let (_, _, ext) = split_path_name(&state.path);
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("rename.title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.tf("rename.current", &[("path", &state.path)])),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(100.0))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("rename.name")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(rgb(theme::bg()))
+                                    .border_1()
+                                    .border_color(rgb(theme::default_fg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .child(format!("{}▌", state.name)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::gutter_fg()))
+                                    .child(ext.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("rename.hint")),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("rename-save")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("rename.save"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.rename_save(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("rename-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("rename.cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rename = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn delete_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let prompt = self.delete_prompt.as_ref().expect("overlay only when open");
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(560.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::agent_err_fg()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("delete.title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.tf("delete.body", &[("name", &prompt.name)])),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("delete.hint")),
+                    )
+                    .when(!prompt.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(prompt.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("delete-confirm")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::agent_err_fg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("delete.confirm"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.confirm_delete(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("delete-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("delete.cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.delete_prompt = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
     }
 
@@ -4980,7 +5645,12 @@ impl Editor {
     /// again closes it.
     fn on_new_file(&mut self, _: &NewFile, _window: &mut Window, cx: &mut Context<Self>) {
         // One modal/prompt owns the keyboard at a time.
-        if self.new_project.is_some() || self.unsaved_prompt.is_some() || self.settings.is_some() {
+        if self.new_project.is_some()
+            || self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
+        {
             return;
         }
         if self.new_file.is_some() {
@@ -4993,7 +5663,11 @@ impl Editor {
 
     fn open_new_file(&mut self, cx: &mut Context<Self>) {
         // The New Project dialog or the unsaved prompt owns the workspace.
-        if self.new_project.is_some() || self.unsaved_prompt.is_some() {
+        if self.new_project.is_some()
+            || self.unsaved_prompt.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
+        {
             return;
         }
         if self.project.is_none() {
@@ -5229,6 +5903,8 @@ impl Editor {
             || self.settings.is_some()
             || self.project_settings.is_some()
             || self.palette.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
         {
             return false;
         }
@@ -6083,6 +6759,16 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.rename.is_some() {
+            self.rename = None;
+            cx.notify();
+            return;
+        }
+        if self.delete_prompt.is_some() {
+            self.delete_prompt = None;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette = None;
             cx.notify();
@@ -6124,6 +6810,8 @@ impl Editor {
             || self.settings.is_some()
             || self.project_settings.is_some()
             || self.palette.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
         {
             return;
         }
@@ -6329,6 +7017,13 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.rename.is_some() {
+            self.rename_backspace(cx);
+            return;
+        }
+        if self.delete_prompt.is_some() {
+            return;
+        }
         if self.palette.is_some() {
             self.palette_backspace(cx);
             return;
@@ -6446,6 +7141,15 @@ impl Editor {
         }
         if self.context_menu.is_some() {
             self.context_menu_activate_selected(window, cx);
+            return;
+        }
+        if self.rename.is_some() {
+            self.rename_save(cx);
+            return;
+        }
+        if self.delete_prompt.is_some() {
+            self.delete_prompt = None;
+            cx.notify();
             return;
         }
         if self.palette.is_some() {
@@ -6941,6 +7645,16 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.rename.is_some() {
+            self.rename = None;
+            cx.notify();
+            return;
+        }
+        if self.delete_prompt.is_some() {
+            self.delete_prompt = None;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette = None;
             cx.notify();
@@ -7111,6 +7825,8 @@ impl Editor {
             || self.settings.is_some()
             || self.project_settings.is_some()
             || self.palette.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
         {
             return Err(self.t("notice.finish_dialog").to_string());
         }
@@ -8945,6 +9661,12 @@ impl Editor {
                 } else {
                     theme::explorer_bg()
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.open_tab_context_menu(index, event.position, window, cx);
+                    }),
+                )
                 .child(title_row.on_click(cx.listener(move |this, _, window, cx| {
                     if this.activate_tab(index) {
                         window.focus(&this.focus_handle(cx));
@@ -9198,6 +9920,7 @@ impl Editor {
             }
             let path = row.path.clone();
             let is_dir = row.is_dir;
+            let right_path = path.clone();
             panel = panel.child(
                 div()
                     .id(("tree", index))
@@ -9216,7 +9939,19 @@ impl Editor {
                         } else {
                             this.select_path(&path, window, cx);
                         }
-                    })),
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_explorer_context_menu(
+                                right_path.clone(),
+                                is_dir,
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        }),
+                    ),
             );
         }
         // Document outline (M8 slice 3): the open document's scene headings.
@@ -10118,12 +10853,39 @@ impl Editor {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let target = match self.context_target.as_ref() {
+                Some(ContextTarget::Editor) => "editor",
+                Some(ContextTarget::File(_)) => "file",
+                Some(ContextTarget::Dir(_)) => "dir",
+                Some(ContextTarget::Tab(_)) => "tab",
+                None => "",
+            };
             format!(
-                "{{\"open\":true,\"x\":{:.1},\"y\":{:.1},\"selected\":{},\"items\":[{}]}}",
-                menu.x, menu.y, menu.selected, items
+                "{{\"open\":true,\"target\":\"{}\",\"x\":{:.1},\"y\":{:.1},\"selected\":{},\"items\":[{}]}}",
+                target, menu.x, menu.y, menu.selected, items
             )
         } else {
-            "{\"open\":false,\"x\":0,\"y\":0,\"selected\":0,\"items\":[]}".to_string()
+            "{\"open\":false,\"target\":\"\",\"x\":0,\"y\":0,\"selected\":0,\"items\":[]}"
+                .to_string()
+        };
+        let rename_dump = if let Some(state) = self.rename.as_ref() {
+            format!(
+                "{{\"open\":true,\"path\":\"{}\",\"name\":\"{}\",\"error\":\"{}\"}}",
+                escape_json(&state.path),
+                escape_json(&state.name),
+                escape_json(&state.error)
+            )
+        } else {
+            "{\"open\":false,\"path\":\"\",\"name\":\"\",\"error\":\"\"}".to_string()
+        };
+        let delete_dump = if let Some(prompt) = self.delete_prompt.as_ref() {
+            format!(
+                "{{\"open\":true,\"path\":\"{}\",\"error\":\"{}\"}}",
+                escape_json(&prompt.path),
+                escape_json(&prompt.error)
+            )
+        } else {
+            "{\"open\":false,\"path\":\"\",\"error\":\"\"}".to_string()
         };
         let unsaved_dump = match self.unsaved_prompt {
             Some(prompt) => {
@@ -10323,6 +11085,7 @@ impl Editor {
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
                  \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
+                 \"rename\":{},\"delete_prompt\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
@@ -10386,6 +11149,8 @@ impl Editor {
             settings_dump,
             palette_dump,
             context_dump,
+            rename_dump,
+            delete_dump,
             new_file_dump,
             new_project_dump,
             tabs_dump,
@@ -10572,6 +11337,18 @@ fn filter_palette_paths(paths: Vec<String>, query: &str) -> Vec<String> {
     starts.extend(contains);
     starts.truncate(80);
     starts
+}
+
+/// Split a project-relative path into `(parent, stem, extension)`; the
+/// extension includes its leading dot and is empty when the name has none.
+fn split_path_name(path: &str) -> (&str, &str, &str) {
+    let (parent, filename) = path.rsplit_once('/').unwrap_or(("", path));
+    match filename.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < filename.len() => {
+            (parent, &filename[..dot], &filename[dot..])
+        }
+        _ => (parent, filename, ""),
+    }
 }
 
 /// Localized project kind label for the Project Settings form.
@@ -10862,6 +11639,13 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
+        if self.rename.is_some() {
+            self.rename_input(new_text, cx);
+            return;
+        }
+        if self.delete_prompt.is_some() {
+            return;
+        }
         if self.palette.is_some() {
             self.palette_input(new_text, cx);
             return;
@@ -10977,6 +11761,13 @@ impl EntityInputHandler for Editor {
         if self.context_menu.is_some() {
             self.context_menu = None;
             cx.notify();
+            return;
+        }
+        if self.rename.is_some() {
+            self.rename_input(new_text, cx);
+            return;
+        }
+        if self.delete_prompt.is_some() {
             return;
         }
         if self.palette.is_some() {
@@ -11332,6 +12123,10 @@ impl Render for Editor {
             })
             .when(self.context_menu.is_some(), |root| {
                 root.child(self.context_menu_overlay(cx))
+            })
+            .when(self.rename.is_some(), |root| root.child(self.rename_overlay(cx)))
+            .when(self.delete_prompt.is_some(), |root| {
+                root.child(self.delete_overlay(cx))
             })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
@@ -11946,6 +12741,9 @@ fn run() -> Result<(), String> {
                 project_settings: None,
                 palette: None,
                 context_menu: None,
+                context_target: None,
+                rename: None,
+                delete_prompt: None,
                 show_config_files: initial_show_config_files,
                 word_wrap: initial_word_wrap,
                 propose: ProposeView::new(),
@@ -12246,6 +13044,20 @@ mod tests {
             vec!["screenplay/main.fountain".to_string()]
         );
         assert!(filter_palette_paths(Vec::new(), "x").is_empty());
+    }
+
+    #[test]
+    fn path_names_split_into_parent_stem_and_extension() {
+        assert_eq!(
+            split_path_name("notes/decisions.md"),
+            ("notes", "decisions", ".md")
+        );
+        assert_eq!(
+            split_path_name("screenplay/S01E01.fountain"),
+            ("screenplay", "S01E01", ".fountain")
+        );
+        assert_eq!(split_path_name("README"), ("", "README", ""));
+        assert_eq!(split_path_name("notes/.hidden"), ("notes", ".hidden", ""));
     }
 
     #[test]
