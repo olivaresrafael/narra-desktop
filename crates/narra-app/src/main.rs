@@ -114,8 +114,10 @@
 //! Output: JSON lines on stdout starting with `{"kind":"spike-a`.
 
 mod agent_view;
+mod assets;
 mod buffer;
 mod explorer;
+mod git_status;
 mod i18n;
 mod new_file;
 mod new_project;
@@ -139,12 +141,13 @@ use agent_view::{
 };
 use buffer::{Buffer, Position};
 use explorer::{FileKind, Row};
+use git_status::GitStatus;
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection,
     Window, WindowBounds, WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb,
-    rgba, size,
+    rgba, size, svg,
 };
 use i18n::Lang;
 use narra_core::agent::{
@@ -154,6 +157,7 @@ use narra_core::agent::{
 use narra_core::cancel::CancellationToken;
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
+use narra_core::git::WorktreeStatus;
 use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
 use recent::RecentProjects;
@@ -260,6 +264,10 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        // panels and bottom bar (M10 slice 3c)
+        ToggleExplorer,
+        ToggleAgentPanel,
+        ToggleGitPanel,
     ]
 );
 
@@ -321,6 +329,13 @@ const EXPLORER_W: f32 = 220.0;
 const EXPLORER_BG: u32 = 0x252526;
 const EXPLORER_BORDER: u32 = 0x3c3c3c;
 const DOC_SELECTED_BG: u32 = 0x37373d;
+/// Explorer state colors (M10 S3c): type is an icon, color is state.
+const DIRTY_FG: u32 = 0xfbbf24;
+const GIT_MODIFIED_FG: u32 = 0xfbbf24;
+const GIT_ADDED_FG: u32 = 0x4ade80;
+const GIT_DELETED_FG: u32 = 0xf87171;
+const GIT_RENAMED_FG: u32 = 0x7dd3fc;
+const GIT_CONFLICT_FG: u32 = 0xfb923c;
 /// Line-number gutter (M9 slice 3): fixed column before the text.
 const GUTTER_W: f32 = 44.0;
 const GUTTER_FG: u32 = 0x6a6a6a;
@@ -485,6 +500,14 @@ enum PendingUnsaved {
 struct UnsavedPrompt {
     action: PendingUnsaved,
     dirty: usize,
+}
+
+/// Local Git refresh result (M10 S3c), generation-checked like search/export.
+enum GitMessage {
+    Done {
+        request: u64,
+        result: Result<GitStatus, String>,
+    },
 }
 
 /// Message from the project-search worker thread. The generation identifies
@@ -1108,6 +1131,17 @@ struct Editor {
     /// workspace.
     workspace_generation: u64,
 
+    /// Local Git status against HEAD (M10 S3c): files, folder aggregates and
+    /// branch/ahead/behind. Refreshed on a worker, never on the UI thread.
+    git: GitStatus,
+    git_pending: bool,
+    git_request: u64,
+    git_refreshed_at: Option<Instant>,
+    /// Panel visibility (session state; persistent settings arrive in S4).
+    explorer_open: bool,
+    agent_panel_open: bool,
+    git_panel_open: bool,
+
     focus_handle: FocusHandle,
     /// Wrap width for non-hot rows, refreshed from the viewport each frame and
     /// read by the `list` render callback (which reaches the editor via the
@@ -1295,6 +1329,55 @@ impl Editor {
     fn reset_tabs(&mut self) {
         self.tabs = vec![Tab { document: None }];
         self.active_tab = 0;
+    }
+
+    // ---- panels (M10 S3c) -------------------------------------------------
+
+    fn on_toggle_explorer(
+        &mut self,
+        _: &ToggleExplorer,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.explorer_open = !self.explorer_open;
+        // Re-opening the sidebar shows the file explorer, not a stale Git
+        // panel from the previous session of the toggle.
+        if self.explorer_open {
+            self.git_panel_open = false;
+        }
+        cx.notify();
+    }
+
+    fn on_toggle_agent_panel(
+        &mut self,
+        _: &ToggleAgentPanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_panel_open = !self.agent_panel_open;
+        cx.notify();
+    }
+
+    fn on_toggle_git_panel(
+        &mut self,
+        _: &ToggleGitPanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_panel_open = !self.git_panel_open;
+        if self.git_panel_open {
+            self.explorer_open = true;
+            self.refresh_git_now(cx);
+        }
+        cx.notify();
+    }
+
+    /// Open the Git panel and force a refresh (explicit user action).
+    fn refresh_git_now(&mut self, cx: &mut Context<Self>) {
+        self.git_refreshed_at = None;
+        if !self.git_pending {
+            self.request_git_refresh(cx);
+        }
     }
 
     fn caret(&self) -> usize {
@@ -2471,6 +2554,7 @@ impl Editor {
                         self.open_document_tab(DocumentState::new(path.clone(), &text));
                         window.focus(&self.focus_handle(cx));
                         self.notice = Some(created);
+                        self.git_refreshed_at = None;
                     }
                     Err(error) => {
                         self.notice = Some(self.tf(
@@ -2773,6 +2857,10 @@ impl Editor {
 
         self.workspace_generation += 1;
         self.agent_generation += 1;
+        self.git = GitStatus::default();
+        self.git_pending = false;
+        self.git_request = self.git_request.saturating_add(1);
+        self.git_refreshed_at = None;
         self.project = Some(project);
         self.explorer = explorer;
         self.collapsed.clear();
@@ -3218,6 +3306,63 @@ impl Editor {
                 doc.pages_dirty = false;
             }
         }
+    }
+
+    // ---- local Git status (M10 S3c) --------------------------------------
+
+    /// Refresh Git at most every five seconds while a project is open, and
+    /// immediately after explicit events (project open, save, new file) by
+    /// clearing the clock. The command runs on a worker.
+    fn maybe_refresh_git(&mut self, cx: &mut Context<Self>) {
+        if self.project.is_none() {
+            if self.git.available || !self.git.error.is_empty() {
+                self.git = GitStatus::default();
+            }
+            return;
+        }
+        if self.git_pending {
+            return;
+        }
+        if let Some(last) = self.git_refreshed_at
+            && last.elapsed() < Duration::from_secs(5)
+        {
+            return;
+        }
+        self.request_git_refresh(cx);
+    }
+
+    fn request_git_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        self.git_pending = true;
+        self.git_request = self.git_request.saturating_add(1);
+        let request = self.git_request;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = git_status::refresh(&root);
+            let _ = tx.send(GitMessage::Done { request, result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Done { request, result } = message;
+            if request != view.git_request {
+                // A newer refresh (or a project switch) superseded this one.
+                return true;
+            }
+            view.git_pending = false;
+            view.git_refreshed_at = Some(Instant::now());
+            match result {
+                Ok(git) => view.git = git,
+                Err(error) => {
+                    view.git = GitStatus {
+                        error,
+                        ..GitStatus::default()
+                    };
+                }
+            }
+            true
+        });
     }
 
     // ---- crash-safety backups and the quit guard (M9 slice 6) -----------
@@ -4390,6 +4535,7 @@ impl Editor {
                 }
                 let _ = narra_core::backup::remove_backup(project.root(), &path);
                 self.notice = Some(self.tf("notice.saved", &[("path", &path)]));
+                self.git_refreshed_at = None;
                 true
             }
             Err(error) => {
@@ -4456,6 +4602,7 @@ impl Editor {
                 self.doc.backup_saved_at = None;
                 self.doc.backup_error = None;
                 self.notice = Some(self.tf("notice.saved", &[("path", &self.doc.path)]));
+                self.git_refreshed_at = None;
             }
             Err(error) => {
                 self.notice = Some(self.tf(
@@ -4655,6 +4802,7 @@ impl Editor {
                 return;
             }
         };
+        self.agent_panel_open = true;
         self.agent_generation += 1;
         let generation = self.agent_generation;
         self.agent.begin(scene_number, focus.clone());
@@ -4766,6 +4914,7 @@ impl Editor {
                 return;
             }
         };
+        self.agent_panel_open = true;
         self.agent_generation += 1;
         let generation = self.agent_generation;
         self.propose.begin(scene_number, instruction.clone());
@@ -5532,11 +5681,42 @@ impl Editor {
     fn agent_panel(&self) -> impl IntoElement {
         // Proposal section (M6 slice 4) takes the panel whenever a proposal
         // flow is active; the review content shows only when a review has
-        // been run and no proposal is open.
+        // been run and no proposal is open. An explicitly opened empty panel
+        // explains how to start a review instead of pretending to be a chat.
         if self.propose.is_open() {
             return self.proposal_panel().into_any_element();
         }
-        self.review_panel().into_any_element()
+        if self.agent.is_open() {
+            return self.review_panel().into_any_element();
+        }
+        div()
+            .id("agent-panel-empty")
+            .w(px(AGENT_PANEL_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(rgb(EXPLORER_BG))
+            .border_l_1()
+            .border_color(rgb(EXPLORER_BORDER))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(rgb(DEFAULT_FG))
+                    .child(icon("message-square", CUE_FG, 14.0))
+                    .child(self.t("panel.agent_title")),
+            )
+            .child(
+                div()
+                    .text_color(rgb(STATUS_FG))
+                    .child(self.t("panel.agent_empty")),
+            )
+            .into_any_element()
     }
 
     /// The review column (M6 slice 3), unchanged semantics.
@@ -5879,6 +6059,117 @@ impl Editor {
         }
     }
 
+    /// Bottom status bar (M10 S3c): panel toggles on the left, the workspace
+    /// status/notice in the middle, language and Git state on the right.
+    fn bottom_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let title = self
+            .project
+            .as_ref()
+            .map(|project| project.manifest().title.clone())
+            .unwrap_or_default();
+        let status = self.status_text();
+        let lang = language_name(&self.doc.path);
+        let git = self.git.branch_label();
+        let changes = self.git.changed_count();
+        let git_tint = if self.git.available {
+            if changes > 0 {
+                GIT_MODIFIED_FG
+            } else {
+                GIT_ADDED_FG
+            }
+        } else {
+            GUTTER_FG
+        };
+        div()
+            .id("bottom-bar")
+            .h(px(26.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .bg(rgb(STATUS_BG))
+            .text_sm()
+            .whitespace_nowrap()
+            .text_color(rgb(STATUS_FG))
+            .child(
+                div()
+                    .id("bar-explorer")
+                    .p_1()
+                    .cursor_pointer()
+                    .text_color(rgb(if self.explorer_open {
+                        DEFAULT_FG
+                    } else {
+                        STATUS_FG
+                    }))
+                    .child(icon(
+                        "panel-left",
+                        if self.explorer_open {
+                            DEFAULT_FG
+                        } else {
+                            STATUS_FG
+                        },
+                        15.0,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_explorer(&ToggleExplorer, window, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .max_w(px(180.0))
+                    .overflow_hidden()
+                    .text_color(rgb(DEFAULT_FG))
+                    .child(title),
+            )
+            .child(div().flex_1().overflow_hidden().child(status))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(rgb(CUE_FG))
+                    .child(div().child(format!("{lang} · {}", self.t("bar.language_native")))),
+            )
+            .child(
+                div()
+                    .id("bar-git")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(rgb(git_tint))
+                    .child(icon("git-branch", git_tint, 14.0))
+                    .when(!git.is_empty(), |segment| segment.child(div().child(git)))
+                    .when(changes > 0, |segment| {
+                        segment.child(div().child(format!("· {changes}")))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_git_panel(&ToggleGitPanel, window, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .id("bar-agent")
+                    .p_1()
+                    .cursor_pointer()
+                    .child(icon(
+                        "message-square",
+                        if self.agent_panel_open {
+                            CUE_FG
+                        } else {
+                            STATUS_FG
+                        },
+                        15.0,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_agent_panel(&ToggleAgentPanel, window, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// Tab strip (M10 S3b): one tab per open document, active tab highlighted,
     /// dirty tabs dotted. Clicking a title activates it; the close button
     /// asks for confirmation when that tab (or the active buffer) is dirty.
@@ -5894,9 +6185,34 @@ impl Editor {
             .border_color(rgb(EXPLORER_BORDER));
         for index in 0..self.tabs.len() {
             let active = index == self.active_tab;
+            let path = self.tab_path(index).to_string();
             let title = self.tab_title(index);
             let dirty = self.tab_is_dirty(index);
             let label = if dirty { format!("{title} •") } else { title };
+            let kind = FileKind::from_path(&path);
+            let git = self.git.file_status(&path);
+            let icon_color =
+                git.map(git_color)
+                    .unwrap_or(if active { DEFAULT_FG } else { STATUS_FG });
+            let mut title_row = div()
+                .id(("tab-title", index))
+                .flex_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .text_color(rgb(if active { DEFAULT_FG } else { STATUS_FG }))
+                .child(icon(kind.icon_name(), icon_color, 14.0))
+                .child(div().overflow_hidden().whitespace_nowrap().child(label));
+            if let Some(status) = git {
+                title_row = title_row.child(
+                    div()
+                        .text_color(rgb(git_color(status)))
+                        .child(git_letter(status)),
+                );
+            }
             let tab = div()
                 .id(("tab", index))
                 .w(px(190.0))
@@ -5909,29 +6225,19 @@ impl Editor {
                 .border_r_1()
                 .border_color(rgb(EXPLORER_BORDER))
                 .bg(rgb(if active { BG } else { EXPLORER_BG }))
-                .child(
-                    div()
-                        .id(("tab-title", index))
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .cursor_pointer()
-                        .text_color(rgb(if active { DEFAULT_FG } else { STATUS_FG }))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if this.activate_tab(index) {
-                                window.focus(&this.focus_handle(cx));
-                                cx.notify();
-                            }
-                        })),
-                )
+                .child(title_row.on_click(cx.listener(move |this, _, window, cx| {
+                    if this.activate_tab(index) {
+                        window.focus(&this.focus_handle(cx));
+                        cx.notify();
+                    }
+                })))
                 .child(
                     div()
                         .id(("tab-close", index))
                         .px_1()
                         .cursor_pointer()
                         .text_color(rgb(if active { STATUS_FG } else { GUTTER_FG }))
-                        .child("×")
+                        .child(icon("x", if active { STATUS_FG } else { GUTTER_FG }, 12.0))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.request_close_tab(index, window, cx)
                         })),
@@ -5939,6 +6245,110 @@ impl Editor {
             bar = bar.child(tab);
         }
         bar.into_any_element()
+    }
+
+    /// Minimal read-only Git panel (M10 S3c): branch, ahead/behind and the
+    /// changed files. Toggled from the bottom bar; commit/push stay future
+    /// work with explicit confirmation.
+    fn git_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut panel = div()
+            .id("git-panel")
+            .w(px(EXPLORER_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .bg(rgb(EXPLORER_BG))
+            .border_r_1()
+            .border_color(rgb(EXPLORER_BORDER));
+        let branch = if self.git.available {
+            self.git.branch_label()
+        } else {
+            self.t("panel.git_none").to_string()
+        };
+        panel = panel.child(
+            div()
+                .px_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_sm()
+                .text_color(rgb(STATUS_FG))
+                .child(icon(
+                    "git-branch",
+                    if self.git.available {
+                        DEFAULT_FG
+                    } else {
+                        STATUS_FG
+                    },
+                    14.0,
+                ))
+                .child(div().flex_1().overflow_hidden().child(branch))
+                .child(
+                    div()
+                        .text_color(rgb(STATUS_FG))
+                        .child(self.git.changed_count().to_string()),
+                ),
+        );
+        if !self.git.available {
+            if !self.git.error.is_empty() {
+                panel = panel.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .text_color(rgb(AGENT_ERR_FG))
+                        .child(self.git.error.clone()),
+                );
+            }
+            return panel.into_any_element();
+        }
+        if self.git.files.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgb(GIT_ADDED_FG))
+                    .child(self.t("panel.git_clean")),
+            );
+            return panel.into_any_element();
+        }
+        let mut paths: Vec<&String> = self.git.files.keys().collect();
+        paths.sort();
+        for (index, path) in paths.into_iter().enumerate() {
+            let Some(status) = self.git.file_status(path) else {
+                continue;
+            };
+            let kind = FileKind::from_path(path);
+            let path_owned = path.clone();
+            panel = panel.child(
+                div()
+                    .id(("git-file", index))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .text_color(rgb(STATUS_FG))
+                    .child(icon(kind.icon_name(), git_color(status), 14.0))
+                    .child(div().flex_1().overflow_hidden().child(path_owned.clone()))
+                    .child(
+                        div()
+                            .text_color(rgb(git_color(status)))
+                            .child(git_letter(status)),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_path(&path_owned, window, cx)
+                    })),
+            );
+        }
+        panel.into_any_element()
     }
 
     /// Explorer panel (M6 slice 1): one row per project document. Clicking
@@ -5949,6 +6359,9 @@ impl Editor {
     fn explorer_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if !self.search.hits.is_empty() {
             return self.search_results_panel(cx).into_any_element();
+        }
+        if self.git_panel_open {
+            return self.git_panel(cx);
         }
         let title = self
             .project
@@ -5984,26 +6397,55 @@ impl Editor {
                             .on_click(cx.listener(|this, _, _, cx| this.open_new_file(cx))),
                     ),
             );
-        // Tree rows (M9 slice 4): folders first, indented, collapsible;
-        // files colored by type and the open document marked/dirty-dotted.
+        // Tree rows (M9 slice 4 / S3c): type is an icon, color is state.
+        // Dirty is an accent dot; Git status tints the icon and adds a letter
+        // so the information does not depend on color alone.
         let rows: Vec<Row> = explorer::build_rows(&self.explorer, &self.collapsed);
         for (index, row) in rows.iter().enumerate() {
             let selected = !row.is_dir && row.path == self.doc.path;
+            let dirty = !row.is_dir
+                && self
+                    .find_tab(&row.path)
+                    .is_some_and(|tab| self.tab_is_dirty(tab));
+            let git = if row.is_dir {
+                self.git.dir_status(&row.path)
+            } else {
+                self.git.file_status(&row.path)
+            };
+            let base_color = if selected { DEFAULT_FG } else { STATUS_FG };
+            let icon_color = git.map(git_color).unwrap_or(base_color);
+            let icon_name = if row.is_dir {
+                row.folder_kind.icon_name()
+            } else {
+                row.kind.icon_name()
+            };
             let label = if row.is_dir {
                 format!("{} {}", if row.collapsed { "▸" } else { "▾" }, row.name)
             } else {
-                let dirty = self
-                    .find_tab(&row.path)
-                    .is_some_and(|tab| self.tab_is_dirty(tab));
-                format!("{}{}", row.name, if dirty { " •" } else { "" })
+                row.name.clone()
             };
-            let color = if selected {
-                DEFAULT_FG
-            } else if row.is_dir {
-                STATUS_FG
-            } else {
-                kind_color(row.kind)
-            };
+            let mut content = div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(icon(icon_name, icon_color, 14.0))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(rgb(base_color))
+                        .child(label),
+                );
+            if dirty {
+                content = content.child(div().text_color(rgb(DIRTY_FG)).child("•"));
+            }
+            if let Some(status) = git {
+                content = content.child(
+                    div()
+                        .text_color(rgb(git_color(status)))
+                        .child(git_letter(status)),
+                );
+            }
             let path = row.path.clone();
             let is_dir = row.is_dir;
             panel = panel.child(
@@ -6016,9 +6458,8 @@ impl Editor {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
-                    .text_color(rgb(color))
                     .cursor_pointer()
-                    .child(label)
+                    .child(content)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if is_dir {
                             this.toggle_folder(&path, cx);
@@ -6723,6 +7164,36 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let recents_error = self.recents.error().unwrap_or("").to_string();
+        let git_dump = {
+            let mut files: Vec<(&String, &WorktreeStatus)> = self.git.files.iter().collect();
+            files.sort_by(|a, b| a.0.cmp(b.0));
+            let files = files
+                .iter()
+                .map(|(path, status)| {
+                    format!(
+                        "{{\"path\":\"{}\",\"status\":\"{}\"}}",
+                        escape_json(path),
+                        worktree_status_key(**status)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"available\":{},\"branch\":\"{}\",\"ahead\":{},\"behind\":{},\
+                 \"changed\":{},\"files\":[{}],\"error\":\"{}\"}}",
+                self.git.available,
+                escape_json(&self.git.branch),
+                self.git.ahead,
+                self.git.behind,
+                self.git.changed_count(),
+                files,
+                escape_json(&self.git.error),
+            )
+        };
+        let panels_dump = format!(
+            "{{\"explorer\":{},\"agent\":{},\"git\":{}}}",
+            self.explorer_open, self.agent_panel_open, self.git_panel_open
+        );
         let unsaved_dump = match self.unsaved_prompt {
             Some(prompt) => {
                 let (action, tab) = match prompt.action {
@@ -6912,10 +7383,10 @@ impl Editor {
                 "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}},",
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
-                "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
+                "\"document\":\"{}\",\"language\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"unsaved\":{},\
+                 \"unsaved\":{},\"git\":{},\"panels\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
@@ -6956,6 +7427,7 @@ impl Editor {
             click_h_dump,
             click_offset_dump,
             escape_json(&self.doc.path),
+            language_name(&self.doc.path),
             self.dirty(),
             notice_dump,
             explorer_dump,
@@ -6972,6 +7444,8 @@ impl Editor {
                 .unwrap_or_else(|| "null".to_string()),
             self.unsaved_prompt.is_some(),
             unsaved_dump,
+            git_dump,
+            panels_dump,
             new_file_dump,
             new_project_dump,
             tabs_dump,
@@ -7070,6 +7544,10 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.prev_tab"), PrevTab),
                 gpui::MenuItem::action(label("menu.next_tab"), NextTab),
                 gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.toggle_explorer"), ToggleExplorer),
+                gpui::MenuItem::action(label("menu.toggle_agent"), ToggleAgentPanel),
+                gpui::MenuItem::action(label("menu.toggle_git"), ToggleGitPanel),
+                gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.toggle_diff"), ToggleDiff),
                 gpui::MenuItem::action(label("menu.language"), ToggleLang),
             ],
@@ -7104,13 +7582,64 @@ fn gutter_element(ix: usize, active: bool) -> gpui::Div {
 }
 
 /// Explorer file-type colors (M9 slice 4).
-fn kind_color(kind: FileKind) -> u32 {
-    match kind {
-        FileKind::Fountain => SCENE_FG,
-        FileKind::Markdown => CUE_FG,
-        FileKind::Yaml => TRANSITION_FG,
-        FileKind::Other => STATUS_FG,
+fn language_name(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("fountain") => "Fountain",
+        Some("md") => "Markdown",
+        Some("yaml") | Some("yml") => "YAML",
+        _ => "Text",
     }
+}
+
+fn git_color(status: WorktreeStatus) -> u32 {
+    match status {
+        WorktreeStatus::Modified => GIT_MODIFIED_FG,
+        WorktreeStatus::Added | WorktreeStatus::Untracked => GIT_ADDED_FG,
+        WorktreeStatus::Deleted => GIT_DELETED_FG,
+        WorktreeStatus::Renamed | WorktreeStatus::Copied => GIT_RENAMED_FG,
+        WorktreeStatus::Conflicted => GIT_CONFLICT_FG,
+        WorktreeStatus::Unmodified | WorktreeStatus::Unknown => STATUS_FG,
+    }
+}
+
+/// Letter shown next to a changed file/folder so the state is not conveyed by
+/// color alone.
+fn git_letter(status: WorktreeStatus) -> &'static str {
+    match status {
+        WorktreeStatus::Modified => "M",
+        WorktreeStatus::Added => "A",
+        WorktreeStatus::Untracked => "U",
+        WorktreeStatus::Deleted => "D",
+        WorktreeStatus::Renamed => "R",
+        WorktreeStatus::Copied => "C",
+        WorktreeStatus::Conflicted => "!",
+        WorktreeStatus::Unmodified | WorktreeStatus::Unknown => "",
+    }
+}
+
+fn worktree_status_key(status: WorktreeStatus) -> &'static str {
+    match status {
+        WorktreeStatus::Unmodified => "unmodified",
+        WorktreeStatus::Modified => "modified",
+        WorktreeStatus::Added => "added",
+        WorktreeStatus::Deleted => "deleted",
+        WorktreeStatus::Renamed => "renamed",
+        WorktreeStatus::Copied => "copied",
+        WorktreeStatus::Untracked => "untracked",
+        WorktreeStatus::Conflicted => "conflicted",
+        WorktreeStatus::Unknown => "unknown",
+    }
+}
+
+/// Monochrome Lucide icon from the embedded asset set (S3c). The SVG is
+/// painted as an alpha mask and tinted with the current text color.
+fn icon(name: &'static str, color: u32, size: f32) -> gpui::Svg {
+    svg()
+        .path(format!("icons/{name}.svg"))
+        .flex_none()
+        .w(px(size))
+        .h(px(size))
+        .text_color(rgb(color))
 }
 
 fn escape_json(text: &str) -> String {
@@ -7511,6 +8040,7 @@ impl Render for Editor {
         self.refresh_scenes();
         self.refresh_element_kinds(cx);
         self.maybe_request_pages(cx);
+        self.maybe_refresh_git(cx);
 
         // The probe is driven by a timer scheduled from here, never by
         // notifying during render (see `advance_probe`).
@@ -7520,14 +8050,13 @@ impl Render for Editor {
         // The `list` render callback reads it back through the entity. With
         // the explorer panel open (project mode) the document area is narrower
         // by exactly the panel width, so wrapped rows never hide under it.
-        let explorer_w = if self.project.is_some() {
+        let explorer_w = if self.project.is_some() && self.explorer_open {
             EXPLORER_W
         } else {
             0.0
         };
-        // The review/proposal panel (M6 slice 3/4) narrows the document
-        // area too, so wrapped rows never hide under it either.
-        let agent_w = if self.agent.is_open() || self.propose.is_open() {
+        // The explicitly toggled agent panel narrows the document area too.
+        let agent_w = if self.agent_panel_open {
             AGENT_PANEL_W
         } else {
             0.0
@@ -7536,7 +8065,6 @@ impl Render for Editor {
             - px(explorer_w + agent_w + ROW_PADDING_X * 2.0 + GUTTER_W))
         .max(px(200.0));
 
-        let status = self.status_text();
         let focus = self.focus_handle.clone();
         let entity = cx.entity();
 
@@ -7598,6 +8126,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
+            // panels (M10 slice 3c)
+            .on_action(cx.listener(Self::on_toggle_explorer))
+            .on_action(cx.listener(Self::on_toggle_agent_panel))
+            .on_action(cx.listener(Self::on_toggle_git_panel))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -7639,20 +8171,6 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_project_search))
             .on_action(cx.listener(Self::on_search_prev))
             .on_action(cx.listener(Self::on_search_next))
-            .child(
-                div()
-                    .id("status")
-                    .h(px(26.0))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .bg(rgb(STATUS_BG))
-                    .text_sm()
-                    .whitespace_nowrap()
-                    .text_color(rgb(STATUS_FG))
-                    .child(status),
-            )
             .when(self.doc.find.open, |bar| bar.child(self.find_bar()))
             .when(self.search.open, |bar| bar.child(self.search_bar()))
             .when(self.propose_bar.open, |bar| bar.child(self.propose_bar()))
@@ -7664,7 +8182,7 @@ impl Render for Editor {
                     // Body row (M6 slice 1): explorer panel (project mode
                     // only) + document area. Fixture mode has no panel, so
                     // the verified full-width spike geometry is unchanged.
-                    .when(self.project.is_some(), |body| {
+                    .when(self.project.is_some() && self.explorer_open, |body| {
                         body.child(self.explorer_panel(cx))
                     })
                     .child(
@@ -7737,13 +8255,13 @@ impl Render for Editor {
                                     ),
                             ),
                     )
-                    // Review/proposal panel (M6 slice 3/4): right column of
-                    // the body row, visible whenever a review or proposal
-                    // has been requested.
-                    .when(self.agent.is_open() || self.propose.is_open(), |body| {
+                    // Agent panel (review/proposal or the empty state): right
+                    // column of the body row, toggled from the bottom bar.
+                    .when(self.agent_panel_open, |body| {
                         body.child(self.agent_panel())
                     }),
             )
+            .child(self.bottom_bar(cx))
             .when(self.unsaved_prompt.is_some(), |root| {
                 root.child(self.quit_overlay(cx))
             })
@@ -8041,232 +8559,245 @@ fn run() -> Result<(), String> {
     let agent_settings = args.agent;
     let lang = args.lang;
     let debug_metrics_flag = args.debug_metrics;
-    Application::new().run(move |cx: &mut App| {
-        cx.activate(true);
-        cx.bind_keys([
-            // navigation and quit
-            KeyBinding::new("cmd-g", NextScene, None),
-            KeyBinding::new("cmd-shift-g", PrevScene, None),
-            KeyBinding::new("cmd-q", Quit, None),
-            // caret movement
-            KeyBinding::new("left", MoveLeft, None),
-            KeyBinding::new("right", MoveRight, None),
-            KeyBinding::new("up", MoveUp, None),
-            KeyBinding::new("down", MoveDown, None),
-            KeyBinding::new("home", MoveHome, None),
-            KeyBinding::new("end", MoveEnd, None),
-            // selection
-            KeyBinding::new("shift-left", SelectLeft, None),
-            KeyBinding::new("shift-right", SelectRight, None),
-            KeyBinding::new("shift-up", SelectUp, None),
-            KeyBinding::new("shift-down", SelectDown, None),
-            KeyBinding::new("shift-home", SelectHome, None),
-            KeyBinding::new("shift-end", SelectEnd, None),
-            KeyBinding::new("cmd-a", SelectAll, None),
-            // word/line editing and document navigation (M9 slice 2, VSCode
-            // parity: option=word, cmd=line/document, pageup/pagedown).
-            KeyBinding::new("alt-left", WordLeft, None),
-            KeyBinding::new("alt-right", WordRight, None),
-            KeyBinding::new("alt-shift-left", SelectWordLeft, None),
-            KeyBinding::new("alt-shift-right", SelectWordRight, None),
-            KeyBinding::new("alt-backspace", DeleteWordLeft, None),
-            KeyBinding::new("alt-delete", DeleteWordRight, None),
-            KeyBinding::new("alt-up", MoveLineUp, None),
-            KeyBinding::new("alt-down", MoveLineDown, None),
-            KeyBinding::new("alt-shift-up", DuplicateLineUp, None),
-            KeyBinding::new("alt-shift-down", DuplicateLineDown, None),
-            KeyBinding::new("cmd-shift-k", DeleteLine, None),
-            KeyBinding::new("cmd-up", DocStart, None),
-            KeyBinding::new("cmd-down", DocEnd, None),
-            KeyBinding::new("cmd-shift-up", SelectDocStart, None),
-            KeyBinding::new("cmd-shift-down", SelectDocEnd, None),
-            KeyBinding::new("cmd-left", MoveHome, None),
-            KeyBinding::new("cmd-right", MoveEnd, None),
-            KeyBinding::new("cmd-shift-left", SelectHome, None),
-            KeyBinding::new("cmd-shift-right", SelectEnd, None),
-            KeyBinding::new("pageup", PageUp, None),
-            KeyBinding::new("pagedown", PageDown, None),
-            KeyBinding::new("shift-pageup", SelectPageUp, None),
-            KeyBinding::new("shift-pagedown", SelectPageDown, None),
-            // screenplay elements (M9 slice 5): Tab/⇧Tab cycle the caret
-            // line's forceable element type (scene heading, action,
-            // character, transition) via Fountain forced markers.
-            KeyBinding::new("tab", CycleElement, None),
-            KeyBinding::new("shift-tab", CycleElementBack, None),
-            // crash-safety backups (M9 slice 6): restore the newest backup
-            // into the buffer (⌘S decides whether it becomes canonical) or
-            // discard it.
-            KeyBinding::new("cmd-shift-b", RestoreBackup, None),
-            KeyBinding::new("cmd-shift-d", DiscardBackup, None),
-            // new documents (M10 slice 2): ⌘N opens the kind/name/format
-            // dialog; the file is created in the canonical folder.
-            KeyBinding::new("cmd-n", NewFile, None),
-            // projects (M10 slice 2b): ⌘O picks a project folder; ⇧⌘N opens
-            // the new-project dialog (native save panel for the location).
-            KeyBinding::new("cmd-o", OpenProject, None),
-            KeyBinding::new("cmd-shift-n", NewProject, None),
-            // tabs (M10 slice 3b): ⌘W closes the active tab, ⌘⇧[/] walk the
-            // strip; unsaved tabs get the save/discard/cancel prompt.
-            KeyBinding::new("cmd-w", CloseTab, None),
-            KeyBinding::new("cmd-shift-[", PrevTab, None),
-            KeyBinding::new("cmd-shift-]", NextTab, None),
-            // editing
-            KeyBinding::new("backspace", Backspace, None),
-            KeyBinding::new("delete", DeleteText, None),
-            KeyBinding::new("enter", InsertNewline, None),
-            KeyBinding::new("cmd-z", Undo, None),
-            KeyBinding::new("cmd-shift-z", Redo, None),
-            KeyBinding::new("cmd-c", CopyText, None),
-            KeyBinding::new("cmd-x", CutText, None),
-            KeyBinding::new("cmd-v", PasteText, None),
-            // save through the project IO (M6 slice 1; no-op notice in
-            // fixture mode, where there is no project to write to)
-            KeyBinding::new("cmd-s", Save, None),
-            // find / replace (slice 3)
-            KeyBinding::new("cmd-f", ToggleFind, None),
-            KeyBinding::new("cmd-alt-f", FocusReplace, None),
-            KeyBinding::new("escape", CloseFind, None),
-            KeyBinding::new("cmd-enter", ReplaceCurrent, None),
-            KeyBinding::new("cmd-alt-enter", ReplaceAll, None),
-            // diff view (slice 3, M1-3b): cmd-d toggles, cmd-g/shift-g walk
-            // hunks while it is open.
-            KeyBinding::new("cmd-d", ToggleDiff, None),
-            // agent review (M6 slice 3): cmd-r reviews the caret's scene,
-            // cmd-. cancels the run. The review panel scrolls with
-            // ctrl-up/down when no search results are on screen (M9 slice 2
-            // freed option arrows for word/line editing).
-            KeyBinding::new("cmd-r", ReviewScene, None),
-            KeyBinding::new("cmd-.", CancelReview, None),
-            // proposals (M6 slice 4): cmd-p opens the instruction bar,
-            // cmd-shift-enter applies the ready proposal (two-step: arm,
-            // then apply), cmd-backspace rejects it.
-            KeyBinding::new("cmd-p", OpenPropose, None),
-            KeyBinding::new("cmd-shift-enter", ApplyProposal, None),
-            KeyBinding::new("cmd-backspace", RejectProposal, None),
-            // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
-            // enter commits the focus and runs the review.
-            KeyBinding::new("cmd-shift-r", OpenFocusBar, None),
-            // hunk selection (M6 slice 6): option-arrows walk the record's
-            // hunks while a proposal is visible (M9 slice 2 scopes this in
-            // the WordLeft/WordRight handlers; the buffer gets word
-            // movement otherwise); alt-enter toggles the hunk under the
-            // cursor and apply gets exactly the selected subset.
-            KeyBinding::new("alt-enter", ToggleHunk, None),
-            // retry (M6 slice 8): cmd-alt-r re-runs the visible flow's last
-            // task with the same stored inputs (only if it failed or was
-            // cancelled).
-            KeyBinding::new("cmd-alt-r", RetryAgent, None),
-            // language (M6 slice 9): cmd-alt-l toggles EN/ES live.
-            KeyBinding::new("cmd-alt-l", ToggleLang, None),
-            // export (M7 slice 4): cmd-e writes exports/<screenplay>.pdf.
-            KeyBinding::new("cmd-e", ExportPdf, None),
-            // project search (M8 slice 2): cmd-shift-f searches every
-            // project document; ctrl-up/down move through the results (and
-            // scroll the agent panel when there are none, M9 slice 2).
-            KeyBinding::new("cmd-shift-f", ProjectSearch, None),
-            KeyBinding::new("ctrl-up", SearchPrev, None),
-            KeyBinding::new("ctrl-down", SearchNext, None),
-        ]);
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(move |cx: &mut App| {
+            cx.activate(true);
+            cx.bind_keys([
+                // navigation and quit
+                KeyBinding::new("cmd-g", NextScene, None),
+                KeyBinding::new("cmd-shift-g", PrevScene, None),
+                KeyBinding::new("cmd-q", Quit, None),
+                // caret movement
+                KeyBinding::new("left", MoveLeft, None),
+                KeyBinding::new("right", MoveRight, None),
+                KeyBinding::new("up", MoveUp, None),
+                KeyBinding::new("down", MoveDown, None),
+                KeyBinding::new("home", MoveHome, None),
+                KeyBinding::new("end", MoveEnd, None),
+                // selection
+                KeyBinding::new("shift-left", SelectLeft, None),
+                KeyBinding::new("shift-right", SelectRight, None),
+                KeyBinding::new("shift-up", SelectUp, None),
+                KeyBinding::new("shift-down", SelectDown, None),
+                KeyBinding::new("shift-home", SelectHome, None),
+                KeyBinding::new("shift-end", SelectEnd, None),
+                KeyBinding::new("cmd-a", SelectAll, None),
+                // word/line editing and document navigation (M9 slice 2, VSCode
+                // parity: option=word, cmd=line/document, pageup/pagedown).
+                KeyBinding::new("alt-left", WordLeft, None),
+                KeyBinding::new("alt-right", WordRight, None),
+                KeyBinding::new("alt-shift-left", SelectWordLeft, None),
+                KeyBinding::new("alt-shift-right", SelectWordRight, None),
+                KeyBinding::new("alt-backspace", DeleteWordLeft, None),
+                KeyBinding::new("alt-delete", DeleteWordRight, None),
+                KeyBinding::new("alt-up", MoveLineUp, None),
+                KeyBinding::new("alt-down", MoveLineDown, None),
+                KeyBinding::new("alt-shift-up", DuplicateLineUp, None),
+                KeyBinding::new("alt-shift-down", DuplicateLineDown, None),
+                KeyBinding::new("cmd-shift-k", DeleteLine, None),
+                KeyBinding::new("cmd-up", DocStart, None),
+                KeyBinding::new("cmd-down", DocEnd, None),
+                KeyBinding::new("cmd-shift-up", SelectDocStart, None),
+                KeyBinding::new("cmd-shift-down", SelectDocEnd, None),
+                KeyBinding::new("cmd-left", MoveHome, None),
+                KeyBinding::new("cmd-right", MoveEnd, None),
+                KeyBinding::new("cmd-shift-left", SelectHome, None),
+                KeyBinding::new("cmd-shift-right", SelectEnd, None),
+                KeyBinding::new("pageup", PageUp, None),
+                KeyBinding::new("pagedown", PageDown, None),
+                KeyBinding::new("shift-pageup", SelectPageUp, None),
+                KeyBinding::new("shift-pagedown", SelectPageDown, None),
+                // screenplay elements (M9 slice 5): Tab/⇧Tab cycle the caret
+                // line's forceable element type (scene heading, action,
+                // character, transition) via Fountain forced markers.
+                KeyBinding::new("tab", CycleElement, None),
+                KeyBinding::new("shift-tab", CycleElementBack, None),
+                // crash-safety backups (M9 slice 6): restore the newest backup
+                // into the buffer (⌘S decides whether it becomes canonical) or
+                // discard it.
+                KeyBinding::new("cmd-shift-b", RestoreBackup, None),
+                KeyBinding::new("cmd-shift-d", DiscardBackup, None),
+                // new documents (M10 slice 2): ⌘N opens the kind/name/format
+                // dialog; the file is created in the canonical folder.
+                KeyBinding::new("cmd-n", NewFile, None),
+                // projects (M10 slice 2b): ⌘O picks a project folder; ⇧⌘N opens
+                // the new-project dialog (native save panel for the location).
+                KeyBinding::new("cmd-o", OpenProject, None),
+                KeyBinding::new("cmd-shift-n", NewProject, None),
+                // tabs (M10 slice 3b): ⌘W closes the active tab, ⌘⇧[/] walk the
+                // strip; unsaved tabs get the save/discard/cancel prompt.
+                KeyBinding::new("cmd-w", CloseTab, None),
+                KeyBinding::new("cmd-shift-[", PrevTab, None),
+                KeyBinding::new("cmd-shift-]", NextTab, None),
+                // panels (M10 slice 3c), approved D-026 additions.
+                KeyBinding::new("cmd-b", ToggleExplorer, None),
+                KeyBinding::new("cmd-shift-a", ToggleAgentPanel, None),
+                KeyBinding::new("cmd-alt-g", ToggleGitPanel, None),
+                // editing
+                KeyBinding::new("backspace", Backspace, None),
+                KeyBinding::new("delete", DeleteText, None),
+                KeyBinding::new("enter", InsertNewline, None),
+                KeyBinding::new("cmd-z", Undo, None),
+                KeyBinding::new("cmd-shift-z", Redo, None),
+                KeyBinding::new("cmd-c", CopyText, None),
+                KeyBinding::new("cmd-x", CutText, None),
+                KeyBinding::new("cmd-v", PasteText, None),
+                // save through the project IO (M6 slice 1; no-op notice in
+                // fixture mode, where there is no project to write to)
+                KeyBinding::new("cmd-s", Save, None),
+                // find / replace (slice 3)
+                KeyBinding::new("cmd-f", ToggleFind, None),
+                KeyBinding::new("cmd-alt-f", FocusReplace, None),
+                KeyBinding::new("escape", CloseFind, None),
+                KeyBinding::new("cmd-enter", ReplaceCurrent, None),
+                KeyBinding::new("cmd-alt-enter", ReplaceAll, None),
+                // diff view (slice 3, M1-3b): cmd-d toggles, cmd-g/shift-g walk
+                // hunks while it is open.
+                KeyBinding::new("cmd-d", ToggleDiff, None),
+                // agent review (M6 slice 3): cmd-r reviews the caret's scene,
+                // cmd-. cancels the run. The review panel scrolls with
+                // ctrl-up/down when no search results are on screen (M9 slice 2
+                // freed option arrows for word/line editing).
+                KeyBinding::new("cmd-r", ReviewScene, None),
+                KeyBinding::new("cmd-.", CancelReview, None),
+                // proposals (M6 slice 4): cmd-p opens the instruction bar,
+                // cmd-shift-enter applies the ready proposal (two-step: arm,
+                // then apply), cmd-backspace rejects it.
+                KeyBinding::new("cmd-p", OpenPropose, None),
+                KeyBinding::new("cmd-shift-enter", ApplyProposal, None),
+                KeyBinding::new("cmd-backspace", RejectProposal, None),
+                // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
+                // enter commits the focus and runs the review.
+                KeyBinding::new("cmd-shift-r", OpenFocusBar, None),
+                // hunk selection (M6 slice 6): option-arrows walk the record's
+                // hunks while a proposal is visible (M9 slice 2 scopes this in
+                // the WordLeft/WordRight handlers; the buffer gets word
+                // movement otherwise); alt-enter toggles the hunk under the
+                // cursor and apply gets exactly the selected subset.
+                KeyBinding::new("alt-enter", ToggleHunk, None),
+                // retry (M6 slice 8): cmd-alt-r re-runs the visible flow's last
+                // task with the same stored inputs (only if it failed or was
+                // cancelled).
+                KeyBinding::new("cmd-alt-r", RetryAgent, None),
+                // language (M6 slice 9): cmd-alt-l toggles EN/ES live.
+                KeyBinding::new("cmd-alt-l", ToggleLang, None),
+                // export (M7 slice 4): cmd-e writes exports/<screenplay>.pdf.
+                KeyBinding::new("cmd-e", ExportPdf, None),
+                // project search (M8 slice 2): cmd-shift-f searches every
+                // project document; ctrl-up/down move through the results (and
+                // scroll the agent panel when there are none, M9 slice 2).
+                KeyBinding::new("cmd-shift-f", ProjectSearch, None),
+                KeyBinding::new("ctrl-up", SearchPrev, None),
+                KeyBinding::new("ctrl-down", SearchNext, None),
+            ]);
 
-        cx.observe_keystrokes({
-            let metrics = metrics.clone();
-            move |_, _, _| metrics.borrow_mut().mark_keystroke(Instant::now())
-        })
-        .detach();
-
-        // Native macOS menus (M10 slice 1), localized with the startup
-        // language and rebuilt by the ⌘⌥L toggle. The recents submenu is
-        // part of the same rebuild (M10 slice 2b).
-        install_menus(lang, recents.paths(), cx);
-
-        let entity = cx.new(|cx| Editor {
-            doc: DocumentState::new(doc_path, &content),
-            tabs: vec![Tab { document: None }],
-            active_tab: 0,
-            autosave_started: false,
-            unsaved_prompt: None,
-            debug_metrics: debug_metrics_flag,
-            new_file: None,
-            new_project: None,
-            recents,
-            workspace_generation: 0,
-            focus_handle: cx.focus_handle(),
-            wrap_width: px(800.0),
-            metrics: metrics.clone(),
-            probe_left: steps,
-            probe_cursor: 1,
-            probe_scheduled: false,
-            find_probe_left: find_steps,
-            find_probe_cursor: 0,
-            diff_probe_left: diff_steps,
-            diff_probe_total: diff_steps,
-            project,
-            explorer,
-            collapsed: HashSet::new(),
-            notice: None,
-            lang,
-            export: ExportState::default(),
-            search: SearchState::default(),
-            agent: AgentState::new(),
-            agent_cancel: None,
-            agent_generation: 0,
-            agent_settings: agent_settings.clone(),
-            propose: ProposeView::new(),
-            propose_bar: ProposeBar::default(),
-            focus_bar: FocusBar::default(),
-            review_focus: String::new(),
-        });
-        let bounds = Bounds::centered(None, size(px(1100.0), px(780.0)), cx);
-        let window = match cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, _| entity.clone(),
-        ) {
-            Ok(window) => window,
-            Err(err) => {
-                eprintln!("no se pudo abrir la ventana: {err}");
-                std::process::exit(1);
-            }
-        };
-
-        window
-            .update(cx, |view, window, cx| {
-                // M6 slice 9: the reducers follow the startup language.
-                view.agent.lang = lang;
-                view.propose.lang = lang;
-                // M9 slice 6: periodic crash-safety backups.
-                view.start_autosave(window, cx);
-                window.focus(&view.focus_handle(cx));
-            })
-            .ok();
-
-        // Timed self-report: lets an automated driver capture keystroke
-        // metrics without relying on the window keeping focus.
-        if let Some(ms) = report_after_ms {
-            let metrics = metrics.clone();
-            cx.spawn(async move |cx| {
-                Timer::after(Duration::from_millis(ms)).await;
-                println!("{}", metrics.borrow().report());
-                cx.update(|cx| cx.quit()).ok();
+            cx.observe_keystrokes({
+                let metrics = metrics.clone();
+                move |_, _, _| metrics.borrow_mut().mark_keystroke(Instant::now())
             })
             .detach();
-        }
 
-        // Timed buffer dump: scripted keystroke verification.
-        if let Some(ms) = dump_after_ms {
-            cx.spawn(async move |cx| {
-                Timer::after(Duration::from_millis(ms)).await;
-                cx.update(|cx| {
-                    entity.update(cx, |view, _| println!("{}", view.dump_json()));
-                    cx.quit();
+            // Native macOS menus (M10 slice 1), localized with the startup
+            // language and rebuilt by the ⌘⌥L toggle. The recents submenu is
+            // part of the same rebuild (M10 slice 2b).
+            install_menus(lang, recents.paths(), cx);
+
+            let entity = cx.new(|cx| Editor {
+                doc: DocumentState::new(doc_path, &content),
+                tabs: vec![Tab { document: None }],
+                active_tab: 0,
+                autosave_started: false,
+                unsaved_prompt: None,
+                debug_metrics: debug_metrics_flag,
+                new_file: None,
+                new_project: None,
+                recents,
+                workspace_generation: 0,
+                git: GitStatus::default(),
+                git_pending: false,
+                git_request: 0,
+                git_refreshed_at: None,
+                explorer_open: true,
+                agent_panel_open: false,
+                git_panel_open: false,
+                focus_handle: cx.focus_handle(),
+                wrap_width: px(800.0),
+                metrics: metrics.clone(),
+                probe_left: steps,
+                probe_cursor: 1,
+                probe_scheduled: false,
+                find_probe_left: find_steps,
+                find_probe_cursor: 0,
+                diff_probe_left: diff_steps,
+                diff_probe_total: diff_steps,
+                project,
+                explorer,
+                collapsed: HashSet::new(),
+                notice: None,
+                lang,
+                export: ExportState::default(),
+                search: SearchState::default(),
+                agent: AgentState::new(),
+                agent_cancel: None,
+                agent_generation: 0,
+                agent_settings: agent_settings.clone(),
+                propose: ProposeView::new(),
+                propose_bar: ProposeBar::default(),
+                focus_bar: FocusBar::default(),
+                review_focus: String::new(),
+            });
+            let bounds = Bounds::centered(None, size(px(1100.0), px(780.0)), cx);
+            let window = match cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, _| entity.clone(),
+            ) {
+                Ok(window) => window,
+                Err(err) => {
+                    eprintln!("no se pudo abrir la ventana: {err}");
+                    std::process::exit(1);
+                }
+            };
+
+            window
+                .update(cx, |view, window, cx| {
+                    // M6 slice 9: the reducers follow the startup language.
+                    view.agent.lang = lang;
+                    view.propose.lang = lang;
+                    // M9 slice 6: periodic crash-safety backups.
+                    view.start_autosave(window, cx);
+                    window.focus(&view.focus_handle(cx));
                 })
                 .ok();
-            })
-            .detach();
-        }
-    });
+
+            // Timed self-report: lets an automated driver capture keystroke
+            // metrics without relying on the window keeping focus.
+            if let Some(ms) = report_after_ms {
+                let metrics = metrics.clone();
+                cx.spawn(async move |cx| {
+                    Timer::after(Duration::from_millis(ms)).await;
+                    println!("{}", metrics.borrow().report());
+                    cx.update(|cx| cx.quit()).ok();
+                })
+                .detach();
+            }
+
+            // Timed buffer dump: scripted keystroke verification.
+            if let Some(ms) = dump_after_ms {
+                cx.spawn(async move |cx| {
+                    Timer::after(Duration::from_millis(ms)).await;
+                    cx.update(|cx| {
+                        entity.update(cx, |view, _| println!("{}", view.dump_json()));
+                        cx.quit();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        });
 
     Ok(())
 }
@@ -8388,6 +8919,30 @@ mod tests {
 
     // visual_row_starts tests require a Window, so they're integration-tested
     // via the live click verification (B-2) and the wrapped-caret live run below.
+
+    #[test]
+    fn git_state_has_a_letter_and_a_distinct_color() {
+        assert_eq!(git_letter(WorktreeStatus::Modified), "M");
+        assert_eq!(git_letter(WorktreeStatus::Untracked), "U");
+        assert_eq!(git_letter(WorktreeStatus::Conflicted), "!");
+        assert_eq!(git_letter(WorktreeStatus::Unmodified), "");
+        assert_ne!(
+            git_color(WorktreeStatus::Modified),
+            git_color(WorktreeStatus::Deleted)
+        );
+        assert_eq!(
+            worktree_status_key(WorktreeStatus::Conflicted),
+            "conflicted"
+        );
+    }
+
+    #[test]
+    fn language_names_follow_the_document_extension() {
+        assert_eq!(language_name("screenplay/main.fountain"), "Fountain");
+        assert_eq!(language_name("notes/a.md"), "Markdown");
+        assert_eq!(language_name("agents.yml"), "YAML");
+        assert_eq!(language_name("README"), "Text");
+    }
 
     #[test]
     fn tab_navigation_wraps_and_handles_one_tab() {

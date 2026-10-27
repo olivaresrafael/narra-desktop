@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-/// File kind, used for the explorer's per-type colors.
+/// File kind, used for the explorer's icon (M10 S3c).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Fountain,
@@ -24,6 +24,65 @@ impl FileKind {
             Some("md") => FileKind::Markdown,
             Some("yaml") | Some("yml") => FileKind::Yaml,
             _ => FileKind::Other,
+        }
+    }
+
+    /// Lucide asset name (without the `icons/` prefix or `.svg` suffix).
+    pub fn icon_name(self) -> &'static str {
+        match self {
+            FileKind::Fountain => "clapperboard",
+            FileKind::Markdown => "file-text",
+            FileKind::Yaml => "sliders-horizontal",
+            FileKind::Other => "file",
+        }
+    }
+}
+
+/// Folder category, used for the explorer's icon (M10 S3c). The canonical
+/// project layout is fixed (D-017); unknown folders stay generic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderKind {
+    Bible,
+    Characters,
+    Locations,
+    Objects,
+    Screenplay,
+    Structure,
+    Research,
+    Notes,
+    Reviews,
+    Generic,
+}
+
+impl FolderKind {
+    pub fn from_path(path: &str) -> FolderKind {
+        match path {
+            "bible" => FolderKind::Bible,
+            "bible/characters" => FolderKind::Characters,
+            "bible/locations" => FolderKind::Locations,
+            "bible/objects" => FolderKind::Objects,
+            "screenplay" => FolderKind::Screenplay,
+            "structure" => FolderKind::Structure,
+            "research" => FolderKind::Research,
+            "notes" => FolderKind::Notes,
+            "reviews" => FolderKind::Reviews,
+            _ => FolderKind::Generic,
+        }
+    }
+
+    /// Lucide asset name (without the `icons/` prefix or `.svg` suffix).
+    pub fn icon_name(self) -> &'static str {
+        match self {
+            FolderKind::Bible => "book-open",
+            FolderKind::Characters => "users",
+            FolderKind::Locations => "map-pin",
+            FolderKind::Objects => "package",
+            FolderKind::Screenplay => "clapperboard",
+            FolderKind::Structure => "list-tree",
+            FolderKind::Research => "search",
+            FolderKind::Notes => "notebook-pen",
+            FolderKind::Reviews => "square-check-big",
+            FolderKind::Generic => "folder",
         }
     }
 }
@@ -42,6 +101,8 @@ pub struct Row {
     pub collapsed: bool,
     /// Files only (`Other` for folders).
     pub kind: FileKind,
+    /// Folders only (`Generic` for files).
+    pub folder_kind: FolderKind,
 }
 
 /// Build the visible rows for `paths`, honoring `collapsed` folders.
@@ -100,6 +161,7 @@ fn emit(
             is_dir: true,
             collapsed: is_collapsed,
             kind: FileKind::Other,
+            folder_kind: FolderKind::from_path(dir),
         });
         if !is_collapsed {
             emit(dir, depth + 1, dirs, files, collapsed, rows);
@@ -113,6 +175,7 @@ fn emit(
             is_dir: false,
             collapsed: false,
             kind: FileKind::from_path(file),
+            folder_kind: FolderKind::Generic,
         });
     }
 }
@@ -175,7 +238,26 @@ mod tests {
     }
 
     #[test]
-    fn file_kinds_drive_the_explorer_colors() {
+    fn folder_kinds_pick_the_category_icons() {
+        assert_eq!(FolderKind::from_path("bible"), FolderKind::Bible);
+        assert_eq!(
+            FolderKind::from_path("bible/characters"),
+            FolderKind::Characters
+        );
+        assert_eq!(
+            FolderKind::from_path("bible/locations"),
+            FolderKind::Locations
+        );
+        assert_eq!(FolderKind::from_path("bible/objects"), FolderKind::Objects);
+        assert_eq!(FolderKind::from_path("screenplay"), FolderKind::Screenplay);
+        assert_eq!(FolderKind::from_path("notes"), FolderKind::Notes);
+        assert_eq!(FolderKind::from_path("notes/nested"), FolderKind::Generic);
+        assert_eq!(FolderKind::Characters.icon_name(), "users");
+        assert_eq!(FolderKind::Generic.icon_name(), "folder");
+    }
+
+    #[test]
+    fn file_kinds_drive_the_explorer_icons() {
         assert_eq!(
             FileKind::from_path("screenplay/main.fountain"),
             FileKind::Fountain
@@ -188,6 +270,10 @@ mod tests {
         assert_eq!(FileKind::from_path("project.yaml"), FileKind::Yaml);
         assert_eq!(FileKind::from_path("exports/main.pdf"), FileKind::Other);
         assert_eq!(FileKind::from_path("README"), FileKind::Other);
+        assert_eq!(FileKind::Markdown.icon_name(), "file-text");
+        assert_eq!(FileKind::Fountain.icon_name(), "clapperboard");
+        assert_eq!(FileKind::Yaml.icon_name(), "sliders-horizontal");
+        assert_eq!(FileKind::Other.icon_name(), "file");
     }
 
     #[test]
