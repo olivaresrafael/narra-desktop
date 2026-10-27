@@ -262,6 +262,41 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "export fallido: {error}",
     ),
     ("notice.lang", "language: {lang}", "idioma: {lang}"),
+    (
+        "notice.backup_found",
+        "a newer backup is available (⌘⇧B restores · ⌘⇧D discards)",
+        "hay un backup más reciente (⌘⇧B restaura · ⌘⇧D descarta)",
+    ),
+    (
+        "notice.backup_restored",
+        "backup restored into the buffer (⌘S saves)",
+        "backup restaurado en el buffer (⌘S guarda)",
+    ),
+    (
+        "notice.backup_discarded",
+        "backup discarded",
+        "backup descartado",
+    ),
+    (
+        "notice.backup_missing",
+        "no backup to restore",
+        "no hay backup que restaurar",
+    ),
+    (
+        "notice.backup_failed",
+        "backup error: {error}",
+        "error de backup: {error}",
+    ),
+    // --- unsaved-changes prompt ------------------------------------------
+    ("quit.title", "Unsaved changes", "Cambios sin guardar"),
+    (
+        "quit.body",
+        "Save before closing, or discard the changes.",
+        "Guarda antes de cerrar o descarta los cambios.",
+    ),
+    ("quit.save", "Save and close", "Guardar y cerrar"),
+    ("quit.discard", "Discard and close", "Descartar y cerrar"),
+    ("quit.cancel", "Cancel", "Cancelar"),
     // --- shared status words --------------------------------------------
     ("status.idle", "idle", "inactivo"),
     ("status.running", "running", "en curso"),

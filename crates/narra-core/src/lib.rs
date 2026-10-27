@@ -25,6 +25,7 @@
 //! - no secrets in errors, logs or events.
 
 pub mod agent;
+pub mod backup;
 pub mod cancel;
 pub mod document;
 pub mod export;

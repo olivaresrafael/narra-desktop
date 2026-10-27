@@ -95,6 +95,13 @@
 //!       M9 slice 4 (explorer tree): folders first with indentation and
 //!       collapse toggles, file-type colors (fountain/markdown/yaml),
 //!       dirty dot on the open document, wheel scrolling; dump: `tree`.
+//!       M9 slice 5 (screenplay): element-kind highlighting (debounced full
+//!       parse), Tab/⇧Tab element cycling with Fountain forced markers, and
+//!       a smart Enter that inserts the blank separator after headings.
+//!       M9 slice 6 (data protection): autosave to `.narra/backups/` every
+//!       2 s while dirty (never canonical), ⌘⇧B restores into the buffer,
+//!       ⌘⇧D discards, ⌘S removes it, and a save/discard/cancel prompt
+//!       guards ⌘Q with unsaved changes; dump: `backup`, `quit_prompt`.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -235,6 +242,9 @@ actions!(
         // screenplay elements (M9 slice 5)
         CycleElement,
         CycleElementBack,
+        // crash-safety backups (M9 slice 6)
+        RestoreBackup,
+        DiscardBackup,
     ]
 );
 
@@ -863,6 +873,14 @@ struct Editor {
     elements_parsed_at: Option<Instant>,
     /// A delayed re-render is already scheduled after a debounced edit.
     elements_timer: bool,
+    /// Autosave loop started (M9 slice 6).
+    autosave_started: bool,
+    /// Last backup written for the open document, and its clock/error.
+    backup_path: Option<String>,
+    backup_saved_at: Option<Instant>,
+    backup_error: Option<String>,
+    /// The unsaved-changes prompt is open (⌘Q with a dirty buffer).
+    quit_prompt: bool,
     scenes_dirty: bool,
     current_scene: usize,
 
@@ -2034,7 +2052,270 @@ impl Editor {
         self.ensure_caret_visible();
     }
 
+    // ---- crash-safety backups and the quit guard (M9 slice 6) -----------
+
+    /// Start the periodic autosave loop (M9 slice 6): every two seconds a
+    /// dirty buffer is written to `.narra/backups/` — never the canonical
+    /// file. The loop lives with the window; the dump reports the backup.
+    fn start_autosave(&mut self, window: &Window, cx: &Context<Self>) {
+        if self.autosave_started {
+            return;
+        }
+        self.autosave_started = true;
+        let entity = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    Timer::after(Duration::from_millis(2000)).await;
+                    let alive =
+                        cx.update(|_window, cx| entity.update(cx, |view, cx| view.autosave(cx)));
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    fn autosave(&mut self, _cx: &mut Context<Self>) {
+        if !self.dirty() {
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let document = self.doc_path.clone();
+        let text = self.full_text();
+        match narra_core::backup::write_backup(&root, &document, &text) {
+            Ok(path) => {
+                self.backup_path = Some(path.display().to_string());
+                self.backup_saved_at = Some(Instant::now());
+                self.backup_error = None;
+            }
+            Err(error) => self.backup_error = Some(error.to_string()),
+        }
+    }
+
+    /// Notice when a backup exists and differs from the loaded document.
+    fn check_backup_notice(&mut self) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let document = self.doc_path.clone();
+        if let Ok(Some(text)) = narra_core::backup::read_backup(&root, &document)
+            && text != self.full_text()
+        {
+            self.notice = Some(self.t("notice.backup_found").to_string());
+        }
+    }
+
+    /// ⌘⇧B: restore the backup into the buffer (unsaved changes; ⌘S decides).
+    fn on_restore_backup(
+        &mut self,
+        _: &RestoreBackup,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let document = self.doc_path.clone();
+        match narra_core::backup::read_backup(&root, &document) {
+            Ok(Some(text)) => {
+                self.replace_buffer_text(&text);
+                self.notice = Some(self.t("notice.backup_restored").to_string());
+            }
+            Ok(None) => self.notice = Some(self.t("notice.backup_missing").to_string()),
+            Err(error) => {
+                self.notice =
+                    Some(self.tf("notice.backup_failed", &[("error", &error.to_string())]))
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌘⇧D: discard the backup.
+    fn on_discard_backup(
+        &mut self,
+        _: &DiscardBackup,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let document = self.doc_path.clone();
+        match narra_core::backup::remove_backup(&root, &document) {
+            Ok(()) => {
+                self.backup_path = None;
+                self.backup_saved_at = None;
+                self.notice = Some(self.t("notice.backup_discarded").to_string());
+            }
+            Err(error) => {
+                self.notice =
+                    Some(self.tf("notice.backup_failed", &[("error", &error.to_string())]))
+            }
+        }
+        cx.notify();
+    }
+
+    /// Replace the buffer contents in place, keeping the canonical base: the
+    /// restored text is unsaved (dirty) until the user saves.
+    fn replace_buffer_text(&mut self, text: &str) {
+        self.buffer = Buffer::new(text);
+        self.selected = 0..0;
+        self.reversed = false;
+        self.marked = None;
+        self.composing = false;
+        self.dragging = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.scene_lines.clear();
+        self.outline.clear();
+        self.elements_dirty = true;
+        self.elements_parsed_at = None;
+        self.scenes_dirty = true;
+        self.find.matches.clear();
+        self.find.current = 0;
+        self.diff.open = false;
+        self.list_state = ListState::new(
+            self.buffer.line_count(),
+            ListAlignment::Top,
+            px(LINE_HEIGHT * 2.0),
+        );
+        // The restored text diverges from the canonical base: mark it dirty
+        // without touching the canonical file.
+        self.metrics.borrow_mut().edits += 1;
+    }
+
+    /// ⌘Q (M9 slice 6): never lose unsaved work silently. A dirty buffer
+    /// opens the save/discard/cancel prompt; a clean buffer quits.
+    fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_prompt {
+            self.quit_prompt = false;
+            cx.notify();
+            return;
+        }
+        if self.dirty() {
+            self.quit_prompt = true;
+            cx.notify();
+            return;
+        }
+        self.finish_quit(cx);
+    }
+
+    fn quit_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_save(&Save, window, cx);
+        self.quit_prompt = false;
+        if self.dirty() {
+            // Save refused or failed: keep the window, the notice explains.
+            cx.notify();
+            return;
+        }
+        self.finish_quit(cx);
+    }
+
+    fn quit_discard(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.quit_prompt = false;
+        self.finish_quit(cx);
+    }
+
+    fn quit_cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.quit_prompt = false;
+        cx.notify();
+    }
+
+    fn finish_quit(&mut self, cx: &mut Context<Self>) {
+        println!("{}", self.metrics.borrow().report());
+        cx.quit();
+    }
+
+    /// The unsaved-changes prompt: a centered card over the window with save
+    /// / discard / cancel. The keyboard is owned by the prompt while open
+    /// (typing cannot reach the buffer).
+    fn quit_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .child(
+                div()
+                    .w(px(480.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(0x252526))
+                    .border_1()
+                    .border_color(rgb(EXPLORER_BORDER))
+                    .child(
+                        div()
+                            .text_color(rgb(DEFAULT_FG))
+                            .child(self.t("quit.title")),
+                    )
+                    .child(div().text_color(rgb(STATUS_FG)).child(self.t("quit.body")))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("quit-save")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("quit.save"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.quit_save(window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("quit-discard")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(AGENT_ERR_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("quit.discard"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.quit_discard(window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("quit-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(STATUS_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("quit.cancel"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.quit_cancel(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     fn on_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_prompt {
+            return;
+        }
         if self.find.open {
             self.find_backspace();
             cx.notify();
@@ -2097,9 +2378,15 @@ impl Editor {
     fn on_insert_newline(
         &mut self,
         _: &InsertNewline,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The unsaved-changes prompt owns enter (M9 slice 6): the default
+        // button is "save and close" (macOS convention), Esc cancels.
+        if self.quit_prompt {
+            self.quit_save(window, cx);
+            return;
+        }
         // While the find bar owns keystrokes, enter means "next match" in the
         // query field and "replace current + advance" in the replacement
         // field (the routing note in the module header).
@@ -2520,7 +2807,12 @@ impl Editor {
     fn on_close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
         // Escape closes whichever bar owns the keystrokes (single bar model:
         // find, the instruction bar and the focus bar are never open at the
-        // same time).
+        // same time). The unsaved-changes prompt wins over all of them.
+        if self.quit_prompt {
+            self.quit_prompt = false;
+            cx.notify();
+            return;
+        }
         if self.find.open {
             self.close_find(cx);
         } else if self.search.open {
@@ -2633,6 +2925,8 @@ impl Editor {
         self.elements_dirty = true;
         self.elements_parsed_at = None;
         self.current_scene = 0;
+        // M9 slice 6: surface a newer recovery backup for this document.
+        self.check_backup_notice();
         self.list_state = ListState::new(
             self.buffer.line_count(),
             ListAlignment::Top,
@@ -2724,6 +3018,12 @@ impl Editor {
                     // Keep the dump honest; opening the diff rebuilds rows.
                     self.recompute_diff();
                 }
+                // The canonical file now holds the buffer: the recovery
+                // backup is no longer needed (best effort).
+                let _ = narra_core::backup::remove_backup(project.root(), &self.doc_path);
+                self.backup_path = None;
+                self.backup_saved_at = None;
+                self.backup_error = None;
                 self.notice = Some(self.tf("notice.saved", &[("path", &self.doc_path)]));
             }
             Err(error) => {
@@ -4945,7 +5245,9 @@ impl Editor {
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
-                 \"outline\":[{}],\"tree\":[{}],\"lang\":\"{}\"}}"
+                 \"outline\":[{}],\"tree\":[{}],\"quit_prompt\":{},\
+                 \"backup\":{{\"path\":\"{}\",\"saved\":{},\"error\":\"{}\"}},\
+                 \"lang\":\"{}\"}}"
             ),
             self.buffer.line_count(),
             len,
@@ -4989,6 +5291,10 @@ impl Editor {
             search_dump,
             outline_dump.join(","),
             tree_rows.join(","),
+            self.quit_prompt,
+            escape_json(self.backup_path.as_deref().unwrap_or("")),
+            self.backup_saved_at.is_some(),
+            escape_json(self.backup_error.as_deref().unwrap_or("")),
             self.lang.key(),
         )
     }
@@ -5230,6 +5536,10 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The unsaved-changes prompt owns the keyboard (M9 slice 6).
+        if self.quit_prompt {
+            return;
+        }
         // Find bar owns keystrokes while open: typing, IME commits and
         // pastes land in the active field, never in the buffer.
         if self.find.open {
@@ -5419,6 +5729,7 @@ impl Render for Editor {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(BG))
@@ -5460,6 +5771,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_select_page_down))
             .on_action(cx.listener(Self::on_cycle_element))
             .on_action(cx.listener(Self::on_cycle_element_back))
+            // crash-safety backups (M9 slice 6)
+            .on_action(cx.listener(Self::on_restore_backup))
+            .on_action(cx.listener(Self::on_discard_backup))
+            .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_insert_newline))
@@ -5596,6 +5911,7 @@ impl Render for Editor {
                         body.child(self.agent_panel())
                     }),
             )
+            .when(self.quit_prompt, |root| root.child(self.quit_overlay(cx)))
     }
 }
 
@@ -5915,6 +6231,11 @@ fn run() -> Result<(), String> {
             // character, transition) via Fountain forced markers.
             KeyBinding::new("tab", CycleElement, None),
             KeyBinding::new("shift-tab", CycleElementBack, None),
+            // crash-safety backups (M9 slice 6): restore the newest backup
+            // into the buffer (⌘S decides whether it becomes canonical) or
+            // discard it.
+            KeyBinding::new("cmd-shift-b", RestoreBackup, None),
+            KeyBinding::new("cmd-shift-d", DiscardBackup, None),
             // editing
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", DeleteText, None),
@@ -5979,14 +6300,6 @@ fn run() -> Result<(), String> {
         })
         .detach();
 
-        cx.on_action({
-            let metrics = metrics.clone();
-            move |_: &Quit, cx| {
-                println!("{}", metrics.borrow().report());
-                cx.quit();
-            }
-        });
-
         let buffer = Buffer::new(&content);
         let line_count = buffer.line_count();
         // Seed the diff base with the same representation `Buffer::new`
@@ -6028,6 +6341,11 @@ fn run() -> Result<(), String> {
             elements_dirty: true,
             elements_parsed_at: None,
             elements_timer: false,
+            autosave_started: false,
+            backup_path: None,
+            backup_saved_at: None,
+            backup_error: None,
+            quit_prompt: false,
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
@@ -6069,6 +6387,8 @@ fn run() -> Result<(), String> {
                 // M6 slice 9: the reducers follow the startup language.
                 view.agent.lang = lang;
                 view.propose.lang = lang;
+                // M9 slice 6: periodic crash-safety backups.
+                view.start_autosave(window, cx);
                 window.focus(&view.focus_handle(cx));
             })
             .ok();
