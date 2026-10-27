@@ -70,6 +70,24 @@ The endpoint defaults to `http://localhost:11434/v1`; override with
 environment variable (unset = no key, which is correct for local servers) —
 never pass it as an argument.
 
+### Exporting a screenplay (M7)
+
+Export is local-only: no credentials, no network, no model. The core owns
+the layout, so the PDF pagination (Courier 12pt, 55-line pages, orphan
+control, `(MORE)`/`(CONT'D)` dialogue splits) is deterministic and tested.
+
+```sh
+# PDF into <project>/exports/main.pdf (the app does the same with ⌘E)
+cargo run -p narra-harness -- export <project-root>
+
+# A shareable Fountain copy (title page from the manifest when absent)
+cargo run -p narra-harness -- export <project-root> --format fountain --out copia.fountain
+```
+
+Installation, backup and troubleshooting live in
+[`docs/INSTALL.md`](docs/INSTALL.md); `scripts/package_macos.sh` assembles
+`Narra.app` for the reference machine.
+
 Add `--stream` to any model task (`brief`, `propose`, `renew`) to receive the
 text as it is generated: the JSONL stream then carries `model_delta` events
 before the final `task_output`, and cancellation (Ctrl-C) takes effect
