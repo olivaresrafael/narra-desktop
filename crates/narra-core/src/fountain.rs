@@ -512,3 +512,22 @@ mod tests {
         assert_eq!(elements.len(), text.lines().count());
     }
 }
+
+#[cfg(test)]
+mod perf {
+    use super::parse;
+
+    /// Perf probe (ignored by default): full classification of the M1
+    /// fixture, the cost the editor pays per edit for element colors.
+    /// Run with `cargo test -p narra-core --release --lib perf_full_parse
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf probe"]
+    fn perf_full_parse_19k_lines() {
+        let text =
+            std::fs::read_to_string("../../fixtures/screenplay-1000.fountain").expect("fixture");
+        let start = std::time::Instant::now();
+        let elements = parse(&text);
+        println!("parsed {} lines in {:?}", elements.len(), start.elapsed());
+    }
+}

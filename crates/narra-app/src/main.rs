@@ -110,6 +110,7 @@ mod agent_view;
 mod buffer;
 mod explorer;
 mod i18n;
+mod screenplay;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -142,6 +143,7 @@ use narra_core::agent::{
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::export;
+use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::{DocumentError, Project, ProjectError, open_project};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -230,6 +232,9 @@ actions!(
         PageDown,
         SelectPageUp,
         SelectPageDown,
+        // screenplay elements (M9 slice 5)
+        CycleElement,
+        CycleElementBack,
     ]
 );
 
@@ -847,6 +852,17 @@ struct Editor {
     /// Document outline (M8 slice 3): (line index, heading text) for the
     /// open document, refreshed with the scene scan.
     outline: Vec<(usize, String)>,
+    /// Element kind per line for the open document (M9 slice 5), from the
+    /// derived Fountain parser; drives the full screenplay highlighting.
+    element_kinds: Vec<FountainKind>,
+    /// The classification is stale (an edit happened). Recomputing costs a
+    /// full parse (~2.2 ms on the 19k-line fixture), so it is debounced to
+    /// keep the keystroke→frame path inside the D-019 thresholds.
+    elements_dirty: bool,
+    /// When the last full classification finished (debounce clock).
+    elements_parsed_at: Option<Instant>,
+    /// A delayed re-render is already scheduled after a debounced edit.
+    elements_timer: bool,
     scenes_dirty: bool,
     current_scene: usize,
 
@@ -1204,6 +1220,7 @@ impl Editor {
         self.reversed = false;
         self.marked = None;
         self.scenes_dirty = true;
+        self.elements_dirty = true;
         // Offsets shifted: keep find matches valid (silent — edits are not
         // query submissions and must not pollute the search baseline).
         if self.find.open {
@@ -1219,6 +1236,7 @@ impl Editor {
         self.marked = None;
         self.composing = false;
         self.scenes_dirty = true;
+        self.elements_dirty = true;
         if self.find.open {
             self.refresh_matches(false);
         }
@@ -1272,6 +1290,51 @@ impl Editor {
             .collect();
         self.scene_lines = self.outline.iter().map(|(line, _)| *line).collect();
         self.scenes_dirty = false;
+    }
+
+    /// Refresh the line classification for the screenplay highlighting (M9
+    /// slice 5), debounced: a full parse of the 19k-line fixture costs ~2.2
+    /// ms, which would blow the keystroke→frame budget if paid per key, so
+    /// the previous classification stays visible for 150 ms and a delayed
+    /// render recomputes once typing pauses.
+    fn refresh_element_kinds(&mut self, cx: &mut Context<Self>) {
+        if !self.elements_dirty {
+            return;
+        }
+        let now = Instant::now();
+        let wait = Duration::from_millis(150);
+        if let Some(last) = self.elements_parsed_at {
+            let elapsed = now.duration_since(last);
+            if elapsed < wait {
+                if !self.elements_timer {
+                    self.elements_timer = true;
+                    let entity = cx.entity();
+                    let remaining = wait - elapsed;
+                    cx.spawn(async move |_, cx| {
+                        Timer::after(remaining).await;
+                        entity
+                            .update(cx, |view, cx| {
+                                view.elements_timer = false;
+                                view.refresh_element_kinds(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .detach();
+                }
+                return;
+            }
+        }
+        let text = self.buffer.slice(0..self.buffer.doc_len());
+        let mut kinds = vec![FountainKind::Action; self.buffer.line_count()];
+        for element in narra_core::fountain::parse(&text) {
+            if element.line_number >= 1 && element.line_number <= kinds.len() {
+                kinds[element.line_number - 1] = element.kind;
+            }
+        }
+        self.element_kinds = kinds;
+        self.elements_dirty = false;
+        self.elements_parsed_at = Some(now);
     }
 
     fn jump(&mut self, direction: i64) {
@@ -1929,6 +1992,48 @@ impl Editor {
         self.ensure_caret_visible();
     }
 
+    // ---- screenplay element cycling (M9 slice 5) -------------------------
+
+    /// Tab/⇧Tab: cycle the caret line between the forceable element kinds
+    /// (scene heading, action, character, transition). The line is rewritten
+    /// only with Fountain forced markers; its text is preserved and the
+    /// caret keeps its position over the same characters.
+    fn cycle_element(&mut self, forward: bool) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        let position = self.buffer.position_at(self.caret());
+        let line = position.line;
+        let range = self.buffer.line_content_range(line);
+        let text = self.buffer.lines()[line].clone();
+        let new_text = screenplay::cycle(&text, forward);
+        if new_text == text {
+            return;
+        }
+        let col = position.col.min(text.len());
+        let new_col = (col as isize + (new_text.len() as isize - text.len() as isize))
+            .clamp(0, new_text.len() as isize) as usize;
+        self.apply_edit(range.clone(), &new_text);
+        self.set_caret(range.start + new_col, false);
+    }
+
+    fn on_cycle_element(&mut self, _: &CycleElement, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_element(true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_cycle_element_back(
+        &mut self,
+        _: &CycleElementBack,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_element(false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
     fn on_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
         if self.find.open {
             self.find_backspace();
@@ -2026,8 +2131,23 @@ impl Editor {
             self.submit_focus(cx);
             return;
         }
+        // Smart Enter (M9 slice 5): a scene heading, transition or section
+        // needs the blank separator line Fountain's block structure uses,
+        // so Enter inserts it and lands on the line below; everything else
+        // keeps the plain newline (dialogue continues line by line).
         let caret = self.caret();
-        self.apply_edit(caret..caret, "\n");
+        let line = self.buffer.position_at(caret).line;
+        let inserted = if matches!(
+            self.element_kind(line),
+            Some(FountainKind::SceneHeading)
+                | Some(FountainKind::Transition)
+                | Some(FountainKind::Section)
+        ) {
+            "\n\n"
+        } else {
+            "\n"
+        };
+        self.apply_edit(caret..caret, inserted);
         cx.notify();
         self.ensure_caret_visible();
     }
@@ -2510,6 +2630,8 @@ impl Editor {
         self.redo_stack.clear();
         self.scene_lines.clear();
         self.scenes_dirty = true;
+        self.elements_dirty = true;
+        self.elements_parsed_at = None;
         self.current_scene = 0;
         self.list_state = ListState::new(
             self.buffer.line_count(),
@@ -3960,8 +4082,35 @@ impl Editor {
         panel
     }
 
+    /// Element kind of a line (M9 slice 5); `None` before the first scan.
+    fn element_kind(&self, ix: usize) -> Option<FountainKind> {
+        self.element_kinds.get(ix).copied()
+    }
+
+    /// Screenplay element color (M9 slice 5), falling back to the line
+    /// heuristics before the first classification pass.
+    fn element_color(&self, ix: usize, text: &str) -> Rgba {
+        match self.element_kind(ix) {
+            Some(FountainKind::SceneHeading) => rgb(SCENE_FG),
+            Some(FountainKind::Character) => rgb(CUE_FG),
+            Some(FountainKind::Parenthetical) => rgb(0x9aa4b2),
+            Some(FountainKind::Dialogue) => rgb(DEFAULT_FG),
+            Some(FountainKind::Transition) => rgb(TRANSITION_FG),
+            Some(FountainKind::Section) => rgb(SECTION_FG),
+            Some(FountainKind::Synopsis) => rgb(0x7a7a7a),
+            Some(FountainKind::Note) => rgb(NOTE_FG),
+            Some(FountainKind::Boneyard) => rgb(GUTTER_FG),
+            Some(FountainKind::Lyric)
+            | Some(FountainKind::Action)
+            | Some(FountainKind::Centered)
+            | Some(FountainKind::TitlePage)
+            | Some(FountainKind::PageBreak) => rgb(DEFAULT_FG),
+            None => line_color(text),
+        }
+    }
+
     /// Explorer panel (M6 slice 1): one row per project document. Clicking
-    /// loads it (`select_doc`); the active document is highlighted to mirror
+    /// loads it (`select_path`); the active document is highlighted to mirror
     /// `doc_path`. Long paths clip at the panel edge (status bar shows the
     /// full path). While a search report is on screen the results replace
     /// it (M8 slice 2).
@@ -4337,13 +4486,16 @@ impl Editor {
 
         // Build visual rows as a column inside the gutter row.
         let mut col = div().flex().flex_col().w(self.wrap_width);
+        let color = self.element_color(ix, text);
+        let italic = self.element_kind(ix) == Some(FountainKind::Lyric);
         for (row_idx, &start) in starts.iter().enumerate() {
             let end = starts.get(row_idx + 1).copied().unwrap_or(text.len());
             let segment_text = &text[start..end];
             let mut row_div = div()
                 .font_family(FONT_FAMILY)
                 .text_size(px(TEXT_SIZE))
-                .text_color(line_color(text))
+                .text_color(color)
+                .when(italic, |row| row.italic())
                 .h(px(LINE_HEIGHT))
                 .flex()
                 .items_center();
@@ -4419,7 +4571,10 @@ impl Editor {
             .px_2()
             .font_family(FONT_FAMILY)
             .text_size(px(TEXT_SIZE))
-            .text_color(line_color(text))
+            .text_color(self.element_color(ix, text))
+            .when(self.element_kind(ix) == Some(FountainKind::Lyric), |row| {
+                row.italic()
+            })
             .when(ix == caret_line, |row| row.bg(rgb(ACTIVE_LINE_BG)));
 
         // Cold row: no caret/selection/IME/matches -> gutter + wrapped text.
@@ -5229,8 +5384,10 @@ impl Render for Editor {
         let now = Instant::now();
         self.metrics.borrow_mut().on_render(now);
         // Keep the scene index/outline fresh for the explorer (cheap: the
-        // scan only runs after an edit or a document load).
+        // scan only runs after an edit or a document load); the element
+        // classification is debounced.
         self.refresh_scenes();
+        self.refresh_element_kinds(cx);
 
         // The probe is driven by a timer scheduled from here, never by
         // notifying during render (see `advance_probe`).
@@ -5301,6 +5458,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_page_down))
             .on_action(cx.listener(Self::on_select_page_up))
             .on_action(cx.listener(Self::on_select_page_down))
+            .on_action(cx.listener(Self::on_cycle_element))
+            .on_action(cx.listener(Self::on_cycle_element_back))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_insert_newline))
@@ -5751,6 +5910,11 @@ fn run() -> Result<(), String> {
             KeyBinding::new("pagedown", PageDown, None),
             KeyBinding::new("shift-pageup", SelectPageUp, None),
             KeyBinding::new("shift-pagedown", SelectPageDown, None),
+            // screenplay elements (M9 slice 5): Tab/⇧Tab cycle the caret
+            // line's forceable element type (scene heading, action,
+            // character, transition) via Fountain forced markers.
+            KeyBinding::new("tab", CycleElement, None),
+            KeyBinding::new("shift-tab", CycleElementBack, None),
             // editing
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", DeleteText, None),
@@ -5860,6 +6024,10 @@ fn run() -> Result<(), String> {
             redo_stack: Vec::new(),
             scene_lines: Vec::new(),
             outline: Vec::new(),
+            element_kinds: Vec::new(),
+            elements_dirty: true,
+            elements_parsed_at: None,
+            elements_timer: false,
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
