@@ -14,6 +14,7 @@
 
 pub mod adapter;
 pub mod brief;
+pub mod chat;
 pub mod mock;
 pub mod openai_compat;
 pub mod proposal;
@@ -26,6 +27,9 @@ pub mod tools;
 
 pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
+pub use chat::{
+    ChatAttachment, ChatMode, ChatProposalRef, ChatTask, ChatThread, ChatTurn, ChatTurnRole,
+};
 pub use mock::MockAdapter;
 pub use openai_compat::{
     LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig, fetch_model_ids,

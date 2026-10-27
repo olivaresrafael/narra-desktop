@@ -117,6 +117,7 @@
 mod agent_view;
 mod assets;
 mod buffer;
+mod chat_view;
 mod context_menu;
 mod explorer;
 mod git_status;
@@ -145,6 +146,7 @@ use agent_view::{
     ProposeView, RetryTarget, retry_target,
 };
 use buffer::{Buffer, Position};
+use chat_view::{ChatProposalView, ChatStatus, ChatUiState, ProposalCardStatus};
 use context_menu::{ContextAction, ContextMenuItem, ContextMenuState};
 use explorer::{FileKind, Row};
 use git_status::GitStatus;
@@ -157,9 +159,9 @@ use gpui::{
 };
 use i18n::Lang;
 use narra_core::agent::{
-    AgentError, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter,
-    OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, fetch_model_ids, proposal,
-    roles,
+    AgentError, ChatAttachment, ChatMode, ChatTask, ChatThread, LOCAL_DEFAULT_BASE_URL,
+    MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig, SceneEditTask,
+    SceneReviewTask, TaskOptions, fetch_model_ids, proposal, roles,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
@@ -184,6 +186,8 @@ actions!(
         OpenProjectSettings,
         ToggleConfigFiles,
         ShowContextMenu,
+        FocusChat,
+        ChatNewline,
         QuickOpen,
         CommandPalette,
         NextScene,
@@ -333,7 +337,7 @@ const EXPLORER_W: f32 = 220.0;
 const OUTLINE_VISIBLE_ROWS: usize = 120;
 /// Agent review panel (M6 slice 3): right-hand column with status, context
 /// sources and a scrolled window of the review text.
-const AGENT_PANEL_W: f32 = 380.0;
+const AGENT_PANEL_W: f32 = 420.0;
 /// Review lines visible in the panel at once; `⌥↑/⌥↓` scrolls by 3 lines.
 /// Approximate chrome-free budget (the panel also shows header, sources and
 /// hints); the dump always carries the full text, so this is display-only.
@@ -720,6 +724,19 @@ struct DeletePromptState {
     path: String,
     name: String,
     error: String,
+}
+
+/// Which surface the right-hand panel shows (M12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightTab {
+    Chat,
+    Activity,
+}
+
+/// Messages from the chat worker.
+enum ChatRunMessage {
+    Event(narra_core::agent::TaskEvent),
+    Done(Result<narra_core::agent::TaskOutput, AgentError>),
 }
 
 /// What to do once the unsaved-changes prompt is resolved.
@@ -1483,6 +1500,17 @@ struct Editor {
     context_menu: Option<ContextMenuState>,
     /// What the open context menu acts on (editor, explorer file/folder, tab).
     context_target: Option<ContextTarget>,
+    /// Right-hand surface: Chat (M12) or the older review/proposal activity.
+    right_tab: RightTab,
+    /// Conversational workspace state (M12).
+    chat: ChatUiState,
+    /// Bumped for each chat run/project switch so stale events never land.
+    chat_generation: u64,
+    /// Cancellation token for the in-flight chat run.
+    chat_cancel: Option<CancellationToken>,
+    /// Saved chat threads and whether the history list is visible.
+    chat_history: Vec<ChatThread>,
+    chat_history_open: bool,
     /// Rename dialog, when open.
     rename: Option<FilePromptState>,
     /// Delete confirmation, when open.
@@ -1579,6 +1607,7 @@ impl Editor {
             self.recompute_diff();
         }
         self.check_backup_notice();
+        self.chat.focused = false;
         true
     }
 
@@ -4601,6 +4630,7 @@ impl Editor {
         if self.doc.diff.open || event.button != MouseButton::Left {
             return;
         }
+        self.chat.focused = false;
         let Some(offset) = self.offset_for_point(event.position, window) else {
             return;
         };
@@ -6052,6 +6082,14 @@ impl Editor {
         self.explorer = explorer;
         self.refresh_entities();
         self.collapsed.clear();
+        self.chat_generation = self.chat_generation.saturating_add(1);
+        if let Some(cancel) = self.chat_cancel.take() {
+            cancel.cancel();
+        }
+        self.chat = ChatUiState::new(ChatMode::Plan);
+        self.chat_history.clear();
+        self.chat_history_open = false;
+        self.right_tab = RightTab::Chat;
         // Project-level surfaces never carry over: a review, proposal,
         // search result or export belongs to the project that produced it.
         self.export = ExportState::default();
@@ -7024,6 +7062,11 @@ impl Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.chat.focused {
+            self.chat.backspace();
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette_backspace(cx);
             return;
@@ -7150,6 +7193,10 @@ impl Editor {
         if self.delete_prompt.is_some() {
             self.delete_prompt = None;
             cx.notify();
+            return;
+        }
+        if self.chat.focused {
+            self.chat_send(window, cx);
             return;
         }
         if self.palette.is_some() {
@@ -7655,6 +7702,11 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.chat.focused {
+            self.chat.focused = false;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette = None;
             cx.notify();
@@ -7857,6 +7909,7 @@ impl Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        self.chat.focused = false;
         match self.open_document_path(path) {
             Ok(()) => {
                 // A click re-targets typing (and IME composition) at the
@@ -8202,6 +8255,7 @@ impl Editor {
             }
         };
         self.agent_panel_open = true;
+        self.right_tab = RightTab::Activity;
         self.agent_generation += 1;
         let generation = self.agent_generation;
         self.agent.begin(scene_number, focus.clone());
@@ -8314,6 +8368,7 @@ impl Editor {
             }
         };
         self.agent_panel_open = true;
+        self.right_tab = RightTab::Activity;
         self.agent_generation += 1;
         let generation = self.agent_generation;
         self.propose.begin(scene_number, instruction.clone());
@@ -9029,12 +9084,11 @@ impl Editor {
     /// ⌘.: cancel the in-flight review. Cooperative: the task checks the
     /// token between steps, so a model call already in flight finishes but
     /// no further work happens.
-    fn on_cancel_review(
-        &mut self,
-        _: &CancelReview,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn on_cancel_review(&mut self, _: &CancelReview, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat.status == ChatStatus::Running {
+            self.chat_stop(cx);
+            return;
+        }
         if let Some(token) = self.agent_cancel.take() {
             token.cancel();
             self.notice = Some(self.t("notice.cancelling_review").to_string());
@@ -9074,50 +9128,1103 @@ impl Editor {
         }
     }
 
+    // ---- chat workspace (M12) -------------------------------------------
+
+    fn on_focus_chat(&mut self, _: &FocusChat, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_panel_open = true;
+        self.right_tab = RightTab::Chat;
+        self.chat.focused = true;
+        self.chat_history_open = false;
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn on_chat_newline(&mut self, _: &ChatNewline, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat.focused {
+            self.chat.newline();
+            cx.notify();
+        }
+    }
+
+    fn chat_set_mode(&mut self, mode: ChatMode, cx: &mut Context<Self>) {
+        self.chat.set_mode(mode);
+        self.chat.clear_error();
+        self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn open_ai_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            self.on_open_settings(&OpenSettings, window, cx);
+        }
+        if let Some(settings) = self.settings.as_mut() {
+            settings.section = SettingsSection::Ai;
+        }
+        cx.notify();
+    }
+
+    fn chat_attach_scene(&mut self, cx: &mut Context<Self>) {
+        let caret_line = self.doc.buffer.position_at(self.caret()).line;
+        if self.doc.scene_lines.is_empty() {
+            self.notice = Some(self.t("chat.no_scene").to_string());
+            cx.notify();
+            return;
+        }
+        let index = self
+            .doc
+            .scene_lines
+            .partition_point(|line| *line <= caret_line)
+            .saturating_sub(1);
+        let start = self.doc.scene_lines[index];
+        let end = self
+            .doc
+            .scene_lines
+            .get(index + 1)
+            .copied()
+            .unwrap_or_else(|| self.doc.buffer.line_count());
+        let text: Vec<String> = self.doc.buffer.lines()[start..end].to_vec();
+        self.chat.add_attachment(ChatAttachment::new(
+            "scene",
+            format!("Escena {}", index + 1),
+            format!("{}:L{}-L{}", self.doc.path, start + 1, end),
+            text.join("\n"),
+        ));
+        self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn chat_attach_selection(&mut self, cx: &mut Context<Self>) {
+        if self.doc.selected.is_empty() {
+            self.notice = Some(self.t("chat.no_selection").to_string());
+            cx.notify();
+            return;
+        }
+        let start = self.doc.buffer.position_at(self.doc.selected.start);
+        let end = self.doc.buffer.position_at(self.doc.selected.end);
+        self.chat.add_attachment(ChatAttachment::new(
+            "selection",
+            self.t("chat.selection_chip").to_string(),
+            format!("{}:L{}-L{}", self.doc.path, start.line + 1, end.line + 1),
+            self.doc.buffer.slice(self.doc.selected.clone()),
+        ));
+        self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn chat_attach_document(&mut self, cx: &mut Context<Self>) {
+        let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
+        self.chat.add_attachment(ChatAttachment::new(
+            "document",
+            self.doc
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or("documento")
+                .to_string(),
+            self.doc.path.clone(),
+            text,
+        ));
+        self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn chat_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat.status == ChatStatus::Running || !self.chat.can_send() {
+            return;
+        }
+        let raw = self.chat.input.trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let (mode, instruction) = match split_chat_command(&raw) {
+            Some(("/plan", rest)) => {
+                self.chat.set_mode(ChatMode::Plan);
+                if rest.is_empty() {
+                    self.chat.set_input(String::new());
+                    cx.notify();
+                    return;
+                }
+                (ChatMode::Plan, rest.to_string())
+            }
+            Some(("/build", rest)) => {
+                self.chat.set_mode(ChatMode::Build);
+                if rest.is_empty() {
+                    self.chat.set_input(String::new());
+                    cx.notify();
+                    return;
+                }
+                (ChatMode::Build, rest.to_string())
+            }
+            Some(("/review", rest)) => {
+                self.chat.set_mode(ChatMode::Review);
+                if rest.is_empty() {
+                    self.chat.set_input(String::new());
+                    cx.notify();
+                    return;
+                }
+                (ChatMode::Review, rest.to_string())
+            }
+            Some(("/rewrite", rest)) => {
+                self.chat.set_mode(ChatMode::Build);
+                if rest.is_empty() {
+                    self.chat
+                        .set_input(self.t("chat.rewrite_prompt").to_string());
+                    cx.notify();
+                    return;
+                }
+                (ChatMode::Build, rest.to_string())
+            }
+            Some(("/continuity", rest)) => {
+                self.chat.set_mode(ChatMode::Review);
+                if rest.is_empty() {
+                    self.chat
+                        .set_input(self.t("chat.continuity_prompt").to_string());
+                    cx.notify();
+                    return;
+                }
+                (ChatMode::Review, rest.to_string())
+            }
+            _ => (self.chat.mode(), raw),
+        };
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        let root = project.root().to_string_lossy().into_owned();
+        let history = self.chat.thread.messages.clone();
+        let attachments = self.chat.attachments.clone();
+        self.chat.set_input(String::new());
+        self.chat
+            .begin_run(instruction.clone(), attachments.clone());
+        self.chat.focused = true;
+        self.agent_panel_open = true;
+        self.right_tab = RightTab::Chat;
+        self.chat_generation = self.chat_generation.saturating_add(1);
+        let generation = self.chat_generation;
+        let cancel = CancellationToken::new();
+        self.chat_cancel = Some(cancel.clone());
+        let task = ChatTask::new(root, mode, history, instruction).with_attachments(attachments);
+        let settings = self.agent_settings.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = TaskOptions {
+                timeout: AGENT_TIMEOUT,
+                cancel,
+                stream: mode != ChatMode::Build,
+            };
+            let result = match settings.build_adapter() {
+                Ok(adapter) => task.run(&*adapter, &options, |event| {
+                    let _ = tx.send(ChatRunMessage::Event(event));
+                }),
+                Err(error) => Err(AgentError::Adapter(error)),
+            };
+            let _ = tx.send(ChatRunMessage::Done(result));
+        });
+        self.save_chat_thread();
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            if generation != view.chat_generation {
+                return true;
+            }
+            let done = matches!(message, ChatRunMessage::Done(_));
+            match message {
+                ChatRunMessage::Event(event) => view.chat.apply_event(&event),
+                ChatRunMessage::Done(result) => {
+                    view.chat_cancel = None;
+                    view.chat.finish(result);
+                    view.load_chat_proposal_diffs();
+                    view.save_chat_thread();
+                    view.notice = Some(match view.chat.status {
+                        ChatStatus::Completed => view.t("chat.completed").to_string(),
+                        ChatStatus::Failed => {
+                            view.tf("chat.failed", &[("error", &view.chat.error.clone())])
+                        }
+                        ChatStatus::Cancelled => view.t("chat.cancelled").to_string(),
+                        _ => view.t("chat.completed").to_string(),
+                    });
+                }
+            }
+            done
+        });
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn chat_stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = self.chat_cancel.take() {
+            cancel.cancel();
+            self.notice = Some(self.t("chat.stopping").to_string());
+        } else {
+            self.notice = Some(self.t("chat.not_running").to_string());
+        }
+        cx.notify();
+    }
+
+    fn chat_new_thread(&mut self, cx: &mut Context<Self>) {
+        if self.chat.status == ChatStatus::Running {
+            return;
+        }
+        let mode = self.chat.mode();
+        self.chat = ChatUiState::new(mode);
+        self.chat.focused = true;
+        self.chat_history_open = false;
+        self.right_tab = RightTab::Chat;
+        cx.notify();
+    }
+
+    fn chat_toggle_history(&mut self, cx: &mut Context<Self>) {
+        if self.chat_history_open {
+            self.chat_history_open = false;
+        } else {
+            self.chat_history = self
+                .project
+                .as_ref()
+                .map(|project| ChatThread::list(project.root()))
+                .unwrap_or_default();
+            self.chat_history_open = true;
+        }
+        cx.notify();
+    }
+
+    fn chat_load_thread(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(thread) = self.chat_history.get(index).cloned() else {
+            return;
+        };
+        self.chat = ChatUiState::from_thread(thread);
+        self.chat_history_open = false;
+        self.right_tab = RightTab::Chat;
+        self.load_chat_proposal_diffs();
+        cx.notify();
+    }
+
+    fn save_chat_thread(&mut self) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        if self.chat.thread.messages.is_empty() {
+            return;
+        }
+        if let Err(error) = self.chat.thread.save(project.root()) {
+            self.notice = Some(self.tf("chat.save_failed", &[("error", &error)]));
+        }
+    }
+
+    fn load_chat_proposal_diffs(&mut self) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        for view in &mut self.chat.proposals {
+            if !view.diff_rows.is_empty() {
+                continue;
+            }
+            let Ok(record) = proposal::load(&root, &view.id) else {
+                continue;
+            };
+            view.hunks = record.hunks.len();
+            view.selected = vec![true; view.hunks];
+            view.diff_rows = diff_rows_from_hunks(&record.hunks);
+            view.status = match record.state {
+                proposal::ProposalState::Applied => ProposalCardStatus::Applied,
+                proposal::ProposalState::Rejected => ProposalCardStatus::Rejected,
+                proposal::ProposalState::Stale => ProposalCardStatus::Failed,
+                _ => ProposalCardStatus::Ready,
+            };
+        }
+    }
+
+    fn chat_apply_proposal(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project_short").to_string());
+            cx.notify();
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let Some(view) = self.chat.proposal(&id).cloned() else {
+            return;
+        };
+        if view.status != ProposalCardStatus::Ready {
+            return;
+        }
+        if !view.armed {
+            if let Some(view) = self.chat.proposal_mut(&id) {
+                view.armed = true;
+            }
+            self.notice = Some(self.t("chat.apply_arm").to_string());
+            cx.notify();
+            return;
+        }
+        let accepted = if view.all_selected() {
+            None
+        } else {
+            let selected = view.selected_hunks();
+            if selected.is_empty() {
+                self.notice = Some(self.t("chat.select_hunk").to_string());
+                cx.notify();
+                return;
+            }
+            Some(selected)
+        };
+        match proposal::apply(&root, &id, accepted.as_deref()) {
+            Ok(outcome) => {
+                if let Some(view) = self.chat.proposal_mut(&id) {
+                    view.status = ProposalCardStatus::Applied;
+                    view.armed = false;
+                }
+                let target = outcome.proposal.target.clone();
+                if self.doc.path == target
+                    && let Some(project) = self.project.as_ref()
+                    && let Ok(text) = project.read_document(&target)
+                {
+                    self.load_document(target.clone(), text);
+                }
+                self.notice = Some(self.tf("chat.applied", &[("target", &target)]));
+                self.chat
+                    .thread
+                    .push_assistant(self.t("chat.applied_note").to_string());
+                self.save_chat_thread();
+                window.focus(&self.focus_handle(cx));
+            }
+            Err(error) => {
+                if let Some(view) = self.chat.proposal_mut(&id) {
+                    view.status = ProposalCardStatus::Failed;
+                    view.error = error.to_string();
+                    view.armed = false;
+                }
+                self.notice = Some(self.tf("chat.apply_failed", &[("error", &error.to_string())]));
+            }
+        }
+        cx.notify();
+    }
+
+    fn chat_proposal_move(&mut self, id: &str, delta: isize, cx: &mut Context<Self>) {
+        if let Some(view) = self.chat.proposal_mut(id) {
+            view.move_cursor(delta);
+        }
+        cx.notify();
+    }
+
+    fn chat_proposal_toggle(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(view) = self.chat.proposal_mut(id) {
+            view.toggle();
+        }
+        cx.notify();
+    }
+
+    fn chat_reject_proposal(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        match proposal::reject(project.root(), &id) {
+            Ok(_) => {
+                if let Some(view) = self.chat.proposal_mut(&id) {
+                    view.status = ProposalCardStatus::Rejected;
+                    view.armed = false;
+                }
+                self.chat
+                    .thread
+                    .push_assistant(self.t("chat.rejected_note").to_string());
+                self.save_chat_thread();
+                self.notice = Some(self.t("chat.rejected").to_string());
+            }
+            Err(error) => {
+                self.notice = Some(self.tf("chat.reject_failed", &[("error", &error.to_string())]));
+            }
+        }
+        cx.notify();
+    }
+
+    fn right_tab_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(theme::explorer_border()))
+            .child(self.right_tab_button("chat.tab.chat", RightTab::Chat, cx))
+            .child(self.right_tab_button("chat.tab.activity", RightTab::Activity, cx))
+    }
+
+    fn right_tab_button(
+        &self,
+        label: &'static str,
+        tab: RightTab,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let selected = self.right_tab == tab;
+        div()
+            .id(label)
+            .px_2()
+            .py_1()
+            .text_sm()
+            .cursor_pointer()
+            .text_color(rgb(if selected {
+                theme::default_fg()
+            } else {
+                theme::status_fg()
+            }))
+            .when(selected, |button| button.bg(rgb(theme::doc_selected_bg())))
+            .child(self.t(label))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.right_tab = tab;
+                if tab == RightTab::Chat {
+                    this.chat_history_open = false;
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn chat_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = |key: &str| self.t(key).to_string();
+        let mut panel = div()
+            .id("chat-panel")
+            .w(px(AGENT_PANEL_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(theme::explorer_bg()))
+            .border_l_1()
+            .border_color(rgb(theme::explorer_border()))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .child(self.right_tab_bar(cx));
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(div().flex_1().text_color(rgb(theme::default_fg())).child(
+                if self.chat.thread.title.is_empty() {
+                    t("chat.new")
+                } else {
+                    self.chat.thread.title.clone()
+                },
+            ))
+            .child(
+                div()
+                    .id("chat-new")
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::status_fg()))
+                    .child("+")
+                    .on_click(cx.listener(|this, _, _, cx| this.chat_new_thread(cx))),
+            )
+            .child(
+                div()
+                    .id("chat-history")
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(icon("list-tree", theme::status_fg(), 14.0))
+                    .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_history(cx))),
+            );
+        if self.chat_history_open {
+            let mut history = div()
+                .id("chat-history-list")
+                .max_h(px(180.0))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(rgb(theme::explorer_border()));
+            if self.chat_history.is_empty() {
+                history = history.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(t("chat.no_history")),
+                );
+            }
+            for (index, thread) in self.chat_history.iter().enumerate() {
+                let label = if thread.title.is_empty() {
+                    thread.id.clone()
+                } else {
+                    thread.title.clone()
+                };
+                history = history.child(
+                    div()
+                        .id(("chat-history-row", index))
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(format!("{} · {}", label, thread.mode.key()))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.chat_load_thread(index, cx)),
+                        ),
+                );
+            }
+            panel = panel.child(history);
+        }
+        panel = panel.child(header);
+        let mut messages = div()
+            .id("chat-messages")
+            .flex_1()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2();
+        if self.chat.thread.messages.is_empty() && self.chat.streaming.is_empty() {
+            messages = messages
+                .child(
+                    div()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(t("chat.empty_title")),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(t("chat.empty_hint")),
+                );
+        }
+        for turn in &self.chat.thread.messages {
+            let user = turn.role == narra_core::agent::ChatTurnRole::User;
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(rgb(theme::explorer_border()))
+                .bg(rgb(if user {
+                    theme::bg()
+                } else {
+                    theme::explorer_bg()
+                }))
+                .text_color(rgb(if user {
+                    theme::cue_fg()
+                } else {
+                    theme::default_fg()
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(t(if user { "chat.you" } else { "chat.assistant" })),
+                )
+                .child(div().whitespace_normal().child(turn.content.clone()));
+            if !user {
+                card = card.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(t("chat.assistant_note")),
+                );
+            }
+            messages = messages.child(card);
+        }
+        if self.chat.status == ChatStatus::Running {
+            let streaming = if self.chat.streaming.is_empty() {
+                t("chat.working")
+            } else {
+                self.chat.streaming.clone()
+            };
+            messages = messages.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .text_color(rgb(theme::status_fg()))
+                    .child(streaming),
+            );
+        }
+        if !self.chat.sources.is_empty() {
+            let mut sources = div()
+                .mx_2()
+                .mb_2()
+                .border_1()
+                .border_color(rgb(theme::explorer_border()))
+                .flex()
+                .flex_col();
+            sources = sources.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(self.tf(
+                        "chat.sources",
+                        &[("n", &self.chat.sources.len().to_string())],
+                    )),
+            );
+            for source in &self.chat.sources {
+                sources = sources.child(
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(format!("{} · {}", source.kind, source.location)),
+                );
+            }
+            messages = messages.child(sources);
+        }
+        for (index, view) in self.chat.proposals.iter().enumerate() {
+            messages = messages.child(self.chat_proposal_card(view, index, cx));
+        }
+        if !self.chat.error.is_empty() {
+            messages = messages.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(theme::agent_err_fg()))
+                    .child(self.chat.error.clone()),
+            );
+        }
+        panel = panel.child(messages);
+        panel = panel.child(self.chat_composer(cx));
+        panel.into_any_element()
+    }
+
+    fn chat_proposal_card(
+        &self,
+        view: &ChatProposalView,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let status = view.status_key();
+        let mut card = div()
+            .mx_2()
+            .mb_2()
+            .border_1()
+            .border_color(rgb(if view.status == ProposalCardStatus::Ready {
+                theme::git_modified_fg()
+            } else {
+                theme::explorer_border()
+            }))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .child(
+                div()
+                    .text_color(rgb(theme::default_fg()))
+                    .child(format!("{} · {}", view.target, status)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(format!(
+                        "{} hunks · {} selected",
+                        view.hunks,
+                        view.selected_hunks().len()
+                    )),
+            );
+        if view.hunks > 0 {
+            let checked = view.selected.get(view.cursor).copied().unwrap_or(false);
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .id(("chat-hunk-prev", index))
+                            .px_1()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child("◀")
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, _, cx| this.chat_proposal_move(&id, -1, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("chat-hunk-toggle", index))
+                            .px_1()
+                            .cursor_pointer()
+                            .text_color(rgb(if checked {
+                                theme::default_fg()
+                            } else {
+                                theme::gutter_fg()
+                            }))
+                            .child(format!(
+                                "hunk {}/{} [{}]",
+                                view.cursor + 1,
+                                view.hunks,
+                                if checked { "x" } else { " " }
+                            ))
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, _, cx| this.chat_proposal_toggle(&id, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("chat-hunk-next", index))
+                            .px_1()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child("▶")
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, _, cx| this.chat_proposal_move(&id, 1, cx)
+                            })),
+                    ),
+            );
+        }
+        if !view.error.is_empty() {
+            card = card.child(
+                div()
+                    .text_color(rgb(theme::agent_err_fg()))
+                    .child(view.error.clone()),
+            );
+        }
+        for row in view.diff_rows.iter().take(20) {
+            card = card.child(
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(rgb(match row.0 {
+                        '+' => theme::git_added_fg(),
+                        '-' => theme::agent_err_fg(),
+                        _ => theme::gutter_fg(),
+                    }))
+                    .child(format!("{}{}", row.0, row.1)),
+            );
+        }
+        if view.status == ProposalCardStatus::Ready {
+            card = card.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(("chat-reject", index))
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("chat.reject"))
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, _, cx| this.chat_reject_proposal(id.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("chat-apply", index))
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::default_fg()))
+                            .child(if view.armed {
+                                self.t("chat.apply_confirm")
+                            } else {
+                                self.t("chat.apply")
+                            })
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, window, cx| {
+                                    this.chat_apply_proposal(id.clone(), window, cx)
+                                }
+                            })),
+                    ),
+            );
+        }
+        card
+    }
+
+    fn chat_composer(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let t = |key: &str| self.t(key).to_string();
+        let mut attachments = div().flex().flex_wrap().gap_1();
+        for (index, attachment) in self.chat.attachments.iter().enumerate() {
+            attachments = attachments.child(
+                div()
+                    .id(("chat-attachment", index))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(theme::bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .text_color(rgb(theme::cue_fg()))
+                    .child(attachment.label.clone())
+                    .child(
+                        div()
+                            .id(("chat-attachment-remove", index))
+                            .cursor_pointer()
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.chat.remove_attachment(index);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        let mut modes = div().flex().items_center().gap_1();
+        for mode in ChatMode::ALL {
+            let selected = self.chat.mode() == mode;
+            modes = modes.child(
+                div()
+                    .id(mode.key())
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::bg()
+                    }))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
+                    .child(t(chat_mode_key(mode)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.chat_set_mode(mode, cx))),
+            );
+        }
+        let commands = [
+            "/plan",
+            "/build",
+            "/review",
+            "/rewrite",
+            "/continuity",
+            "/character",
+        ];
+        let mut command_row = div().flex().flex_wrap().gap_1();
+        for command in commands {
+            command_row = command_row.child(
+                div()
+                    .id(command)
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(theme::bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(command)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.chat.focused = true;
+                        this.chat.set_input(format!("{command} "));
+                        window.focus(&this.focus_handle(cx));
+                        cx.notify();
+                    })),
+            );
+        }
+        let input = if self.chat.input.is_empty() {
+            format!("{}▌", t("chat.placeholder"))
+        } else {
+            format!("{}▌", self.chat.input)
+        };
+        let send_label = if self.chat.status == ChatStatus::Running {
+            t("chat.stop")
+        } else {
+            t("chat.send")
+        };
+        div()
+            .border_t_1()
+            .border_color(rgb(theme::explorer_border()))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(attachments)
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("chat-attach-scene")
+                            .px_1()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child("@ Escena")
+                            .on_click(cx.listener(|this, _, _, cx| this.chat_attach_scene(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("chat-attach-selection")
+                            .px_1()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child("@ Selección")
+                            .on_click(cx.listener(|this, _, _, cx| this.chat_attach_selection(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("chat-attach-document")
+                            .px_1()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child("@ Documento")
+                            .on_click(cx.listener(|this, _, _, cx| this.chat_attach_document(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("chat-input")
+                    .min_h(px(54.0))
+                    .max_h(px(120.0))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .bg(rgb(theme::bg()))
+                    .border_1()
+                    .border_color(rgb(if self.chat.focused {
+                        theme::default_fg()
+                    } else {
+                        theme::explorer_border()
+                    }))
+                    .text_color(rgb(if self.chat.input.is_empty() {
+                        theme::gutter_fg()
+                    } else {
+                        theme::default_fg()
+                    }))
+                    .whitespace_normal()
+                    .cursor_text()
+                    .child(input)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.chat.focused = true;
+                        window.focus(&this.focus_handle(cx));
+                        cx.notify();
+                    })),
+            )
+            .child(command_row)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(modes)
+                    .child(
+                        div()
+                            .id("chat-model")
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(format!(
+                                "{} · {}",
+                                self.agent_settings.provider.key(),
+                                self.agent_settings.model
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_ai_settings(window, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("chat-ai-settings")
+                            .px_1()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(icon("sliders-horizontal", theme::status_fg(), 14.0))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_ai_settings(window, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("chat-send")
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(if self.chat.status == ChatStatus::Running {
+                                theme::agent_err_fg()
+                            } else {
+                                theme::status_bg()
+                            }))
+                            .text_color(rgb(theme::default_fg()))
+                            .cursor_pointer()
+                            .child(send_label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.chat.status == ChatStatus::Running {
+                                    this.chat_stop(cx);
+                                } else {
+                                    this.chat_send(window, cx);
+                                }
+                            })),
+                    ),
+            )
+    }
+
     /// Agent review panel (M6 slice 3): right-hand column with the run's
     /// status, the context sources the task actually read, and a scrolled
     /// window of the review text. The dump prints the full text, so headless
     /// verification never depends on what fits on screen. M6 slice 4 adds a
     /// proposal section (diff + apply/reject hints) rendered when a proposal
     /// is active; the panel shows the proposal instead of an idle review.
-    fn agent_panel(&self) -> impl IntoElement {
+    /// M12 adds the Chat tab as the default surface.
+    fn agent_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.right_tab == RightTab::Chat {
+            return self.chat_panel(cx);
+        }
         // Proposal section (M6 slice 4) takes the panel whenever a proposal
         // flow is active; the review content shows only when a review has
         // been run and no proposal is open. An explicitly opened empty panel
         // explains how to start a review instead of pretending to be a chat.
-        if self.propose.is_open() {
-            return self.proposal_panel().into_any_element();
-        }
-        if self.agent.is_open() {
-            return self.review_panel().into_any_element();
-        }
+        let content = if self.propose.is_open() {
+            self.proposal_panel().into_any_element()
+        } else if self.agent.is_open() {
+            self.review_panel().into_any_element()
+        } else {
+            div()
+                .id("agent-panel-empty")
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_sm()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(rgb(theme::default_fg()))
+                        .child(icon("message-square", theme::cue_fg(), 14.0))
+                        .child(self.t("panel.agent_title")),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(self.t("panel.agent_empty")),
+                )
+                .into_any_element()
+        };
         div()
-            .id("agent-panel-empty")
             .w(px(AGENT_PANEL_W))
             .h_full()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
             .bg(rgb(theme::explorer_bg()))
             .border_l_1()
             .border_color(rgb(theme::explorer_border()))
-            .text_sm()
-            .font_family(FONT_FAMILY)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(theme::default_fg()))
-                    .child(icon("message-square", theme::cue_fg(), 14.0))
-                    .child(self.t("panel.agent_title")),
-            )
-            .child(
-                div()
-                    .text_color(rgb(theme::status_fg()))
-                    .child(self.t("panel.agent_empty")),
-            )
+            .child(self.right_tab_bar(cx))
+            .child(div().flex_1().overflow_hidden().child(content))
             .into_any_element()
     }
 
@@ -10868,6 +11975,7 @@ impl Editor {
             "{\"open\":false,\"target\":\"\",\"x\":0,\"y\":0,\"selected\":0,\"items\":[]}"
                 .to_string()
         };
+        let chat_dump = self.chat.dump_json();
         let rename_dump = if let Some(state) = self.rename.as_ref() {
             format!(
                 "{{\"open\":true,\"path\":\"{}\",\"name\":\"{}\",\"error\":\"{}\"}}",
@@ -11085,7 +12193,7 @@ impl Editor {
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
                  \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
-                 \"rename\":{},\"delete_prompt\":{},\
+                 \"rename\":{},\"delete_prompt\":{},\"chat\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
@@ -11151,6 +12259,7 @@ impl Editor {
             context_dump,
             rename_dump,
             delete_dump,
+            chat_dump,
             new_file_dump,
             new_project_dump,
             tabs_dump,
@@ -11337,6 +12446,34 @@ fn filter_palette_paths(paths: Vec<String>, query: &str) -> Vec<String> {
     starts.extend(contains);
     starts.truncate(80);
     starts
+}
+
+/// Parse `/command rest` at the start of a chat message. Returns the command
+/// (including slash) and the remaining instruction; unknown text returns
+/// `None` and is sent untouched.
+fn split_chat_command(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next()?;
+    let rest = parts.next().unwrap_or("").trim_start();
+    match command {
+        "/plan" | "/build" | "/review" | "/rewrite" | "/continuity" | "/character" => {
+            Some((command, rest))
+        }
+        _ => None,
+    }
+}
+
+/// i18n key for a chat mode button.
+fn chat_mode_key(mode: ChatMode) -> &'static str {
+    match mode {
+        ChatMode::Plan => "chat.mode.plan",
+        ChatMode::Build => "chat.mode.build",
+        ChatMode::Review => "chat.mode.review",
+    }
 }
 
 /// Split a project-relative path into `(parent, stem, extension)`; the
@@ -11646,6 +12783,11 @@ impl EntityInputHandler for Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.chat.focused {
+            self.chat.push_input(new_text);
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette_input(new_text, cx);
             return;
@@ -11768,6 +12910,11 @@ impl EntityInputHandler for Editor {
             return;
         }
         if self.delete_prompt.is_some() {
+            return;
+        }
+        if self.chat.focused {
+            self.chat.push_input(new_text);
+            cx.notify();
             return;
         }
         if self.palette.is_some() {
@@ -11974,6 +13121,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_open_project_settings))
             .on_action(cx.listener(Self::on_toggle_config_files))
             .on_action(cx.listener(Self::on_show_context_menu))
+            .on_action(cx.listener(Self::on_focus_chat))
+            .on_action(cx.listener(Self::on_chat_newline))
             .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_quit))
@@ -12105,7 +13254,7 @@ impl Render for Editor {
                     // Agent panel (review/proposal or the empty state): right
                     // column of the body row, toggled from the bottom bar.
                     .when(self.agent_panel_open, |body| {
-                        body.child(self.agent_panel())
+                        body.child(self.agent_panel(cx))
                     }),
             )
             .child(self.bottom_bar(cx))
@@ -12658,6 +13807,10 @@ fn run() -> Result<(), String> {
                 // cmd-shift-enter applies the ready proposal (two-step: arm,
                 // then apply), cmd-backspace rejects it.
                 KeyBinding::new("cmd-k", OpenPropose, None),
+                // chat (M12): cmd-l focuses the composer; shift-enter inserts
+                // a newline while enter sends.
+                KeyBinding::new("cmd-l", FocusChat, None),
+                KeyBinding::new("shift-enter", ChatNewline, None),
                 KeyBinding::new("cmd-shift-enter", ApplyProposal, None),
                 KeyBinding::new("cmd-backspace", RejectProposal, None),
                 // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
@@ -12742,6 +13895,12 @@ fn run() -> Result<(), String> {
                 palette: None,
                 context_menu: None,
                 context_target: None,
+                right_tab: RightTab::Chat,
+                chat: ChatUiState::new(ChatMode::Plan),
+                chat_generation: 0,
+                chat_cancel: None,
+                chat_history: Vec::new(),
+                chat_history_open: false,
                 rename: None,
                 delete_prompt: None,
                 show_config_files: initial_show_config_files,
