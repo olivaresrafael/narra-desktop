@@ -1445,3 +1445,94 @@ fn broken_role_config_is_an_explicit_failure_not_a_silent_fallback() {
     let error = record["error"].as_str().expect("error message");
     assert!(error.contains("agents.yaml"), "{error}");
 }
+
+#[test]
+fn export_pdf_writes_a_well_formed_artifact_without_credentials() {
+    let root = sample_with_scenes();
+    let screenplay_before =
+        fs::read(root.join(narra_core::DEFAULT_SCREENPLAY)).expect("screenplay before");
+
+    let output = harness()
+        .args(["export", root.to_str().expect("utf8")])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(0), "success exit code");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("export record is JSON");
+    assert_eq!(record["kind"], "export");
+    assert_eq!(record["format"], "pdf");
+    assert!(record["bytes"].as_u64().unwrap_or(0) > 1_000);
+    assert!(record["pages"].as_u64().unwrap_or(0) >= 1);
+
+    let out = PathBuf::from(record["out"].as_str().expect("out path"));
+    assert_eq!(out, root.join("exports/main.pdf"));
+    let bytes = fs::read(&out).expect("pdf written");
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(bytes.windows(5).any(|w| w == b"%%EOF"));
+
+    // Export is an artifact: the canonical screenplay is byte-identical.
+    let screenplay_after =
+        fs::read(root.join(narra_core::DEFAULT_SCREENPLAY)).expect("screenplay after");
+    assert_eq!(screenplay_before, screenplay_after);
+}
+
+#[test]
+fn export_fountain_carries_the_manifest_title_page_to_an_explicit_path() {
+    let root = sample_with_scenes();
+    let out = temp_root().join("copia.fountain");
+
+    let output = harness()
+        .args([
+            "export",
+            root.to_str().expect("utf8"),
+            "--format",
+            "fountain",
+            "--out",
+            out.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(0));
+
+    let text = fs::read_to_string(&out).expect("fountain written");
+    assert!(text.starts_with("Title: Harness de Prueba\n"), "{text}");
+    assert!(text.contains("INT. TALLER - NOCHE"));
+    assert!(text.contains("Esto es una prueba."));
+}
+
+#[test]
+fn export_rejects_an_unknown_format_and_stray_options() {
+    let root = sample_with_scenes();
+    let output = harness()
+        .args(["export", root.to_str().expect("utf8"), "--format", "docx"])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--format"), "{stderr}");
+
+    let output = harness()
+        .args(["brief", root.to_str().expect("utf8"), "--format", "pdf"])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("solo se pueden usar con la orden export"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn export_fails_explicitly_on_a_missing_project() {
+    let missing = temp_root().join("no-existe");
+    let output = harness()
+        .args(["export", missing.to_str().expect("utf8")])
+        .output()
+        .expect("run harness");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("export fallido"), "{stderr}");
+}

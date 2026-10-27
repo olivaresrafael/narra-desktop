@@ -15,6 +15,7 @@
 //!   narra-harness propose <project-root> --scene <n> --instruction <texto> [options]
 //!   narra-harness review <project-root> --scene <n> [--focus <texto>] [options]
 //!   narra-harness roles <project-root>
+//!   narra-harness export <project-root> [--format fountain|pdf] [--out <ruta>]
 //!   narra-harness proposals <project-root> [list]
 //!   narra-harness proposals <project-root> show <proposal-id>
 //!   narra-harness proposals <project-root> apply <proposal-id> [--hunks 0,2]
@@ -83,6 +84,7 @@ use narra_core::agent::{
     roles,
 };
 use narra_core::cancel::CancellationToken;
+use narra_core::export;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -103,6 +105,11 @@ fn main() -> ExitCode {
     // Role listing: local config only, no adapter, no network.
     if let Command::Roles { root } = &parsed.command {
         return run_roles(root);
+    }
+
+    // Export is local-only (M7): no token, no network, no model adapter.
+    if let Command::Export { root, format, out } = &parsed.command {
+        return run_export(root, *format, out.as_deref());
     }
 
     // Provider commands use the token store and (some) the REST API, but
@@ -202,6 +209,7 @@ fn main() -> ExitCode {
             Err(error) => Err(error),
         },
         Command::Roles { .. } => unreachable!("roles runs before the adapter is built"),
+        Command::Export { .. } => unreachable!("export runs before the adapter is built"),
         Command::Renew { root, id } => proposal::load(Path::new(&root), &id)
             .map_err(AgentError::Proposal)
             .and_then(|record| SceneEditTask::from_proposal(root, &record))
@@ -281,6 +289,7 @@ const USAGE: &str = "uso: narra-harness brief <project-root> [--role <id>] [--ti
      narra-harness propose <project-root> --scene <n> --instruction <texto> [--role <id>] [mismas opciones]
      narra-harness review <project-root> --scene <n> [--focus <texto>] [--role <id>] [mismas opciones]
      narra-harness roles <project-root>
+     narra-harness export <project-root> [--format fountain|pdf] [--out <ruta>]
      narra-harness proposals <project-root> [list]
      narra-harness proposals <project-root> show <id>
      narra-harness proposals <project-root> apply <id> [--hunks 0,2]
@@ -321,6 +330,26 @@ struct ProviderOptions {
     api_url: Option<String>,
 }
 
+/// Output formats of the `export` command (M7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Fountain,
+    Pdf,
+}
+
+impl ExportFormat {
+    fn key(self) -> &'static str {
+        match self {
+            ExportFormat::Fountain => "fountain",
+            ExportFormat::Pdf => "pdf",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        self.key()
+    }
+}
+
 #[derive(Debug)]
 enum Command {
     Brief {
@@ -344,6 +373,13 @@ enum Command {
     /// slice 7), printed as JSON for headless verification.
     Roles {
         root: String,
+    },
+    /// Screenplay export (M7): Fountain or PDF from the canonical project
+    /// state. Local only — no network, no model, no credentials.
+    Export {
+        root: String,
+        format: ExportFormat,
+        out: Option<String>,
     },
     Renew {
         root: String,
@@ -555,6 +591,8 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut focus: Option<String> = None;
     let mut role: Option<String> = None;
     let mut hunks: Option<Vec<usize>> = None;
+    let mut export_format: Option<ExportFormat> = None;
+    let mut export_out: Option<String> = None;
     let mut model_options_seen = false;
     let mut stream = false;
     let mut allow_tool: Vec<String> = Vec::new();
@@ -652,6 +690,22 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 let value = iter.next().ok_or("--hunks requiere un valor")?;
                 hunks = Some(parse_hunks(value)?);
             }
+            "--format" => {
+                let value = iter.next().ok_or("--format requiere un valor")?;
+                export_format = Some(match value.as_str() {
+                    "fountain" => ExportFormat::Fountain,
+                    "pdf" => ExportFormat::Pdf,
+                    other => {
+                        return Err(format!(
+                            "--format: «{other}» no es fountain ni pdf (export)"
+                        ));
+                    }
+                });
+            }
+            "--out" => {
+                let value = iter.next().ok_or("--out requiere una ruta")?;
+                export_out = Some((*value).clone());
+            }
             "--api-url" => {
                 let value = iter.next().ok_or("--api-url requiere un valor")?;
                 api_url = Some((*value).clone());
@@ -736,6 +790,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let state_seen = state.is_some();
     let method_seen = method.is_some();
     let confirm_seen = confirm;
+    let export_opts_seen = export_format.is_some() || export_out.is_some();
 
     let command = match positional.as_slice() {
         ["brief", root] if !root.is_empty() => Command::Brief {
@@ -756,6 +811,11 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         },
         ["roles", root] if !root.is_empty() => Command::Roles {
             root: (*root).to_string(),
+        },
+        ["export", root] if !root.is_empty() => Command::Export {
+            root: (*root).to_string(),
+            format: export_format.unwrap_or(ExportFormat::Pdf),
+            out: export_out.take(),
         },
         ["proposals", root] | ["proposals", root, "list"] if !root.is_empty() => {
             Command::Proposals {
@@ -920,6 +980,9 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--allow-tool/--allow-destructive solo se pueden usar con la orden loop".to_string(),
         );
     }
+    if export_opts_seen && !matches!(command, Command::Export { .. }) {
+        return Err("--format/--out solo se pueden usar con la orden export".to_string());
+    }
     if hunks_seen
         && !matches!(
             command,
@@ -1067,6 +1130,78 @@ fn resolve_task_role(
 
 /// `roles <root>`: print the effective roles (built-ins + project config)
 /// as JSON so the configured workspace is verifiable headless.
+/// Export the project's screenplay (M7): local Fountain or PDF artifact,
+/// never a canonical file. Prints one JSON record; the default output is
+/// `<root>/exports/<screenplay-stem>.<ext>`.
+fn run_export(root: &str, format: ExportFormat, out: Option<&str>) -> ExitCode {
+    let project = match narra_core::open_project(Path::new(root)) {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!("export fallido: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let manifest = project.manifest().clone();
+    let screenplay_path = manifest.default_screenplay_path.clone();
+    let source = match project.read_document(&screenplay_path) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("export fallido: no se pudo leer {screenplay_path}: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (bytes, pages) = match format {
+        ExportFormat::Fountain => (export::fountain(&manifest, &source).into_bytes(), None),
+        ExportFormat::Pdf => {
+            // Physical page count: body pages plus the title page (the
+            // source's own or the one synthesized from the manifest).
+            let body = export::pdf::layout(&source).pages.len();
+            let bytes = export::pdf::export(&manifest, &source);
+            (bytes, Some(body + 1))
+        }
+    };
+    let path = match out {
+        Some(out) => std::path::PathBuf::from(out),
+        None => {
+            let stem = Path::new(&screenplay_path)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "screenplay".to_string());
+            Path::new(root)
+                .join("exports")
+                .join(format!("{stem}.{}", format.extension()))
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "export fallido: no se pudo crear {}: {error}",
+            parent.display()
+        );
+        return ExitCode::from(1);
+    }
+    if let Err(error) = std::fs::write(&path, &bytes) {
+        eprintln!(
+            "export fallido: no se pudo escribir {}: {error}",
+            path.display()
+        );
+        return ExitCode::from(1);
+    }
+    let mut record = serde_json::json!({
+        "kind": "export",
+        "format": format.key(),
+        "out": path.display().to_string(),
+        "bytes": bytes.len(),
+        "source": screenplay_path,
+    });
+    if let Some(pages) = pages {
+        record["pages"] = serde_json::json!(pages);
+    }
+    println!("{record}");
+    ExitCode::SUCCESS
+}
+
 fn run_roles(root: &str) -> ExitCode {
     match roles::load_roles(Path::new(root)) {
         Ok(effective) => match serde_json::to_string_pretty(&effective) {
