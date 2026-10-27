@@ -92,6 +92,9 @@
 //!       agent panel when no search results are shown.
 //!       M9 slice 3 (gutter): line numbers in a fixed gutter, the caret's
 //!       line highlighted; click/caret/wrap math accounts for the gutter.
+//!       M9 slice 4 (explorer tree): folders first with indentation and
+//!       collapse toggles, file-type colors (fountain/markdown/yaml),
+//!       dirty dot on the open document, wheel scrolling; dump: `tree`.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -105,9 +108,11 @@
 
 mod agent_view;
 mod buffer;
+mod explorer;
 mod i18n;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::ops::Range;
@@ -122,6 +127,7 @@ use agent_view::{
     ProposeView, RetryTarget, retry_target,
 };
 use buffer::{Buffer, Position};
+use explorer::{FileKind, Row};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
@@ -882,6 +888,9 @@ struct Editor {
     project: Option<Project>,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
+    /// Folders the user collapsed in the explorer tree (M9 slice 4);
+    /// persists across document switches for the session.
+    collapsed: HashSet<String>,
     /// Document this buffer represents: project-relative path in project
     /// mode, fixture path in spike mode. The status bar shows it.
     doc_path: String,
@@ -2520,33 +2529,42 @@ impl Editor {
     /// Explorer click: load the selected document. Unsaved changes block the
     /// switch explicitly (save with ⌘S first) — editor state is never dropped
     /// silently, which is the M6 acceptance rule.
-    fn select_doc(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project) = self.project.clone() else {
-            return;
-        };
-        let Some(path) = self.explorer.get(ix).cloned() else {
-            return;
-        };
+    /// Open a document from the explorer tree (M9 slice 4). Same
+    /// clean-buffer gate as before, addressed by path now that folders and
+    /// files share the panel.
+    fn select_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         if path == self.doc_path {
             return;
         }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
         if self.dirty() {
             self.notice = Some(self.t("notice.dirty_switch").to_string());
             cx.notify();
             return;
         }
-        match project.read_document(&path) {
+        match project.read_document(path) {
             Ok(text) => {
-                self.load_document(path, text);
-                // A click re-targets typing (and IME composition) at the buffer.
+                self.load_document(path.to_string(), text);
+                // A click re-targets typing (and IME composition) at the
+                // buffer.
                 window.focus(&self.focus_handle(cx));
             }
             Err(error) => {
                 self.notice = Some(self.tf(
                     "notice.open_failed",
-                    &[("path", &path), ("error", &error.to_string())],
+                    &[("path", path), ("error", &error.to_string())],
                 ));
             }
+        }
+        cx.notify();
+    }
+
+    /// Collapse/expand a folder in the explorer tree (M9 slice 4).
+    fn toggle_folder(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path.to_string());
         }
         cx.notify();
     }
@@ -3908,6 +3926,7 @@ impl Editor {
             .flex()
             .flex_col()
             .overflow_hidden()
+            .overflow_y_scroll()
             .bg(rgb(EXPLORER_BG))
             .border_r_1()
             .border_color(rgb(EXPLORER_BORDER))
@@ -3961,6 +3980,7 @@ impl Editor {
             .h_full()
             .flex()
             .flex_col()
+            .overflow_y_scroll()
             .bg(rgb(EXPLORER_BG))
             .border_r_1()
             .border_color(rgb(EXPLORER_BORDER))
@@ -3972,23 +3992,46 @@ impl Editor {
                     .text_color(rgb(STATUS_FG))
                     .child(title),
             );
-        for (ix, path) in self.explorer.iter().enumerate() {
-            let selected = *path == self.doc_path;
+        // Tree rows (M9 slice 4): folders first, indented, collapsible;
+        // files colored by type and the open document marked/dirty-dotted.
+        let rows: Vec<Row> = explorer::build_rows(&self.explorer, &self.collapsed);
+        for (index, row) in rows.iter().enumerate() {
+            let selected = !row.is_dir && row.path == self.doc_path;
+            let label = if row.is_dir {
+                format!("{} {}", if row.collapsed { "▸" } else { "▾" }, row.name)
+            } else {
+                let dirty = selected && self.dirty();
+                format!("{}{}", row.name, if dirty { " •" } else { "" })
+            };
+            let color = if selected {
+                DEFAULT_FG
+            } else if row.is_dir {
+                STATUS_FG
+            } else {
+                kind_color(row.kind)
+            };
+            let path = row.path.clone();
+            let is_dir = row.is_dir;
             panel = panel.child(
                 div()
-                    .id(("doc", ix))
-                    .px_2()
+                    .id(("tree", index))
+                    .pl(px(8.0 + row.depth as f32 * 12.0))
+                    .pr_2()
                     .py_1()
                     .text_sm()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .text_color(rgb(color))
                     .cursor_pointer()
-                    .child(path.clone())
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.select_doc(ix, window, cx)),
-                    ),
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if is_dir {
+                            this.toggle_folder(&path, cx);
+                        } else {
+                            this.select_path(&path, window, cx);
+                        }
+                    })),
             );
         }
         // Document outline (M8 slice 3): the open document's scene headings.
@@ -4607,6 +4650,27 @@ impl Editor {
                 )
             })
             .collect();
+        let tree_rows: Vec<String> = explorer::build_rows(&self.explorer, &self.collapsed)
+            .iter()
+            .map(|row| {
+                let kind = match row.kind {
+                    FileKind::Fountain => "fountain",
+                    FileKind::Markdown => "markdown",
+                    FileKind::Yaml => "yaml",
+                    FileKind::Other => "other",
+                };
+                format!(
+                    "{{\"path\":\"{}\",\"name\":\"{}\",\"depth\":{},\"dir\":{},\
+                     \"collapsed\":{},\"kind\":\"{}\"}}",
+                    escape_json(&row.path),
+                    escape_json(&row.name),
+                    row.depth,
+                    row.is_dir,
+                    row.collapsed,
+                    kind,
+                )
+            })
+            .collect();
         let search_dump = format!(
             "{{\"open\":{},\"query\":\"{}\",\"searched\":\"{}\",\"hits\":{},\
              \"selected\":{},\"truncated\":{},\"scanned\":{},\"skipped\":{},\
@@ -4726,7 +4790,7 @@ impl Editor {
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
-                 \"outline\":[{}],\"lang\":\"{}\"}}"
+                 \"outline\":[{}],\"tree\":[{}],\"lang\":\"{}\"}}"
             ),
             self.buffer.line_count(),
             len,
@@ -4769,6 +4833,7 @@ impl Editor {
             export_dump,
             search_dump,
             outline_dump.join(","),
+            tree_rows.join(","),
             self.lang.key(),
         )
     }
@@ -4794,6 +4859,16 @@ fn gutter_element(ix: usize, active: bool) -> gpui::Div {
         .text_align(gpui::TextAlign::Right)
         .text_color(rgb(if active { STATUS_FG } else { GUTTER_FG }))
         .child(format!("{}", ix + 1))
+}
+
+/// Explorer file-type colors (M9 slice 4).
+fn kind_color(kind: FileKind) -> u32 {
+    match kind {
+        FileKind::Fountain => SCENE_FG,
+        FileKind::Markdown => CUE_FG,
+        FileKind::Yaml => TRANSITION_FG,
+        FileKind::Other => STATUS_FG,
+    }
 }
 
 fn escape_json(text: &str) -> String {
@@ -5760,6 +5835,7 @@ fn run() -> Result<(), String> {
             buffer,
             project,
             explorer,
+            collapsed: HashSet::new(),
             doc_path,
             base_text: content.clone(),
             saved_edits: 0,
