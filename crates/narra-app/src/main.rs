@@ -90,6 +90,8 @@
 //!       it, ⌘↑/↓ document start/end, RePág/AvPág; ⌥ arrows stay with the
 //!       proposal hunks while one is visible and ctrl-up/down scroll the
 //!       agent panel when no search results are shown.
+//!       M9 slice 3 (gutter): line numbers in a fixed gutter, the caret's
+//!       line highlighted; click/caret/wrap math accounts for the gutter.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -275,6 +277,10 @@ const EXPLORER_W: f32 = 220.0;
 const EXPLORER_BG: u32 = 0x252526;
 const EXPLORER_BORDER: u32 = 0x3c3c3c;
 const DOC_SELECTED_BG: u32 = 0x37373d;
+/// Line-number gutter (M9 slice 3): fixed column before the text.
+const GUTTER_W: f32 = 44.0;
+const GUTTER_FG: u32 = 0x6a6a6a;
+const ACTIVE_LINE_BG: u32 = 0x2a2a2e;
 /// Outline rows rendered in the explorer (M8 slice 3). The panel has no
 /// scrollbar yet; the remainder is reported as "… N more".
 const OUTLINE_VISIBLE_ROWS: usize = 120;
@@ -993,7 +999,8 @@ impl Editor {
                     .map(|g| (g.index, f32::from(g.position.x)))
             })
             .collect();
-        let wrap_width = f32::from((bounds.size.width - px(ROW_PADDING_X * 2.0)).max(px(0.0)));
+        let wrap_width =
+            f32::from((bounds.size.width - px(ROW_PADDING_X * 2.0 + GUTTER_W)).max(px(0.0)));
         let rows = wrap_row_starts(&glyphs, wrap_width);
         let visual_row =
             (((position.y - bounds.top()) / px(LINE_HEIGHT)).floor() as usize).min(rows.len() - 1);
@@ -1005,7 +1012,7 @@ impl Editor {
             .find(|(index, _)| *index >= rows[visual_row])
             .map(|(_, x)| *x)
             .unwrap_or(0.0);
-        let x = f32::from(position.x - bounds.left() - px(ROW_PADDING_X)) + row_start_x;
+        let x = f32::from(position.x - bounds.left() - px(ROW_PADDING_X + GUTTER_W)) + row_start_x;
         let col = shaped.closest_index_for_x(px(x)).min(text.len());
         // Snap down to a grapheme boundary: a combining mark's glyph index can
         // land inside one.
@@ -4269,10 +4276,12 @@ impl Editor {
         &self,
         window: &Window,
         base: gpui::Div,
+        ix: usize,
         text: &str,
         doc: Range<usize>,
         caret: usize,
     ) -> gpui::Div {
+        let active = self.buffer.position_at(caret).line == ix;
         let caret_col = (caret - doc.start).min(text.len());
         let wrap_w = f32::from(self.wrap_width);
         // The visual row comes from the pure geometry; the caret's x within
@@ -4283,8 +4292,8 @@ impl Editor {
         let (visual_row, _caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
         let starts = visual_row_starts(window, text, wrap_w);
 
-        // Build visual rows as a flex column.
-        let mut col = base.flex().flex_col().w(self.wrap_width);
+        // Build visual rows as a column inside the gutter row.
+        let mut col = div().flex().flex_col().w(self.wrap_width);
         for (row_idx, &start) in starts.iter().enumerate() {
             let end = starts.get(row_idx + 1).copied().unwrap_or(text.len());
             let segment_text = &text[start..end];
@@ -4317,7 +4326,7 @@ impl Editor {
             }
             col = col.child(row_div);
         }
-        col
+        base.flex().child(gutter_element(ix, active)).child(col)
     }
 
     /// One row of the virtualized list.
@@ -4333,6 +4342,7 @@ impl Editor {
 
         let doc = self.buffer.line_content_range(ix);
         let caret = self.caret();
+        let caret_line = self.buffer.position_at(caret).line;
         let selection = if self.selected.is_empty() {
             None
         } else {
@@ -4366,15 +4376,19 @@ impl Editor {
             .px_2()
             .font_family(FONT_FAMILY)
             .text_size(px(TEXT_SIZE))
-            .text_color(line_color(text));
+            .text_color(line_color(text))
+            .when(ix == caret_line, |row| row.bg(rgb(ACTIVE_LINE_BG)));
 
-        // Cold row: no caret/selection/IME/matches -> simple wrapped div.
+        // Cold row: no caret/selection/IME/matches -> gutter + wrapped text.
         if selection_here.is_none()
             && marked_here.is_none()
             && !caret_here
             && matches_here.is_empty()
         {
-            return base.w(self.wrap_width).child(text.clone());
+            return base
+                .flex()
+                .child(gutter_element(ix, ix == caret_line))
+                .child(div().w(self.wrap_width).child(text.clone()));
         }
 
         // Caret-only (no selection, no IME, no matches): wrap the line and
@@ -4385,14 +4399,15 @@ impl Editor {
             && matches_here.is_empty()
             && caret_here
         {
-            return self.render_caret_only_wrapped_row(window, base, text, doc, caret);
+            return self.render_caret_only_wrapped_row(window, base, ix, text, doc, caret);
         }
 
         let mut row = base
             .h(px(LINE_HEIGHT))
             .flex()
             .items_center()
-            .whitespace_nowrap();
+            .whitespace_nowrap()
+            .child(gutter_element(ix, ix == caret_line));
 
         let len = text.len();
         let mut cuts: Vec<usize> = vec![0, len];
@@ -4768,6 +4783,17 @@ fn cursor_element() -> gpui::Div {
     // The negative right margin keeps the cursor's flow width at zero so the
     // text after the caret is not pushed sideways.
     div().w(px(2.0)).mr(px(-2.0)).h_full().bg(rgb(CURSOR_FG))
+}
+
+/// Line-number gutter cell (M9 slice 3): fixed width, right-aligned digits.
+fn gutter_element(ix: usize, active: bool) -> gpui::Div {
+    div()
+        .w(px(GUTTER_W))
+        .flex_none()
+        .pr_2()
+        .text_align(gpui::TextAlign::Right)
+        .text_color(rgb(if active { STATUS_FG } else { GUTTER_FG }))
+        .child(format!("{}", ix + 1))
 }
 
 fn escape_json(text: &str) -> String {
@@ -5152,7 +5178,7 @@ impl Render for Editor {
             0.0
         };
         self.wrap_width = (window.viewport_size().width
-            - px(explorer_w + agent_w + ROW_PADDING_X * 2.0))
+            - px(explorer_w + agent_w + ROW_PADDING_X * 2.0 + GUTTER_W))
         .max(px(200.0));
 
         let status = self.status_text();
