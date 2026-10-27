@@ -118,6 +118,8 @@ mod buffer;
 mod explorer;
 mod i18n;
 mod new_file;
+mod new_project;
+mod recent;
 mod screenplay;
 
 use std::cell::RefCell;
@@ -125,7 +127,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -152,8 +154,9 @@ use narra_core::agent::{
 use narra_core::cancel::CancellationToken;
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
-use narra_core::{DocumentError, Project, ProjectError, open_project};
+use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
+use recent::RecentProjects;
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
@@ -249,8 +252,20 @@ actions!(
         DiscardBackup,
         // new documents (M10 slice 2)
         NewFile,
+        // projects (M10 slice 2b)
+        OpenProject,
+        NewProject,
+        ClearRecentProjects,
     ]
 );
+
+/// A recent-project menu item carrying its root. Menus construct it directly
+/// (`no_json`), so it never comes from a keymap and needs no serde surface.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = narra_app, no_json, no_register)]
+struct OpenRecentProject {
+    path: PathBuf,
+}
 
 /// Baseline line height. Wrapping (slice 3) makes non-hot rows variable-height
 /// (`list` measures each); this constant still sizes the caret, the hot-row
@@ -392,9 +407,13 @@ struct ExportState {
     error: String,
 }
 
-/// Message from the export worker thread into the view.
+/// Message from the export worker thread into the view. The generation
+/// discards an export that finished after the user switched projects.
 enum ExportMessage {
-    Done(Result<ExportOutcome, String>),
+    Done {
+        generation: u64,
+        result: Result<ExportOutcome, String>,
+    },
 }
 
 struct ExportOutcome {
@@ -427,9 +446,34 @@ struct NewFileState {
     error: String,
 }
 
-/// Message from the project-search worker thread.
+/// The New Project modal (M10 slice 2b): title, kind, primary language and
+/// the native save-panel phase. `picking` is true while the OS dialog owns
+/// the app; duplicate Creates cannot open two panels.
+#[derive(Debug)]
+struct NewProjectState {
+    title: String,
+    kind: ProjectType,
+    lang: Lang,
+    error: String,
+    picking: bool,
+}
+
+/// Snapshot of the dialog inputs handed to the async save-panel task: what
+/// the user saw when pressing Create decides the manifest, even if the modal
+/// is still on screen while the OS dialog runs.
+#[derive(Debug, Clone)]
+struct NewProjectDraft {
+    title: String,
+    kind: ProjectType,
+    lang: Lang,
+}
+
+/// Message from the project-search worker thread. The generation identifies
+/// the workspace the query started in: a result that lands after a project
+/// switch is discarded instead of populating the new workspace.
 enum SearchMessage {
     Done {
+        generation: u64,
         query: String,
         result: Result<narra_core::search::SearchReport, String>,
     },
@@ -904,6 +948,14 @@ struct Editor {
     debug_metrics: bool,
     /// The New File modal, when open (M10 slice 2).
     new_file: Option<NewFileState>,
+    /// The New Project modal, when open (M10 slice 2b).
+    new_project: Option<NewProjectState>,
+    /// Recent project roots, most recent first (M10 slice 2b).
+    recents: RecentProjects,
+    /// Bumped on every project switch; async search/export results carry the
+    /// generation they started with so stale work never touches the new
+    /// workspace.
+    workspace_generation: u64,
     scenes_dirty: bool,
     current_scene: usize,
 
@@ -972,6 +1024,10 @@ struct Editor {
     /// Cancellation token for the in-flight agent task (review or propose;
     /// one at a time, so cancellation stays unambiguous).
     agent_cancel: Option<CancellationToken>,
+    /// Bumped whenever a review/proposal run starts or the project changes;
+    /// a pump from an older run returns immediately, so a cancelled task
+    /// that finishes late cannot write into the new project.
+    agent_generation: u64,
     /// Adapter settings for agent tasks (from the `--agent-*` flags).
     agent_settings: AgentSettings,
     /// Proposal surface state (M6 slice 4). Pure reducer — see agent_view.
@@ -2049,6 +2105,7 @@ impl Editor {
             || self.propose_bar.open
             || self.focus_bar.open
             || self.new_file.is_some()
+            || self.new_project.is_some()
         {
             return;
         }
@@ -2089,6 +2146,10 @@ impl Editor {
     /// ⌘N / File → New File…: open the kind/name/format dialog; pressing it
     /// again closes it.
     fn on_new_file(&mut self, _: &NewFile, _window: &mut Window, cx: &mut Context<Self>) {
+        // One modal owns the keyboard at a time (M10 slice 2b).
+        if self.new_project.is_some() {
+            return;
+        }
         if self.new_file.is_some() {
             self.new_file = None;
             cx.notify();
@@ -2098,6 +2159,10 @@ impl Editor {
     }
 
     fn open_new_file(&mut self, cx: &mut Context<Self>) {
+        // The New Project dialog owns the workspace while it is open.
+        if self.new_project.is_some() {
+            return;
+        }
         if self.project.is_none() {
             self.notice = Some(self.t("notice.fixture_no_project").to_string());
             cx.notify();
@@ -2306,6 +2371,543 @@ impl Editor {
                             ),
                     ),
             )
+    }
+
+    // ---- projects (M10 slice 2b) -----------------------------------------
+
+    /// A project switch must never drop unsaved work or let an agent result
+    /// from the previous project land in the new one. Open dialogs and the
+    /// quit prompt also own the keyboard, so the menu cannot start a second
+    /// flow behind them.
+    fn can_switch_project(&mut self) -> bool {
+        if self.quit_prompt {
+            return false;
+        }
+        if self.new_file.is_some() || self.new_project.is_some() {
+            self.notice = Some(self.t("notice.finish_dialog").to_string());
+            return false;
+        }
+        if self.agent_cancel.is_some() {
+            self.notice = Some(self.t("notice.project_agent_running").to_string());
+            return false;
+        }
+        if self.project.is_some() && self.dirty() {
+            self.notice = Some(self.t("notice.dirty_project_switch").to_string());
+            return false;
+        }
+        true
+    }
+
+    /// ⌘O / File → Open Project…: native directory picker, then the core's
+    /// validated `open_project`. The receiver is awaited off the UI path; a
+    /// cancelled dialog changes nothing.
+    fn on_open_project(&mut self, _: &OpenProject, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_switch_project() {
+            cx.notify();
+            return;
+        }
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.t("dialog.open_project").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => Ok(paths.into_iter().next()),
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = view.update(cx, |view, cx| view.finish_open_project(picked, cx));
+        })
+        .detach();
+    }
+
+    fn finish_open_project(
+        &mut self,
+        picked: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match picked {
+            Ok(Some(path)) => self.open_project_path(&path, cx),
+            Ok(None) => {}
+            Err(error) => {
+                self.notice = Some(
+                    self.tf("notice.project_dialog_failed", &[("error", &error)])
+                        .to_string(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open a project by path (dialog or recent menu). Missing folders are
+    /// dropped from the recents list so a moved project does not linger.
+    fn open_project_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let root = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(current) = self.project.as_ref() {
+            let current =
+                fs::canonicalize(current.root()).unwrap_or_else(|_| current.root().to_path_buf());
+            if current == root {
+                self.notice = Some(self.t("notice.project_already_open").to_string());
+                return;
+            }
+        }
+        match open_project(&root) {
+            Ok(project) => {
+                if let Err(error) = self.install_project(project, cx) {
+                    self.notice = Some(self.tf(
+                        "notice.project_open_failed",
+                        &[("path", &root.display().to_string()), ("error", &error)],
+                    ));
+                }
+            }
+            Err(error) => {
+                let stale = matches!(
+                    error,
+                    ProjectError::NotFound(_) | ProjectError::NotADirectory(_)
+                );
+                if stale && self.recents.remove(&root) {
+                    self.recents.save();
+                    self.refresh_menus(cx);
+                }
+                self.notice = Some(self.tf(
+                    "notice.project_open_failed",
+                    &[
+                        ("path", &root.display().to_string()),
+                        ("error", &error.to_string()),
+                    ],
+                ));
+            }
+        }
+    }
+
+    /// Install a freshly opened project: read its default screenplay and
+    /// document list, then reset every surface that belonged to the previous
+    /// project. Reads happen before any state is touched, so a permission or
+    /// manifest problem leaves the current workspace intact.
+    fn install_project(
+        &mut self,
+        mut project: Project,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        // macOS may hand back `/var/...` while recents canonicalize to
+        // `/private/var/...`; keep the open project on the same canonical
+        // root so comparisons, recents and diagnostics agree.
+        let root =
+            fs::canonicalize(project.root()).unwrap_or_else(|_| project.root().to_path_buf());
+        if root != project.root() {
+            project = open_project(&root).map_err(|error| error.to_string())?;
+        }
+        let doc_path = project.manifest().default_screenplay_path.clone();
+        let title = project.manifest().title.clone();
+        let content = match project.read_document(&doc_path) {
+            Ok(text) => text,
+            // A project may legitimately have no screenplay file yet; the
+            // blank buffer saves through the same safe IO on ⌘S.
+            Err(ProjectError::Document(DocumentError::Io { source, .. }))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                String::new()
+            }
+            Err(error) => return Err(format!("{doc_path}: {error}")),
+        };
+        let explorer = project
+            .list_documents()
+            .map_err(|error| error.to_string())?;
+
+        self.workspace_generation += 1;
+        self.agent_generation += 1;
+        self.project = Some(project);
+        self.explorer = explorer;
+        self.collapsed.clear();
+        // Project-level surfaces never carry over: a review, proposal,
+        // search result or export belongs to the project that produced it.
+        self.export = ExportState::default();
+        self.search = SearchState::default();
+        self.agent = AgentState::new();
+        self.agent.lang = self.lang;
+        self.agent_cancel = None;
+        self.propose = ProposeView::new();
+        self.propose.lang = self.lang;
+        self.propose_bar = ProposeBar::default();
+        self.focus_bar = FocusBar::default();
+        self.review_focus.clear();
+        self.new_file = None;
+        self.quit_prompt = false;
+        self.backup_path = None;
+        self.backup_saved_at = None;
+        self.backup_error = None;
+        self.page_count = None;
+        self.pages_pending = false;
+        self.pages_requested_at = None;
+        self.load_document(doc_path, content);
+        // `load_document` clears the notice, so surface a newer recovery
+        // backup once more before the project-opened confirmation.
+        self.check_backup_notice();
+
+        self.recents.record(&root);
+        self.recents.save();
+        self.refresh_menus(cx);
+        if self.notice.is_none() {
+            self.notice = Some(self.tf(
+                "notice.project_opened",
+                &[("title", &title), ("path", &root.display().to_string())],
+            ));
+        }
+        Ok(())
+    }
+
+    /// File → Open Recent → <project>.
+    fn on_open_recent(
+        &mut self,
+        action: &OpenRecentProject,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_switch_project() {
+            cx.notify();
+            return;
+        }
+        self.open_project_path(&action.path, cx);
+        cx.notify();
+    }
+
+    fn on_clear_recents(
+        &mut self,
+        _: &ClearRecentProjects,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.recents.clear();
+        self.recents.save();
+        self.refresh_menus(cx);
+        self.notice = Some(self.t("notice.recents_cleared").to_string());
+        cx.notify();
+    }
+
+    /// ⇧⌘N / File → New Project…: toggle the title/kind/language dialog.
+    fn on_new_project(&mut self, _: &NewProject, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_project.is_some() {
+            if !self.new_project.as_ref().is_some_and(|state| state.picking) {
+                self.new_project = None;
+                cx.notify();
+            }
+            return;
+        }
+        if !self.can_switch_project() {
+            cx.notify();
+            return;
+        }
+        self.new_project = Some(NewProjectState {
+            title: String::new(),
+            kind: ProjectType::Feature,
+            lang: self.lang,
+            error: String::new(),
+            picking: false,
+        });
+        cx.notify();
+    }
+
+    fn set_new_project_error(&mut self, message: String) {
+        if let Some(state) = self.new_project.as_mut() {
+            state.error = message;
+        }
+    }
+
+    /// Starting directory for the save panel: next to the current project
+    /// when there is one, home otherwise.
+    fn default_project_dir(&self) -> PathBuf {
+        if let Some(project) = self.project.as_ref()
+            && let Some(parent) = project.root().parent()
+            && parent.is_dir()
+        {
+            return parent.to_path_buf();
+        }
+        recent::home_dir()
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Create in the modal: validate the title, then ask the OS for the
+    /// exact project folder with a save panel (suggested name included).
+    fn begin_new_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.new_project.as_ref() else {
+            return;
+        };
+        if state.picking {
+            return;
+        }
+        let Some(title) = new_project::clean_title(&state.title) else {
+            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
+            cx.notify();
+            return;
+        };
+        let Some(folder) = new_project::suggested_folder(&title) else {
+            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
+            cx.notify();
+            return;
+        };
+        let draft = NewProjectDraft {
+            title,
+            kind: state.kind,
+            lang: state.lang,
+        };
+        let start = self.default_project_dir();
+        let rx = cx.prompt_for_new_path(&start, Some(&folder));
+        if let Some(state) = self.new_project.as_mut() {
+            state.picking = true;
+            state.error.clear();
+        }
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let picked = match rx.await {
+                Ok(Ok(path)) => Ok(path),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.finish_new_project_path(draft, picked, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn finish_new_project_path(
+        &mut self,
+        draft: NewProjectDraft,
+        picked: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.new_project.as_mut() {
+            state.picking = false;
+        }
+        match picked {
+            Ok(None) => {}
+            Err(error) => {
+                let message = self.tf("newproject.dialog_failed", &[("error", &error)]);
+                self.set_new_project_error(message);
+            }
+            Ok(Some(path)) => {
+                if let Err(error) = new_project::check_destination(&path) {
+                    let message = match error {
+                        new_project::DestinationError::NotADirectory => {
+                            self.t("newproject.not_directory").to_string()
+                        }
+                        new_project::DestinationError::NotEmpty => {
+                            self.t("newproject.not_empty").to_string()
+                        }
+                    };
+                    self.set_new_project_error(message);
+                    cx.notify();
+                    return;
+                }
+                match create_project(&path, &draft.title, draft.kind, draft.lang.key()) {
+                    Ok(project) => match self.install_project(project, cx) {
+                        Ok(()) => {
+                            self.new_project = None;
+                        }
+                        Err(error) => {
+                            let message = self.tf("newproject.open_failed", &[("error", &error)]);
+                            self.set_new_project_error(message);
+                        }
+                    },
+                    Err(error) => {
+                        let message =
+                            self.tf("newproject.failed", &[("error", &error.to_string())]);
+                        self.set_new_project_error(message);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// New Project dialog: title, kind, primary language, then the native
+    /// destination panel. Enter opens the panel; Esc closes the dialog.
+    fn new_project_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.new_project.as_ref().expect("overlay only when open");
+        let mut kinds = div().flex().flex_wrap().gap_2();
+        for kind in new_project::TYPES {
+            let selected = kind == state.kind;
+            kinds = kinds.child(
+                div()
+                    .id(kind.as_str())
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        DEFAULT_FG
+                    } else {
+                        EXPLORER_BORDER
+                    }))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .cursor_pointer()
+                    .child(self.t(new_project::type_i18n_key(kind)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.new_project.as_mut()
+                            && !state.picking
+                        {
+                            state.kind = kind;
+                            state.error.clear();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut languages = div().flex().gap_2();
+        for lang in [Lang::En, Lang::Es] {
+            let selected = lang == state.lang;
+            languages = languages.child(
+                div()
+                    .id(lang.key())
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        DEFAULT_FG
+                    } else {
+                        EXPLORER_BORDER
+                    }))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .cursor_pointer()
+                    .child(lang.name())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.new_project.as_mut()
+                            && !state.picking
+                        {
+                            state.lang = lang;
+                            state.error.clear();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .child(
+                div()
+                    .w(px(600.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(0x252526))
+                    .border_1()
+                    .border_color(rgb(EXPLORER_BORDER))
+                    .child(
+                        div()
+                            .text_color(rgb(DEFAULT_FG))
+                            .child(self.t("newproject.title")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("newproject.name")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .bg(rgb(0x1e1e20))
+                                    .px_2()
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .child(format!("{}▌", state.title)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .pt_1()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("newproject.type")),
+                            )
+                            .child(kinds),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("newproject.language")),
+                            )
+                            .child(languages),
+                    )
+                    .child(div().text_color(rgb(STATUS_FG)).child(if state.picking {
+                        self.t("newproject.waiting")
+                    } else {
+                        self.t("newproject.hint")
+                    }))
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(AGENT_ERR_FG))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("new-project-create")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("newproject.create"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.begin_new_project(window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("new-project-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(STATUS_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("newproject.cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this
+                                            .new_project
+                                            .as_ref()
+                                            .is_some_and(|state| state.picking)
+                                        {
+                                            this.new_project = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// Rebuild the native menus with the current language and recents.
+    fn refresh_menus(&self, cx: &gpui::App) {
+        install_menus(self.lang, self.recents.paths(), cx);
     }
 
     // ---- live page count (M9 slice 7) ------------------------------------
@@ -2619,6 +3221,20 @@ impl Editor {
             cx.notify();
             return;
         }
+        // The New Project dialog owns its title field (M10 slice 2b).
+        if self.new_project.is_some() {
+            if let Some(state) = self.new_project.as_mut()
+                && !state.picking
+            {
+                if let Some(last) = state.title.chars().last() {
+                    let len = state.title.len();
+                    state.title.truncate(len - last.len_utf8());
+                }
+                state.error.clear();
+            }
+            cx.notify();
+            return;
+        }
         if self.find.open {
             self.find_backspace();
             cx.notify();
@@ -2693,6 +3309,12 @@ impl Editor {
         // The New File modal creates on enter (M10 slice 2).
         if self.new_file.is_some() {
             self.create_new_file(window, cx);
+            return;
+        }
+        // The New Project dialog asks the OS for the location on enter
+        // (M10 slice 2b).
+        if self.new_project.is_some() {
+            self.begin_new_project(window, cx);
             return;
         }
         // While the find bar owns keystrokes, enter means "next match" in the
@@ -3126,6 +3748,13 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.new_project.is_some() {
+            if !self.new_project.as_ref().is_some_and(|state| state.picking) {
+                self.new_project = None;
+            }
+            cx.notify();
+            return;
+        }
         if self.find.open {
             self.close_find(cx);
         } else if self.search.open {
@@ -3539,6 +4168,8 @@ impl Editor {
                 return;
             }
         };
+        self.agent_generation += 1;
+        let generation = self.agent_generation;
         self.agent.begin(scene_number, focus.clone());
         self.agent.role = role.id.clone();
         self.agent.role_source = role.origin_key().to_string();
@@ -3570,7 +4201,10 @@ impl Editor {
             };
             let _ = tx.send(AgentMessage::Done(result));
         });
-        Self::spawn_message_pump(cx, rx, |view, message| {
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            if generation != view.agent_generation {
+                return true;
+            }
             let done = matches!(message, AgentMessage::Done(_));
             view.apply_agent_message(message, done);
             done
@@ -3645,6 +4279,8 @@ impl Editor {
                 return;
             }
         };
+        self.agent_generation += 1;
+        let generation = self.agent_generation;
         self.propose.begin(scene_number, instruction.clone());
         self.propose.role = role.id.clone();
         self.propose.role_source = role.origin_key().to_string();
@@ -3690,7 +4326,10 @@ impl Editor {
             };
             let _ = tx.send(ProposeMessage::Done(result));
         });
-        Self::spawn_message_pump(cx, rx, |view, message| {
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            if generation != view.agent_generation {
+                return true;
+            }
             let done = matches!(message, ProposeMessage::Done(_));
             view.apply_propose_message(message, done);
             done
@@ -3729,8 +4368,8 @@ impl Editor {
         self.propose.lang = self.lang;
         self.notice = Some(self.tf("notice.lang", &[("lang", self.lang.name())]));
         // The native menus are localized too: rebuild them in the new
-        // language (M10 slice 1).
-        install_menus(self.lang, cx);
+        // language (M10 slice 1), keeping the current recents (M10 slice 2b).
+        self.refresh_menus(cx);
         cx.notify();
     }
 
@@ -3752,6 +4391,7 @@ impl Editor {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "screenplay".to_string());
         let text = self.full_text();
+        let generation = self.workspace_generation;
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -3770,10 +4410,13 @@ impl Editor {
                     pages: body + 1,
                 })
             })();
-            let _ = tx.send(ExportMessage::Done(result));
+            let _ = tx.send(ExportMessage::Done { generation, result });
         });
         Self::spawn_message_pump(cx, rx, |view, message| {
-            let ExportMessage::Done(result) = message;
+            let ExportMessage::Done { generation, result } = message;
+            if generation != view.workspace_generation {
+                return true;
+            }
             match result {
                 Ok(outcome) => {
                     view.export = ExportState {
@@ -3886,18 +4529,27 @@ impl Editor {
             cx.notify();
             return;
         };
+        let generation = self.workspace_generation;
         let (tx, rx) = mpsc::channel();
         let thread_query = query.clone();
         std::thread::spawn(move || {
             let result = narra_core::search::search(&project, &thread_query)
                 .map_err(|error| error.to_string());
             let _ = tx.send(SearchMessage::Done {
+                generation,
                 query: thread_query,
                 result,
             });
         });
         Self::spawn_message_pump(cx, rx, |view, message| {
-            let SearchMessage::Done { query, result } = message;
+            let SearchMessage::Done {
+                generation,
+                query,
+                result,
+            } = message;
+            if generation != view.workspace_generation {
+                return true;
+            }
             match result {
                 Ok(report) => {
                     view.search.selected = 0;
@@ -5460,6 +6112,33 @@ impl Editor {
             ),
             None => "{\"open\":false,\"kind\":\"\",\"name\":\"\",\"error\":\"\"}".to_string(),
         };
+        let new_project_dump = match &self.new_project {
+            Some(state) => format!(
+                "{{\"open\":true,\"title\":\"{}\",\"type\":\"{}\",\"lang\":\"{}\",\
+                 \"error\":\"{}\",\"picking\":{}}}",
+                escape_json(&state.title),
+                state.kind.as_str(),
+                state.lang.key(),
+                escape_json(&state.error),
+                state.picking,
+            ),
+            None => "{\"open\":false,\"title\":\"\",\"type\":\"\",\"lang\":\"\",\
+                     \"error\":\"\",\"picking\":false}"
+                .to_string(),
+        };
+        let project_dump = self
+            .project
+            .as_ref()
+            .map(|project| project.root().display().to_string())
+            .unwrap_or_default();
+        let recents_dump = self
+            .recents
+            .paths()
+            .iter()
+            .map(|path| format!("\"{}\"", escape_json(&path.display().to_string())))
+            .collect::<Vec<_>>()
+            .join(",");
+        let recents_error = self.recents.error().unwrap_or("").to_string();
         let tree_rows: Vec<String> = explorer::build_rows(&self.explorer, &self.collapsed)
             .iter()
             .map(|row| {
@@ -5601,7 +6280,9 @@ impl Editor {
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"new_file\":{},\
+                 \"new_file\":{},\"new_project\":{},\
+                 \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
+                 \"workspace\":{},\
                  \"backup\":{{\"path\":\"{}\",\"saved\":{},\"error\":\"{}\"}},\
                  \"lang\":\"{}\"}}"
             ),
@@ -5652,6 +6333,11 @@ impl Editor {
                 .unwrap_or_else(|| "null".to_string()),
             self.quit_prompt,
             new_file_dump,
+            new_project_dump,
+            escape_json(&project_dump),
+            recents_dump,
+            escape_json(&recents_error),
+            self.workspace_generation,
             escape_json(self.backup_path.as_deref().unwrap_or("")),
             self.backup_saved_at.is_some(),
             escape_json(self.backup_error.as_deref().unwrap_or("")),
@@ -5675,12 +6361,41 @@ fn cursor_element() -> gpui::Div {
 /// table and are rebuilt when the language toggles; items dispatch the same
 /// actions as the keybindings, and the shortcut column is resolved by the
 /// platform from the keymap.
-fn install_menus(lang: Lang, cx: &gpui::App) {
+fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
     let label = |key: &str| i18n::tr(lang, key);
     let menu = |key: &str, items: Vec<gpui::MenuItem>| gpui::Menu {
         name: label(key).into(),
         items,
     };
+    let mut file_items = vec![
+        gpui::MenuItem::action(label("menu.new_file"), NewFile),
+        gpui::MenuItem::action(label("menu.new_project"), NewProject),
+        gpui::MenuItem::action(label("menu.open_project"), OpenProject),
+    ];
+    if !recents.is_empty() {
+        let mut recent_items: Vec<gpui::MenuItem> = recents
+            .iter()
+            .map(|path| {
+                gpui::MenuItem::action(
+                    recent::display_path(path),
+                    OpenRecentProject { path: path.clone() },
+                )
+            })
+            .collect();
+        recent_items.push(gpui::MenuItem::separator());
+        recent_items.push(gpui::MenuItem::action(
+            label("menu.clear_recents"),
+            ClearRecentProjects,
+        ));
+        file_items.push(gpui::MenuItem::submenu(gpui::Menu {
+            name: label("menu.open_recent").into(),
+            items: recent_items,
+        }));
+    }
+    file_items.push(gpui::MenuItem::separator());
+    file_items.push(gpui::MenuItem::action(label("menu.save"), Save));
+    file_items.push(gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf));
+
     cx.set_menus(vec![
         menu(
             "menu.app",
@@ -5689,14 +6404,7 @@ fn install_menus(lang: Lang, cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.quit"), Quit),
             ],
         ),
-        menu(
-            "menu.file",
-            vec![
-                gpui::MenuItem::action(label("menu.new_file"), NewFile),
-                gpui::MenuItem::action(label("menu.save"), Save),
-                gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf),
-            ],
-        ),
+        menu("menu.file", file_items),
         menu(
             "menu.edit",
             vec![
@@ -5980,6 +6688,21 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
+        // The New Project dialog owns its title field (M10 slice 2b).
+        if self.new_project.is_some() {
+            let cleaned: String = new_text
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect();
+            if let Some(state) = self.new_project.as_mut()
+                && !state.picking
+            {
+                state.title.push_str(&cleaned);
+                state.error.clear();
+            }
+            cx.notify();
+            return;
+        }
         // Find bar owns keystrokes while open: typing, IME commits and
         // pastes land in the active field, never in the buffer.
         if self.find.open {
@@ -6217,6 +6940,11 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_discard_backup))
             // new documents (M10 slice 2)
             .on_action(cx.listener(Self::on_new_file))
+            // projects (M10 slice 2b)
+            .on_action(cx.listener(Self::on_open_project))
+            .on_action(cx.listener(Self::on_new_project))
+            .on_action(cx.listener(Self::on_open_recent))
+            .on_action(cx.listener(Self::on_clear_recents))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -6357,6 +7085,9 @@ impl Render for Editor {
             .when(self.quit_prompt, |root| root.child(self.quit_overlay(cx)))
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
+            })
+            .when(self.new_project.is_some(), |root| {
+                root.child(self.new_project_overlay(cx))
             })
     }
 }
@@ -6555,6 +7286,11 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let started = Instant::now();
 
+    // M10 slice 2b: the per-user recent list feeds File → Open Recent. A
+    // project opened through `--project` counts as opened and moves to the
+    // front before the first menu is installed.
+    let mut recents = RecentProjects::load();
+
     // M6 slice 1: `--project` goes through narra-core (validated manifest,
     // boundary-checked IO); `--fixture` is the untouched spike path.
     let project = match &args.project {
@@ -6564,6 +7300,10 @@ fn run() -> Result<(), String> {
         ),
         None => None,
     };
+    if let Some(project) = project.as_ref() {
+        recents.record(project.root());
+        recents.save();
+    }
 
     let (content, doc_path) = match &project {
         Some(project) => {
@@ -6697,6 +7437,10 @@ fn run() -> Result<(), String> {
             // new documents (M10 slice 2): ⌘N opens the kind/name/format
             // dialog; the file is created in the canonical folder.
             KeyBinding::new("cmd-n", NewFile, None),
+            // projects (M10 slice 2b): ⌘O picks a project folder; ⇧⌘N opens
+            // the new-project dialog (native save panel for the location).
+            KeyBinding::new("cmd-o", OpenProject, None),
+            KeyBinding::new("cmd-shift-n", NewProject, None),
             // editing
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", DeleteText, None),
@@ -6762,8 +7506,9 @@ fn run() -> Result<(), String> {
         .detach();
 
         // Native macOS menus (M10 slice 1), localized with the startup
-        // language and rebuilt by the ⌘⌥L toggle.
-        install_menus(lang, cx);
+        // language and rebuilt by the ⌘⌥L toggle. The recents submenu is
+        // part of the same rebuild (M10 slice 2b).
+        install_menus(lang, recents.paths(), cx);
 
         let buffer = Buffer::new(&content);
         let line_count = buffer.line_count();
@@ -6787,6 +7532,7 @@ fn run() -> Result<(), String> {
             search: SearchState::default(),
             agent: AgentState::new(),
             agent_cancel: None,
+            agent_generation: 0,
             agent_settings: agent_settings.clone(),
             propose: ProposeView::new(),
             propose_bar: ProposeBar::default(),
@@ -6818,6 +7564,9 @@ fn run() -> Result<(), String> {
             pages_generation: 0,
             debug_metrics: debug_metrics_flag,
             new_file: None,
+            new_project: None,
+            recents,
+            workspace_generation: 0,
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
