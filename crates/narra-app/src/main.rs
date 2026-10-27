@@ -890,7 +890,13 @@ struct Edit {
     composition: bool,
 }
 
-struct Editor {
+/// State owned by one open document (M10 S3a).
+///
+/// Everything here travels with a document when tabs arrive: content,
+/// selection, undo history, per-document scroll and derived caches, its
+/// recovery backup and its dirty revision. Project-level state (search,
+/// agent, explorer, notices, language) stays in [`Editor`].
+struct DocumentState {
     buffer: Buffer,
     /// Selection as a sorted doc-offset range; empty == caret only.
     selected: Range<usize>,
@@ -929,14 +935,11 @@ struct Editor {
     elements_parsed_at: Option<Instant>,
     /// A delayed re-render is already scheduled after a debounced edit.
     elements_timer: bool,
-    /// Autosave loop started (M9 slice 6).
-    autosave_started: bool,
     /// Last backup written for the open document, and its clock/error.
     backup_path: Option<String>,
     backup_saved_at: Option<Instant>,
     backup_error: Option<String>,
-    /// The unsaved-changes prompt is open (⌘Q with a dirty buffer).
-    quit_prompt: bool,
+
     /// Live page count (M9 slice 7): physical pages (body + title page),
     /// computed from the export layout in a worker thread.
     page_count: Option<usize>,
@@ -944,6 +947,102 @@ struct Editor {
     pages_pending: bool,
     pages_requested_at: Option<Instant>,
     pages_generation: u64,
+
+    scenes_dirty: bool,
+    current_scene: usize,
+
+    list_state: ListState,
+    /// Scroll state for the diff view (its own list, sized to the rows).
+    diff_list_state: ListState,
+
+    /// Find/replace bar (slice 3). While `open`, keystrokes route here
+    /// instead of the buffer (single-focus spike compromise).
+    find: FindState,
+
+    /// Unified diff view (slice 3, M1-3b). While `open`, it renders instead
+    /// of the buffer rows and the probe/diff navigation takes over.
+    diff: DiffState,
+
+    /// Document this buffer represents: project-relative path in project
+    /// mode, fixture path in spike mode. The status bar shows it.
+    path: String,
+    /// File text as last loaded or saved. Dirty is a per-document revision
+    /// comparison (O(1)) rather than a scan of the document; the status bar
+    /// reads it every frame.
+    base_text: String,
+    /// Edit generation for this document and the generation at its last
+    /// load/save. `revision != saved_revision` means dirty. Each document
+    /// owns its pair, so saving one tab never cleans another (S3).
+    revision: u64,
+    saved_revision: u64,
+}
+
+impl DocumentState {
+    /// Fresh document state: loaded text is the canonical base and there are
+    /// no unsaved edits. Everything else starts empty; derived caches are
+    /// marked dirty so the first render builds them for this document.
+    fn new(path: String, text: &str) -> Self {
+        let buffer = Buffer::new(text);
+        let line_count = buffer.line_count();
+        Self {
+            buffer,
+            selected: 0..0,
+            reversed: false,
+            marked: None,
+            composing: false,
+            dragging: None,
+            last_click: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            scene_lines: Vec::new(),
+            outline: Vec::new(),
+            element_kinds: Vec::new(),
+            elements_dirty: true,
+            elements_parsed_at: None,
+            elements_timer: false,
+            backup_path: None,
+            backup_saved_at: None,
+            backup_error: None,
+            page_count: None,
+            pages_dirty: true,
+            pages_pending: false,
+            pages_requested_at: None,
+            pages_generation: 0,
+            scenes_dirty: true,
+            current_scene: 0,
+            list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
+            diff_list_state: ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
+            find: FindState::default(),
+            diff: DiffState {
+                base_lines: text.split('\n').map(str::to_string).collect(),
+                ..DiffState::default()
+            },
+            path,
+            base_text: text.to_string(),
+            revision: 0,
+            saved_revision: 0,
+        }
+    }
+
+    /// Dirty is per document: saving or loading one document snapshots only
+    /// its own revision pair.
+    fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+}
+
+/// The workspace: project-level state plus the active document (S3a).
+///
+/// The document lives in one field so the tab refactor can later hold a
+/// vector of `DocumentState`s and swap the active one without touching the
+/// project-level surfaces.
+struct Editor {
+    doc: DocumentState,
+
+    /// Autosave loop started (M9 slice 6).
+    autosave_started: bool,
+    /// The unsaved-changes prompt is open (⌘Q with a dirty buffer).
+    quit_prompt: bool,
     /// Append the performance metrics to the status bar (--debug-metrics).
     debug_metrics: bool,
     /// The New File modal, when open (M10 slice 2).
@@ -956,12 +1055,7 @@ struct Editor {
     /// generation they started with so stale work never touches the new
     /// workspace.
     workspace_generation: u64,
-    scenes_dirty: bool,
-    current_scene: usize,
 
-    list_state: ListState,
-    /// Scroll state for the diff view (its own list, sized to the rows).
-    diff_list_state: ListState,
     focus_handle: FocusHandle,
     /// Wrap width for non-hot rows, refreshed from the viewport each frame and
     /// read by the `list` render callback (which reaches the editor via the
@@ -984,14 +1078,6 @@ struct Editor {
     /// Total diff steps requested (detects the seeding first step).
     diff_probe_total: usize,
 
-    /// Find/replace bar (slice 3). While `open`, keystrokes route here
-    /// instead of the buffer (single-focus spike compromise).
-    find: FindState,
-
-    /// Unified diff view (slice 3, M1-3b). While `open`, it renders instead
-    /// of the buffer rows and the probe/diff navigation takes over.
-    diff: DiffState,
-
     /// Open Narra project (M6 slice 1). `None` in `--fixture` spike mode,
     /// which keeps the verified spike surface unchanged.
     project: Option<Project>,
@@ -1000,16 +1086,6 @@ struct Editor {
     /// Folders the user collapsed in the explorer tree (M9 slice 4);
     /// persists across document switches for the session.
     collapsed: HashSet<String>,
-    /// Document this buffer represents: project-relative path in project
-    /// mode, fixture path in spike mode. The status bar shows it.
-    doc_path: String,
-    /// File text as last loaded or saved. The dirty flag compares the edit
-    /// generation instead of scanning the document, because the status bar
-    /// reads it every frame (O(1), no per-frame allocation).
-    base_text: String,
-    /// Value of `metrics.edits` at the last load/save: `edits != saved_edits`
-    /// means the buffer diverged (every mutation path bumps `metrics.edits`).
-    saved_edits: usize,
     /// Last user-visible outcome (save/open/blocked switch). Display only.
     notice: Option<String>,
     /// UI language (M6 slice 9): every string the workspace displays is
@@ -1049,33 +1125,33 @@ impl Focusable for Editor {
 
 impl Editor {
     fn caret(&self) -> usize {
-        if self.reversed {
-            self.selected.start
+        if self.doc.reversed {
+            self.doc.selected.start
         } else {
-            self.selected.end
+            self.doc.selected.end
         }
     }
 
     fn set_caret(&mut self, target: usize, extend: bool) {
         if extend {
-            if self.reversed {
-                self.selected.start = target;
-                if self.selected.start > self.selected.end {
-                    let (start, end) = (self.selected.end, self.selected.start);
-                    self.selected = start..end;
-                    self.reversed = false;
+            if self.doc.reversed {
+                self.doc.selected.start = target;
+                if self.doc.selected.start > self.doc.selected.end {
+                    let (start, end) = (self.doc.selected.end, self.doc.selected.start);
+                    self.doc.selected = start..end;
+                    self.doc.reversed = false;
                 }
             } else {
-                self.selected.end = target;
-                if self.selected.end < self.selected.start {
-                    let (start, end) = (self.selected.end, self.selected.start);
-                    self.selected = start..end;
-                    self.reversed = true;
+                self.doc.selected.end = target;
+                if self.doc.selected.end < self.doc.selected.start {
+                    let (start, end) = (self.doc.selected.end, self.doc.selected.start);
+                    self.doc.selected = start..end;
+                    self.doc.reversed = true;
                 }
             }
         } else {
-            self.selected = target..target;
-            self.reversed = false;
+            self.doc.selected = target..target;
+            self.doc.reversed = false;
         }
     }
 
@@ -1088,8 +1164,8 @@ impl Editor {
     /// by the scroll position; it runs once per click, never per frame.
     fn offset_for_point(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
         let mut best: Option<(usize, Bounds<Pixels>)> = None;
-        for ix in 0..self.buffer.line_count() {
-            let Some(bounds) = self.list_state.bounds_for_item(ix) else {
+        for ix in 0..self.doc.buffer.line_count() {
+            let Some(bounds) = self.doc.list_state.bounds_for_item(ix) else {
                 continue;
             };
             if bounds.top() > position.y {
@@ -1104,10 +1180,10 @@ impl Editor {
         // Below the last measured row: clamp to that row's content end (the
         // last line's end is the document end).
         if position.y >= bounds.bottom() {
-            return Some(self.buffer.line_content_range(line).end);
+            return Some(self.doc.buffer.line_content_range(line).end);
         }
-        let text = &self.buffer.lines()[line];
-        let start = self.buffer.line_content_range(line).start;
+        let text = &self.doc.buffer.lines()[line];
+        let start = self.doc.buffer.line_content_range(line).start;
         if text.is_empty() {
             return Some(start);
         }
@@ -1139,13 +1215,13 @@ impl Editor {
         // Snap down to a grapheme boundary: a combining mark's glyph index can
         // land inside one.
         let offset = start + col;
-        let snapped = self.buffer.prev_boundary(offset);
-        let offset = if self.buffer.next_boundary(snapped) == offset {
+        let snapped = self.doc.buffer.prev_boundary(offset);
+        let offset = if self.doc.buffer.next_boundary(snapped) == offset {
             offset
         } else {
             snapped
         };
-        Some(offset.min(self.buffer.doc_len()))
+        Some(offset.min(self.doc.buffer.doc_len()))
     }
 
     /// Click-to-caret (Spike B): a plain click moves the caret, shift-click
@@ -1160,7 +1236,7 @@ impl Editor {
         // Record debug for every left click (even on diff), so the dump shows
         // what coordinates the handler received and what it resolved.
         if event.button == MouseButton::Left {
-            self.last_click = Some((
+            self.doc.last_click = Some((
                 f32::from(event.position.x),
                 f32::from(event.position.y),
                 None,
@@ -1169,21 +1245,21 @@ impl Editor {
                 None,
             ));
         }
-        if self.diff.open || event.button != MouseButton::Left {
+        if self.doc.diff.open || event.button != MouseButton::Left {
             return;
         }
         let Some(offset) = self.offset_for_point(event.position, window) else {
             return;
         };
         // Update debug with resolved line and bounds.
-        let pos = self.buffer.position_at(offset);
+        let pos = self.doc.buffer.position_at(offset);
         let line = pos.line;
-        let bounds = self.list_state.bounds_for_item(line);
+        let bounds = self.doc.list_state.bounds_for_item(line);
         let (item_top, item_h) = match bounds {
             Some(b) => (Some(f32::from(b.top())), f32::from(b.size.height)),
             None => (None, 0.0),
         };
-        self.last_click = Some((
+        self.doc.last_click = Some((
             f32::from(event.position.x),
             f32::from(event.position.y),
             Some(line),
@@ -1195,18 +1271,18 @@ impl Editor {
         // a plain click moves the caret and arms the drag anchor.
         match event.click_count {
             2 => {
-                self.selected = self.buffer.word_range_at(offset);
-                self.reversed = false;
-                self.dragging = Some(offset);
+                self.doc.selected = self.doc.buffer.word_range_at(offset);
+                self.doc.reversed = false;
+                self.doc.dragging = Some(offset);
             }
             count if count >= 3 => {
-                self.selected = self.buffer.line_range_at(offset);
-                self.reversed = false;
-                self.dragging = Some(offset);
+                self.doc.selected = self.doc.buffer.line_range_at(offset);
+                self.doc.reversed = false;
+                self.doc.dragging = Some(offset);
             }
             _ => {
                 self.set_caret(offset, event.modifiers.shift);
-                self.dragging = if event.modifiers.shift {
+                self.doc.dragging = if event.modifiers.shift {
                     None
                 } else {
                     Some(offset)
@@ -1228,28 +1304,28 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.diff.open || event.pressed_button != Some(MouseButton::Left) {
+        if self.doc.diff.open || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        let Some(anchor) = self.dragging else {
+        let Some(anchor) = self.doc.dragging else {
             return;
         };
-        let viewport = self.list_state.viewport_bounds();
+        let viewport = self.doc.list_state.viewport_bounds();
         let edge = px(LINE_HEIGHT);
         if event.position.y < viewport.top() + edge {
-            self.list_state.scroll_by(px(-LINE_HEIGHT));
+            self.doc.list_state.scroll_by(px(-LINE_HEIGHT));
         } else if event.position.y > viewport.bottom() - edge {
-            self.list_state.scroll_by(px(LINE_HEIGHT));
+            self.doc.list_state.scroll_by(px(LINE_HEIGHT));
         }
         let Some(offset) = self.offset_for_point(event.position, window) else {
             return;
         };
         if offset >= anchor {
-            self.selected = anchor..offset;
-            self.reversed = false;
+            self.doc.selected = anchor..offset;
+            self.doc.reversed = false;
         } else {
-            self.selected = offset..anchor;
-            self.reversed = true;
+            self.doc.selected = offset..anchor;
+            self.doc.reversed = true;
         }
         cx.notify();
     }
@@ -1261,7 +1337,7 @@ impl Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        self.dragging = None;
+        self.doc.dragging = None;
     }
 
     /// Keep the `list` item count in sync with the buffer after an edit that
@@ -1269,60 +1345,62 @@ impl Editor {
     /// `start_offset`. Uses `splice`, not `reset`, so the scroll position is
     /// preserved across keystrokes (reset would jump to the top).
     fn splice_for_edit(&self, start_offset: usize, deleted: &str, inserted: &str) {
-        let start_line = self.buffer.position_at(start_offset).line;
+        let start_line = self.doc.buffer.position_at(start_offset).line;
         let old_span = deleted.matches('\n').count() + 1;
         let new_span = inserted.matches('\n').count() + 1;
-        self.list_state
+        self.doc
+            .list_state
             .splice(start_line..start_line + old_span, new_span);
     }
 
     fn clamp(&self, range: Range<usize>) -> Range<usize> {
-        let len = self.buffer.doc_len();
+        let len = self.doc.buffer.doc_len();
         let start = range.start.min(len);
         let end = range.end.min(len).max(start);
         start..end
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.buffer.utf16_to_offset(range.start)..self.buffer.utf16_to_offset(range.end)
+        self.doc.buffer.utf16_to_offset(range.start)..self.doc.buffer.utf16_to_offset(range.end)
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.buffer.offset_to_utf16(range.start)..self.buffer.offset_to_utf16(range.end)
+        self.doc.buffer.offset_to_utf16(range.start)..self.doc.buffer.offset_to_utf16(range.end)
     }
 
     /// Apply an edit, record undo state, move the caret after the inserted
     /// text and invalidate the derived scene index.
     fn apply_edit(&mut self, range: Range<usize>, text: &str) -> Range<usize> {
         let start = range.start;
-        let (inserted, deleted) = self.buffer.replace(range.clone(), text);
+        let (inserted, deleted) = self.doc.buffer.replace(range.clone(), text);
         self.splice_for_edit(start, &deleted, text);
         self.metrics.borrow_mut().edits += 1;
+        self.doc.revision = self.doc.revision.saturating_add(1);
         // Undo bookkeeping goes through `record_edit` so IME composition
         // updates collapse into the single open entry (one undo per session).
         record_edit(
-            &mut self.undo_stack,
-            self.composing,
+            &mut self.doc.undo_stack,
+            self.doc.composing,
             range,
             inserted.clone(),
             text,
             deleted,
         );
         const MAX_UNDO: usize = 5000;
-        if self.undo_stack.len() > MAX_UNDO {
-            self.undo_stack.remove(0);
+        if self.doc.undo_stack.len() > MAX_UNDO {
+            self.doc.undo_stack.remove(0);
         }
-        self.redo_stack.clear();
-        self.selected = inserted.end..inserted.end;
-        self.reversed = false;
-        self.marked = None;
-        self.scenes_dirty = true;
-        self.elements_dirty = true;
-        self.pages_dirty = true;
-        self.pages_generation += 1;
+        self.doc.redo_stack.clear();
+        self.doc.selected = inserted.end..inserted.end;
+        self.doc.reversed = false;
+        self.doc.marked = None;
+        self.doc.scenes_dirty = true;
+        self.doc.elements_dirty = true;
+        self.doc.pages_dirty = true;
+        self.doc.pages_generation += 1;
         // Offsets shifted: keep find matches valid (silent — edits are not
         // query submissions and must not pollute the search baseline).
-        if self.find.open {
+        if self.doc.find.open {
             self.refresh_matches(false);
         }
         inserted
@@ -1330,28 +1408,29 @@ impl Editor {
 
     fn after_history_edit(&mut self, caret: usize) {
         self.metrics.borrow_mut().edits += 1;
-        self.selected = caret..caret;
-        self.reversed = false;
-        self.marked = None;
-        self.composing = false;
-        self.scenes_dirty = true;
-        self.elements_dirty = true;
-        self.pages_dirty = true;
-        self.pages_generation += 1;
-        if self.find.open {
+        self.doc.revision = self.doc.revision.saturating_add(1);
+        self.doc.selected = caret..caret;
+        self.doc.reversed = false;
+        self.doc.marked = None;
+        self.doc.composing = false;
+        self.doc.scenes_dirty = true;
+        self.doc.elements_dirty = true;
+        self.doc.pages_dirty = true;
+        self.doc.pages_generation += 1;
+        if self.doc.find.open {
             self.refresh_matches(false);
         }
     }
 
     fn undo(&mut self) {
-        let Some(edit) = self.undo_stack.pop() else {
+        let Some(edit) = self.doc.undo_stack.pop() else {
             return;
         };
         let inserted = edit.range.start..edit.range.start + edit.new_text.len();
         let start = inserted.start;
-        let (restored, deleted) = self.buffer.replace(inserted, &edit.old_text);
+        let (restored, deleted) = self.doc.buffer.replace(inserted, &edit.old_text);
         self.splice_for_edit(start, &deleted, &edit.old_text);
-        self.redo_stack.push(Edit {
+        self.doc.redo_stack.push(Edit {
             range: restored.clone(),
             new_text: edit.old_text.clone(),
             old_text: deleted,
@@ -1361,14 +1440,14 @@ impl Editor {
     }
 
     fn redo(&mut self) {
-        let Some(edit) = self.redo_stack.pop() else {
+        let Some(edit) = self.doc.redo_stack.pop() else {
             return;
         };
         let current = edit.range.start..edit.range.start + edit.new_text.len();
         let start = current.start;
-        let (restored, deleted) = self.buffer.replace(current, &edit.old_text);
+        let (restored, deleted) = self.doc.buffer.replace(current, &edit.old_text);
         self.splice_for_edit(start, &deleted, &edit.old_text);
-        self.undo_stack.push(Edit {
+        self.doc.undo_stack.push(Edit {
             range: restored.clone(),
             new_text: edit.old_text.clone(),
             old_text: deleted,
@@ -1378,10 +1457,11 @@ impl Editor {
     }
 
     fn refresh_scenes(&mut self) {
-        if !self.scenes_dirty {
+        if !self.doc.scenes_dirty {
             return;
         }
-        self.outline = self
+        self.doc.outline = self
+            .doc
             .buffer
             .lines()
             .iter()
@@ -1389,8 +1469,8 @@ impl Editor {
             .filter(|(_, line)| is_scene_heading(line))
             .map(|(ix, line)| (ix, line.trim().to_string()))
             .collect();
-        self.scene_lines = self.outline.iter().map(|(line, _)| *line).collect();
-        self.scenes_dirty = false;
+        self.doc.scene_lines = self.doc.outline.iter().map(|(line, _)| *line).collect();
+        self.doc.scenes_dirty = false;
     }
 
     /// Refresh the line classification for the screenplay highlighting (M9
@@ -1399,23 +1479,23 @@ impl Editor {
     /// the previous classification stays visible for 150 ms and a delayed
     /// render recomputes once typing pauses.
     fn refresh_element_kinds(&mut self, cx: &mut Context<Self>) {
-        if !self.elements_dirty {
+        if !self.doc.elements_dirty {
             return;
         }
         let now = Instant::now();
         let wait = Duration::from_millis(150);
-        if let Some(last) = self.elements_parsed_at {
+        if let Some(last) = self.doc.elements_parsed_at {
             let elapsed = now.duration_since(last);
             if elapsed < wait {
-                if !self.elements_timer {
-                    self.elements_timer = true;
+                if !self.doc.elements_timer {
+                    self.doc.elements_timer = true;
                     let entity = cx.entity();
                     let remaining = wait - elapsed;
                     cx.spawn(async move |_, cx| {
                         Timer::after(remaining).await;
                         entity
                             .update(cx, |view, cx| {
-                                view.elements_timer = false;
+                                view.doc.elements_timer = false;
                                 view.refresh_element_kinds(cx);
                                 cx.notify();
                             })
@@ -1426,31 +1506,31 @@ impl Editor {
                 return;
             }
         }
-        let text = self.buffer.slice(0..self.buffer.doc_len());
-        let mut kinds = vec![FountainKind::Action; self.buffer.line_count()];
+        let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
+        let mut kinds = vec![FountainKind::Action; self.doc.buffer.line_count()];
         for element in narra_core::fountain::parse(&text) {
             if element.line_number >= 1 && element.line_number <= kinds.len() {
                 kinds[element.line_number - 1] = element.kind;
             }
         }
-        self.element_kinds = kinds;
-        self.elements_dirty = false;
-        self.elements_parsed_at = Some(now);
+        self.doc.element_kinds = kinds;
+        self.doc.elements_dirty = false;
+        self.doc.elements_parsed_at = Some(now);
     }
 
     fn jump(&mut self, direction: i64) {
         self.refresh_scenes();
-        if self.scene_lines.is_empty() {
+        if self.doc.scene_lines.is_empty() {
             return;
         }
-        let len = self.scene_lines.len() as i64;
-        let next = (self.current_scene as i64 + direction).rem_euclid(len);
-        self.current_scene = next as usize;
-        let line = self.scene_lines[self.current_scene];
-        self.list_state.scroll_to_reveal_item(line);
-        let offset = self.buffer.offset_at(Position { line, col: 0 });
-        self.selected = offset..offset;
-        self.reversed = false;
+        let len = self.doc.scene_lines.len() as i64;
+        let next = (self.doc.current_scene as i64 + direction).rem_euclid(len);
+        self.doc.current_scene = next as usize;
+        let line = self.doc.scene_lines[self.doc.current_scene];
+        self.doc.list_state.scroll_to_reveal_item(line);
+        let offset = self.doc.buffer.offset_at(Position { line, col: 0 });
+        self.doc.selected = offset..offset;
+        self.doc.reversed = false;
     }
 
     /// One probe step: jump to the next scene and request a frame.
@@ -1460,11 +1540,11 @@ impl Editor {
     /// (observed in both debug and release, 2026-10-21).
     fn advance_probe(&mut self, cx: &mut Context<Self>) {
         self.refresh_scenes();
-        if self.scene_lines.is_empty() {
+        if self.doc.scene_lines.is_empty() {
             return;
         }
-        let target_line = self.scene_lines[self.probe_cursor % self.scene_lines.len()];
-        self.list_state.scroll_to_reveal_item(target_line);
+        let target_line = self.doc.scene_lines[self.probe_cursor % self.doc.scene_lines.len()];
+        self.doc.list_state.scroll_to_reveal_item(target_line);
         self.probe_cursor += 1;
         self.probe_left = self.probe_left.saturating_sub(1);
 
@@ -1493,13 +1573,13 @@ impl Editor {
             // machinery (query a common word, swap every match) rather than a
             // bespoke edit, so the seeded change is produced by the same code
             // a user drives. `INT.` matches ~778 scene headings.
-            self.find.query = "INT.".to_string();
-            self.find.replacement = "CENA.".to_string();
+            self.doc.find.query = "INT.".to_string();
+            self.doc.find.replacement = "CENA.".to_string();
             self.refresh_matches(false);
             self.replace_all(cx);
         }
 
-        if self.diff.open {
+        if self.doc.diff.open {
             self.close_diff(cx);
         } else {
             self.open_diff(cx);
@@ -1546,27 +1626,27 @@ impl Editor {
     }
 
     fn ensure_caret_visible(&mut self) {
-        let line = self.buffer.position_at(self.caret()).line;
-        self.list_state.scroll_to_reveal_item(line);
+        let line = self.doc.buffer.position_at(self.caret()).line;
+        self.doc.list_state.scroll_to_reveal_item(line);
     }
 
     // ---- caret movement -------------------------------------------------
 
     fn move_horiz(&mut self, direction: i64, extend: bool) {
-        if !extend && !self.selected.is_empty() {
+        if !extend && !self.doc.selected.is_empty() {
             let target = if direction < 0 {
-                self.selected.start
+                self.doc.selected.start
             } else {
-                self.selected.end
+                self.doc.selected.end
             };
             self.set_caret(target, false);
             return;
         }
         let caret = self.caret();
         let target = if direction < 0 {
-            self.buffer.prev_boundary(caret)
+            self.doc.buffer.prev_boundary(caret)
         } else {
-            self.buffer.next_boundary(caret)
+            self.doc.buffer.next_boundary(caret)
         };
         self.set_caret(target, extend);
     }
@@ -1576,9 +1656,9 @@ impl Editor {
     /// total_visual_rows is the number of visual rows the line wraps to.
     /// caret_x is the x-offset within the visual row where the caret sits.
     fn caret_visual_info(&self, window: &Window, caret: usize) -> (usize, usize, f32) {
-        let pos = self.buffer.position_at(caret);
+        let pos = self.doc.buffer.position_at(caret);
         let line = pos.line;
-        let text = &self.buffer.lines()[line];
+        let text = &self.doc.buffer.lines()[line];
         let caret_col = pos.col;
         let wrap_w = f32::from(self.wrap_width);
         let (visual_row, caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
@@ -1595,13 +1675,13 @@ impl Editor {
         caret_x: f32,
         window: &Window,
     ) -> usize {
-        let pos = self.buffer.position_at(caret);
+        let pos = self.doc.buffer.position_at(caret);
         let line = pos.line;
-        let text = &self.buffer.lines()[line];
+        let text = &self.doc.buffer.lines()[line];
         let wrap_w = f32::from(self.wrap_width);
         let starts = visual_row_starts(window, text, wrap_w);
         if target_visual_row >= starts.len() {
-            return self.buffer.line_content_range(line).end;
+            return self.doc.buffer.line_content_range(line).end;
         }
         let row_start = starts[target_visual_row];
         let row_end = starts
@@ -1630,8 +1710,8 @@ impl Editor {
             .map(|(ix, _)| *ix)
             .unwrap_or(row_text.len())
             .min(row_text.len());
-        (self.buffer.line_content_range(line).start + starts[target_visual_row] + col)
-            .min(self.buffer.doc_len())
+        (self.doc.buffer.line_content_range(line).start + starts[target_visual_row] + col)
+            .min(self.doc.buffer.doc_len())
     }
 
     fn move_vert(&mut self, delta: i64, extend: bool, window: &Window) {
@@ -1661,23 +1741,23 @@ impl Editor {
             }
         }
         // Not on a wrapped line, or at boundary of wrapped line: use logical line navigation
-        let target = self.buffer.vertical(caret, delta);
+        let target = self.doc.buffer.vertical(caret, delta);
         self.set_caret(target, extend);
     }
 
     fn move_line_edge(&mut self, to_start: bool, extend: bool) {
         let caret = self.caret();
         let target = if to_start {
-            self.buffer.line_start(caret)
+            self.doc.buffer.line_start(caret)
         } else {
-            self.buffer.line_end(caret)
+            self.doc.buffer.line_end(caret)
         };
         self.set_caret(target, extend);
     }
 
     fn select_all(&mut self) {
-        self.selected = 0..self.buffer.doc_len();
-        self.reversed = false;
+        self.doc.selected = 0..self.doc.buffer.doc_len();
+        self.doc.reversed = false;
     }
 
     // ---- action handlers -------------------------------------------------
@@ -1686,11 +1766,11 @@ impl Editor {
         // With the find bar open, cmd-g/shift-g navigate matches (same
         // shortcuts the scene jump uses when it is closed); with the diff
         // view open they walk its hunks.
-        if self.diff.open {
+        if self.doc.diff.open {
             self.diff_move_cursor(1, cx);
             return;
         }
-        if self.find.open {
+        if self.doc.find.open {
             self.next_match(cx);
             return;
         }
@@ -1699,11 +1779,11 @@ impl Editor {
     }
 
     fn prev_scene(&mut self, _: &PrevScene, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff.open {
+        if self.doc.diff.open {
             self.diff_move_cursor(-1, cx);
             return;
         }
-        if self.find.open {
+        if self.doc.find.open {
             self.prev_match(cx);
             return;
         }
@@ -1794,20 +1874,20 @@ impl Editor {
     /// option arrows belong to it (the visible panel wins, same rule as the
     /// other panel actions); otherwise they move by words in the buffer.
     fn move_word(&mut self, direction: i64, extend: bool) {
-        if !extend && !self.selected.is_empty() {
+        if !extend && !self.doc.selected.is_empty() {
             let target = if direction < 0 {
-                self.selected.start
+                self.doc.selected.start
             } else {
-                self.selected.end
+                self.doc.selected.end
             };
             self.set_caret(target, false);
             return;
         }
         let caret = self.caret();
         let target = if direction < 0 {
-            self.buffer.word_left(caret)
+            self.doc.buffer.word_left(caret)
         } else {
-            self.buffer.word_right(caret)
+            self.doc.buffer.word_right(caret)
         };
         self.set_caret(target, extend);
     }
@@ -1863,16 +1943,16 @@ impl Editor {
     }
 
     fn delete_word(&mut self, backward: bool) {
-        if !self.selected.is_empty() {
-            let range = self.selected.clone();
+        if !self.doc.selected.is_empty() {
+            let range = self.doc.selected.clone();
             self.apply_edit(range, "");
             return;
         }
         let caret = self.caret();
         let range = if backward {
-            self.buffer.word_left(caret)..caret
+            self.doc.buffer.word_left(caret)..caret
         } else {
-            caret..self.buffer.word_right(caret)
+            caret..self.doc.buffer.word_right(caret)
         };
         if range.start == range.end {
             return;
@@ -1886,7 +1966,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
         self.delete_word(true);
@@ -1900,7 +1980,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
         self.delete_word(false);
@@ -1911,17 +1991,17 @@ impl Editor {
     /// ⌥↑/⌥↓: move the caret's line one position up/down (the caret keeps
     /// its column). A single edit keeps undo/redo and the scene scan honest.
     fn move_line(&mut self, direction: i64) {
-        let position = self.buffer.position_at(self.caret());
+        let position = self.doc.buffer.position_at(self.caret());
         let line = position.line;
         let target = line as i64 + direction;
-        if target < 0 || target as usize >= self.buffer.line_count() {
+        if target < 0 || target as usize >= self.doc.buffer.line_count() {
             return;
         }
         let other = target as usize;
-        let other_range = self.buffer.line_content_range(other);
-        let line_range = self.buffer.line_content_range(line);
-        let other_text = self.buffer.lines()[other].clone();
-        let line_text = self.buffer.lines()[line].clone();
+        let other_range = self.doc.buffer.line_content_range(other);
+        let line_range = self.doc.buffer.line_content_range(line);
+        let other_text = self.doc.buffer.lines()[other].clone();
+        let line_text = self.doc.buffer.lines()[line].clone();
         let (span, replacement, caret) = if direction < 0 {
             (
                 other_range.start..line_range.end,
@@ -1940,7 +2020,7 @@ impl Editor {
     }
 
     fn on_move_line_up(&mut self, _: &MoveLineUp, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
         self.move_line(-1);
@@ -1954,7 +2034,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
         self.move_line(1);
@@ -1964,10 +2044,10 @@ impl Editor {
 
     /// ⇧⌥↑/⇧⌥↓: duplicate the caret's line below/above it.
     fn duplicate_line(&mut self, above: bool) {
-        let position = self.buffer.position_at(self.caret());
+        let position = self.doc.buffer.position_at(self.caret());
         let line = position.line;
-        let range = self.buffer.line_content_range(line);
-        let text = self.buffer.lines()[line].clone();
+        let range = self.doc.buffer.line_content_range(line);
+        let text = self.doc.buffer.lines()[line].clone();
         if above {
             self.apply_edit(range.start..range.start, &format!("{text}\n"));
             self.set_caret(range.start + text.len() + 1 + position.col, false);
@@ -1983,7 +2063,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
         self.duplicate_line(true);
@@ -1997,7 +2077,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
         self.duplicate_line(false);
@@ -2007,22 +2087,22 @@ impl Editor {
 
     /// ⌘⇧K: delete the caret's line (VSCode parity).
     fn on_delete_line(&mut self, _: &DeleteLine, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
             return;
         }
-        let position = self.buffer.position_at(self.caret());
+        let position = self.doc.buffer.position_at(self.caret());
         let line = position.line;
-        let count = self.buffer.line_count();
-        let range = self.buffer.line_content_range(line);
+        let count = self.doc.buffer.line_count();
+        let range = self.doc.buffer.line_content_range(line);
         let span = if line + 1 < count {
-            range.start..self.buffer.line_content_range(line + 1).start
+            range.start..self.doc.buffer.line_content_range(line + 1).start
         } else if line > 0 {
-            self.buffer.line_content_range(line - 1).end..range.end
+            self.doc.buffer.line_content_range(line - 1).end..range.end
         } else {
             range
         };
         self.apply_edit(span.clone(), "");
-        let target = span.start.min(self.buffer.doc_len());
+        let target = span.start.min(self.doc.buffer.doc_len());
         self.set_caret(target, false);
         cx.notify();
         self.ensure_caret_visible();
@@ -2035,7 +2115,7 @@ impl Editor {
     }
 
     fn on_doc_end(&mut self, _: &DocEnd, _window: &mut Window, cx: &mut Context<Self>) {
-        let end = self.buffer.doc_len();
+        let end = self.doc.buffer.doc_len();
         self.set_caret(end, false);
         cx.notify();
         self.ensure_caret_visible();
@@ -2058,7 +2138,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let end = self.buffer.doc_len();
+        let end = self.doc.buffer.doc_len();
         self.set_caret(end, true);
         cx.notify();
         self.ensure_caret_visible();
@@ -2100,7 +2180,7 @@ impl Editor {
     /// only with Fountain forced markers; its text is preserved and the
     /// caret keeps its position over the same characters.
     fn cycle_element(&mut self, forward: bool) {
-        if self.find.open
+        if self.doc.find.open
             || self.search.open
             || self.propose_bar.open
             || self.focus_bar.open
@@ -2109,10 +2189,10 @@ impl Editor {
         {
             return;
         }
-        let position = self.buffer.position_at(self.caret());
+        let position = self.doc.buffer.position_at(self.caret());
         let line = position.line;
-        let range = self.buffer.line_content_range(line);
-        let text = self.buffer.lines()[line].clone();
+        let range = self.doc.buffer.line_content_range(line);
+        let text = self.doc.buffer.lines()[line].clone();
         let new_text = screenplay::cycle(&text, forward);
         if new_text == text {
             return;
@@ -2536,12 +2616,12 @@ impl Editor {
         self.review_focus.clear();
         self.new_file = None;
         self.quit_prompt = false;
-        self.backup_path = None;
-        self.backup_saved_at = None;
-        self.backup_error = None;
-        self.page_count = None;
-        self.pages_pending = false;
-        self.pages_requested_at = None;
+        self.doc.backup_path = None;
+        self.doc.backup_saved_at = None;
+        self.doc.backup_error = None;
+        self.doc.page_count = None;
+        self.doc.pages_pending = false;
+        self.doc.pages_requested_at = None;
         self.load_document(doc_path, content);
         // `load_document` clears the notice, so surface a newer recovery
         // backup once more before the project-opened confirmation.
@@ -2917,18 +2997,18 @@ impl Editor {
     /// fixture) and the result is applied when the generation still matches
     /// — a newer edit leaves `pages_dirty` set and the next render retries.
     fn maybe_request_pages(&mut self, cx: &mut Context<Self>) {
-        if !self.pages_dirty || self.pages_pending {
+        if !self.doc.pages_dirty || self.doc.pages_pending {
             return;
         }
-        if let Some(last) = self.pages_requested_at
+        if let Some(last) = self.doc.pages_requested_at
             && last.elapsed() < Duration::from_millis(250)
         {
             return;
         }
-        self.pages_pending = true;
-        self.pages_requested_at = Some(Instant::now());
-        let generation = self.pages_generation;
-        let text = self.buffer.slice(0..self.buffer.doc_len());
+        self.doc.pages_pending = true;
+        self.doc.pages_requested_at = Some(Instant::now());
+        let generation = self.doc.pages_generation;
+        let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             // Physical pages: body pages plus the title page (the export
@@ -2937,10 +3017,10 @@ impl Editor {
             let _ = tx.send(pages);
         });
         Self::spawn_message_pump(cx, rx, move |view, pages| {
-            view.pages_pending = false;
-            if view.pages_generation == generation {
-                view.page_count = Some(pages);
-                view.pages_dirty = false;
+            view.doc.pages_pending = false;
+            if view.doc.pages_generation == generation {
+                view.doc.page_count = Some(pages);
+                view.doc.pages_dirty = false;
             }
             true
         });
@@ -2979,15 +3059,15 @@ impl Editor {
             return;
         };
         let root = project.root().to_path_buf();
-        let document = self.doc_path.clone();
+        let document = self.doc.path.clone();
         let text = self.full_text();
         match narra_core::backup::write_backup(&root, &document, &text) {
             Ok(path) => {
-                self.backup_path = Some(path.display().to_string());
-                self.backup_saved_at = Some(Instant::now());
-                self.backup_error = None;
+                self.doc.backup_path = Some(path.display().to_string());
+                self.doc.backup_saved_at = Some(Instant::now());
+                self.doc.backup_error = None;
             }
-            Err(error) => self.backup_error = Some(error.to_string()),
+            Err(error) => self.doc.backup_error = Some(error.to_string()),
         }
     }
 
@@ -2997,7 +3077,7 @@ impl Editor {
             return;
         };
         let root = project.root().to_path_buf();
-        let document = self.doc_path.clone();
+        let document = self.doc.path.clone();
         if let Ok(Some(text)) = narra_core::backup::read_backup(&root, &document)
             && text != self.full_text()
         {
@@ -3018,7 +3098,7 @@ impl Editor {
             return;
         };
         let root = project.root().to_path_buf();
-        let document = self.doc_path.clone();
+        let document = self.doc.path.clone();
         match narra_core::backup::read_backup(&root, &document) {
             Ok(Some(text)) => {
                 self.replace_buffer_text(&text);
@@ -3046,11 +3126,11 @@ impl Editor {
             return;
         };
         let root = project.root().to_path_buf();
-        let document = self.doc_path.clone();
+        let document = self.doc.path.clone();
         match narra_core::backup::remove_backup(&root, &document) {
             Ok(()) => {
-                self.backup_path = None;
-                self.backup_saved_at = None;
+                self.doc.backup_path = None;
+                self.doc.backup_saved_at = None;
                 self.notice = Some(self.t("notice.backup_discarded").to_string());
             }
             Err(error) => {
@@ -3064,30 +3144,31 @@ impl Editor {
     /// Replace the buffer contents in place, keeping the canonical base: the
     /// restored text is unsaved (dirty) until the user saves.
     fn replace_buffer_text(&mut self, text: &str) {
-        self.buffer = Buffer::new(text);
-        self.selected = 0..0;
-        self.reversed = false;
-        self.marked = None;
-        self.composing = false;
-        self.dragging = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.scene_lines.clear();
-        self.outline.clear();
-        self.elements_dirty = true;
-        self.elements_parsed_at = None;
-        self.scenes_dirty = true;
-        self.find.matches.clear();
-        self.find.current = 0;
-        self.diff.open = false;
-        self.list_state = ListState::new(
-            self.buffer.line_count(),
+        self.doc.buffer = Buffer::new(text);
+        self.doc.selected = 0..0;
+        self.doc.reversed = false;
+        self.doc.marked = None;
+        self.doc.composing = false;
+        self.doc.dragging = None;
+        self.doc.undo_stack.clear();
+        self.doc.redo_stack.clear();
+        self.doc.scene_lines.clear();
+        self.doc.outline.clear();
+        self.doc.elements_dirty = true;
+        self.doc.elements_parsed_at = None;
+        self.doc.scenes_dirty = true;
+        self.doc.find.matches.clear();
+        self.doc.find.current = 0;
+        self.doc.diff.open = false;
+        self.doc.list_state = ListState::new(
+            self.doc.buffer.line_count(),
             ListAlignment::Top,
             px(LINE_HEIGHT * 2.0),
         );
         // The restored text diverges from the canonical base: mark it dirty
         // without touching the canonical file.
         self.metrics.borrow_mut().edits += 1;
+        self.doc.revision = self.doc.revision.saturating_add(1);
     }
 
     /// ⌘Q (M9 slice 6): never lose unsaved work silently. A dirty buffer
@@ -3235,7 +3316,7 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.find.open {
+        if self.doc.find.open {
             self.find_backspace();
             cx.notify();
             return;
@@ -3265,14 +3346,14 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.selected.is_empty() {
+        if self.doc.selected.is_empty() {
             let caret = self.caret();
-            let previous = self.buffer.prev_boundary(caret);
+            let previous = self.doc.buffer.prev_boundary(caret);
             if previous < caret {
                 self.apply_edit(previous..caret, "");
             }
         } else {
-            let range = self.selected.clone();
+            let range = self.doc.selected.clone();
             self.apply_edit(range, "");
         }
         cx.notify();
@@ -3280,14 +3361,14 @@ impl Editor {
     }
 
     fn on_delete(&mut self, _: &DeleteText, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
+        if self.doc.selected.is_empty() {
             let caret = self.caret();
-            let next = self.buffer.next_boundary(caret);
+            let next = self.doc.buffer.next_boundary(caret);
             if next > caret {
                 self.apply_edit(caret..next, "");
             }
         } else {
-            let range = self.selected.clone();
+            let range = self.doc.selected.clone();
             self.apply_edit(range, "");
         }
         cx.notify();
@@ -3320,8 +3401,8 @@ impl Editor {
         // While the find bar owns keystrokes, enter means "next match" in the
         // query field and "replace current + advance" in the replacement
         // field (the routing note in the module header).
-        if self.find.open {
-            match self.find.field {
+        if self.doc.find.open {
+            match self.doc.find.field {
                 FindField::Query => self.next_match(cx),
                 FindField::Replacement => {
                     self.replace_current(cx);
@@ -3353,7 +3434,7 @@ impl Editor {
         // so Enter inserts it and lands on the line below; everything else
         // keeps the plain newline (dialogue continues line by line).
         let caret = self.caret();
-        let line = self.buffer.position_at(caret).line;
+        let line = self.doc.buffer.position_at(caret).line;
         let inserted = if matches!(
             self.element_kind(line),
             Some(FountainKind::SceneHeading)
@@ -3382,17 +3463,17 @@ impl Editor {
     }
 
     fn on_copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
-            let text = self.buffer.slice(self.selected.clone());
+        if !self.doc.selected.is_empty() {
+            let text = self.doc.buffer.slice(self.doc.selected.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
-            let text = self.buffer.slice(self.selected.clone());
+        if !self.doc.selected.is_empty() {
+            let text = self.doc.buffer.slice(self.doc.selected.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            let range = self.selected.clone();
+            let range = self.doc.selected.clone();
             self.apply_edit(range, "");
             cx.notify();
         }
@@ -3410,29 +3491,29 @@ impl Editor {
     /// open; cmd-alt-f opens it with the replacement field focused. A
     /// non-single-line selection prefills the query on first open.
     fn open_find(&mut self, with_replacement: bool, cx: &mut Context<Self>) {
-        let selection = if self.selected.is_empty() {
+        let selection = if self.doc.selected.is_empty() {
             String::new()
         } else {
-            self.buffer.slice(self.selected.clone())
+            self.doc.buffer.slice(self.doc.selected.clone())
         };
-        let first_open = !self.find.open;
-        self.find.open = true;
-        self.find.field = if with_replacement {
+        let first_open = !self.doc.find.open;
+        self.doc.find.open = true;
+        self.doc.find.field = if with_replacement {
             FindField::Replacement
         } else {
             FindField::Query
         };
         if first_open && !selection.is_empty() && !selection.contains('\n') {
-            self.find.query = selection;
+            self.doc.find.query = selection;
         }
         self.refresh_matches(true);
         cx.notify();
     }
 
     fn close_find(&mut self, cx: &mut Context<Self>) {
-        self.find.open = false;
-        self.find.matches.clear();
-        self.find.current = 0;
+        self.doc.find.open = false;
+        self.doc.find.matches.clear();
+        self.doc.find.current = 0;
         cx.notify();
     }
 
@@ -3441,52 +3522,52 @@ impl Editor {
     /// after buffer edits keep the baseline free of maintenance noise.
     /// An empty query clears matches without recording anything.
     fn refresh_matches(&mut self, measured: bool) {
-        if self.find.query.is_empty() {
-            self.find.matches.clear();
-            self.find.current = 0;
+        if self.doc.find.query.is_empty() {
+            self.doc.find.matches.clear();
+            self.doc.find.current = 0;
             return;
         }
         let start = Instant::now();
-        self.find.matches = self.buffer.find_all(&self.find.query);
+        self.doc.find.matches = self.doc.buffer.find_all(&self.doc.find.query);
         if measured {
             let mut metrics = self.metrics.borrow_mut();
             metrics.search_compute_ms.push(duration_ms(start.elapsed()));
             metrics.mark_search(Instant::now());
         }
-        if self.find.current >= self.find.matches.len() {
-            self.find.current = 0;
+        if self.doc.find.current >= self.doc.find.matches.len() {
+            self.doc.find.current = 0;
         }
     }
 
     /// Reveal and select the match at `index` (wraps).
     fn goto_match(&mut self, index: usize) {
-        if self.find.matches.is_empty() {
+        if self.doc.find.matches.is_empty() {
             return;
         }
-        self.find.current = index % self.find.matches.len();
-        let range = self.find.matches[self.find.current].clone();
-        let line = self.buffer.position_at(range.start).line;
-        self.selected = range;
-        self.reversed = false;
-        self.marked = None;
-        self.list_state.scroll_to_reveal_item(line);
+        self.doc.find.current = index % self.doc.find.matches.len();
+        let range = self.doc.find.matches[self.doc.find.current].clone();
+        let line = self.doc.buffer.position_at(range.start).line;
+        self.doc.selected = range;
+        self.doc.reversed = false;
+        self.doc.marked = None;
+        self.doc.list_state.scroll_to_reveal_item(line);
     }
 
     fn next_match(&mut self, cx: &mut Context<Self>) {
-        if self.find.matches.is_empty() {
+        if self.doc.find.matches.is_empty() {
             return;
         }
-        let next = (self.find.current + 1) % self.find.matches.len();
+        let next = (self.doc.find.current + 1) % self.doc.find.matches.len();
         self.goto_match(next);
         cx.notify();
     }
 
     fn prev_match(&mut self, cx: &mut Context<Self>) {
-        if self.find.matches.is_empty() {
+        if self.doc.find.matches.is_empty() {
             return;
         }
-        let len = self.find.matches.len();
-        let prev = (self.find.current + len - 1) % len;
+        let len = self.doc.find.matches.len();
+        let prev = (self.doc.find.current + len - 1) % len;
         self.goto_match(prev);
         cx.notify();
     }
@@ -3499,21 +3580,21 @@ impl Editor {
             .chars()
             .filter(|c| !c.is_control() || *c == ' ')
             .collect();
-        match self.find.field {
+        match self.doc.find.field {
             FindField::Query => {
-                self.find.query.push_str(&cleaned);
+                self.doc.find.query.push_str(&cleaned);
                 self.refresh_matches(true);
             }
-            FindField::Replacement => self.find.replacement.push_str(&cleaned),
+            FindField::Replacement => self.doc.find.replacement.push_str(&cleaned),
         }
     }
 
     /// Grapheme-aware backspace for the active find field (same standard as
     /// the buffer).
     fn find_backspace(&mut self) {
-        let field = match self.find.field {
-            FindField::Query => &mut self.find.query,
-            FindField::Replacement => &mut self.find.replacement,
+        let field = match self.doc.find.field {
+            FindField::Query => &mut self.doc.find.query,
+            FindField::Replacement => &mut self.doc.find.replacement,
         };
         let new_len = field
             .graphemes(true)
@@ -3522,7 +3603,7 @@ impl Editor {
         if let Some(len) = new_len {
             field.truncate(len);
         }
-        if self.find.field == FindField::Query {
+        if self.doc.find.field == FindField::Query {
             self.refresh_matches(true);
         }
     }
@@ -3530,17 +3611,18 @@ impl Editor {
     /// Replace the current match (cmd-enter, or enter in the replacement
     /// field) and keep the visual position near where the edit happened.
     fn replace_current(&mut self, cx: &mut Context<Self>) {
-        if self.find.matches.is_empty() {
+        if self.doc.find.matches.is_empty() {
             return;
         }
-        let range = self.find.matches[self.find.current].clone();
+        let range = self.doc.find.matches[self.doc.find.current].clone();
         let anchor = range.start;
-        let replacement = self.find.replacement.clone();
+        let replacement = self.doc.find.replacement.clone();
         // apply_edit pushes one undo entry and silently refreshes matches.
         self.apply_edit(range, &replacement);
-        self.find.replaced_total += 1;
-        if !self.find.matches.is_empty() {
+        self.doc.find.replaced_total += 1;
+        if !self.doc.find.matches.is_empty() {
             let index = self
+                .doc
                 .find
                 .matches
                 .iter()
@@ -3554,22 +3636,22 @@ impl Editor {
     /// Replace every match in a single document-wide edit (one undo entry),
     /// measured as one operation into `replace_all_ms`.
     fn replace_all(&mut self, cx: &mut Context<Self>) {
-        if self.find.matches.is_empty() {
+        if self.doc.find.matches.is_empty() {
             return;
         }
         let start = Instant::now();
-        let count = self.find.matches.len();
-        let mut new_text = String::with_capacity(self.buffer.doc_len());
+        let count = self.doc.find.matches.len();
+        let mut new_text = String::with_capacity(self.doc.buffer.doc_len());
         let mut last = 0usize;
-        for range in &self.find.matches {
-            new_text.push_str(&self.buffer.slice(last..range.start));
-            new_text.push_str(&self.find.replacement);
+        for range in &self.doc.find.matches {
+            new_text.push_str(&self.doc.buffer.slice(last..range.start));
+            new_text.push_str(&self.doc.find.replacement);
             last = range.end;
         }
-        new_text.push_str(&self.buffer.slice(last..self.buffer.doc_len()));
-        let doc_len = self.buffer.doc_len();
+        new_text.push_str(&self.doc.buffer.slice(last..self.doc.buffer.doc_len()));
+        let doc_len = self.doc.buffer.doc_len();
         self.apply_edit(0..doc_len, &new_text);
-        self.find.replaced_total += count;
+        self.doc.find.replaced_total += count;
         self.metrics
             .borrow_mut()
             .replace_all_ms
@@ -3589,8 +3671,8 @@ impl Editor {
     /// `diff_reconstructs_edited_document`.
     fn recompute_diff(&mut self) {
         let start = Instant::now();
-        let base = self.diff.base_lines.join("\n");
-        let current = self.buffer.lines().join("\n");
+        let base = self.doc.diff.base_lines.join("\n");
+        let current = self.doc.buffer.lines().join("\n");
         let d = similar::TextDiff::from_lines(&base, &current);
         let mut rows = Vec::new();
         let mut added = 0usize;
@@ -3612,12 +3694,13 @@ impl Editor {
                 text: change.value().trim_end_matches('\n').to_string(),
             });
         }
-        self.diff.rows = rows;
-        self.diff.added_total += added;
-        self.diff.removed_total += removed;
+        self.doc.diff.rows = rows;
+        self.doc.diff.added_total += added;
+        self.doc.diff.removed_total += removed;
         // Park the cursor on the first hunk so opening the diff shows the
         // change, not the unchanged head of the file.
-        self.diff.cursor = self
+        self.doc.diff.cursor = self
+            .doc
             .diff
             .rows
             .iter()
@@ -3632,23 +3715,23 @@ impl Editor {
     /// Open the diff view (cmd-d). The base is seeded from the loaded file
     /// the first time; the cursor and scroll reset to the first hunk.
     fn open_diff(&mut self, cx: &mut Context<Self>) {
-        if !self.diff.open {
-            self.diff.open = true;
+        if !self.doc.diff.open {
+            self.doc.diff.open = true;
         }
         self.recompute_diff();
-        self.diff_list_state = ListState::new(
-            self.diff.rows.len(),
+        self.doc.diff_list_state = ListState::new(
+            self.doc.diff.rows.len(),
             ListAlignment::Top,
             px(LINE_HEIGHT * 2.0),
         );
-        let cursor = self.diff.cursor;
-        self.diff_list_state.scroll_to_reveal_item(cursor);
+        let cursor = self.doc.diff.cursor;
+        self.doc.diff_list_state.scroll_to_reveal_item(cursor);
         self.metrics.borrow_mut().mark_diff(Instant::now());
         cx.notify();
     }
 
     fn close_diff(&mut self, cx: &mut Context<Self>) {
-        self.diff.open = false;
+        self.doc.diff.open = false;
         cx.notify();
     }
 
@@ -3657,13 +3740,13 @@ impl Editor {
     /// row step would park between them; instead, leave the current block of
     /// consecutive change rows and land on the next one, wrapping.
     fn diff_move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let len = self.diff.rows.len();
+        let len = self.doc.diff.rows.len();
         if len == 0 {
             return;
         }
         let step = if delta >= 0 { 1isize } else { -1 };
-        let is_change = |ix: usize| self.diff.rows[ix].label != ' ';
-        let mut ix = self.diff.cursor;
+        let is_change = |ix: usize| self.doc.diff.rows[ix].label != ' ';
+        let mut ix = self.doc.diff.cursor;
         // Leave the current change block (the +/− pair of one hunk)…
         let mut guard = 0usize;
         while is_change(ix) {
@@ -3682,14 +3765,16 @@ impl Editor {
                 return; // no changes at all (empty diff): stay put
             }
         }
-        self.diff.cursor = ix;
-        self.diff_list_state.scroll_to_reveal_item(self.diff.cursor);
+        self.doc.diff.cursor = ix;
+        self.doc
+            .diff_list_state
+            .scroll_to_reveal_item(self.doc.diff.cursor);
         cx.notify();
     }
 
     /// The diff view row: label gutter + line text, colored by tag.
     fn diff_row(&self, ix: usize) -> gpui::Div {
-        let Some(row) = self.diff.rows.get(ix) else {
+        let Some(row) = self.doc.diff.rows.get(ix) else {
             return div();
         };
         let (label_color, bg) = match row.label {
@@ -3705,7 +3790,7 @@ impl Editor {
             .whitespace_nowrap()
             .font_family(FONT_FAMILY)
             .text_size(px(TEXT_SIZE));
-        if ix == self.diff.cursor {
+        if ix == self.doc.diff.cursor {
             element = element.bg(rgba(SELECTION_BG));
         } else if let Some(color) = bg {
             element = element.bg(rgb(color));
@@ -3723,7 +3808,7 @@ impl Editor {
     // ---- find bar actions ------------------------------------------------
 
     fn on_toggle_find(&mut self, _: &ToggleFind, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.open && self.find.field == FindField::Query {
+        if self.doc.find.open && self.doc.find.field == FindField::Query {
             self.close_find(cx);
         } else {
             self.open_find(false, cx);
@@ -3755,7 +3840,7 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.find.open {
+        if self.doc.find.open {
             self.close_find(cx);
         } else if self.search.open {
             // Escape clears the project-search results and closes the bar.
@@ -3783,13 +3868,13 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open {
+        if self.doc.find.open {
             self.replace_current(cx);
         }
     }
 
     fn on_replace_all(&mut self, _: &ReplaceAll, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.open {
+        if self.doc.find.open {
             self.replace_all(cx);
         }
     }
@@ -3797,7 +3882,7 @@ impl Editor {
     // ---- diff view actions (slice 3, M1-3b) ------------------------------
 
     fn on_toggle_diff(&mut self, _: &ToggleDiff, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff.open {
+        if self.doc.diff.open {
             self.close_diff(cx);
         } else {
             self.open_diff(cx);
@@ -3811,14 +3896,14 @@ impl Editor {
     /// interactive bar calls, so the measured path is the shipped path.
     fn advance_find_probe(&mut self, cx: &mut Context<Self>) {
         const QUERIES: [&str; 5] = ["noche", "INT.", "toda la noche", "habitación", "escena"];
-        self.find.open = true;
-        self.find.field = FindField::Query;
+        self.doc.find.open = true;
+        self.doc.find.field = FindField::Query;
         let query = QUERIES[self.find_probe_cursor % QUERIES.len()];
-        self.find.query = query.to_string();
+        self.doc.find.query = query.to_string();
         self.refresh_matches(true);
-        if !self.find.matches.is_empty() {
-            self.find.current = self.find_probe_cursor % self.find.matches.len();
-            self.goto_match(self.find.current);
+        if !self.doc.find.matches.is_empty() {
+            self.doc.find.current = self.find_probe_cursor % self.doc.find.matches.len();
+            self.goto_match(self.doc.find.current);
         }
         self.find_probe_cursor += 1;
         self.find_probe_left = self.find_probe_left.saturating_sub(1);
@@ -3837,13 +3922,14 @@ impl Editor {
     /// Full buffer text. Round-trips what was loaded: `Buffer::new` splits
     /// on `\n` and `slice(0..doc_len)` joins the same lines back.
     fn full_text(&self) -> String {
-        self.buffer.slice(0..self.buffer.doc_len())
+        self.doc.buffer.slice(0..self.doc.buffer.doc_len())
     }
 
-    /// True when the buffer diverged from the last loaded/saved text.
-    /// Generation-based (O(1)): every mutation path bumps `metrics.edits`.
+    /// True when this document diverged from its last load/save.
+    /// Generation-based (O(1)): every mutation path bumps the document's
+    /// revision; saving snapshots it. Per-document, so tabs stay independent.
     fn dirty(&self) -> bool {
-        self.metrics.borrow().edits != self.saved_edits
+        self.doc.is_dirty()
     }
 
     /// Replace the buffer with a freshly loaded document, resetting all
@@ -3851,38 +3937,40 @@ impl Editor {
     /// starts at the top: this is an explicit document switch, not a jump the
     /// user must recover from. `base_text` becomes the new diff/save base.
     fn load_document(&mut self, path: String, text: String) {
-        self.buffer = Buffer::new(&text);
-        self.base_text = text.clone();
-        self.doc_path = path;
-        self.selected = 0..0;
-        self.reversed = false;
-        self.marked = None;
-        self.composing = false;
-        self.dragging = None;
-        self.last_click = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.scene_lines.clear();
-        self.scenes_dirty = true;
-        self.elements_dirty = true;
-        self.elements_parsed_at = None;
-        self.pages_dirty = true;
-        self.pages_generation += 1;
-        self.current_scene = 0;
+        self.doc.buffer = Buffer::new(&text);
+        self.doc.base_text = text.clone();
+        self.doc.path = path;
+        self.doc.selected = 0..0;
+        self.doc.reversed = false;
+        self.doc.marked = None;
+        self.doc.composing = false;
+        self.doc.dragging = None;
+        self.doc.last_click = None;
+        self.doc.undo_stack.clear();
+        self.doc.redo_stack.clear();
+        self.doc.scene_lines.clear();
+        self.doc.scenes_dirty = true;
+        self.doc.elements_dirty = true;
+        self.doc.elements_parsed_at = None;
+        self.doc.pages_dirty = true;
+        self.doc.pages_generation += 1;
+        self.doc.current_scene = 0;
         // M9 slice 6: surface a newer recovery backup for this document.
         self.check_backup_notice();
-        self.list_state = ListState::new(
-            self.buffer.line_count(),
+        self.doc.list_state = ListState::new(
+            self.doc.buffer.line_count(),
             ListAlignment::Top,
             px(LINE_HEIGHT * 2.0),
         );
-        self.find = FindState::default();
-        self.diff = DiffState {
+        self.doc.find = FindState::default();
+        self.doc.diff = DiffState {
             base_lines: text.split('\n').map(str::to_string).collect(),
             ..DiffState::default()
         };
-        self.diff_list_state = ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0));
-        self.saved_edits = self.metrics.borrow().edits;
+        self.doc.diff_list_state = ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0));
+        // A freshly loaded document has no unsaved edits of its own.
+        self.doc.revision = 0;
+        self.doc.saved_revision = 0;
         self.notice = None;
     }
 
@@ -3893,7 +3981,7 @@ impl Editor {
     /// clean-buffer gate as before, addressed by path now that folders and
     /// files share the panel.
     fn select_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if path == self.doc_path {
+        if path == self.doc.path {
             return;
         }
         let Some(project) = self.project.clone() else {
@@ -3939,23 +4027,22 @@ impl Editor {
             return;
         };
         let text = self.full_text();
-        let edits = self.metrics.borrow().edits;
-        if text == self.base_text {
+        if text == self.doc.base_text {
             // Converged back (e.g. undo to the original): clear the dirty
             // flag without touching the file.
-            self.saved_edits = edits;
+            self.doc.saved_revision = self.doc.revision;
             self.notice = Some(self.t("notice.no_changes").to_string());
             cx.notify();
             return;
         }
-        match project.write_document(&self.doc_path, &text) {
+        match project.write_document(&self.doc.path, &text) {
             Ok(()) => {
-                self.base_text = text.clone();
-                self.saved_edits = edits;
+                self.doc.base_text = text.clone();
+                self.doc.saved_revision = self.doc.revision;
                 // The saved file becomes the diff base (same model as the M4
                 // proposal surface: canonical file vs. edited buffer).
-                self.diff.base_lines = text.split('\n').map(str::to_string).collect();
-                if self.diff.open {
+                self.doc.diff.base_lines = text.split('\n').map(str::to_string).collect();
+                if self.doc.diff.open {
                     // Recompute and resize the rows list in one step.
                     self.open_diff(cx);
                 } else {
@@ -3964,16 +4051,16 @@ impl Editor {
                 }
                 // The canonical file now holds the buffer: the recovery
                 // backup is no longer needed (best effort).
-                let _ = narra_core::backup::remove_backup(project.root(), &self.doc_path);
-                self.backup_path = None;
-                self.backup_saved_at = None;
-                self.backup_error = None;
-                self.notice = Some(self.tf("notice.saved", &[("path", &self.doc_path)]));
+                let _ = narra_core::backup::remove_backup(project.root(), &self.doc.path);
+                self.doc.backup_path = None;
+                self.doc.backup_saved_at = None;
+                self.doc.backup_error = None;
+                self.notice = Some(self.tf("notice.saved", &[("path", &self.doc.path)]));
             }
             Err(error) => {
                 self.notice = Some(self.tf(
                     "notice.save_failed",
-                    &[("path", &self.doc_path), ("error", &error.to_string())],
+                    &[("path", &self.doc.path), ("error", &error.to_string())],
                 ));
             }
         }
@@ -4044,7 +4131,7 @@ impl Editor {
             self.notice = Some(self.t("notice.fixture_no_project_agent").to_string());
             return None;
         };
-        if self.doc_path != screenplay {
+        if self.doc.path != screenplay {
             self.notice = Some(self.tf("notice.open_screenplay", &[("path", &screenplay)]));
             return None;
         }
@@ -4062,8 +4149,8 @@ impl Editor {
     fn agent_task_gates(&mut self) -> Option<(String, usize, AgentSettings, CancellationToken)> {
         let (root, settings, cancel) = self.agent_task_base_gates()?;
         self.refresh_scenes();
-        let caret_line = self.buffer.position_at(self.caret()).line;
-        let Some(scene_number) = scene_number_at(&self.scene_lines, caret_line) else {
+        let caret_line = self.doc.buffer.position_at(self.caret()).line;
+        let Some(scene_number) = scene_number_at(&self.doc.scene_lines, caret_line) else {
             self.notice = Some(self.t("notice.caret_outside_scene").to_string());
             return None;
         };
@@ -4456,7 +4543,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open {
+        if self.doc.find.open {
             self.close_find(cx);
         }
         if self.propose_bar.open {
@@ -4593,7 +4680,7 @@ impl Editor {
             "notice.search_open",
             &[("document", &hit.document), ("line", &hit.line.to_string())],
         );
-        if hit.document == self.doc_path {
+        if hit.document == self.doc.path {
             let offset = self.offset_for_line_column(hit.line, hit.column);
             self.set_caret(offset, false);
             self.search.open = false;
@@ -4643,9 +4730,9 @@ impl Editor {
     fn offset_for_line_column(&self, line: usize, column: usize) -> usize {
         let index = line
             .saturating_sub(1)
-            .min(self.buffer.line_count().saturating_sub(1));
-        let range = self.buffer.line_content_range(index);
-        let text = &self.buffer.lines()[index];
+            .min(self.doc.buffer.line_count().saturating_sub(1));
+        let range = self.doc.buffer.line_content_range(index);
+        let text = &self.doc.buffer.lines()[index];
         let byte = text
             .char_indices()
             .nth(column.saturating_sub(1))
@@ -4657,10 +4744,10 @@ impl Editor {
     /// Click on an outline row (M8 slice 3): jump to that scene's heading.
     fn select_outline(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_scenes();
-        let Some(&line) = self.scene_lines.get(index) else {
+        let Some(&line) = self.doc.scene_lines.get(index) else {
             return;
         };
-        let offset = self.buffer.line_content_range(line).start;
+        let offset = self.doc.buffer.line_content_range(line).start;
         self.set_caret(offset, false);
         window.focus(&self.focus_handle(cx));
         cx.notify();
@@ -4705,7 +4792,7 @@ impl Editor {
     /// bar borrows the single focus (spike compromise): the find bar closes
     /// when it opens and vice versa.
     fn on_open_propose(&mut self, _: &OpenPropose, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.open {
+        if self.doc.find.open {
             self.close_find(cx);
         }
         if self.focus_bar.open {
@@ -4728,7 +4815,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.open {
+        if self.doc.find.open {
             self.close_find(cx);
         }
         if self.propose_bar.open {
@@ -4884,8 +4971,8 @@ impl Editor {
                 let reloaded = self
                     .project
                     .as_ref()
-                    .filter(|_| self.doc_path == target)
-                    .map(|project| project.read_document(&self.doc_path));
+                    .filter(|_| self.doc.path == target)
+                    .map(|project| project.read_document(&self.doc.path));
                 let mut final_notice = if skipped > 0 {
                     self.tf(
                         "notice.applied_skipped",
@@ -4903,7 +4990,7 @@ impl Editor {
                 };
                 match reloaded {
                     Some(Ok(text)) => {
-                        let path = self.doc_path.clone();
+                        let path = self.doc.path.clone();
                         self.load_document(path, text);
                     }
                     Some(Err(error)) => {
@@ -5354,7 +5441,7 @@ impl Editor {
 
     /// Element kind of a line (M9 slice 5); `None` before the first scan.
     fn element_kind(&self, ix: usize) -> Option<FountainKind> {
-        self.element_kinds.get(ix).copied()
+        self.doc.element_kinds.get(ix).copied()
     }
 
     /// Screenplay element color (M9 slice 5), falling back to the line
@@ -5426,7 +5513,7 @@ impl Editor {
         // files colored by type and the open document marked/dirty-dotted.
         let rows: Vec<Row> = explorer::build_rows(&self.explorer, &self.collapsed);
         for (index, row) in rows.iter().enumerate() {
-            let selected = !row.is_dir && row.path == self.doc_path;
+            let selected = !row.is_dir && row.path == self.doc.path;
             let label = if row.is_dir {
                 format!("{} {}", if row.collapsed { "▸" } else { "▾" }, row.name)
             } else {
@@ -5466,9 +5553,9 @@ impl Editor {
         }
         // Document outline (M8 slice 3): the open document's scene headings.
         // Clicking a row jumps to that scene; the caret's scene is marked.
-        if !self.outline.is_empty() {
-            let caret_line = self.buffer.position_at(self.caret()).line;
-            let current_scene = scene_number_at(&self.scene_lines, caret_line);
+        if !self.doc.outline.is_empty() {
+            let caret_line = self.doc.buffer.position_at(self.caret()).line;
+            let current_scene = scene_number_at(&self.doc.scene_lines, caret_line);
             panel = panel.child(
                 div()
                     .px_2()
@@ -5477,11 +5564,11 @@ impl Editor {
                     .text_color(rgb(STATUS_FG))
                     .child(self.tf(
                         "panel.outline_title",
-                        &[("n", &self.outline.len().to_string())],
+                        &[("n", &self.doc.outline.len().to_string())],
                     )),
             );
-            let visible = OUTLINE_VISIBLE_ROWS.min(self.outline.len());
-            for (index, (_, heading)) in self.outline.iter().take(visible).enumerate() {
+            let visible = OUTLINE_VISIBLE_ROWS.min(self.doc.outline.len());
+            for (index, (_, heading)) in self.doc.outline.iter().take(visible).enumerate() {
                 let selected = current_scene == Some(index + 1);
                 panel = panel.child(
                     div()
@@ -5500,7 +5587,7 @@ impl Editor {
                         })),
                 );
             }
-            if self.outline.len() > visible {
+            if self.doc.outline.len() > visible {
                 panel = panel.child(
                     div()
                         .px_2()
@@ -5509,7 +5596,7 @@ impl Editor {
                         .text_color(rgb(STATUS_FG))
                         .child(self.tf(
                             "panel.outline_more",
-                            &[("n", &(self.outline.len() - visible).to_string())],
+                            &[("n", &(self.doc.outline.len() - visible).to_string())],
                         )),
                 );
             }
@@ -5518,10 +5605,10 @@ impl Editor {
     }
 
     fn status_text(&self) -> String {
-        let caret = self.buffer.position_at(self.caret());
+        let caret = self.doc.buffer.position_at(self.caret());
         // M6 slice 1: show the document (not just the run's fixture path) with
         // a dirty marker, plus the last outcome (save/open/blocked switch).
-        let document = format!("{}{}", self.doc_path, if self.dirty() { " •" } else { "" });
+        let document = format!("{}{}", self.doc.path, if self.dirty() { " •" } else { "" });
         let notice = self
             .notice
             .as_ref()
@@ -5567,6 +5654,7 @@ impl Editor {
         // agent/proposal lifecycle and the last notice. The development
         // metrics moved behind --debug-metrics (the report/dump keep them).
         let pages = self
+            .doc
             .page_count
             .map(|pages| pages.to_string())
             .unwrap_or_else(|| "…".to_string());
@@ -5576,7 +5664,7 @@ impl Editor {
                 ("doc", &document),
                 ("line", &(caret.line + 1).to_string()),
                 ("col", &caret.col.to_string()),
-                ("scenes", &self.scene_lines.len().to_string()),
+                ("scenes", &self.doc.scene_lines.len().to_string()),
                 ("pages", &pages),
             ],
         );
@@ -5610,13 +5698,13 @@ impl Editor {
     /// display-only: keystrokes are routed here by the input handler
     /// (single-focus spike compromise, see the module header).
     fn find_bar(&self) -> gpui::Div {
-        let total = self.find.matches.len();
-        let counter = if self.find.query.is_empty() {
+        let total = self.doc.find.matches.len();
+        let counter = if self.doc.find.query.is_empty() {
             String::new()
         } else if total == 0 {
             "0/0".to_string()
         } else {
-            format!("{}/{}", self.find.current + 1, total)
+            format!("{}/{}", self.doc.find.current + 1, total)
         };
         let marker = |active: bool| if active { "▌" } else { "" };
         let field = |label: &str, value: String, active: bool| {
@@ -5644,13 +5732,13 @@ impl Editor {
             .whitespace_nowrap()
             .child(field(
                 self.t("find.query_label"),
-                self.find.query.clone(),
-                self.find.field == FindField::Query,
+                self.doc.find.query.clone(),
+                self.doc.find.field == FindField::Query,
             ))
             .child(field(
                 self.t("find.replace_label"),
-                self.find.replacement.clone(),
-                self.find.field == FindField::Replacement,
+                self.doc.find.replacement.clone(),
+                self.doc.find.field == FindField::Replacement,
             ))
             .child(div().text_color(rgb(FIND_FG)).child(counter))
             .child(
@@ -5771,7 +5859,7 @@ impl Editor {
         doc: Range<usize>,
         caret: usize,
     ) -> gpui::Div {
-        let active = self.buffer.position_at(caret).line == ix;
+        let active = self.doc.buffer.position_at(caret).line == ix;
         let caret_col = (caret - doc.start).min(text.len());
         let wrap_w = f32::from(self.wrap_width);
         // The visual row comes from the pure geometry; the caret's x within
@@ -5831,17 +5919,17 @@ impl Editor {
     /// wrap) so the caret stays exact — the documented spike compromise for
     /// wrapped editing.
     fn row(&self, ix: usize, window: &Window) -> gpui::Div {
-        let text = &self.buffer.lines()[ix];
+        let text = &self.doc.buffer.lines()[ix];
 
-        let doc = self.buffer.line_content_range(ix);
+        let doc = self.doc.buffer.line_content_range(ix);
         let caret = self.caret();
-        let caret_line = self.buffer.position_at(caret).line;
-        let selection = if self.selected.is_empty() {
+        let caret_line = self.doc.buffer.position_at(caret).line;
+        let selection = if self.doc.selected.is_empty() {
             None
         } else {
-            Some(self.selected.clone())
+            Some(self.doc.selected.clone())
         };
-        let marked = self.marked.clone().filter(|range| !range.is_empty());
+        let marked = self.doc.marked.clone().filter(|range| !range.is_empty());
 
         let intersects = |range: &Range<usize>| range.end > doc.start && range.start < doc.end;
         let selection_here = selection.as_ref().filter(|range| intersects(range));
@@ -5853,13 +5941,17 @@ impl Editor {
         // the scan stops at the first match past the line (bounded work per
         // visible row even with hundreds of matches).
         let matches_here: Vec<(Range<usize>, bool)> =
-            if self.find.open && !self.find.matches.is_empty() {
-                let first = self.find.matches.partition_point(|m| m.end <= doc.start);
-                self.find.matches[first..]
+            if self.doc.find.open && !self.doc.find.matches.is_empty() {
+                let first = self
+                    .doc
+                    .find
+                    .matches
+                    .partition_point(|m| m.end <= doc.start);
+                self.doc.find.matches[first..]
                     .iter()
                     .enumerate()
                     .take_while(|(_, m)| m.start < doc.end)
-                    .map(|(offset, m)| (m.clone(), first + offset == self.find.current))
+                    .map(|(offset, m)| (m.clone(), first + offset == self.doc.find.current))
                     .collect()
             } else {
                 Vec::new()
@@ -5971,8 +6063,8 @@ impl Editor {
     /// after a driven sequence of keystrokes.
     fn dump_json(&self) -> String {
         let caret = self.caret();
-        let position = self.buffer.position_at(caret);
-        let len = self.buffer.doc_len();
+        let position = self.doc.buffer.position_at(caret);
+        let len = self.doc.buffer.doc_len();
 
         let mut start = caret.saturating_sub(64);
         while start < caret && !self.is_boundary(start) {
@@ -5982,11 +6074,11 @@ impl Editor {
         while end > caret && !self.is_boundary(end) {
             end -= 1;
         }
-        let around = escape_json(&self.buffer.slice(start..end));
+        let around = escape_json(&self.doc.buffer.slice(start..end));
         // The selected text travels in the dump so drag/double/triple-click
         // verification compares the actual selection (capped to stay small).
         let selected_text = {
-            let text = self.buffer.slice(self.selected.clone());
+            let text = self.doc.buffer.slice(self.doc.selected.clone());
             let mut capped: String = text.chars().take(200).collect();
             if text.chars().count() > 200 {
                 capped.push('…');
@@ -5998,13 +6090,25 @@ impl Editor {
         // leans on: every row must be a real change (no phantom EOF line)
         // and `buffer_hash` lets an external check compare the rendered
         // buffer against an independently computed expectation.
-        let diff_lines = self.diff.rows.len();
-        let diff_added = self.diff.rows.iter().filter(|row| row.label == '+').count();
-        let diff_removed = self.diff.rows.iter().filter(|row| row.label == '-').count();
+        let diff_lines = self.doc.diff.rows.len();
+        let diff_added = self
+            .doc
+            .diff
+            .rows
+            .iter()
+            .filter(|row| row.label == '+')
+            .count();
+        let diff_removed = self
+            .doc
+            .diff
+            .rows
+            .iter()
+            .filter(|row| row.label == '-')
+            .count();
         let buffer_hash = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            for line in self.buffer.lines() {
+            for line in self.doc.buffer.lines() {
                 line.hash(&mut hasher);
             }
             format!("{:016x}", hasher.finish())
@@ -6015,7 +6119,7 @@ impl Editor {
         // `composing` is the undo-group session flag. Together they let an
         // external check observe a composition mid-flight and confirm the
         // session closed after commit.
-        let marked_dump = match &self.marked {
+        let marked_dump = match &self.doc.marked {
             Some(range) => format!("[{},{}]", range.start, range.end),
             None => "null".to_string(),
         };
@@ -6023,8 +6127,10 @@ impl Editor {
         // Click debug (Spike B): the last left-click's window coordinates,
         // resolved line, item bounds, and doc offset. `null` when no click
         // has been recorded or the click was ignored.
-        let (click_x, click_y, click_line, click_top, click_h, click_offset) =
-            self.last_click.unwrap_or((0.0, 0.0, None, None, 0.0, None));
+        let (click_x, click_y, click_line, click_top, click_h, click_offset) = self
+            .doc
+            .last_click
+            .unwrap_or((0.0, 0.0, None, None, 0.0, None));
         let click_line_dump = click_line
             .map(|l| l.to_string())
             .unwrap_or("null".to_string());
@@ -6079,6 +6185,7 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let outline_dump: Vec<String> = self
+            .doc
             .outline
             .iter()
             .map(|(line, heading)| {
@@ -6269,6 +6376,7 @@ impl Editor {
             concat!(
                 "{{\"kind\":\"spike-a-buffer-dump\",",
                 "\"lines\":{},\"doc_len\":{},\"edits\":{},",
+                "\"revision\":{},\"saved_revision\":{},",
                 "\"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],\"selected_text\":\"{}\",",
                 "\"scenes\":{},\"undo\":{},\"redo\":{},\"around\":\"{}\",",
                 "\"find\":{{\"open\":{},\"query\":\"{}\",\"matches\":{},",
@@ -6286,38 +6394,40 @@ impl Editor {
                  \"backup\":{{\"path\":\"{}\",\"saved\":{},\"error\":\"{}\"}},\
                  \"lang\":\"{}\"}}"
             ),
-            self.buffer.line_count(),
+            self.doc.buffer.line_count(),
             len,
             self.metrics.borrow().edits,
+            self.doc.revision,
+            self.doc.saved_revision,
             position.line + 1,
             position.col,
-            self.selected.start,
-            self.selected.end,
+            self.doc.selected.start,
+            self.doc.selected.end,
             selected_text,
-            self.scene_lines.len(),
-            self.undo_stack.len(),
-            self.redo_stack.len(),
+            self.doc.scene_lines.len(),
+            self.doc.undo_stack.len(),
+            self.doc.redo_stack.len(),
             around,
-            self.find.open,
-            escape_json(&self.find.query),
-            self.find.matches.len(),
-            self.find.current,
-            self.find.replaced_total,
-            self.diff.open,
+            self.doc.find.open,
+            escape_json(&self.doc.find.query),
+            self.doc.find.matches.len(),
+            self.doc.find.current,
+            self.doc.find.replaced_total,
+            self.doc.diff.open,
             diff_lines,
             diff_added,
             diff_removed,
-            self.diff.cursor,
+            self.doc.diff.cursor,
             buffer_hash,
             marked_dump,
-            self.composing,
+            self.doc.composing,
             click_x,
             click_y,
             click_line_dump,
             click_top_dump,
             click_h_dump,
             click_offset_dump,
-            escape_json(&self.doc_path),
+            escape_json(&self.doc.path),
             self.dirty(),
             notice_dump,
             explorer_dump,
@@ -6328,7 +6438,8 @@ impl Editor {
             search_dump,
             outline_dump.join(","),
             tree_rows.join(","),
-            self.page_count
+            self.doc
+                .page_count
                 .map(|pages| pages.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             self.quit_prompt,
@@ -6338,16 +6449,16 @@ impl Editor {
             recents_dump,
             escape_json(&recents_error),
             self.workspace_generation,
-            escape_json(self.backup_path.as_deref().unwrap_or("")),
-            self.backup_saved_at.is_some(),
-            escape_json(self.backup_error.as_deref().unwrap_or("")),
+            escape_json(self.doc.backup_path.as_deref().unwrap_or("")),
+            self.doc.backup_saved_at.is_some(),
+            escape_json(self.doc.backup_error.as_deref().unwrap_or("")),
             self.lang.key(),
         )
     }
 
     fn is_boundary(&self, offset: usize) -> bool {
-        let position = self.buffer.position_at(offset);
-        self.buffer.lines()[position.line].is_char_boundary(position.col)
+        let position = self.doc.buffer.position_at(offset);
+        self.doc.buffer.lines()[position.line].is_char_boundary(position.col)
     }
 }
 
@@ -6633,7 +6744,7 @@ impl EntityInputHandler for Editor {
     ) -> Option<String> {
         let range = self.clamp(self.range_from_utf16(&range_utf16));
         adjusted_range.replace(self.range_to_utf16(&range));
-        Some(self.buffer.slice(range))
+        Some(self.doc.buffer.slice(range))
     }
 
     fn selected_text_range(
@@ -6643,8 +6754,8 @@ impl EntityInputHandler for Editor {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selected),
-            reversed: self.reversed,
+            range: self.range_to_utf16(&self.doc.selected),
+            reversed: self.doc.reversed,
         })
     }
 
@@ -6653,15 +6764,18 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        self.marked.as_ref().map(|range| self.range_to_utf16(range))
+        self.doc
+            .marked
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         // The system calls this after commit (insertText) or when it drops
         // the composition; the buffer text was already settled by the
         // preceding call, so this only ends the session.
-        self.marked = None;
-        self.composing = false;
+        self.doc.marked = None;
+        self.doc.composing = false;
     }
 
     fn replace_text_in_range(
@@ -6705,7 +6819,7 @@ impl EntityInputHandler for Editor {
         }
         // Find bar owns keystrokes while open: typing, IME commits and
         // pastes land in the active field, never in the buffer.
-        if self.find.open {
+        if self.doc.find.open {
             self.find_input(new_text);
             cx.notify();
             return;
@@ -6745,8 +6859,8 @@ impl EntityInputHandler for Editor {
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
-            .or(self.marked.clone())
-            .unwrap_or_else(|| self.selected.clone());
+            .or(self.doc.marked.clone())
+            .unwrap_or_else(|| self.doc.selected.clone());
         let text = normalize_newlines(new_text);
         let range = {
             let mut range = self.clamp(range);
@@ -6760,7 +6874,7 @@ impl EntityInputHandler for Editor {
         // way no marked session survives it (the system's later unmarkText
         // becomes a no-op). This also guarantees a stale `composing` flag
         // can never swallow the next keystroke into an old entry.
-        self.composing = false;
+        self.doc.composing = false;
         cx.notify();
     }
 
@@ -6775,7 +6889,7 @@ impl EntityInputHandler for Editor {
         // IME while the find bar is open: commit into the active field with
         // no marked state (the documented single-focus compromise — live
         // composition inside the bar is production work).
-        if self.find.open {
+        if self.doc.find.open {
             self.find_input(new_text);
             cx.notify();
             return;
@@ -6783,21 +6897,21 @@ impl EntityInputHandler for Editor {
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
-            .or(self.marked.clone())
-            .unwrap_or_else(|| self.selected.clone());
+            .or(self.doc.marked.clone())
+            .unwrap_or_else(|| self.doc.selected.clone());
         let text = normalize_newlines(new_text);
         let range = self.clamp(range);
         // First update of a session opens the undo group; subsequent marked
         // updates merge into that entry inside `record_edit`.
-        self.composing = true;
+        self.doc.composing = true;
         let inserted = self.apply_edit(range, &text);
-        self.marked = (!text.is_empty()).then_some(inserted.clone());
+        self.doc.marked = (!text.is_empty()).then_some(inserted.clone());
         if text.is_empty() {
             // An empty setMarkedText is the IME removing the composition
             // (cancellation): the session ends here even if the system's
             // unmarkText never follows, so the stale flag can never swallow
             // the next keystroke into an old entry.
-            self.composing = false;
+            self.doc.composing = false;
         }
         // `selectedRange` from setMarkedText is relative to the *marked
         // string*, not to the document: convert it inside `text` (treating it
@@ -6810,7 +6924,7 @@ impl EntityInputHandler for Editor {
                 (inserted.start + local.start)..(inserted.start + local.end)
             })
             .unwrap_or_else(|| inserted.end..inserted.end);
-        self.selected = self.clamp(selection);
+        self.doc.selected = self.clamp(selection);
         cx.notify();
     }
 
@@ -6822,14 +6936,14 @@ impl EntityInputHandler for Editor {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.clamp(self.range_from_utf16(&range_utf16));
-        let start = self.buffer.position_at(range.start);
-        let end = self.buffer.position_at(range.end);
+        let start = self.doc.buffer.position_at(range.start);
+        let end = self.doc.buffer.position_at(range.end);
         // `bounds_for_item` already accounts for scroll. Only rendered (visible)
         // items report bounds, which is fine: IME positions over visible text.
-        let start_bounds = self.list_state.bounds_for_item(start.line)?;
-        let end_bounds = self.list_state.bounds_for_item(end.line);
-        let x_start = x_for_index(window, &self.buffer.lines()[start.line], start.col);
-        let x_end = x_for_index(window, &self.buffer.lines()[end.line], end.col);
+        let start_bounds = self.doc.list_state.bounds_for_item(start.line)?;
+        let end_bounds = self.doc.list_state.bounds_for_item(end.line);
+        let x_start = x_for_index(window, &self.doc.buffer.lines()[start.line], start.col);
+        let x_end = x_for_index(window, &self.doc.buffer.lines()[end.line], end.col);
         let top_left = point(start_bounds.left() + x_start, start_bounds.top());
         let bottom_right = match end_bounds {
             Some(bounds) => point(bounds.left() + x_end, bounds.bottom()),
@@ -6848,7 +6962,7 @@ impl EntityInputHandler for Editor {
         // as a mouse click; the index crosses the Cocoa boundary as UTF-16,
         // like every other range this handler reports.
         let offset = self.offset_for_point(position, window)?;
-        Some(self.buffer.offset_to_utf16(offset))
+        Some(self.doc.buffer.offset_to_utf16(offset))
     }
 }
 
@@ -7000,7 +7114,7 @@ impl Render for Editor {
                     .text_color(rgb(STATUS_FG))
                     .child(status),
             )
-            .when(self.find.open, |bar| bar.child(self.find_bar()))
+            .when(self.doc.find.open, |bar| bar.child(self.find_bar()))
             .when(self.search.open, |bar| bar.child(self.search_bar()))
             .when(self.propose_bar.open, |bar| bar.child(self.propose_bar()))
             .when(self.focus_bar.open, |bar| bar.child(self.focus_bar()))
@@ -7026,9 +7140,9 @@ impl Render for Editor {
                             // The diff view replaces the buffer rows while open; the
                             // buffer list keeps its own (idle) scroll state so
                             // closing the diff restores the caret position.
-                            .when(self.diff.open, |host| {
+                            .when(self.doc.diff.open, |host| {
                                 host.child(
-                                    list(self.diff_list_state.clone(), {
+                                    list(self.doc.diff_list_state.clone(), {
                                         let entity = entity.clone();
                                         move |ix: usize, _window: &mut Window, cx: &mut App| {
                                             entity.read(cx).diff_row(ix).into_any_element()
@@ -7037,9 +7151,9 @@ impl Render for Editor {
                                     .size_full(),
                                 )
                             })
-                            .when(!self.diff.open, |host| {
+                            .when(!self.doc.diff.open, |host| {
                                 host.child(
-                                    list(self.list_state.clone(), {
+                                    list(self.doc.list_state.clone(), {
                                         let entity = entity.clone();
                                         move |ix: usize, window: &mut Window, cx: &mut App| {
                                             entity.read(cx).row(ix, window).into_any_element()
@@ -7510,22 +7624,28 @@ fn run() -> Result<(), String> {
         // part of the same rebuild (M10 slice 2b).
         install_menus(lang, recents.paths(), cx);
 
-        let buffer = Buffer::new(&content);
-        let line_count = buffer.line_count();
-        // Seed the diff base with the same representation `Buffer::new`
-        // uses (`split('\n')`, keeping the final empty line), so the base
-        // matches the buffer byte for byte at load and every diff row after
-        // that is a real change — `str::lines` here would fake a one-line
-        // change at EOF on every diff.
-        let base_lines: Vec<String> = content.split('\n').map(str::to_string).collect();
         let entity = cx.new(|cx| Editor {
-            buffer,
+            doc: DocumentState::new(doc_path, &content),
+            autosave_started: false,
+            quit_prompt: false,
+            debug_metrics: debug_metrics_flag,
+            new_file: None,
+            new_project: None,
+            recents,
+            workspace_generation: 0,
+            focus_handle: cx.focus_handle(),
+            wrap_width: px(800.0),
+            metrics: metrics.clone(),
+            probe_left: steps,
+            probe_cursor: 1,
+            probe_scheduled: false,
+            find_probe_left: find_steps,
+            find_probe_cursor: 0,
+            diff_probe_left: diff_steps,
+            diff_probe_total: diff_steps,
             project,
             explorer,
             collapsed: HashSet::new(),
-            doc_path,
-            base_text: content.clone(),
-            saved_edits: 0,
             notice: None,
             lang,
             export: ExportState::default(),
@@ -7538,56 +7658,7 @@ fn run() -> Result<(), String> {
             propose_bar: ProposeBar::default(),
             focus_bar: FocusBar::default(),
             review_focus: String::new(),
-            selected: 0..0,
-            reversed: false,
-            marked: None,
-            composing: false,
-            dragging: None,
-            last_click: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            scene_lines: Vec::new(),
-            outline: Vec::new(),
-            element_kinds: Vec::new(),
-            elements_dirty: true,
-            elements_parsed_at: None,
-            elements_timer: false,
-            autosave_started: false,
-            backup_path: None,
-            backup_saved_at: None,
-            backup_error: None,
-            quit_prompt: false,
-            page_count: None,
-            pages_dirty: true,
-            pages_pending: false,
-            pages_requested_at: None,
-            pages_generation: 0,
-            debug_metrics: debug_metrics_flag,
-            new_file: None,
-            new_project: None,
-            recents,
-            workspace_generation: 0,
-            scenes_dirty: true,
-            current_scene: 0,
-            list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
-            diff_list_state: ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
-            focus_handle: cx.focus_handle(),
-            wrap_width: px(800.0),
-            metrics: metrics.clone(),
-            probe_left: steps,
-            probe_cursor: 1,
-            probe_scheduled: false,
-            find_probe_left: find_steps,
-            find_probe_cursor: 0,
-            diff_probe_left: diff_steps,
-            diff_probe_total: diff_steps,
-            find: FindState::default(),
-            diff: DiffState {
-                base_lines,
-                ..DiffState::default()
-            },
         });
-
         let bounds = Bounds::centered(None, size(px(1100.0), px(780.0)), cx);
         let window = match cx.open_window(
             WindowOptions {
@@ -7760,6 +7831,39 @@ mod tests {
 
     // visual_row_starts tests require a Window, so they're integration-tested
     // via the live click verification (B-2) and the wrapped-caret live run below.
+
+    #[test]
+    fn document_state_seeds_the_save_and_diff_base() {
+        let doc = DocumentState::new("screenplay/main.fountain".to_string(), "uno\ndos\n");
+        assert_eq!(doc.path, "screenplay/main.fountain");
+        assert_eq!(doc.base_text, "uno\ndos\n");
+        assert_eq!(doc.buffer.line_count(), 3);
+        assert_eq!(doc.diff.base_lines, vec!["uno", "dos", ""]);
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn dirty_is_per_document_and_saving_only_snapshots_that_document() {
+        let mut first = DocumentState::new("a.md".to_string(), "a");
+        let mut second = DocumentState::new("b.md".to_string(), "b");
+
+        first.revision += 1;
+        assert!(first.is_dirty());
+        assert!(!second.is_dirty(), "a separate document stays clean");
+
+        first.saved_revision = first.revision;
+        assert!(!first.is_dirty());
+
+        second.revision += 1;
+        assert!(second.is_dirty());
+        assert!(!first.is_dirty(), "saving one never cleans another");
+
+        // Loading replaces both sides of the pair for that document only.
+        first.revision = 0;
+        first.saved_revision = 0;
+        assert!(!first.is_dirty());
+        assert!(second.is_dirty());
+    }
 
     #[test]
     fn utf16_to_byte_in_maps_relative_offsets() {
