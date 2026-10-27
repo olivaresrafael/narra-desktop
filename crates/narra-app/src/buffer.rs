@@ -272,6 +272,48 @@ impl Buffer {
         self.line_content_range(position.line)
     }
 
+    /// Offset of the start of the word to the left of `offset` (⌥←):
+    /// skip non-word characters, then walk to the start of the word.
+    pub fn word_left(&self, offset: usize) -> usize {
+        let text = self.full_text();
+        let mut index = offset.min(text.len());
+        while index > 0 {
+            let previous = self.prev_boundary(index);
+            if is_word_text_at(&text, previous) {
+                break;
+            }
+            index = previous;
+        }
+        while index > 0 {
+            let previous = self.prev_boundary(index);
+            if !is_word_text_at(&text, previous) {
+                break;
+            }
+            index = previous;
+        }
+        index
+    }
+
+    /// Offset just past the word to the right of `offset` (⌥→): in the
+    /// middle of a word it stops at that word's end; in whitespace it skips
+    /// to the end of the next word (the macOS/VSCode behaviour).
+    pub fn word_right(&self, offset: usize) -> usize {
+        let text = self.full_text();
+        let mut index = offset.min(text.len());
+        while index < text.len() && !is_word_text_at(&text, index) {
+            index = self.next_boundary(index);
+        }
+        while index < text.len() && is_word_text_at(&text, index) {
+            index = self.next_boundary(index);
+        }
+        index
+    }
+
+    /// Joined document text (allocating; used by word navigation and
+    /// project-independent helpers).
+    fn full_text(&self) -> String {
+        self.lines.join("\n")
+    }
     /// Move `offset` up/down by `delta` lines, clamping the column to the
     /// target line. Columns are byte-based: exact visual-column tracking
     /// across lines with different encodings is out of scope for the spike
@@ -317,6 +359,24 @@ impl Buffer {
         }
         self.doc_len()
     }
+}
+
+/// Word character at `index` in `text` (mirrors `word_range_at`): letters,
+/// digits, `_`, and apostrophes between word characters.
+fn is_word_text_at(text: &str, index: usize) -> bool {
+    let Some(c) = text[index..].chars().next() else {
+        return false;
+    };
+    if c.is_alphanumeric() || c == '_' {
+        return true;
+    }
+    if matches!(c, '\'' | '\u{2019}') {
+        let before = text[..index].chars().next_back();
+        let after = text[index + c.len_utf8()..].chars().next();
+        return before.is_some_and(|b| b.is_alphanumeric())
+            && after.is_some_and(|a| a.is_alphanumeric());
+    }
+    false
 }
 
 /// Push every non-overlapping occurrence of `query` inside `line` as
@@ -655,5 +715,33 @@ mod tests {
         let empty = Buffer::new("a\n\nb\n");
         let at = 2;
         assert_eq!(empty.line_range_at(at), 2..2);
+    }
+
+    #[test]
+    fn word_navigation_matches_macos_behaviour() {
+        //           0123456789012345678901234567
+        let buffer = Buffer::new("Marta dijo: don't stop.\n");
+        // ⌥← from the middle of a word: its start.
+        assert_eq!(buffer.word_left(3), 0);
+        // ⌥← from a word start crosses the space to the previous word.
+        assert_eq!(buffer.word_left(6), 0);
+        // ⌥→ inside a word: that word's end.
+        assert_eq!(buffer.word_right(2), 5);
+        // ⌥→ from the space after a word: the end of the next word.
+        assert_eq!(buffer.word_right(5), 10);
+        // Inner apostrophes keep `don't` whole.
+        let dont_start = "Marta dijo: ".len();
+        assert_eq!(buffer.word_right(dont_start), dont_start + 5);
+        assert_eq!(buffer.word_left(dont_start + 4), dont_start);
+        // Crossing a newline walks to the previous line's last word.
+        let two_lines = Buffer::new("primera\nsegunda\n");
+        assert_eq!(
+            two_lines.word_left("primera\nseg".len()),
+            "primera".len() + 1
+        );
+        // Ends clamp.
+        let end = buffer.doc_len();
+        assert_eq!(buffer.word_right(end), end);
+        assert_eq!(buffer.word_left(0), 0);
     }
 }

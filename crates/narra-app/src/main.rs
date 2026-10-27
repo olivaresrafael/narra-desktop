@@ -85,6 +85,11 @@
 //!       M9 slice 1 (mouse selection): dragging selects from the anchor,
 //!       double click selects the word, triple click the line; the list
 //!       auto-scrolls at the edges. Dump: `selected_text`.
+//!       M9 slice 2 (word/line editing): ⌥←/→ words (⌥⇧ selects), ⌥⌫/⌥⌦
+//!       delete words, ⌥↑/↓ move the line, ⇧⌥↑/↓ duplicate it, ⌘⇧K deletes
+//!       it, ⌘↑/↓ document start/end, RePág/AvPág; ⌥ arrows stay with the
+//!       proposal hunks while one is visible and ctrl-up/down scroll the
+//!       agent panel when no search results are shown.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -197,6 +202,26 @@ actions!(
         ProjectSearch,
         SearchPrev,
         SearchNext,
+        // word and line editing (M9 slice 2)
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        MoveLineUp,
+        MoveLineDown,
+        DuplicateLineUp,
+        DuplicateLineDown,
+        DeleteLine,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
+        PageUp,
+        PageDown,
+        SelectPageUp,
+        SelectPageDown,
     ]
 );
 
@@ -204,6 +229,9 @@ actions!(
 /// (`list` measures each); this constant still sizes the caret, the hot-row
 /// single-line fallback, and the list overdraw.
 const LINE_HEIGHT: f32 = 18.0;
+/// Lines moved by PageUp/PageDown (M9 slice 2): roughly one screenful at
+/// the default editor size.
+const PAGE_LINES: i64 = 30;
 
 /// Explicit so that cursor x-positions (shaped manually) match rendered rows.
 /// 14 px == `text_sm` (0.875 rem), which slice 1 used.
@@ -1580,6 +1608,311 @@ impl Editor {
         cx.notify();
     }
 
+    // ---- word, line and document editing (M9 slice 2) --------------------
+
+    /// Word-wise movement. While a proposal with hunks is on screen the
+    /// option arrows belong to it (the visible panel wins, same rule as the
+    /// other panel actions); otherwise they move by words in the buffer.
+    fn move_word(&mut self, direction: i64, extend: bool) {
+        if !extend && !self.selected.is_empty() {
+            let target = if direction < 0 {
+                self.selected.start
+            } else {
+                self.selected.end
+            };
+            self.set_caret(target, false);
+            return;
+        }
+        let caret = self.caret();
+        let target = if direction < 0 {
+            self.buffer.word_left(caret)
+        } else {
+            self.buffer.word_right(caret)
+        };
+        self.set_caret(target, extend);
+    }
+
+    fn on_word_left(&mut self, _: &WordLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.proposal_hunks_active() {
+            self.propose.move_hunk_cursor(-1);
+            cx.notify();
+            return;
+        }
+        self.move_word(-1, false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_word_right(&mut self, _: &WordRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.proposal_hunks_active() {
+            self.propose.move_hunk_cursor(1);
+            cx.notify();
+            return;
+        }
+        self.move_word(1, false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_select_word_left(
+        &mut self,
+        _: &SelectWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.proposal_hunks_active() {
+            return;
+        }
+        self.move_word(-1, true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_select_word_right(
+        &mut self,
+        _: &SelectWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.proposal_hunks_active() {
+            return;
+        }
+        self.move_word(1, true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn delete_word(&mut self, backward: bool) {
+        if !self.selected.is_empty() {
+            let range = self.selected.clone();
+            self.apply_edit(range, "");
+            return;
+        }
+        let caret = self.caret();
+        let range = if backward {
+            self.buffer.word_left(caret)..caret
+        } else {
+            caret..self.buffer.word_right(caret)
+        };
+        if range.start == range.end {
+            return;
+        }
+        self.apply_edit(range, "");
+    }
+
+    fn on_delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        self.delete_word(true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        self.delete_word(false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    /// ⌥↑/⌥↓: move the caret's line one position up/down (the caret keeps
+    /// its column). A single edit keeps undo/redo and the scene scan honest.
+    fn move_line(&mut self, direction: i64) {
+        let position = self.buffer.position_at(self.caret());
+        let line = position.line;
+        let target = line as i64 + direction;
+        if target < 0 || target as usize >= self.buffer.line_count() {
+            return;
+        }
+        let other = target as usize;
+        let other_range = self.buffer.line_content_range(other);
+        let line_range = self.buffer.line_content_range(line);
+        let other_text = self.buffer.lines()[other].clone();
+        let line_text = self.buffer.lines()[line].clone();
+        let (span, replacement, caret) = if direction < 0 {
+            (
+                other_range.start..line_range.end,
+                format!("{line_text}\n{other_text}"),
+                other_range.start + position.col.min(line_text.len()),
+            )
+        } else {
+            (
+                line_range.start..other_range.end,
+                format!("{other_text}\n{line_text}"),
+                line_range.start + other_text.len() + 1 + position.col.min(line_text.len()),
+            )
+        };
+        self.apply_edit(span, &replacement);
+        self.set_caret(caret, false);
+    }
+
+    fn on_move_line_up(&mut self, _: &MoveLineUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        self.move_line(-1);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_move_line_down(
+        &mut self,
+        _: &MoveLineDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        self.move_line(1);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    /// ⇧⌥↑/⇧⌥↓: duplicate the caret's line below/above it.
+    fn duplicate_line(&mut self, above: bool) {
+        let position = self.buffer.position_at(self.caret());
+        let line = position.line;
+        let range = self.buffer.line_content_range(line);
+        let text = self.buffer.lines()[line].clone();
+        if above {
+            self.apply_edit(range.start..range.start, &format!("{text}\n"));
+            self.set_caret(range.start + text.len() + 1 + position.col, false);
+        } else {
+            self.apply_edit(range.end..range.end, &format!("\n{text}"));
+            self.set_caret(range.start + position.col.min(text.len()), false);
+        }
+    }
+
+    fn on_duplicate_line_up(
+        &mut self,
+        _: &DuplicateLineUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        self.duplicate_line(true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_duplicate_line_down(
+        &mut self,
+        _: &DuplicateLineDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        self.duplicate_line(false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    /// ⌘⇧K: delete the caret's line (VSCode parity).
+    fn on_delete_line(&mut self, _: &DeleteLine, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+            return;
+        }
+        let position = self.buffer.position_at(self.caret());
+        let line = position.line;
+        let count = self.buffer.line_count();
+        let range = self.buffer.line_content_range(line);
+        let span = if line + 1 < count {
+            range.start..self.buffer.line_content_range(line + 1).start
+        } else if line > 0 {
+            self.buffer.line_content_range(line - 1).end..range.end
+        } else {
+            range
+        };
+        self.apply_edit(span.clone(), "");
+        let target = span.start.min(self.buffer.doc_len());
+        self.set_caret(target, false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_doc_start(&mut self, _: &DocStart, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_caret(0, false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_doc_end(&mut self, _: &DocEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        let end = self.buffer.doc_len();
+        self.set_caret(end, false);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_select_doc_start(
+        &mut self,
+        _: &SelectDocStart,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_caret(0, true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_select_doc_end(
+        &mut self,
+        _: &SelectDocEnd,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = self.buffer.doc_len();
+        self.set_caret(end, true);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_page_up(&mut self, _: &PageUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(-PAGE_LINES, false, window);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_page_down(&mut self, _: &PageDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(PAGE_LINES, false, window);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_select_page_up(&mut self, _: &SelectPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vert(-PAGE_LINES, true, window);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn on_select_page_down(
+        &mut self,
+        _: &SelectPageDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_vert(PAGE_LINES, true, window);
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
     fn on_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
         if self.find.open {
             self.find_backspace();
@@ -2277,6 +2610,15 @@ impl Editor {
         }
     }
 
+    /// Whether the option arrows and alt-enter belong to the proposal panel
+    /// (M9 slice 2): only while the proposal is ready to review. A rejected,
+    /// applied or failed proposal leaves the keys to the buffer.
+    fn proposal_hunks_active(&self) -> bool {
+        self.propose.is_open()
+            && self.propose.status == ProposeStatus::Ready
+            && self.propose.hunks > 0
+    }
+
     /// Localized proposal status label for the panel title.
     fn propose_status_label(&self) -> &'static str {
         match self.propose.status {
@@ -2729,12 +3071,22 @@ impl Editor {
     }
 
     fn on_search_prev(&mut self, _: &SearchPrev, _window: &mut Window, cx: &mut Context<Self>) {
-        self.search_move(-1);
+        if !self.search.hits.is_empty() {
+            self.search_move(-1);
+        } else {
+            // No results on screen: ctrl-up/down scroll the agent panel
+            // (M9 slice 2 moved these keys off the option arrows).
+            self.scroll_agent_panel(-3);
+        }
         cx.notify();
     }
 
     fn on_search_next(&mut self, _: &SearchNext, _window: &mut Window, cx: &mut Context<Self>) {
-        self.search_move(1);
+        if !self.search.hits.is_empty() {
+            self.search_move(1);
+        } else {
+            self.scroll_agent_panel(3);
+        }
         cx.notify();
     }
 
@@ -3001,14 +3353,14 @@ impl Editor {
     /// once the record's hunk count is known; otherwise a no-op (the panel
     /// isn't showing a proposal).
     fn on_hunk_prev(&mut self, _: &HunkPrev, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.propose.is_open() && self.propose.hunks > 0 {
+        if self.proposal_hunks_active() {
             self.propose.move_hunk_cursor(-1);
             cx.notify();
         }
     }
 
     fn on_hunk_next(&mut self, _: &HunkNext, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.propose.is_open() && self.propose.hunks > 0 {
+        if self.proposal_hunks_active() {
             self.propose.move_hunk_cursor(1);
             cx.notify();
         }
@@ -3017,7 +3369,7 @@ impl Editor {
     /// ⌥Enter: toggle the hunk under the cursor (M6 slice 6). Arming is
     /// cleared: changing the selection invalidates a pending confirmation.
     fn on_toggle_hunk(&mut self, _: &ToggleHunk, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.propose.is_open() && self.propose.hunks > 0 {
+        if self.proposal_hunks_active() {
             self.propose.toggle_hunk();
             // A pending "apply" confirmation referenced the previous
             // selection; drop it rather than apply a different set.
@@ -3230,14 +3582,7 @@ impl Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        // M6 slice 4: the arrows scroll whichever panel section is visible.
-        if self.propose.is_open() && !self.agent.is_open() {
-            let total = self.propose.diff_rows.len();
-            self.propose.scroll_lines(-3, total, AGENT_VISIBLE_LINES);
-        } else {
-            let total = self.agent.output.lines().count();
-            self.agent.scroll_lines(-3, total, AGENT_VISIBLE_LINES);
-        }
+        self.scroll_agent_panel(-3);
     }
 
     fn on_review_scroll_down(
@@ -3246,12 +3591,18 @@ impl Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        self.scroll_agent_panel(3);
+    }
+
+    /// Scroll whichever agent panel section is visible (proposal diff while
+    /// a proposal is open, review text otherwise) by `delta` lines.
+    fn scroll_agent_panel(&mut self, delta: i64) {
         if self.propose.is_open() && !self.agent.is_open() {
             let total = self.propose.diff_rows.len();
-            self.propose.scroll_lines(3, total, AGENT_VISIBLE_LINES);
+            self.propose.scroll_lines(delta, total, AGENT_VISIBLE_LINES);
         } else {
             let total = self.agent.output.lines().count();
-            self.agent.scroll_lines(3, total, AGENT_VISIBLE_LINES);
+            self.agent.scroll_lines(delta, total, AGENT_VISIBLE_LINES);
         }
     }
 
@@ -4829,6 +5180,26 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_select_home))
             .on_action(cx.listener(Self::on_select_end))
             .on_action(cx.listener(Self::on_select_all))
+            // word/line editing and document navigation (M9 slice 2)
+            .on_action(cx.listener(Self::on_word_left))
+            .on_action(cx.listener(Self::on_word_right))
+            .on_action(cx.listener(Self::on_select_word_left))
+            .on_action(cx.listener(Self::on_select_word_right))
+            .on_action(cx.listener(Self::on_delete_word_left))
+            .on_action(cx.listener(Self::on_delete_word_right))
+            .on_action(cx.listener(Self::on_move_line_up))
+            .on_action(cx.listener(Self::on_move_line_down))
+            .on_action(cx.listener(Self::on_duplicate_line_up))
+            .on_action(cx.listener(Self::on_duplicate_line_down))
+            .on_action(cx.listener(Self::on_delete_line))
+            .on_action(cx.listener(Self::on_doc_start))
+            .on_action(cx.listener(Self::on_doc_end))
+            .on_action(cx.listener(Self::on_select_doc_start))
+            .on_action(cx.listener(Self::on_select_doc_end))
+            .on_action(cx.listener(Self::on_page_up))
+            .on_action(cx.listener(Self::on_page_down))
+            .on_action(cx.listener(Self::on_select_page_up))
+            .on_action(cx.listener(Self::on_select_page_down))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_insert_newline))
@@ -5254,6 +5625,31 @@ fn run() -> Result<(), String> {
             KeyBinding::new("shift-home", SelectHome, None),
             KeyBinding::new("shift-end", SelectEnd, None),
             KeyBinding::new("cmd-a", SelectAll, None),
+            // word/line editing and document navigation (M9 slice 2, VSCode
+            // parity: option=word, cmd=line/document, pageup/pagedown).
+            KeyBinding::new("alt-left", WordLeft, None),
+            KeyBinding::new("alt-right", WordRight, None),
+            KeyBinding::new("alt-shift-left", SelectWordLeft, None),
+            KeyBinding::new("alt-shift-right", SelectWordRight, None),
+            KeyBinding::new("alt-backspace", DeleteWordLeft, None),
+            KeyBinding::new("alt-delete", DeleteWordRight, None),
+            KeyBinding::new("alt-up", MoveLineUp, None),
+            KeyBinding::new("alt-down", MoveLineDown, None),
+            KeyBinding::new("alt-shift-up", DuplicateLineUp, None),
+            KeyBinding::new("alt-shift-down", DuplicateLineDown, None),
+            KeyBinding::new("cmd-shift-k", DeleteLine, None),
+            KeyBinding::new("cmd-up", DocStart, None),
+            KeyBinding::new("cmd-down", DocEnd, None),
+            KeyBinding::new("cmd-shift-up", SelectDocStart, None),
+            KeyBinding::new("cmd-shift-down", SelectDocEnd, None),
+            KeyBinding::new("cmd-left", MoveHome, None),
+            KeyBinding::new("cmd-right", MoveEnd, None),
+            KeyBinding::new("cmd-shift-left", SelectHome, None),
+            KeyBinding::new("cmd-shift-right", SelectEnd, None),
+            KeyBinding::new("pageup", PageUp, None),
+            KeyBinding::new("pagedown", PageDown, None),
+            KeyBinding::new("shift-pageup", SelectPageUp, None),
+            KeyBinding::new("shift-pagedown", SelectPageDown, None),
             // editing
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", DeleteText, None),
@@ -5276,11 +5672,11 @@ fn run() -> Result<(), String> {
             // hunks while it is open.
             KeyBinding::new("cmd-d", ToggleDiff, None),
             // agent review (M6 slice 3): cmd-r reviews the caret's scene,
-            // cmd-. cancels the run, alt-up/down scroll the review text.
+            // cmd-. cancels the run. The review panel scrolls with
+            // ctrl-up/down when no search results are on screen (M9 slice 2
+            // freed option arrows for word/line editing).
             KeyBinding::new("cmd-r", ReviewScene, None),
             KeyBinding::new("cmd-.", CancelReview, None),
-            KeyBinding::new("alt-up", ReviewScrollUp, None),
-            KeyBinding::new("alt-down", ReviewScrollDown, None),
             // proposals (M6 slice 4): cmd-p opens the instruction bar,
             // cmd-shift-enter applies the ready proposal (two-step: arm,
             // then apply), cmd-backspace rejects it.
@@ -5290,11 +5686,11 @@ fn run() -> Result<(), String> {
             // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
             // enter commits the focus and runs the review.
             KeyBinding::new("cmd-shift-r", OpenFocusBar, None),
-            // hunk selection (M6 slice 6): alt-left/right walk the record's
-            // hunks, alt-enter toggles the one under the cursor; apply gets
-            // exactly the selected subset.
-            KeyBinding::new("alt-left", HunkPrev, None),
-            KeyBinding::new("alt-right", HunkNext, None),
+            // hunk selection (M6 slice 6): option-arrows walk the record's
+            // hunks while a proposal is visible (M9 slice 2 scopes this in
+            // the WordLeft/WordRight handlers; the buffer gets word
+            // movement otherwise); alt-enter toggles the hunk under the
+            // cursor and apply gets exactly the selected subset.
             KeyBinding::new("alt-enter", ToggleHunk, None),
             // retry (M6 slice 8): cmd-alt-r re-runs the visible flow's last
             // task with the same stored inputs (only if it failed or was
@@ -5305,10 +5701,11 @@ fn run() -> Result<(), String> {
             // export (M7 slice 4): cmd-e writes exports/<screenplay>.pdf.
             KeyBinding::new("cmd-e", ExportPdf, None),
             // project search (M8 slice 2): cmd-shift-f searches every
-            // project document; cmd-up/down move through the results.
+            // project document; ctrl-up/down move through the results (and
+            // scroll the agent panel when there are none, M9 slice 2).
             KeyBinding::new("cmd-shift-f", ProjectSearch, None),
-            KeyBinding::new("cmd-up", SearchPrev, None),
-            KeyBinding::new("cmd-down", SearchNext, None),
+            KeyBinding::new("ctrl-up", SearchPrev, None),
+            KeyBinding::new("ctrl-down", SearchNext, None),
         ]);
 
         cx.observe_keystrokes({
