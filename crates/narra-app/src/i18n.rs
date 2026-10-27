@@ -409,9 +409,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         " · propuesta cancelada",
     ),
     (
+        "bar.status",
+        "{doc} · L{line}:C{col} · {scenes} scenes · ~{pages} pages",
+        "{doc} · L{line}:C{col} · {scenes} escenas · ~{pages} páginas",
+    ),
+    (
         "bar.metrics",
-        "{doc} · L{line}:C{col} · edits {edits} · key→frame {keys} · {lines} lines · {scenes} scenes · frames {frames} · gap ms p50 {p50} / p95 {p95} / max {max} · probe{probe}{notice}{agent}{propose}",
-        "{doc} · L{line}:C{col} · ediciones {edits} · tecla→frame {keys} · {lines} líneas · {scenes} escenas · frames {frames} · gap ms p50 {p50} / p95 {p95} / max {max} · probe{probe}{notice}{agent}{propose}",
+        "edits {edits} · key→frame {keys} · {lines} lines · frames {frames} · gap ms p50 {p50} / p95 {p95} / max {max} · probe{probe}",
+        "ediciones {edits} · tecla→frame {keys} · {lines} líneas · frames {frames} · gap ms p50 {p50} / p95 {p95} / max {max} · probe{probe}",
     ),
     // --- bars ------------------------------------------------------------
     ("find.query_label", "Find:", "Buscar:"),

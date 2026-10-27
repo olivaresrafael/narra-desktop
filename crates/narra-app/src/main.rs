@@ -881,6 +881,15 @@ struct Editor {
     backup_error: Option<String>,
     /// The unsaved-changes prompt is open (⌘Q with a dirty buffer).
     quit_prompt: bool,
+    /// Live page count (M9 slice 7): physical pages (body + title page),
+    /// computed from the export layout in a worker thread.
+    page_count: Option<usize>,
+    pages_dirty: bool,
+    pages_pending: bool,
+    pages_requested_at: Option<Instant>,
+    pages_generation: u64,
+    /// Append the performance metrics to the status bar (--debug-metrics).
+    debug_metrics: bool,
     scenes_dirty: bool,
     current_scene: usize,
 
@@ -1239,6 +1248,8 @@ impl Editor {
         self.marked = None;
         self.scenes_dirty = true;
         self.elements_dirty = true;
+        self.pages_dirty = true;
+        self.pages_generation += 1;
         // Offsets shifted: keep find matches valid (silent — edits are not
         // query submissions and must not pollute the search baseline).
         if self.find.open {
@@ -1255,6 +1266,8 @@ impl Editor {
         self.composing = false;
         self.scenes_dirty = true;
         self.elements_dirty = true;
+        self.pages_dirty = true;
+        self.pages_generation += 1;
         if self.find.open {
             self.refresh_matches(false);
         }
@@ -2050,6 +2063,42 @@ impl Editor {
         self.cycle_element(false);
         cx.notify();
         self.ensure_caret_visible();
+    }
+
+    // ---- live page count (M9 slice 7) ------------------------------------
+
+    /// Keep the status bar's page count fresh: after a 250 ms throttle, a
+    /// worker lays the buffer out with the export engine (11 ms on the 19k
+    /// fixture) and the result is applied when the generation still matches
+    /// — a newer edit leaves `pages_dirty` set and the next render retries.
+    fn maybe_request_pages(&mut self, cx: &mut Context<Self>) {
+        if !self.pages_dirty || self.pages_pending {
+            return;
+        }
+        if let Some(last) = self.pages_requested_at
+            && last.elapsed() < Duration::from_millis(250)
+        {
+            return;
+        }
+        self.pages_pending = true;
+        self.pages_requested_at = Some(Instant::now());
+        let generation = self.pages_generation;
+        let text = self.buffer.slice(0..self.buffer.doc_len());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Physical pages: body pages plus the title page (the export
+            // always carries one: the source's own or the manifest's).
+            let pages = narra_core::export::pdf::layout(&text).pages.len() + 1;
+            let _ = tx.send(pages);
+        });
+        Self::spawn_message_pump(cx, rx, move |view, pages| {
+            view.pages_pending = false;
+            if view.pages_generation == generation {
+                view.page_count = Some(pages);
+                view.pages_dirty = false;
+            }
+            true
+        });
     }
 
     // ---- crash-safety backups and the quit guard (M9 slice 6) -----------
@@ -2924,6 +2973,8 @@ impl Editor {
         self.scenes_dirty = true;
         self.elements_dirty = true;
         self.elements_parsed_at = None;
+        self.pages_dirty = true;
+        self.pages_generation += 1;
         self.current_scene = 0;
         // M9 slice 6: surface a newer recovery backup for this document.
         self.check_backup_notice();
@@ -4537,8 +4588,6 @@ impl Editor {
     }
 
     fn status_text(&self) -> String {
-        let metrics = self.metrics.borrow();
-        let (_, p50, p95, max) = Metrics::stats(&metrics.frame_gaps_ms);
         let caret = self.buffer.position_at(self.caret());
         // M6 slice 1: show the document (not just the run's fixture path) with
         // a dirty marker, plus the last outcome (save/open/blocked switch).
@@ -4584,26 +4633,45 @@ impl Editor {
             ProposeStatus::Failed => self.t("bar.propose_failed").to_string(),
             ProposeStatus::Cancelled => self.t("bar.propose_cancelled").to_string(),
         };
-        self.tf(
-            "bar.metrics",
+        // M9 slice 7: document · line:col · scenes · ~pages, then the
+        // agent/proposal lifecycle and the last notice. The development
+        // metrics moved behind --debug-metrics (the report/dump keep them).
+        let pages = self
+            .page_count
+            .map(|pages| pages.to_string())
+            .unwrap_or_else(|| "…".to_string());
+        let mut status = self.tf(
+            "bar.status",
             &[
                 ("doc", &document),
                 ("line", &(caret.line + 1).to_string()),
                 ("col", &caret.col.to_string()),
-                ("edits", &metrics.edits.to_string()),
-                ("keys", &metrics.keystroke_to_frame_ms.len().to_string()),
-                ("lines", &metrics.lines.to_string()),
-                ("scenes", &metrics.scenes.to_string()),
-                ("frames", &metrics.renders.to_string()),
-                ("p50", &format!("{p50:.2}")),
-                ("p95", &format!("{p95:.2}")),
-                ("max", &format!("{max:.2}")),
-                ("probe", &self.probe_left.to_string()),
-                ("notice", &notice),
-                ("agent", &agent),
-                ("propose", &propose),
+                ("scenes", &self.scene_lines.len().to_string()),
+                ("pages", &pages),
             ],
-        )
+        );
+        status.push_str(&agent);
+        status.push_str(&propose);
+        status.push_str(&notice);
+        if self.debug_metrics {
+            let metrics = self.metrics.borrow();
+            let (_, p50, p95, max) = Metrics::stats(&metrics.frame_gaps_ms);
+            let debug = self.tf(
+                "bar.metrics",
+                &[
+                    ("edits", &metrics.edits.to_string()),
+                    ("keys", &metrics.keystroke_to_frame_ms.len().to_string()),
+                    ("lines", &metrics.lines.to_string()),
+                    ("frames", &metrics.renders.to_string()),
+                    ("p50", &format!("{p50:.2}")),
+                    ("p95", &format!("{p95:.2}")),
+                    ("max", &format!("{max:.2}")),
+                    ("probe", &self.probe_left.to_string()),
+                ],
+            );
+            status = format!("{status} · {debug}");
+        }
+        status
     }
 
     /// The find/replace bar (slice 3). Rendered above the document when
@@ -5245,7 +5313,7 @@ impl Editor {
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
-                 \"outline\":[{}],\"tree\":[{}],\"quit_prompt\":{},\
+                 \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
                  \"backup\":{{\"path\":\"{}\",\"saved\":{},\"error\":\"{}\"}},\
                  \"lang\":\"{}\"}}"
             ),
@@ -5291,6 +5359,9 @@ impl Editor {
             search_dump,
             outline_dump.join(","),
             tree_rows.join(","),
+            self.page_count
+                .map(|pages| pages.to_string())
+                .unwrap_or_else(|| "null".to_string()),
             self.quit_prompt,
             escape_json(self.backup_path.as_deref().unwrap_or("")),
             self.backup_saved_at.is_some(),
@@ -5698,6 +5769,7 @@ impl Render for Editor {
         // classification is debounced.
         self.refresh_scenes();
         self.refresh_element_kinds(cx);
+        self.maybe_request_pages(cx);
 
         // The probe is driven by a timer scheduled from here, never by
         // notifying during render (see `advance_probe`).
@@ -5991,6 +6063,9 @@ struct Args {
     /// UI language (M6 slice 9): `--lang en|es`; default from the
     /// environment (`LC_ALL`/`LANG`), English when undeterminable.
     lang: Lang,
+    /// Append the performance metrics to the status bar (on-screen debugging;
+    /// the report/dump always carry them).
+    debug_metrics: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -6005,10 +6080,17 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_after_ms = None;
     let mut agent = AgentSettings::default();
     let mut lang = Lang::detect();
+    let mut debug_metrics = false;
 
     let mut i = 0;
     while i < args.len() {
         let key = args[i].as_str();
+        // Boolean flags first: they take no value.
+        if key == "--debug-metrics" {
+            debug_metrics = true;
+            i += 1;
+            continue;
+        }
         let value = args.get(i + 1).ok_or(format!("{key} requiere un valor"))?;
         match key {
             "--fixture" => {
@@ -6091,6 +6173,7 @@ fn parse_args() -> Result<Args, String> {
         dump_after_ms,
         agent,
         lang,
+        debug_metrics,
     })
 }
 
@@ -6179,6 +6262,7 @@ fn run() -> Result<(), String> {
     let dump_after_ms = args.dump_after_ms;
     let agent_settings = args.agent;
     let lang = args.lang;
+    let debug_metrics_flag = args.debug_metrics;
     Application::new().run(move |cx: &mut App| {
         cx.activate(true);
         cx.bind_keys([
@@ -6346,6 +6430,12 @@ fn run() -> Result<(), String> {
             backup_saved_at: None,
             backup_error: None,
             quit_prompt: false,
+            page_count: None,
+            pages_dirty: true,
+            pages_pending: false,
+            pages_requested_at: None,
+            pages_generation: 0,
+            debug_metrics: debug_metrics_flag,
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),

@@ -874,3 +874,24 @@ mod tests {
         assert_eq!(export(&manifest("Demo"), source), expected);
     }
 }
+
+#[cfg(test)]
+mod perf {
+    /// Perf probe (ignored by default): full layout of the M1 fixture, the
+    /// cost the editor pays (debounced) to show the live page count.
+    /// Run with `cargo test -p narra-core --release --lib perf_layout_19k
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf probe"]
+    fn perf_layout_19k_lines() {
+        let text =
+            std::fs::read_to_string("../../fixtures/screenplay-1000.fountain").expect("fixture");
+        let start = std::time::Instant::now();
+        let layout = super::layout(&text);
+        println!(
+            "laid out {} pages in {:?}",
+            layout.pages.len(),
+            start.elapsed()
+        );
+    }
+}
