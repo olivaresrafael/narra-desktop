@@ -27,6 +27,7 @@
 pub mod agent;
 pub mod cancel;
 pub mod document;
+pub mod export;
 pub mod fountain;
 pub mod git;
 pub mod manifest;
