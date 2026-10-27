@@ -297,6 +297,48 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("quit.save", "Save and close", "Guardar y cerrar"),
     ("quit.discard", "Discard and close", "Descartar y cerrar"),
     ("quit.cancel", "Cancel", "Cancelar"),
+    // --- new file (M10 slice 2) ------------------------------------------
+    ("newfile.title", "New file", "Nuevo archivo"),
+    ("newfile.name", "Name:", "Nombre:"),
+    ("newfile.format", "Format:", "Formato:"),
+    (
+        "newfile.format_fountain",
+        "Fountain (.fountain)",
+        "Fountain (.fountain)",
+    ),
+    (
+        "newfile.format_markdown",
+        "Markdown (.md)",
+        "Markdown (.md)",
+    ),
+    (
+        "newfile.formats_hint",
+        "More formats later; the native format is in design.",
+        "Más formatos después; el formato nativo está en diseño.",
+    ),
+    ("newfile.create", "Create", "Crear"),
+    ("newfile.cancel", "Cancel", "Cancelar"),
+    (
+        "newfile.invalid_name",
+        "Invalid name: letters, digits, spaces and accents (no /, \\, :, *, ?, \" or |).",
+        "Nombre inválido: letras, números, espacios y acentos (sin /, \\, :, *, ?, \" ni |).",
+    ),
+    (
+        "newfile.exists",
+        "A document with that name already exists.",
+        "Ya existe un documento con ese nombre.",
+    ),
+    (
+        "newfile.failed",
+        "Could not create the document: {error}",
+        "No se pudo crear el documento: {error}",
+    ),
+    ("newfile.kind.character", "Character", "Personaje"),
+    ("newfile.kind.notes", "Notes", "Notas"),
+    ("newfile.kind.research", "Research", "Investigación"),
+    ("newfile.kind.screenplay", "Screenplay", "Guion"),
+    ("notice.created", "created {path}", "creado {path}"),
+    ("menu.new_file", "New File…", "Nuevo archivo…"),
     // --- native menus (M10 slice 1) --------------------------------------
     ("menu.app", "Narra", "Narra"),
     ("menu.file", "File", "Archivo"),

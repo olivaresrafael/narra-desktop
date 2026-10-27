@@ -95,6 +95,11 @@ impl Project {
         Ok(document::write_document(&self.root, relative, contents)?)
     }
 
+    /// Create a new document, refusing to overwrite an existing one.
+    pub fn create_document(&self, relative: &str, contents: &str) -> Result<(), ProjectError> {
+        Ok(document::create_document(&self.root, relative, contents)?)
+    }
+
     /// Scan the canonical narrative sources and rebuild the derived index.
     ///
     /// The index is a convenience only; source files remain authoritative

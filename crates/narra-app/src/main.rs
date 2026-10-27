@@ -117,6 +117,7 @@ mod agent_view;
 mod buffer;
 mod explorer;
 mod i18n;
+mod new_file;
 mod screenplay;
 
 use std::cell::RefCell;
@@ -152,6 +153,7 @@ use narra_core::cancel::CancellationToken;
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::{DocumentError, Project, ProjectError, open_project};
+use new_file::Kind as NewFileKind;
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
@@ -245,6 +247,8 @@ actions!(
         // crash-safety backups (M9 slice 6)
         RestoreBackup,
         DiscardBackup,
+        // new documents (M10 slice 2)
+        NewFile,
     ]
 );
 
@@ -413,6 +417,14 @@ struct SearchState {
     truncated: bool,
     scanned: usize,
     skipped: usize,
+}
+
+/// The New File modal (M10 slice 2): kind, name and the last error.
+#[derive(Debug)]
+struct NewFileState {
+    kind: NewFileKind,
+    name: String,
+    error: String,
 }
 
 /// Message from the project-search worker thread.
@@ -890,6 +902,8 @@ struct Editor {
     pages_generation: u64,
     /// Append the performance metrics to the status bar (--debug-metrics).
     debug_metrics: bool,
+    /// The New File modal, when open (M10 slice 2).
+    new_file: Option<NewFileState>,
     scenes_dirty: bool,
     current_scene: usize,
 
@@ -2030,7 +2044,12 @@ impl Editor {
     /// only with Fountain forced markers; its text is preserved and the
     /// caret keeps its position over the same characters.
     fn cycle_element(&mut self, forward: bool) {
-        if self.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.new_file.is_some()
+        {
             return;
         }
         let position = self.buffer.position_at(self.caret());
@@ -2063,6 +2082,230 @@ impl Editor {
         self.cycle_element(false);
         cx.notify();
         self.ensure_caret_visible();
+    }
+
+    // ---- new documents (M10 slice 2) ------------------------------------
+
+    /// ⌘N / File → New File…: open the kind/name/format dialog; pressing it
+    /// again closes it.
+    fn on_new_file(&mut self, _: &NewFile, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_file.is_some() {
+            self.new_file = None;
+            cx.notify();
+        } else {
+            self.open_new_file(cx);
+        }
+    }
+
+    fn open_new_file(&mut self, cx: &mut Context<Self>) {
+        if self.project.is_none() {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        }
+        self.new_file = Some(NewFileState {
+            kind: NewFileKind::Screenplay,
+            name: String::new(),
+            error: String::new(),
+        });
+        cx.notify();
+    }
+
+    /// Create the document described by the dialog: an explicit canonical
+    /// write (refusing existing names), then open it.
+    fn create_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.new_file.as_ref() else {
+            return;
+        };
+        let kind = state.kind;
+        let name = state.name.clone();
+        let Some(path) = new_file::target_path(kind, &name) else {
+            let message = self.t("newfile.invalid_name").to_string();
+            if let Some(state) = self.new_file.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        };
+        let Some(project) = self.project.clone() else {
+            self.new_file = None;
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        if project.read_document(&path).is_ok() {
+            let message = self.t("newfile.exists").to_string();
+            if let Some(state) = self.new_file.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let body = new_file::template(kind, &name);
+        match project.create_document(&path, &body) {
+            Ok(()) => {
+                self.new_file = None;
+                self.explorer = project.list_documents().unwrap_or_default();
+                let created = self.tf("notice.created", &[("path", &path)]);
+                match project.read_document(&path) {
+                    Ok(text) => {
+                        self.load_document(path.clone(), text);
+                        window.focus(&self.focus_handle(cx));
+                        self.notice = Some(created);
+                    }
+                    Err(error) => {
+                        self.notice = Some(self.tf(
+                            "notice.open_failed",
+                            &[("path", &path), ("error", &error.to_string())],
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                let message = self.tf("newfile.failed", &[("error", &error.to_string())]);
+                if let Some(state) = self.new_file.as_mut() {
+                    state.error = message;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The New File dialog: kind chooser, name field and the format row
+    /// (Fountain for screenplays, Markdown otherwise — the format is picked
+    /// here until more screenplay formats and Save As exist).
+    fn new_file_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.new_file.as_ref().expect("overlay only when open");
+        let mut kinds = div().flex().gap_2();
+        for kind in NewFileKind::ALL {
+            let selected = kind == state.kind;
+            kinds = kinds.child(
+                div()
+                    .id(kind.key())
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        DEFAULT_FG
+                    } else {
+                        EXPLORER_BORDER
+                    }))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .cursor_pointer()
+                    .child(self.t(kind.i18n_key()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.new_file.as_mut() {
+                            state.kind = kind;
+                            state.error.clear();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let format = match state.kind {
+            NewFileKind::Screenplay => self.t("newfile.format_fountain"),
+            _ => self.t("newfile.format_markdown"),
+        };
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .child(
+                div()
+                    .w(px(560.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(0x252526))
+                    .border_1()
+                    .border_color(rgb(EXPLORER_BORDER))
+                    .child(
+                        div()
+                            .text_color(rgb(DEFAULT_FG))
+                            .child(self.t("newfile.title")),
+                    )
+                    .child(kinds)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("newfile.name")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .bg(rgb(0x1e1e20))
+                                    .px_2()
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .child(format!("{}▌", state.name)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("newfile.format")),
+                            )
+                            .child(div().text_color(rgb(DEFAULT_FG)).child(format)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(STATUS_FG))
+                            .child(self.t("newfile.formats_hint")),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(AGENT_ERR_FG))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("new-file-create")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("newfile.create"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_new_file(window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("new-file-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(STATUS_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("newfile.cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.new_file = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     // ---- live page count (M9 slice 7) ------------------------------------
@@ -2365,6 +2608,17 @@ impl Editor {
         if self.quit_prompt {
             return;
         }
+        if self.new_file.is_some() {
+            if let Some(state) = self.new_file.as_mut() {
+                if let Some(last) = state.name.chars().last() {
+                    let len = state.name.len();
+                    state.name.truncate(len - last.len_utf8());
+                }
+                state.error.clear();
+            }
+            cx.notify();
+            return;
+        }
         if self.find.open {
             self.find_backspace();
             cx.notify();
@@ -2434,6 +2688,11 @@ impl Editor {
         // button is "save and close" (macOS convention), Esc cancels.
         if self.quit_prompt {
             self.quit_save(window, cx);
+            return;
+        }
+        // The New File modal creates on enter (M10 slice 2).
+        if self.new_file.is_some() {
+            self.create_new_file(window, cx);
             return;
         }
         // While the find bar owns keystrokes, enter means "next match" in the
@@ -2859,6 +3118,11 @@ impl Editor {
         // same time). The unsaved-changes prompt wins over all of them.
         if self.quit_prompt {
             self.quit_prompt = false;
+            cx.notify();
+            return;
+        }
+        if self.new_file.is_some() {
+            self.new_file = None;
             cx.notify();
             return;
         }
@@ -4493,7 +4757,18 @@ impl Editor {
                     .py_1()
                     .text_sm()
                     .text_color(rgb(STATUS_FG))
-                    .child(title),
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().child(title))
+                    .child(
+                        div()
+                            .id("new-file")
+                            .px_1()
+                            .text_color(rgb(DEFAULT_FG))
+                            .cursor_pointer()
+                            .child("+")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_new_file(cx))),
+                    ),
             );
         // Tree rows (M9 slice 4): folders first, indented, collapsible;
         // files colored by type and the open document marked/dirty-dotted.
@@ -5176,6 +5451,15 @@ impl Editor {
                 )
             })
             .collect();
+        let new_file_dump = match &self.new_file {
+            Some(state) => format!(
+                "{{\"open\":true,\"kind\":\"{}\",\"name\":\"{}\",\"error\":\"{}\"}}",
+                state.kind.key(),
+                escape_json(&state.name),
+                escape_json(&state.error),
+            ),
+            None => "{\"open\":false,\"kind\":\"\",\"name\":\"\",\"error\":\"\"}".to_string(),
+        };
         let tree_rows: Vec<String> = explorer::build_rows(&self.explorer, &self.collapsed)
             .iter()
             .map(|row| {
@@ -5317,6 +5601,7 @@ impl Editor {
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
+                 \"new_file\":{},\
                  \"backup\":{{\"path\":\"{}\",\"saved\":{},\"error\":\"{}\"}},\
                  \"lang\":\"{}\"}}"
             ),
@@ -5366,6 +5651,7 @@ impl Editor {
                 .map(|pages| pages.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             self.quit_prompt,
+            new_file_dump,
             escape_json(self.backup_path.as_deref().unwrap_or("")),
             self.backup_saved_at.is_some(),
             escape_json(self.backup_error.as_deref().unwrap_or("")),
@@ -5406,6 +5692,7 @@ fn install_menus(lang: Lang, cx: &gpui::App) {
         menu(
             "menu.file",
             vec![
+                gpui::MenuItem::action(label("menu.new_file"), NewFile),
                 gpui::MenuItem::action(label("menu.save"), Save),
                 gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf),
             ],
@@ -5680,6 +5967,19 @@ impl EntityInputHandler for Editor {
         if self.quit_prompt {
             return;
         }
+        // The New File modal owns typing while open (M10 slice 2).
+        if self.new_file.is_some() {
+            let cleaned: String = new_text
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect();
+            if let Some(state) = self.new_file.as_mut() {
+                state.name.push_str(&cleaned);
+                state.error.clear();
+            }
+            cx.notify();
+            return;
+        }
         // Find bar owns keystrokes while open: typing, IME commits and
         // pastes land in the active field, never in the buffer.
         if self.find.open {
@@ -5915,6 +6215,8 @@ impl Render for Editor {
             // crash-safety backups (M9 slice 6)
             .on_action(cx.listener(Self::on_restore_backup))
             .on_action(cx.listener(Self::on_discard_backup))
+            // new documents (M10 slice 2)
+            .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -6053,6 +6355,9 @@ impl Render for Editor {
                     }),
             )
             .when(self.quit_prompt, |root| root.child(self.quit_overlay(cx)))
+            .when(self.new_file.is_some(), |root| {
+                root.child(self.new_file_overlay(cx))
+            })
     }
 }
 
@@ -6389,6 +6694,9 @@ fn run() -> Result<(), String> {
             // discard it.
             KeyBinding::new("cmd-shift-b", RestoreBackup, None),
             KeyBinding::new("cmd-shift-d", DiscardBackup, None),
+            // new documents (M10 slice 2): ⌘N opens the kind/name/format
+            // dialog; the file is created in the canonical folder.
+            KeyBinding::new("cmd-n", NewFile, None),
             // editing
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", DeleteText, None),
@@ -6509,6 +6817,7 @@ fn run() -> Result<(), String> {
             pages_requested_at: None,
             pages_generation: 0,
             debug_metrics: debug_metrics_flag,
+            new_file: None,
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),

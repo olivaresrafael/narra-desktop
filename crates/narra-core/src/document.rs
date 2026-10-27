@@ -27,6 +27,9 @@ pub enum DocumentError {
     #[error("path `{0}` is not valid UTF-8")]
     NonUtf8Path(String),
 
+    #[error("document `{0}` already exists (new documents never overwrite)")]
+    AlreadyExists(String),
+
     #[error("failed to access `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -83,6 +86,45 @@ pub fn read_document(root: &Path, relative: &str) -> Result<String, DocumentErro
         path: relative.to_string().into(),
         source,
     })
+}
+
+/// Create a **new** document, refusing to overwrite an existing path.
+///
+/// Unlike [`write_document`] this is not a temp-and-rename: the file is
+/// opened with `create_new`, which the filesystem makes atomic with respect
+/// to existence (two creators cannot both succeed). A crash mid-write can
+/// leave a partially written *new* file; templates are tiny and the user
+/// can delete it, whereas silently replacing an existing document would be
+/// data loss.
+pub fn create_document(root: &Path, relative: &str, contents: &str) -> Result<(), DocumentError> {
+    use std::io::Write;
+
+    let path = resolve_within(root, relative)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| DocumentError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(DocumentError::AlreadyExists(relative.to_string()));
+        }
+        Err(source) => return Err(DocumentError::Io { path, source }),
+    };
+    file.write_all(contents.as_bytes())
+        .map_err(|source| DocumentError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    file.sync_all()
+        .map_err(|source| DocumentError::Io { path, source })?;
+    Ok(())
 }
 
 /// Write a document inside the project atomically (temp file + rename).
@@ -205,5 +247,41 @@ mod tests {
             read_document(&root, "project.yaml").expect("read"),
             "schema_version: 1\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        tempfile::tempdir().expect("tempdir").keep()
+    }
+
+    #[test]
+    fn create_writes_and_never_overwrites() {
+        let root = temp_root();
+        create_document(&root, "bible/characters/marta.md", "# Marta\n").expect("create");
+        assert_eq!(
+            fs::read_to_string(root.join("bible/characters/marta.md")).expect("read"),
+            "# Marta\n"
+        );
+        // A second create with different content is refused and leaves the
+        // original bytes untouched.
+        let error =
+            create_document(&root, "bible/characters/marta.md", "# Otra\n").expect_err("exists");
+        assert!(matches!(error, DocumentError::AlreadyExists(_)));
+        assert_eq!(
+            fs::read_to_string(root.join("bible/characters/marta.md")).expect("read"),
+            "# Marta\n"
+        );
+    }
+
+    #[test]
+    fn create_keeps_the_boundary_rules() {
+        let root = temp_root();
+        assert!(create_document(&root, "/tmp/escape.md", "x").is_err());
+        assert!(create_document(&root, "../escape.md", "x").is_err());
+        assert!(!root.join("escape.md").exists());
     }
 }
