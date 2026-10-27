@@ -3429,7 +3429,12 @@ impl Editor {
     ) -> gpui::Div {
         let caret_col = (caret - doc.start).min(text.len());
         let wrap_w = f32::from(self.wrap_width);
-        let (visual_row, caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
+        // The visual row comes from the pure geometry; the caret's x within
+        // the row is implied by the flow width of the text before it
+        // (Menlo is fixed-pitch), so the cursor must NOT also get a
+        // margin-left: that double-counted the offset and opened a gap
+        // between the caret and the rest of the line.
+        let (visual_row, _caret_x) = caret_visual_row_and_x(window, text, caret_col, wrap_w);
         let starts = visual_row_starts(window, text, wrap_w);
 
         // Build visual rows as a flex column.
@@ -3446,10 +3451,8 @@ impl Editor {
                 .items_center();
 
             if row_idx == visual_row {
-                // This visual row contains the caret: split at caret_x.
-                // We render as: text before caret | cursor | text after caret.
-                // For simplicity, we place cursor at the x offset using a
-                // zero-width element with margin-left.
+                // This visual row contains the caret: render it in flow
+                // between the text before and after it.
                 let before = &segment_text[..caret_col
                     .saturating_sub(starts[visual_row])
                     .min(segment_text.len())];
@@ -3459,7 +3462,7 @@ impl Editor {
                 if !before.is_empty() {
                     row_div = row_div.child(before.to_string());
                 }
-                row_div = row_div.child(cursor_element_at(caret_x));
+                row_div = row_div.child(cursor_element());
                 if !after.is_empty() {
                     row_div = row_div.child(after.to_string());
                 }
@@ -3866,18 +3869,6 @@ fn cursor_element() -> gpui::Div {
     // The negative right margin keeps the cursor's flow width at zero so the
     // text after the caret is not pushed sideways.
     div().w(px(2.0)).mr(px(-2.0)).h_full().bg(rgb(CURSOR_FG))
-}
-
-/// Cursor element positioned at a specific x offset within a visual row
-/// (used for wrapped-line caret placement, B-3). The x offset is from the
-/// start of the visual row; we use `ml` (margin-left) to position it.
-fn cursor_element_at(x: f32) -> gpui::Div {
-    div()
-        .w(px(2.0))
-        .mr(px(-2.0))
-        .h_full()
-        .ml(px(x))
-        .bg(rgb(CURSOR_FG))
 }
 
 fn escape_json(text: &str) -> String {
