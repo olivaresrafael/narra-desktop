@@ -117,6 +117,7 @@
 mod agent_view;
 mod assets;
 mod buffer;
+mod context_menu;
 mod explorer;
 mod git_status;
 mod i18n;
@@ -144,6 +145,7 @@ use agent_view::{
     ProposeView, RetryTarget, retry_target,
 };
 use buffer::{Buffer, Position};
+use context_menu::{ContextAction, ContextMenuItem, ContextMenuState};
 use explorer::{FileKind, Row};
 use git_status::GitStatus;
 use gpui::{
@@ -180,6 +182,7 @@ actions!(
         OpenSettings,
         OpenProjectSettings,
         ToggleConfigFiles,
+        ShowContextMenu,
         QuickOpen,
         CommandPalette,
         NextScene,
@@ -1412,6 +1415,8 @@ struct Editor {
     project_settings: Option<ProjectSettingsState>,
     /// Quick open (⌘P) / command palette (⌘⇧P), when open (S5).
     palette: Option<PaletteState>,
+    /// Editor right-click menu (M11 slice 1), when open.
+    context_menu: Option<ContextMenuState>,
     /// Show `project.yaml`/`AGENTS.md`/`agents.yaml` in the explorer (S4c).
     show_config_files: bool,
     /// Soft-wrap long lines (S4c); the geometry still uses `wrap_width`.
@@ -1625,6 +1630,7 @@ impl Editor {
             || self.new_project.is_some()
             || self.project_settings.is_some()
             || self.palette.is_some()
+            || self.context_menu.is_some()
         {
             return;
         }
@@ -2646,6 +2652,7 @@ impl Editor {
             || self.new_file.is_some()
             || self.new_project.is_some()
             || self.palette.is_some()
+            || self.context_menu.is_some()
         {
             return;
         }
@@ -3063,6 +3070,7 @@ impl Editor {
             || self.project_settings.is_some()
             || self.new_file.is_some()
             || self.new_project.is_some()
+            || self.context_menu.is_some()
         {
             return;
         }
@@ -3375,6 +3383,379 @@ impl Editor {
             )
     }
 
+    // ---- editor context menu (M11 slice 1) ------------------------------
+
+    /// Right-click in the buffer: select the word under the pointer when the
+    /// click is outside the current selection, then open the menu. The
+    /// selection is preserved when the click lands inside it, so Cut/Copy and
+    /// Convert act on exactly what the user highlighted.
+    fn open_editor_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.doc.diff.open
+            || self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.new_file.is_some()
+            || self.new_project.is_some()
+        {
+            return;
+        }
+        let Some(offset) = self.offset_for_point(position, window) else {
+            return;
+        };
+        self.open_editor_context_menu_at(offset, position, window, cx);
+    }
+
+    /// Build and open the menu for a known document offset. Right-click uses
+    /// the hit-tested offset; the keyboard entry point (Shift+F10) uses the
+    /// caret and anchors the menu at its line.
+    fn open_editor_context_menu_at(
+        &mut self,
+        offset: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inside_selection = !self.doc.selected.is_empty()
+            && self.doc.selected.start <= offset
+            && offset < self.doc.selected.end;
+        if !inside_selection {
+            let word = self.doc.buffer.word_range_at(offset);
+            if word.is_empty() {
+                self.set_caret(offset, false);
+            } else {
+                self.doc.selected = word;
+                self.doc.reversed = false;
+            }
+        }
+        let selected = self.doc.buffer.slice(self.doc.selected.clone());
+        let has_selection = !selected.is_empty();
+        let entity_name = selected.trim();
+        let entity_ok = !entity_name.is_empty()
+            && !entity_name.contains('\n')
+            && new_file::file_stem(entity_name).is_some();
+        let t = |key: &str| self.t(key).to_string();
+        let mut items = vec![
+            ContextMenuItem::action(ContextAction::Cut, t("context.cut"), "⌘X", has_selection),
+            ContextMenuItem::action(ContextAction::Copy, t("context.copy"), "⌘C", has_selection),
+            ContextMenuItem::action(ContextAction::Paste, t("context.paste"), "⌘V", true),
+            ContextMenuItem::action(
+                ContextAction::SelectAll,
+                t("context.select_all"),
+                "⌘A",
+                true,
+            ),
+            ContextMenuItem::separator(),
+            ContextMenuItem::action(ContextAction::Find, t("context.find"), "⌘F", true),
+            ContextMenuItem::action(
+                ContextAction::ProjectSearch,
+                t("context.project_search"),
+                "⇧⌘F",
+                true,
+            ),
+            ContextMenuItem::separator(),
+            ContextMenuItem::action(ContextAction::Propose, t("context.propose"), "⌘K", true),
+            ContextMenuItem::separator(),
+            ContextMenuItem::action(
+                ContextAction::Convert(NewFileKind::Character),
+                t("context.convert.character"),
+                "",
+                entity_ok,
+            ),
+            ContextMenuItem::action(
+                ContextAction::Convert(NewFileKind::Location),
+                t("context.convert.location"),
+                "",
+                entity_ok,
+            ),
+            ContextMenuItem::action(
+                ContextAction::Convert(NewFileKind::Object),
+                t("context.convert.object"),
+                "",
+                entity_ok,
+            ),
+            ContextMenuItem::separator(),
+        ];
+        for kind in screenplay::ElementType::ALL {
+            items.push(ContextMenuItem::action(
+                ContextAction::SetElement(kind),
+                t(kind.i18n_key()),
+                "",
+                true,
+            ));
+        }
+        let viewport = window.viewport_size();
+        let x = f32::from(position.x).min((f32::from(viewport.width) - 290.0).max(8.0));
+        let y = f32::from(position.y).min((f32::from(viewport.height) - 560.0).max(8.0));
+        self.context_menu = Some(ContextMenuState::new(x, y, items));
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Shift+F10: open the same menu at the caret, selecting the word when
+    /// there is no selection. Keyboard parity for the right-click surface.
+    fn on_show_context_menu(
+        &mut self,
+        _: &ShowContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
+        let caret = self.caret();
+        let pos = self.doc.buffer.position_at(caret);
+        let Some(bounds) = self.doc.list_state.bounds_for_item(pos.line) else {
+            return;
+        };
+        let x = f32::from(bounds.left()) + 80.0;
+        let y = f32::from(bounds.top()) + 6.0;
+        self.open_editor_context_menu_at(caret, point(px(x), px(y)), window, cx);
+    }
+
+    fn context_menu_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.move_selection(delta);
+        }
+        cx.notify();
+    }
+
+    fn context_menu_activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self
+            .context_menu
+            .as_ref()
+            .and_then(ContextMenuState::activate_selected)
+        else {
+            return;
+        };
+        self.context_activate(action, window, cx);
+    }
+
+    fn context_activate(
+        &mut self,
+        action: ContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = None;
+        match action {
+            ContextAction::Cut => self.on_cut(&CutText, window, cx),
+            ContextAction::Copy => self.on_copy(&CopyText, window, cx),
+            ContextAction::Paste => self.on_paste(&PasteText, window, cx),
+            ContextAction::SelectAll => self.on_select_all(&SelectAll, window, cx),
+            ContextAction::Find => self.on_toggle_find(&ToggleFind, window, cx),
+            ContextAction::ProjectSearch => self.on_project_search(&ProjectSearch, window, cx),
+            ContextAction::Propose => self.on_open_propose(&OpenPropose, window, cx),
+            ContextAction::Convert(kind) => self.context_convert_entity(kind, cx),
+            ContextAction::SetElement(kind) => self.context_set_element(kind, cx),
+        }
+    }
+
+    /// Convert the selected word/selection into a bible dossier. Creating a
+    /// dossier is an explicit canonical write; if the file already exists the
+    /// menu opens it instead of overwriting anything.
+    fn context_convert_entity(&mut self, kind: NewFileKind, cx: &mut Context<Self>) {
+        if !kind.is_entity() {
+            return;
+        }
+        let name = self
+            .doc
+            .buffer
+            .slice(self.doc.selected.clone())
+            .trim()
+            .to_string();
+        if name.is_empty() || name.contains('\n') {
+            self.notice = Some(self.t("notice.entity_invalid").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(path) = new_file::target_path(kind, &name) else {
+            self.notice = Some(self.t("notice.entity_invalid").to_string());
+            cx.notify();
+            return;
+        };
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project_short").to_string());
+            cx.notify();
+            return;
+        };
+        if !self.explorer.iter().any(|existing| existing == &path) {
+            let template = new_file::template(kind, &name);
+            if let Err(error) = project.create_document(&path, &template) {
+                self.notice = Some(self.tf(
+                    "notice.entity_create_failed",
+                    &[("error", &error.to_string())],
+                ));
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(project) = self.project.as_ref()
+            && let Ok(paths) = project.list_documents()
+        {
+            self.explorer = paths;
+        }
+        if let Err(error) = self.open_document_path(&path) {
+            self.notice = Some(error);
+            cx.notify();
+            return;
+        }
+        self.notice = Some(self.tf(
+            "notice.entity_opened",
+            &[("kind", self.t(kind.i18n_key())), ("path", &path)],
+        ));
+        cx.notify();
+    }
+
+    /// Apply a specific Fountain element type to every line touched by the
+    /// selection (or to the caret line). Uses the same forced markers as the
+    /// Tab cycle, so the text is preserved.
+    fn context_set_element(&mut self, kind: screenplay::ElementType, cx: &mut Context<Self>) {
+        let caret = self.caret();
+        let start_line = self.doc.buffer.position_at(self.doc.selected.start).line;
+        let end_line = if self.doc.selected.is_empty() {
+            self.doc.buffer.position_at(caret).line
+        } else {
+            self.doc
+                .buffer
+                .position_at(self.doc.selected.end.saturating_sub(1))
+                .line
+        };
+        let start = self.doc.buffer.line_content_range(start_line).start;
+        let end = self.doc.buffer.line_content_range(end_line).end;
+        let range = start..end;
+        let old = self.doc.buffer.slice(range.clone());
+        let new_text = old
+            .split('\n')
+            .map(|line| screenplay::apply(line, kind))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if new_text == old {
+            return;
+        }
+        let col = caret.saturating_sub(start).min(new_text.len());
+        self.apply_edit(range.clone(), &new_text);
+        self.set_caret((range.start + col).min(self.doc.buffer.doc_len()), false);
+        self.notice = Some(self.t("notice.element_applied").to_string());
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
+    fn context_menu_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let menu = self.context_menu.as_ref().expect("overlay only when open");
+        let menu_height = menu
+            .items
+            .iter()
+            .map(|item| if item.action.is_none() { 9.0 } else { 30.0 })
+            .sum::<f32>()
+            + 8.0;
+        let (menu_x, menu_y) = (menu.x, menu.y);
+        let mut rows = div()
+            .id("context-menu-items")
+            .max_h(px(560.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .py_1();
+        for (index, item) in menu.items.iter().enumerate() {
+            if item.action.is_none() {
+                rows = rows.child(
+                    div()
+                        .mx_2()
+                        .my_1()
+                        .h(px(1.0))
+                        .bg(rgb(theme::explorer_border())),
+                );
+                continue;
+            }
+            let selected = index == menu.selected;
+            let enabled = item.enabled;
+            let text_color = if !enabled {
+                theme::gutter_fg()
+            } else if selected {
+                theme::default_fg()
+            } else {
+                theme::status_fg()
+            };
+            let action = item.action.expect("separator handled above");
+            rows = rows.child(
+                div()
+                    .id(("context-item", index))
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(selected && enabled, |row| {
+                        row.bg(rgb(theme::doc_selected_bg()))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(text_color))
+                            .child(item.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(item.shortcut),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if enabled {
+                                this.context_activate(action, window, cx);
+                            }
+                        }),
+                    ),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let x = f32::from(event.position.x);
+                    let y = f32::from(event.position.y);
+                    let inside = x >= menu_x
+                        && x <= menu_x + 280.0
+                        && y >= menu_y
+                        && y <= menu_y + menu_height;
+                    if !inside {
+                        this.context_menu = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .id("context-menu")
+                    .absolute()
+                    .left(px(menu.x))
+                    .top(px(menu.y))
+                    .w(px(280.0))
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(rows),
+            )
+    }
+
     fn caret(&self) -> usize {
         if self.doc.reversed {
             self.doc.selected.start
@@ -3498,6 +3879,10 @@ impl Editor {
                 0.0,
                 None,
             ));
+        }
+        if event.button == MouseButton::Right {
+            self.open_editor_context_menu(event.position, window, cx);
+            return;
         }
         if self.doc.diff.open || event.button != MouseButton::Left {
             return;
@@ -4058,6 +4443,10 @@ impl Editor {
     }
 
     fn on_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() {
+            self.context_menu_move(-1, cx);
+            return;
+        }
         if self.palette.is_some() {
             self.palette_move(-1, cx);
             return;
@@ -4068,6 +4457,10 @@ impl Editor {
     }
 
     fn on_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() {
+            self.context_menu_move(1, cx);
+            return;
+        }
         if self.palette.is_some() {
             self.palette_move(1, cx);
             return;
@@ -4468,7 +4861,7 @@ impl Editor {
     }
 
     fn on_cycle_element(&mut self, _: &CycleElement, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() {
+        if self.context_menu.is_some() || self.palette.is_some() {
             return;
         }
         if self.settings.is_some() {
@@ -5608,6 +6001,11 @@ impl Editor {
     /// dirty tab opens the save/discard/cancel prompt; a clean workspace
     /// quits. Pressing the action again while the prompt is open dismisses it.
     fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette = None;
             cx.notify();
@@ -5849,6 +6247,11 @@ impl Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette_backspace(cx);
             return;
@@ -5962,6 +6365,10 @@ impl Editor {
         // button is "save and close" (macOS convention), Esc cancels.
         if self.unsaved_prompt.is_some() {
             self.prompt_save(window, cx);
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.context_menu_activate_selected(window, cx);
             return;
         }
         if self.palette.is_some() {
@@ -6449,6 +6856,11 @@ impl Editor {
         // same time). The unsaved-changes prompt wins over all of them.
         if self.unsaved_prompt.is_some() {
             self.unsaved_prompt = None;
+            cx.notify();
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.context_menu = None;
             cx.notify();
             return;
         }
@@ -9539,6 +9951,27 @@ impl Editor {
         } else {
             "{\"open\":false,\"mode\":\"\",\"query\":\"\",\"selected\":0,\"results\":0}".to_string()
         };
+        let context_dump = if let Some(menu) = self.context_menu.as_ref() {
+            let items = menu
+                .items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{{\"label\":\"{}\",\"shortcut\":\"{}\",\"enabled\":{}}}",
+                        escape_json(&item.label),
+                        escape_json(item.shortcut),
+                        item.enabled
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"open\":true,\"x\":{:.1},\"y\":{:.1},\"selected\":{},\"items\":[{}]}}",
+                menu.x, menu.y, menu.selected, items
+            )
+        } else {
+            "{\"open\":false,\"x\":0,\"y\":0,\"selected\":0,\"items\":[]}".to_string()
+        };
         let unsaved_dump = match self.unsaved_prompt {
             Some(prompt) => {
                 let (action, tab) = match prompt.action {
@@ -9735,7 +10168,7 @@ impl Editor {
                 "\"document\":\"{}\",\"language\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\
+                 \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
@@ -9797,6 +10230,7 @@ impl Editor {
             panels_dump,
             settings_dump,
             palette_dump,
+            context_dump,
             new_file_dump,
             new_project_dump,
             tabs_dump,
@@ -9899,6 +10333,8 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.find"), ToggleFind),
                 gpui::MenuItem::action(label("menu.replace"), FocusReplace),
                 gpui::MenuItem::action(label("menu.project_search"), ProjectSearch),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.context_menu"), ShowContextMenu),
             ],
         ),
         menu(
@@ -10266,6 +10702,11 @@ impl EntityInputHandler for Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette_input(new_text, cx);
             return;
@@ -10376,6 +10817,11 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         if self.unsaved_prompt.is_some() {
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
             return;
         }
         if self.palette.is_some() {
@@ -10581,6 +11027,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_open_project_settings))
             .on_action(cx.listener(Self::on_toggle_config_files))
+            .on_action(cx.listener(Self::on_show_context_menu))
             .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_quit))
@@ -10653,6 +11100,7 @@ impl Render for Editor {
                                     // Click-to-caret for the buffer list (the diff list is
                             // read-only and ignores clicks in the handler).
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_buffer_click))
+                            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_buffer_click))
                             .on_mouse_move(cx.listener(Self::on_mouse_drag))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_release))
                             // The diff view replaces the buffer rows while open; the
@@ -10726,6 +11174,9 @@ impl Render for Editor {
             })
             .when(self.palette.is_some(), |root| {
                 root.child(self.palette_overlay(cx))
+            })
+            .when(self.context_menu.is_some(), |root| {
+                root.child(self.context_menu_overlay(cx))
             })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
@@ -11153,6 +11604,7 @@ fn run() -> Result<(), String> {
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
                 KeyBinding::new("cmd-shift-,", OpenProjectSettings, None),
+                KeyBinding::new("shift-f10", ShowContextMenu, None),
                 KeyBinding::new("cmd-p", QuickOpen, None),
                 KeyBinding::new("cmd-shift-p", CommandPalette, None),
                 // caret movement
@@ -11333,6 +11785,7 @@ fn run() -> Result<(), String> {
                 settings: None,
                 project_settings: None,
                 palette: None,
+                context_menu: None,
                 show_config_files: initial_show_config_files,
                 word_wrap: initial_word_wrap,
                 propose: ProposeView::new(),

@@ -10,6 +10,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Kind {
     Character,
+    Location,
+    Object,
     Notes,
     Research,
     #[default]
@@ -17,8 +19,10 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Character,
+        Kind::Location,
+        Kind::Object,
         Kind::Notes,
         Kind::Research,
         Kind::Screenplay,
@@ -28,6 +32,8 @@ impl Kind {
     pub fn key(self) -> &'static str {
         match self {
             Kind::Character => "character",
+            Kind::Location => "location",
+            Kind::Object => "object",
             Kind::Notes => "notes",
             Kind::Research => "research",
             Kind::Screenplay => "screenplay",
@@ -38,6 +44,8 @@ impl Kind {
     pub fn folder(self) -> &'static str {
         match self {
             Kind::Character => "bible/characters",
+            Kind::Location => "bible/locations",
+            Kind::Object => "bible/objects",
             Kind::Notes => "notes",
             Kind::Research => "research",
             Kind::Screenplay => "screenplay",
@@ -48,7 +56,7 @@ impl Kind {
     pub fn extension(self) -> &'static str {
         match self {
             Kind::Screenplay => "fountain",
-            Kind::Character | Kind::Notes | Kind::Research => "md",
+            Kind::Character | Kind::Location | Kind::Object | Kind::Notes | Kind::Research => "md",
         }
     }
 
@@ -56,13 +64,19 @@ impl Kind {
     pub fn i18n_key(self) -> &'static str {
         match self {
             Kind::Character => "newfile.kind.character",
+            Kind::Location => "newfile.kind.location",
+            Kind::Object => "newfile.kind.object",
             Kind::Notes => "newfile.kind.notes",
             Kind::Research => "newfile.kind.research",
             Kind::Screenplay => "newfile.kind.screenplay",
         }
     }
-}
 
+    /// Whether this kind is a narrative-entity dossier (M11 context menu).
+    pub fn is_entity(self) -> bool {
+        matches!(self, Kind::Character | Kind::Location | Kind::Object)
+    }
+}
 /// Sanitize a user-supplied name into a file stem.
 ///
 /// The name is preserved (case and accents included: the file stem is the
@@ -109,6 +123,8 @@ pub fn template(kind: Kind, name: &str) -> String {
     let title = name.trim();
     match kind {
         Kind::Character => format!("# {title}\n\n## Rasgos\n\n## Objetivo\n\n## Notas\n"),
+        Kind::Location => format!("# {title}\n\n## Descripción\n\n## Uso narrativo\n\n## Notas\n"),
+        Kind::Object => format!("# {title}\n\n## Descripción\n\n## Importancia\n\n## Notas\n"),
         Kind::Notes | Kind::Research => format!("# {title}\n\n"),
         // A screenplay starts from a blank Fountain page, like the project
         // template's default screenplay.
@@ -129,6 +145,14 @@ mod tests {
         assert_eq!(
             target_path(Kind::Notes, "ideas").as_deref(),
             Some("notes/ideas.md")
+        );
+        assert_eq!(
+            target_path(Kind::Location, "Casa de Marta").as_deref(),
+            Some("bible/locations/Casa de Marta.md")
+        );
+        assert_eq!(
+            target_path(Kind::Object, "Reloj").as_deref(),
+            Some("bible/objects/Reloj.md")
         );
         assert_eq!(
             target_path(Kind::Research, "policía 1920").as_deref(),
@@ -174,6 +198,8 @@ mod tests {
         let character = template(Kind::Character, "Marta");
         assert!(character.starts_with("# Marta\n"));
         assert!(character.contains("## Rasgos"));
+        assert!(template(Kind::Location, "Casa").contains("## Descripción"));
+        assert!(template(Kind::Object, "Reloj").contains("## Importancia"));
         assert!(template(Kind::Notes, "Ideas").contains("# Ideas"));
         assert!(template(Kind::Research, "Fuentes").contains("# Fuentes"));
         assert_eq!(template(Kind::Screenplay, "Piloto"), "");

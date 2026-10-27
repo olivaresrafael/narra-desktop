@@ -18,6 +18,22 @@ pub enum ElementType {
 }
 
 impl ElementType {
+    pub const ALL: [ElementType; 4] = [
+        ElementType::SceneHeading,
+        ElementType::Action,
+        ElementType::Character,
+        ElementType::Transition,
+    ];
+
+    pub fn i18n_key(self) -> &'static str {
+        match self {
+            ElementType::SceneHeading => "context.element.heading",
+            ElementType::Action => "context.element.action",
+            ElementType::Character => "context.element.character",
+            ElementType::Transition => "context.element.transition",
+        }
+    }
+
     fn next(self) -> ElementType {
         match self {
             ElementType::SceneHeading => ElementType::Action,
@@ -98,7 +114,7 @@ fn strip_markers(line: &str) -> String {
     format!("{indent}{body}")
 }
 
-fn apply(line: &str, target: ElementType) -> String {
+pub fn apply(line: &str, target: ElementType) -> String {
     let leading = line.len() - line.trim_start().len();
     let (indent, body) = line.split_at(leading);
     match target {

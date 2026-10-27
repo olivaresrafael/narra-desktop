@@ -368,6 +368,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "No se pudo crear el documento: {error}",
     ),
     ("newfile.kind.character", "Character", "Personaje"),
+    ("newfile.kind.location", "Location", "Localización"),
+    ("newfile.kind.object", "Object", "Objeto"),
     ("newfile.kind.notes", "Notes", "Notas"),
     ("newfile.kind.research", "Research", "Investigación"),
     ("newfile.kind.screenplay", "Screenplay", "Guion"),
@@ -521,6 +523,77 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "notice.project_settings_saved",
         "project settings saved",
         "ajustes del proyecto guardados",
+    ),
+    (
+        "notice.entity_invalid",
+        "select a single word or name to create a bible dossier",
+        "selecciona una palabra o nombre para crear una ficha de la biblia",
+    ),
+    (
+        "notice.entity_create_failed",
+        "could not create the dossier: {error}",
+        "no se pudo crear la ficha: {error}",
+    ),
+    (
+        "notice.entity_opened",
+        "{kind} dossier ready: {path}",
+        "ficha de {kind} lista: {path}",
+    ),
+    (
+        "notice.element_applied",
+        "screenplay element updated",
+        "elemento de guion actualizado",
+    ),
+    // --- editor context menu (M11 slice 1) --------------------------------
+    ("context.cut", "Cut", "Cortar"),
+    ("context.copy", "Copy", "Copiar"),
+    ("context.paste", "Paste", "Pegar"),
+    ("context.select_all", "Select All", "Seleccionar todo"),
+    ("context.find", "Find in file", "Buscar en el archivo"),
+    (
+        "context.project_search",
+        "Search in project",
+        "Buscar en el proyecto",
+    ),
+    (
+        "context.propose",
+        "Propose rewrite with AI…",
+        "Proponer reescritura con IA…",
+    ),
+    (
+        "context.convert.character",
+        "Convert to character",
+        "Convertir en personaje",
+    ),
+    (
+        "context.convert.location",
+        "Convert to location",
+        "Convertir en localización",
+    ),
+    (
+        "context.convert.object",
+        "Convert to object",
+        "Convertir en objeto",
+    ),
+    (
+        "context.element.heading",
+        "Make scene heading",
+        "Convertir en encabezado de escena",
+    ),
+    (
+        "context.element.action",
+        "Make action",
+        "Convertir en acción",
+    ),
+    (
+        "context.element.character",
+        "Make character cue",
+        "Convertir en personaje (diálogo)",
+    ),
+    (
+        "context.element.transition",
+        "Make transition",
+        "Convertir en transición",
     ),
     // --- settings (M10 slice 4) -------------------------------------------
     ("settings.title", "Settings", "Ajustes"),
@@ -730,6 +803,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.select_all", "Select All", "Seleccionar todo"),
     ("menu.find", "Find…", "Buscar…"),
     ("menu.replace", "Replace…", "Reemplazar…"),
+    ("menu.context_menu", "Context Menu", "Menú contextual"),
     (
         "menu.project_search",
         "Project Search…",
