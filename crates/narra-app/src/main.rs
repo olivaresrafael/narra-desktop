@@ -3464,6 +3464,9 @@ impl Editor {
         self.agent.lang = self.lang;
         self.propose.lang = self.lang;
         self.notice = Some(self.tf("notice.lang", &[("lang", self.lang.name())]));
+        // The native menus are localized too: rebuild them in the new
+        // language (M10 slice 1).
+        install_menus(self.lang, cx);
         cx.notify();
     }
 
@@ -5382,6 +5385,72 @@ fn cursor_element() -> gpui::Div {
     div().w(px(2.0)).mr(px(-2.0)).h_full().bg(rgb(CURSOR_FG))
 }
 
+/// Install the native macOS menus (M10 slice 1). Labels come from the i18n
+/// table and are rebuilt when the language toggles; items dispatch the same
+/// actions as the keybindings, and the shortcut column is resolved by the
+/// platform from the keymap.
+fn install_menus(lang: Lang, cx: &gpui::App) {
+    let label = |key: &str| i18n::tr(lang, key);
+    let menu = |key: &str, items: Vec<gpui::MenuItem>| gpui::Menu {
+        name: label(key).into(),
+        items,
+    };
+    cx.set_menus(vec![
+        menu(
+            "menu.app",
+            vec![
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.quit"), Quit),
+            ],
+        ),
+        menu(
+            "menu.file",
+            vec![
+                gpui::MenuItem::action(label("menu.save"), Save),
+                gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf),
+            ],
+        ),
+        menu(
+            "menu.edit",
+            vec![
+                gpui::MenuItem::action(label("menu.undo"), Undo),
+                gpui::MenuItem::action(label("menu.redo"), Redo),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.cut"), CutText),
+                gpui::MenuItem::action(label("menu.copy"), CopyText),
+                gpui::MenuItem::action(label("menu.paste"), PasteText),
+                gpui::MenuItem::action(label("menu.select_all"), SelectAll),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.find"), ToggleFind),
+                gpui::MenuItem::action(label("menu.replace"), FocusReplace),
+                gpui::MenuItem::action(label("menu.project_search"), ProjectSearch),
+            ],
+        ),
+        menu(
+            "menu.view",
+            vec![
+                gpui::MenuItem::action(label("menu.toggle_diff"), ToggleDiff),
+                gpui::MenuItem::action(label("menu.language"), ToggleLang),
+            ],
+        ),
+        menu(
+            "menu.script",
+            vec![
+                gpui::MenuItem::action(label("menu.review"), ReviewScene),
+                gpui::MenuItem::action(label("menu.focus"), OpenFocusBar),
+                gpui::MenuItem::action(label("menu.propose"), OpenPropose),
+                gpui::MenuItem::action(label("menu.retry"), RetryAgent),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.cycle_element"), CycleElement),
+                gpui::MenuItem::action(label("menu.cycle_element_back"), CycleElementBack),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.restore_backup"), RestoreBackup),
+                gpui::MenuItem::action(label("menu.discard_backup"), DiscardBackup),
+            ],
+        ),
+    ]);
+}
+
 /// Line-number gutter cell (M9 slice 3): fixed width, right-aligned digits.
 fn gutter_element(ix: usize, active: bool) -> gpui::Div {
     div()
@@ -6383,6 +6452,10 @@ fn run() -> Result<(), String> {
             move |_, _, _| metrics.borrow_mut().mark_keystroke(Instant::now())
         })
         .detach();
+
+        // Native macOS menus (M10 slice 1), localized with the startup
+        // language and rebuilt by the ⌘⌥L toggle.
+        install_menus(lang, cx);
 
         let buffer = Buffer::new(&content);
         let line_count = buffer.line_count();
