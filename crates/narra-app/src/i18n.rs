@@ -403,6 +403,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Results ({n}) · “{query}”",
         "Resultados ({n}) · «{query}»",
     ),
+    ("panel.outline_title", "Scenes ({n})", "Escenas ({n})"),
+    ("panel.outline_more", "… {n} more", "… {n} más"),
     ("panel.search_truncated", " (truncated)", " (truncado)"),
     (
         "notice.search_done",

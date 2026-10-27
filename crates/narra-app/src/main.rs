@@ -79,6 +79,9 @@
 //!       enter scans every project document on a worker (narra-core
 //!       `search`), results replace the explorer, ⌘↑/⌘↓ move and enter (or
 //!       a click) opens the match; the dump reports `search`.
+//!       M8 slice 3 (outline): the explorer lists the open document's
+//!       scene headings below the file list; clicking one jumps to the
+//!       scene and the caret's scene is highlighted. Dump: `outline`.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -240,6 +243,9 @@ const EXPLORER_W: f32 = 220.0;
 const EXPLORER_BG: u32 = 0x252526;
 const EXPLORER_BORDER: u32 = 0x3c3c3c;
 const DOC_SELECTED_BG: u32 = 0x37373d;
+/// Outline rows rendered in the explorer (M8 slice 3). The panel has no
+/// scrollbar yet; the remainder is reported as "… N more".
+const OUTLINE_VISIBLE_ROWS: usize = 120;
 /// Agent review panel (M6 slice 3): right-hand column with status, context
 /// sources and a scrolled window of the review text.
 const AGENT_PANEL_W: f32 = 380.0;
@@ -791,6 +797,9 @@ struct Editor {
     redo_stack: Vec<Edit>,
 
     scene_lines: Vec<usize>,
+    /// Document outline (M8 slice 3): (line index, heading text) for the
+    /// open document, refreshed with the scene scan.
+    outline: Vec<(usize, String)>,
     scenes_dirty: bool,
     current_scene: usize,
 
@@ -1135,14 +1144,15 @@ impl Editor {
         if !self.scenes_dirty {
             return;
         }
-        self.scene_lines = self
+        self.outline = self
             .buffer
             .lines()
             .iter()
             .enumerate()
             .filter(|(_, line)| is_scene_heading(line))
-            .map(|(ix, _)| ix)
+            .map(|(ix, line)| (ix, line.trim().to_string()))
             .collect();
+        self.scene_lines = self.outline.iter().map(|(line, _)| *line).collect();
         self.scenes_dirty = false;
     }
 
@@ -2800,6 +2810,19 @@ impl Editor {
         (range.start + byte).min(range.end)
     }
 
+    /// Click on an outline row (M8 slice 3): jump to that scene's heading.
+    fn select_outline(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_scenes();
+        let Some(&line) = self.scene_lines.get(index) else {
+            return;
+        };
+        let offset = self.buffer.line_content_range(line).start;
+        self.set_caret(offset, false);
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+        self.ensure_caret_visible();
+    }
+
     /// Click on a result row: select it and open it.
     fn select_search_hit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.search.hits.len() {
@@ -3535,6 +3558,56 @@ impl Editor {
                     ),
             );
         }
+        // Document outline (M8 slice 3): the open document's scene headings.
+        // Clicking a row jumps to that scene; the caret's scene is marked.
+        if !self.outline.is_empty() {
+            let caret_line = self.buffer.position_at(self.caret()).line;
+            let current_scene = scene_number_at(&self.scene_lines, caret_line);
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgb(STATUS_FG))
+                    .child(self.tf(
+                        "panel.outline_title",
+                        &[("n", &self.outline.len().to_string())],
+                    )),
+            );
+            let visible = OUTLINE_VISIBLE_ROWS.min(self.outline.len());
+            for (index, (_, heading)) in self.outline.iter().take(visible).enumerate() {
+                let selected = current_scene == Some(index + 1);
+                panel = panel.child(
+                    div()
+                        .id(("scene", index))
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
+                        .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                        .cursor_pointer()
+                        .child(format!("{} · {}", index + 1, heading))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_outline(index, window, cx)
+                        })),
+                );
+            }
+            if self.outline.len() > visible {
+                panel = panel.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .text_color(rgb(STATUS_FG))
+                        .child(self.tf(
+                            "panel.outline_more",
+                            &[("n", &(self.outline.len() - visible).to_string())],
+                        )),
+                );
+            }
+        }
         panel.into_any_element()
     }
 
@@ -4058,6 +4131,17 @@ impl Editor {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let outline_dump: Vec<String> = self
+            .outline
+            .iter()
+            .map(|(line, heading)| {
+                format!(
+                    "{{\"line\":{},\"heading\":\"{}\"}}",
+                    line + 1,
+                    escape_json(heading),
+                )
+            })
+            .collect();
         let search_results: Vec<String> = self
             .search
             .hits
@@ -4190,7 +4274,8 @@ impl Editor {
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
-                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\"lang\":\"{}\"}}"
+                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
+                 \"outline\":[{}],\"lang\":\"{}\"}}"
             ),
             self.buffer.line_count(),
             len,
@@ -4231,6 +4316,7 @@ impl Editor {
             proposal_dump,
             export_dump,
             search_dump,
+            outline_dump.join(","),
             self.lang.key(),
         )
     }
@@ -4604,6 +4690,9 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         self.metrics.borrow_mut().on_render(now);
+        // Keep the scene index/outline fresh for the explorer (cheap: the
+        // scan only runs after an edit or a document load).
+        self.refresh_scenes();
 
         // The probe is driven by a timer scheduled from here, never by
         // notifying during render (see `advance_probe`).
@@ -5182,6 +5271,7 @@ fn run() -> Result<(), String> {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             scene_lines: Vec::new(),
+            outline: Vec::new(),
             scenes_dirty: true,
             current_scene: 0,
             list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
