@@ -76,6 +76,62 @@ impl OpenAiCompatConfig {
     }
 }
 
+/// Fetch model ids from an OpenAI-style `/models` endpoint. `models_url` is
+/// explicit because gateways such as OpenCode Zen/Go expose the catalog at a
+/// different path from their chat-completions base URL. The key, when
+/// present, only travels in the Authorization header; errors are redacted.
+pub fn fetch_model_ids(
+    models_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<String>, AgentError> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = agent.get(models_url);
+    if let Some(key) = api_key {
+        request = request.header("Authorization", bearer(key));
+    }
+    let mut response = request.call().map_err(|error| {
+        AgentError::Adapter(format!(
+            "no se pudo alcanzar `{models_url}`: {}",
+            crate::git::redact_secrets(&error.to_string())
+        ))
+    })?;
+    let status = response.status();
+    let payload: Value = response.body_mut().read_json().map_err(|error| {
+        AgentError::Adapter(format!(
+            "respuesta no interpretable de `{models_url}` (HTTP {status}): {error}"
+        ))
+    })?;
+    if !status.is_success() {
+        let detail =
+            server_error_detail(&payload).unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(AgentError::Adapter(format!(
+            "el catálogo de modelos devolvió HTTP {}: {}",
+            status.as_u16(),
+            crate::git::redact_secrets(&detail)
+        )));
+    }
+    Ok(parse_model_ids(&payload))
+}
+
+fn parse_model_ids(payload: &Value) -> Vec<String> {
+    payload
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The single provider adapter: OpenAI wire format, any compatible server.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatAdapter {
@@ -558,6 +614,19 @@ mod tests {
     fn missing_choices_is_an_actionable_error() {
         let error = parse_response(json!({"model": "x"})).expect_err("fail");
         assert!(error.to_string().contains("choices[0]"), "{error}");
+    }
+
+    #[test]
+    fn model_catalog_ids_are_parsed_and_missing_entries_are_skipped() {
+        let payload: Value = serde_json::from_str(
+            r#"{"object":"list","data":[{"id":"deepseek-v4.1-flash"},{"id":"glm-5.3-flash"},{"name":"no id"}]}"#,
+        )
+        .expect("json");
+        assert_eq!(
+            parse_model_ids(&payload),
+            vec!["deepseek-v4.1-flash", "glm-5.3-flash"]
+        );
+        assert!(parse_model_ids(&json!({})).is_empty());
     }
 
     #[test]

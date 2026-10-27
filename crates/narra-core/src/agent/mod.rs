@@ -27,7 +27,9 @@ pub mod tools;
 pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
 pub use mock::MockAdapter;
-pub use openai_compat::{LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig};
+pub use openai_compat::{
+    LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig, fetch_model_ids,
+};
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use roles::{Role, RoleOrigin, RolesError};
 pub use scene_edit::SceneEditTask;

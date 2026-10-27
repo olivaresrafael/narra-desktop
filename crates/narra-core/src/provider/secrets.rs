@@ -19,6 +19,11 @@ pub const NARRA_SERVICE_ENV: &str = "NARRA_KEYRING_SERVICE";
 
 /// Keychain account (username) used for the GitHub token.
 pub const GITHUB_TOKEN_ACCOUNT: &str = "github";
+/// Keychain accounts for model-provider keys. The JSON settings store never
+/// contains a key; these accounts are the only persistent home for one.
+pub const OPENAI_COMPAT_API_KEY_ACCOUNT: &str = "openai-compat";
+pub const OPENCODE_API_KEY_ACCOUNT: &str = "opencode";
+pub const OPENCODE_GO_API_KEY_ACCOUNT: &str = "opencode-go";
 
 /// Secret-storage failures. Messages describe the failure, never the secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,19 +182,33 @@ impl SecretStore for MemorySecretStore {
 /// Resolve the GitHub token: Keychain first, `GITHUB_TOKEN` env fallback
 /// (the caller passes the env value so resolution stays testable without
 /// mutating the process environment). Empty values are treated as absent.
+pub fn resolve_secret(
+    store: &dyn SecretStore,
+    account: &str,
+    env_value: Option<&str>,
+) -> Result<Option<String>, SecretError> {
+    match store.get(account) {
+        Ok(Some(secret)) if !secret.trim().is_empty() => Ok(Some(secret)),
+        Ok(_) => Ok(env_value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)),
+        // Headless/CI: the keychain may be unavailable while an explicit
+        // environment key is present. Use the env fallback; otherwise
+        // surface the keychain failure.
+        Err(_) if env_value.is_some_and(|value| !value.trim().is_empty()) => Ok(env_value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn github_token(
     store: &dyn SecretStore,
     env_token: Option<&str>,
 ) -> Result<Option<String>, SecretError> {
-    if let Some(stored) = store.get(GITHUB_TOKEN_ACCOUNT)?
-        && !stored.trim().is_empty()
-    {
-        return Ok(Some(stored));
-    }
-    Ok(env_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string))
+    resolve_secret(store, GITHUB_TOKEN_ACCOUNT, env_token)
 }
 
 #[cfg(test)]
@@ -232,6 +251,24 @@ mod tests {
         let store = MemorySecretStore::default();
         let token = github_token(&store, Some("ghp_fromenv")).expect("resolve");
         assert_eq!(token.as_deref(), Some("ghp_fromenv"));
+    }
+
+    #[test]
+    fn generic_secret_resolution_uses_the_requested_provider_account() {
+        let store = MemorySecretStore::default();
+        store.set("opencode", "sk-opencode").expect("set");
+        assert_eq!(
+            resolve_secret(&store, "opencode", Some("sk-env")).expect("resolve"),
+            Some("sk-opencode".to_string())
+        );
+        assert_eq!(
+            resolve_secret(&store, "opencode-go", Some("sk-go-env")).expect("resolve"),
+            Some("sk-go-env".to_string())
+        );
+        assert_eq!(
+            resolve_secret(&store, "opencode-go", None).expect("resolve"),
+            None
+        );
     }
 
     #[test]

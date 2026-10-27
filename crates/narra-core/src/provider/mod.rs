@@ -30,7 +30,9 @@ pub use github::{
     PullRequestState, Repository, UpdatePullRequest, User,
 };
 pub use secrets::{
-    GITHUB_TOKEN_ACCOUNT, MemorySecretStore, NARRA_SERVICE, OsKeychain, SecretError, SecretStore,
+    GITHUB_TOKEN_ACCOUNT, MemorySecretStore, NARRA_SERVICE, OPENAI_COMPAT_API_KEY_ACCOUNT,
+    OPENCODE_API_KEY_ACCOUNT, OPENCODE_GO_API_KEY_ACCOUNT, OsKeychain, SecretError, SecretStore,
+    resolve_secret,
 };
 
 /// One operation the product may want from a remote provider. The enum is

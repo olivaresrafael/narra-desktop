@@ -54,7 +54,8 @@
 //!       run's status, the context sources read and a scrolled window of
 //!       the review; ⌘. cancels; ⌥↑/⌥↓ scroll. Adapter flags (key never
 //!       from argv, only from OPENAI_API_KEY):
-//!         --agent-adapter mock|openai-compat  (default: mock, offline)
+//!         --agent-adapter mock|openai-compat|opencode|opencode-go
+//!                                             (default: settings, mock offline)
 //!         --agent-model <nombre>              (required for openai-compat)
 //!         --agent-base-url <url>              (default: local Ollama)
 //!         --agent-latency <ms>                (simulated mock latency)
@@ -123,6 +124,7 @@ mod new_file;
 mod new_project;
 mod recent;
 mod screenplay;
+mod settings;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -152,15 +154,18 @@ use gpui::{
 use i18n::Lang;
 use narra_core::agent::{
     AgentError, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter,
-    OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, proposal, roles,
+    OpenAiCompatConfig, SceneEditTask, SceneReviewTask, TaskOptions, fetch_model_ids, proposal,
+    roles,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::git::WorktreeStatus;
+use narra_core::provider::SecretStore;
 use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
 use recent::RecentProjects;
+use settings::{AiProvider, AppSettings};
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
@@ -168,6 +173,7 @@ actions!(
     [
         // windows and navigation
         Quit,
+        OpenSettings,
         NextScene,
         PrevScene,
         // caret movement
@@ -485,6 +491,64 @@ struct NewProjectDraft {
     title: String,
     kind: ProjectType,
     lang: Lang,
+}
+
+/// Field the settings modal is editing. Tab/click moves it; typing and paste
+/// land in the active field (the API key is masked and never dumped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsField {
+    BaseUrl,
+    Model,
+    ApiKey,
+}
+
+/// The settings modal (M10 S4). `key_input` is transient; only Save writes it
+/// to the OS keychain. Everything else is persisted non-secret settings.
+struct SettingsState {
+    provider: AiProvider,
+    base_url: String,
+    model: String,
+    key_input: String,
+    key_present: bool,
+    key_source: String,
+    field: SettingsField,
+    error: String,
+    status: String,
+    models: Vec<String>,
+    models_request: u64,
+    fetching_models: bool,
+}
+
+impl std::fmt::Debug for SettingsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsState")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field(
+                "key_input",
+                &if self.key_input.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("key_present", &self.key_present)
+            .field("key_source", &self.key_source)
+            .field("field", &self.field)
+            .field("error", &self.error)
+            .field("status", &self.status)
+            .field("models", &self.models.len())
+            .field("fetching_models", &self.fetching_models)
+            .finish()
+    }
+}
+
+enum SettingsMessage {
+    Models {
+        request: u64,
+        result: Result<Vec<String>, String>,
+    },
 }
 
 /// What to do once the unsaved-changes prompt is resolved.
@@ -1190,8 +1254,13 @@ struct Editor {
     /// a pump from an older run returns immediately, so a cancelled task
     /// that finishes late cannot write into the new project.
     agent_generation: u64,
-    /// Adapter settings for agent tasks (from the `--agent-*` flags).
+    /// Adapter settings for agent tasks (persisted settings, or explicit
+    /// `--agent-*` flags for this run).
     agent_settings: AgentSettings,
+    /// Persisted non-secret preferences (S4); keys live only in the keychain.
+    app_settings: AppSettings,
+    /// The Settings modal, when open (S4).
+    settings: Option<SettingsState>,
     /// Proposal surface state (M6 slice 4). Pure reducer — see agent_view.
     propose: ProposeView,
     /// Instruction bar for ⌘P (M6 slice 4).
@@ -1254,7 +1323,11 @@ impl Editor {
     /// undo, scroll and find/diff state for both. Returns false for the
     /// already-active or an invalid index.
     fn activate_tab(&mut self, index: usize) -> bool {
-        if self.unsaved_prompt.is_some() || index == self.active_tab || index >= self.tabs.len() {
+        if self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || index == self.active_tab
+            || index >= self.tabs.len()
+        {
             return false;
         }
         let Some(next) = self.tabs[index].document.take() else {
@@ -1378,6 +1451,635 @@ impl Editor {
         if !self.git_pending {
             self.request_git_refresh(cx);
         }
+    }
+
+    // ---- settings (M10 S4) ----------------------------------------------
+
+    /// ⌘, / app menu: toggle the settings modal. It never stacks over another
+    /// modal or the unsaved prompt.
+    fn on_open_settings(&mut self, _: &OpenSettings, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.settings = None;
+            cx.notify();
+            return;
+        }
+        if self.unsaved_prompt.is_some() || self.new_file.is_some() || self.new_project.is_some() {
+            return;
+        }
+        let provider = self.agent_settings.provider;
+        let (key_present, key_source) = provider_key_status(provider);
+        let base_url = provider
+            .fixed_base_url()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.agent_settings.base_url.clone());
+        let model = if self.agent_settings.model.trim().is_empty() {
+            provider.default_model().to_string()
+        } else {
+            self.agent_settings.model.clone()
+        };
+        self.settings = Some(SettingsState {
+            provider,
+            base_url,
+            model,
+            key_input: String::new(),
+            key_present,
+            key_source,
+            field: SettingsField::Model,
+            error: String::new(),
+            status: String::new(),
+            models: provider
+                .known_models()
+                .iter()
+                .map(|model| model.to_string())
+                .collect(),
+            models_request: 0,
+            fetching_models: false,
+        });
+        cx.notify();
+    }
+
+    fn settings_set_provider(&mut self, provider: AiProvider, cx: &mut Context<Self>) {
+        let (key_present, key_source) = provider_key_status(provider);
+        if let Some(state) = self.settings.as_mut() {
+            state.provider = provider;
+            state.base_url = provider
+                .fixed_base_url()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if state.base_url.trim().is_empty() {
+                        LOCAL_DEFAULT_BASE_URL.to_string()
+                    } else {
+                        state.base_url.clone()
+                    }
+                });
+            if state.model.trim().is_empty() {
+                state.model = provider.default_model().to_string();
+            }
+            state.key_input.clear();
+            state.key_present = key_present;
+            state.key_source = key_source;
+            state.models = provider
+                .known_models()
+                .iter()
+                .map(|model| model.to_string())
+                .collect();
+            state.error.clear();
+            state.status.clear();
+        }
+        cx.notify();
+    }
+
+    fn settings_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .collect();
+        if let Some(state) = self.settings.as_mut() {
+            match state.field {
+                SettingsField::BaseUrl => state.base_url.push_str(&cleaned),
+                SettingsField::Model => state.model.push_str(&cleaned),
+                SettingsField::ApiKey => state.key_input.push_str(&cleaned),
+            }
+            state.error.clear();
+            state.status.clear();
+        }
+        cx.notify();
+    }
+
+    fn settings_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings.as_mut() {
+            let target = match state.field {
+                SettingsField::BaseUrl => &mut state.base_url,
+                SettingsField::Model => &mut state.model,
+                SettingsField::ApiKey => &mut state.key_input,
+            };
+            if let Some(last) = target.chars().last() {
+                let len = target.len();
+                target.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+            state.status.clear();
+        }
+        cx.notify();
+    }
+
+    fn settings_cycle_field(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings.as_mut() {
+            let fields: &[SettingsField] = if state.provider.fixed_base_url().is_some() {
+                &[SettingsField::Model, SettingsField::ApiKey]
+            } else {
+                &[
+                    SettingsField::BaseUrl,
+                    SettingsField::Model,
+                    SettingsField::ApiKey,
+                ]
+            };
+            let current = fields
+                .iter()
+                .position(|field| *field == state.field)
+                .unwrap_or(0);
+            let next = if forward {
+                (current + 1) % fields.len()
+            } else {
+                (current + fields.len() - 1) % fields.len()
+            };
+            state.field = fields[next];
+        }
+        cx.notify();
+    }
+
+    fn settings_save(&mut self, cx: &mut Context<Self>) {
+        let lang = self.lang;
+        let Some(state) = self.settings.as_ref() else {
+            return;
+        };
+        let provider = state.provider;
+        let model = if provider == AiProvider::Mock {
+            String::new()
+        } else {
+            state.model.trim().to_string()
+        };
+        let base_url = state
+            .provider
+            .fixed_base_url()
+            .map(str::to_string)
+            .unwrap_or_else(|| state.base_url.trim().to_string());
+        let key_input = state.key_input.trim().to_string();
+        if provider != AiProvider::Mock && model.is_empty() {
+            if let Some(state) = self.settings.as_mut() {
+                state.error = i18n::tr(lang, "settings.model_required").to_string();
+            }
+            cx.notify();
+            return;
+        }
+        if provider == AiProvider::OpenAiCompat && base_url.is_empty() {
+            if let Some(state) = self.settings.as_mut() {
+                state.error = i18n::tr(lang, "settings.base_url_required").to_string();
+            }
+            cx.notify();
+            return;
+        }
+        if provider.requires_key() && key_input.is_empty() && !state.key_present {
+            if let Some(state) = self.settings.as_mut() {
+                state.error = i18n::tr(lang, "settings.key_required").to_string();
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(account) = provider.secret_account()
+            && !key_input.is_empty()
+        {
+            let store = narra_core::provider::OsKeychain::new();
+            if let Err(error) = store.set(account, &key_input) {
+                if let Some(state) = self.settings.as_mut() {
+                    state.error = i18n::tf(
+                        lang,
+                        "settings.key_save_failed",
+                        &[("error", &error.to_string())],
+                    );
+                }
+                cx.notify();
+                return;
+            }
+        }
+        let app_settings = AppSettings {
+            provider,
+            base_url: base_url.clone(),
+            model: model.clone(),
+            error: None,
+        };
+        if let Err(error) = app_settings.save() {
+            if let Some(state) = self.settings.as_mut() {
+                state.error = i18n::tf(lang, "settings.save_failed", &[("error", &error)]);
+            }
+            cx.notify();
+            return;
+        }
+        self.app_settings = app_settings;
+        self.agent_settings = AgentSettings {
+            provider,
+            base_url: self.app_settings.resolved_base_url(),
+            model,
+            latency_ms: self.agent_settings.latency_ms,
+        };
+        self.settings = None;
+        self.notice = Some(self.tf(
+            "notice.settings_saved",
+            &[("provider", self.t(provider.i18n_key()))],
+        ));
+        cx.notify();
+    }
+
+    /// Fetch the live catalog with the key currently in the modal (or the
+    /// stored/env key). This is also the connection check for OpenCode.
+    fn settings_fetch_models(&mut self, cx: &mut Context<Self>) {
+        let lang = self.lang;
+        let Some(state) = self.settings.as_ref() else {
+            return;
+        };
+        if state.fetching_models {
+            return;
+        }
+        let provider = state.provider;
+        if provider == AiProvider::Mock {
+            if let Some(state) = self.settings.as_mut() {
+                state.status = i18n::tr(lang, "settings.mock_local").to_string();
+            }
+            cx.notify();
+            return;
+        }
+        let base_url = if let Some(fixed) = provider.fixed_base_url() {
+            fixed.to_string()
+        } else {
+            state.base_url.trim().to_string()
+        };
+        let Some(models_url) = provider.models_url(&base_url) else {
+            return;
+        };
+        let key = if state.key_input.trim().is_empty() {
+            match resolve_provider_key(provider) {
+                Ok(key) => key,
+                Err(error) => {
+                    if let Some(state) = self.settings.as_mut() {
+                        state.error = error;
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            Some(state.key_input.trim().to_string())
+        };
+        if provider.requires_key() && key.is_none() {
+            if let Some(state) = self.settings.as_mut() {
+                state.error = i18n::tr(lang, "settings.key_required").to_string();
+            }
+            cx.notify();
+            return;
+        }
+        let request = state.models_request.saturating_add(1);
+        if let Some(state) = self.settings.as_mut() {
+            state.models_request = request;
+            state.fetching_models = true;
+            state.error.clear();
+            state.status = i18n::tr(lang, "settings.fetching").to_string();
+        }
+        cx.notify();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = fetch_model_ids(&models_url, key.as_deref(), Duration::from_secs(20))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(SettingsMessage::Models { request, result });
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let SettingsMessage::Models { request, result } = message;
+            let lang = view.lang;
+            if let Some(state) = view.settings.as_mut()
+                && state.models_request == request
+            {
+                state.fetching_models = false;
+                match result {
+                    Ok(mut models) => {
+                        models.sort();
+                        models.dedup();
+                        let count = models.len();
+                        state.models = models;
+                        state.status = i18n::tf(
+                            lang,
+                            "settings.models_fetched",
+                            &[("n", &count.to_string())],
+                        );
+                    }
+                    Err(error) => {
+                        state.error = i18n::tf(
+                            lang,
+                            "settings.models_failed",
+                            &[("error", &error.to_string())],
+                        );
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn settings_clear_key(&mut self, cx: &mut Context<Self>) {
+        let lang = self.lang;
+        let Some(state) = self.settings.as_ref() else {
+            return;
+        };
+        let Some(account) = state.provider.secret_account() else {
+            return;
+        };
+        let store = narra_core::provider::OsKeychain::new();
+        if let Err(error) = store.delete(account) {
+            if let Some(state) = self.settings.as_mut() {
+                state.error = i18n::tf(
+                    lang,
+                    "settings.key_save_failed",
+                    &[("error", &error.to_string())],
+                );
+            }
+            cx.notify();
+            return;
+        }
+        let (key_present, key_source) = provider_key_status(state.provider);
+        if let Some(state) = self.settings.as_mut() {
+            state.key_input.clear();
+            state.key_present = key_present;
+            state.key_source = key_source;
+            state.status = i18n::tr(lang, "settings.key_cleared").to_string();
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    /// The Settings card. The API key is never echoed: the field shows a
+    /// fixed mask and the dump only reports presence/source.
+    fn settings_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.settings.as_ref().expect("overlay only when open");
+        let mut providers = div().flex().flex_wrap().gap_2();
+        for (index, provider) in AiProvider::ALL.into_iter().enumerate() {
+            let selected = provider == state.provider;
+            providers = providers.child(
+                div()
+                    .id(("settings-provider", index))
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        DEFAULT_FG
+                    } else {
+                        EXPLORER_BORDER
+                    }))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .cursor_pointer()
+                    .child(self.t(provider.i18n_key()))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.settings_set_provider(provider, cx)),
+                    ),
+            );
+        }
+        let field = |id: &'static str, text: String, active: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x1e1e20))
+                .border_1()
+                .border_color(rgb(if active { DEFAULT_FG } else { EXPLORER_BORDER }))
+                .text_color(rgb(DEFAULT_FG))
+                .child(text)
+        };
+        let fixed_base = state.provider.fixed_base_url();
+        let base_text = if fixed_base.is_some() {
+            state.base_url.clone()
+        } else {
+            format!("{}▌", state.base_url)
+        };
+        let key_text = if !state.key_input.is_empty() {
+            format!("{}▌", "•".repeat(state.key_input.chars().count().min(32)))
+        } else if state.key_present {
+            format!(
+                "•••••••• ({})",
+                self.t(if state.key_source == "env" {
+                    "settings.key_source_env"
+                } else {
+                    "settings.key_source_keychain"
+                })
+            )
+        } else {
+            self.t("settings.key_empty").to_string()
+        };
+        let key_active = state.field == SettingsField::ApiKey;
+        let model_active = state.field == SettingsField::Model;
+        let base_active = state.field == SettingsField::BaseUrl;
+        let mut model_list = div()
+            .id("settings-models")
+            .h(px(112.0))
+            .w_full()
+            .overflow_y_scroll()
+            .border_1()
+            .border_color(rgb(EXPLORER_BORDER));
+        for (index, model) in state.models.iter().enumerate() {
+            let selected = model == &state.model;
+            let choice = model.clone();
+            model_list = model_list.child(
+                div()
+                    .id(("settings-model", index))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(rgb(if selected { DOC_SELECTED_BG } else { 0x1e1e20 }))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .child(choice.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.settings.as_mut() {
+                            state.model = choice.clone();
+                            state.field = SettingsField::Model;
+                            state.error.clear();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(720.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(0x252526))
+                    .border_1()
+                    .border_color(rgb(EXPLORER_BORDER))
+                    .child(
+                        div()
+                            .text_color(rgb(DEFAULT_FG))
+                            .child(self.t("settings.title")),
+                    )
+                    .child(providers)
+                    .when(state.provider == AiProvider::Mock, |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(STATUS_FG))
+                                .child(self.t("settings.mock_hint")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("settings.base_url")),
+                            )
+                            .child(if fixed_base.is_some() {
+                                div()
+                                    .flex_1()
+                                    .px_2()
+                                    .py_1()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(base_text)
+                                    .into_any_element()
+                            } else {
+                                field("settings-base-url", base_text, base_active)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(state) = this.settings.as_mut() {
+                                            state.field = SettingsField::BaseUrl;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("settings.model")),
+                            )
+                            .child(
+                                field(
+                                    "settings-model-field",
+                                    format!("{}▌", state.model),
+                                    model_active,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(state) = this.settings.as_mut() {
+                                            state.field = SettingsField::Model;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("settings.api_key")),
+                            )
+                            .child(
+                                field("settings-api-key-field", key_text, key_active).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        if let Some(state) = this.settings.as_mut() {
+                                            state.field = SettingsField::ApiKey;
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-clear-key")
+                                    .px_2()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .text_color(rgb(STATUS_FG))
+                                    .child(self.t("settings.clear_key"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.settings_clear_key(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(GUTTER_FG))
+                            .child(self.t("settings.key_hint")),
+                    )
+                    .child(model_list)
+                    .child(
+                        div()
+                            .text_color(rgb(GUTTER_FG))
+                            .child(self.t("settings.model_route_hint")),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(AGENT_ERR_FG))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .when(!state.status.is_empty(), |card| {
+                        card.child(div().text_color(rgb(STATUS_FG)).child(state.status.clone()))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("settings-fetch")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .cursor_pointer()
+                                    .child(if state.fetching_models {
+                                        self.t("settings.fetching")
+                                    } else {
+                                        self.t("settings.fetch_models")
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.settings_fetch_models(cx)
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-save")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(DEFAULT_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("settings.save"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.settings_save(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x37373d))
+                                    .text_color(rgb(STATUS_FG))
+                                    .cursor_pointer()
+                                    .child(self.t("settings.cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn caret(&self) -> usize {
@@ -2462,6 +3164,10 @@ impl Editor {
     }
 
     fn on_cycle_element(&mut self, _: &CycleElement, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.settings_cycle_field(true, cx);
+            return;
+        }
         self.cycle_element(true);
         cx.notify();
         self.ensure_caret_visible();
@@ -2473,6 +3179,10 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            self.settings_cycle_field(false, cx);
+            return;
+        }
         self.cycle_element(false);
         cx.notify();
         self.ensure_caret_visible();
@@ -2484,7 +3194,7 @@ impl Editor {
     /// again closes it.
     fn on_new_file(&mut self, _: &NewFile, _window: &mut Window, cx: &mut Context<Self>) {
         // One modal/prompt owns the keyboard at a time.
-        if self.new_project.is_some() || self.unsaved_prompt.is_some() {
+        if self.new_project.is_some() || self.unsaved_prompt.is_some() || self.settings.is_some() {
             return;
         }
         if self.new_file.is_some() {
@@ -2720,7 +3430,7 @@ impl Editor {
     /// quit prompt also own the keyboard, so the menu cannot start a second
     /// flow behind them.
     fn can_switch_project(&mut self) -> bool {
-        if self.unsaved_prompt.is_some() {
+        if self.unsaved_prompt.is_some() || self.settings.is_some() {
             return false;
         }
         if self.new_file.is_some() || self.new_project.is_some() {
@@ -3548,6 +4258,11 @@ impl Editor {
     /// dirty tab opens the save/discard/cancel prompt; a clean workspace
     /// quits. Pressing the action again while the prompt is open dismisses it.
     fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.settings = None;
+            cx.notify();
+            return;
+        }
         if self.unsaved_prompt.is_some() {
             self.unsaved_prompt = None;
             cx.notify();
@@ -3569,7 +4284,7 @@ impl Editor {
     /// the prompt; a clean tab closes immediately, keeping the editor on a
     /// neighbour (or a blank tab when it was the last one).
     fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() || self.unsaved_prompt.is_some() {
+        if index >= self.tabs.len() || self.unsaved_prompt.is_some() || self.settings.is_some() {
             return;
         }
         if self.tab_is_dirty(index) {
@@ -3769,6 +4484,10 @@ impl Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.settings.is_some() {
+            self.settings_backspace(cx);
+            return;
+        }
         if self.new_file.is_some() {
             if let Some(state) = self.new_file.as_mut() {
                 if let Some(last) = state.name.chars().last() {
@@ -3839,6 +4558,9 @@ impl Editor {
     }
 
     fn on_delete(&mut self, _: &DeleteText, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+            return;
+        }
         if self.doc.selected.is_empty() {
             let caret = self.caret();
             let next = self.doc.buffer.next_boundary(caret);
@@ -3863,6 +4585,10 @@ impl Editor {
         // button is "save and close" (macOS convention), Esc cancels.
         if self.unsaved_prompt.is_some() {
             self.prompt_save(window, cx);
+            return;
+        }
+        if self.settings.is_some() {
+            self.settings_save(cx);
             return;
         }
         // The New File modal creates on enter (M10 slice 2).
@@ -3929,18 +4655,27 @@ impl Editor {
     }
 
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+            return;
+        }
         self.undo();
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+            return;
+        }
         self.redo();
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+            return;
+        }
         if !self.doc.selected.is_empty() {
             let text = self.doc.buffer.slice(self.doc.selected.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -3948,6 +4683,9 @@ impl Editor {
     }
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+            return;
+        }
         if !self.doc.selected.is_empty() {
             let text = self.doc.buffer.slice(self.doc.selected.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -4306,6 +5044,11 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.settings.is_some() {
+            self.settings = None;
+            cx.notify();
+            return;
+        }
         if self.new_file.is_some() {
             self.new_file = None;
             cx.notify();
@@ -4456,7 +5199,7 @@ impl Editor {
     /// is preserved in the tab being left; tabs make switching safe, so the
     /// old document-switch refusal no longer applies here.
     fn open_document_path(&mut self, path: &str) -> Result<(), String> {
-        if self.unsaved_prompt.is_some() {
+        if self.unsaved_prompt.is_some() || self.settings.is_some() {
             return Err(self.t("notice.finish_dialog").to_string());
         }
         if path == self.doc.path {
@@ -7222,6 +7965,30 @@ impl Editor {
             "{{\"explorer\":{},\"agent\":{},\"git\":{}}}",
             self.explorer_open, self.agent_panel_open, self.git_panel_open
         );
+        let settings_dump = if let Some(state) = self.settings.as_ref() {
+            format!(
+                "{{\"open\":true,\"provider\":\"{}\",\"model\":\"{}\",\
+                 \"base_url\":\"{}\",\"key_present\":{},\"key_source\":\"{}\",\
+                 \"models\":{},\"fetching\":{},\"error\":\"{}\"}}",
+                state.provider.key(),
+                escape_json(&state.model),
+                escape_json(&state.base_url),
+                state.key_present || !state.key_input.is_empty(),
+                escape_json(&state.key_source),
+                state.models.len(),
+                state.fetching_models,
+                escape_json(&state.error),
+            )
+        } else {
+            format!(
+                "{{\"open\":false,\"provider\":\"{}\",\"model\":\"{}\",\
+                 \"base_url\":\"{}\",\"key_present\":false,\"key_source\":\"\",\
+                 \"models\":0,\"fetching\":false,\"error\":\"\"}}",
+                self.agent_settings.provider.key(),
+                escape_json(&self.agent_settings.model),
+                escape_json(&self.agent_settings.base_url),
+            )
+        };
         let unsaved_dump = match self.unsaved_prompt {
             Some(prompt) => {
                 let (action, tab) = match prompt.action {
@@ -7415,7 +8182,7 @@ impl Editor {
                 "\"document\":\"{}\",\"language\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"unsaved\":{},\"git\":{},\"panels\":{},\
+                 \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
@@ -7475,6 +8242,7 @@ impl Editor {
             unsaved_dump,
             git_dump,
             panels_dump,
+            settings_dump,
             new_file_dump,
             new_project_dump,
             tabs_dump,
@@ -7546,6 +8314,7 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
         menu(
             "menu.app",
             vec![
+                gpui::MenuItem::action(label("menu.settings"), OpenSettings),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.quit"), Quit),
             ],
@@ -7882,6 +8651,10 @@ impl EntityInputHandler for Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.settings.is_some() {
+            self.settings_input(new_text, cx);
+            return;
+        }
         // The New File modal owns typing while open (M10 slice 2).
         if self.new_file.is_some() {
             let cleaned: String = new_text
@@ -7979,6 +8752,13 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.unsaved_prompt.is_some() {
+            return;
+        }
+        if self.settings.is_some() {
+            self.settings_input(new_text, cx);
+            return;
+        }
         // IME while the find bar is open: commit into the active field with
         // no marked state (the documented single-focus compromise — live
         // composition inside the bar is production work).
@@ -8159,6 +8939,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_toggle_explorer))
             .on_action(cx.listener(Self::on_toggle_agent_panel))
             .on_action(cx.listener(Self::on_toggle_git_panel))
+            .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -8294,6 +9075,9 @@ impl Render for Editor {
             .when(self.unsaved_prompt.is_some(), |root| {
                 root.child(self.quit_overlay(cx))
             })
+            .when(self.settings.is_some(), |root| {
+                root.child(self.settings_overlay(cx))
+            })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
             })
@@ -8303,24 +9087,14 @@ impl Render for Editor {
     }
 }
 
-/// Which model adapter feeds ⌘R reviews.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentKind {
-    /// Deterministic local provider (no network, no credentials): the
-    /// default, so the workspace is verifiable offline.
-    Mock,
-    /// OpenAI-compatible HTTP API (local Ollama or a cloud provider).
-    OpenAiCompat,
-}
-
-/// Adapter settings for agent reviews (`--agent-*` flags). The API key is
-/// never an argument — it is read from the environment at build time, same
-/// rule as `narra-harness` (argv would expose it in `ps`).
+/// Adapter settings for agent reviews, derived from persisted settings or
+/// explicit `--agent-*` flags. API keys are never stored here: they are
+/// resolved from the OS keychain (or the provider's env fallback) at run time.
 #[derive(Clone, Debug)]
 struct AgentSettings {
-    kind: AgentKind,
+    provider: AiProvider,
     base_url: String,
-    model: Option<String>,
+    model: String,
     /// Simulated mock latency in ms (lets a driver observe the running
     /// state; real providers ignore it).
     latency_ms: u64,
@@ -8329,39 +9103,130 @@ struct AgentSettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
-            kind: AgentKind::Mock,
+            provider: AiProvider::Mock,
             base_url: LOCAL_DEFAULT_BASE_URL.to_string(),
-            model: None,
+            model: String::new(),
             latency_ms: 0,
         }
     }
 }
 
+/// Resolve a provider key without ever exposing it to settings/dump/logs.
+/// Keychain first, then the provider's environment fallback. Mock has none.
+fn resolve_provider_key(provider: AiProvider) -> Result<Option<String>, String> {
+    let Some(account) = provider.secret_account() else {
+        return Ok(None);
+    };
+    let store = narra_core::provider::OsKeychain::new();
+    let env_value = provider
+        .env_var()
+        .and_then(|name| env::var(name).ok())
+        .filter(|value| !value.trim().is_empty());
+    let key = narra_core::provider::resolve_secret(&store, account, env_value.as_deref())
+        .map_err(|error| error.to_string())?;
+    if provider.requires_key() && key.is_none() {
+        return Err(format!(
+            "missing API key for {}: set it in Settings (⌘,) or export {}",
+            provider.key(),
+            provider.env_var().unwrap_or("the provider key")
+        ));
+    }
+    Ok(key)
+}
+
+fn provider_key_status(provider: AiProvider) -> (bool, String) {
+    let Some(account) = provider.secret_account() else {
+        return (false, String::new());
+    };
+    let store = narra_core::provider::OsKeychain::new();
+    match store.get(account) {
+        Ok(Some(secret)) if !secret.trim().is_empty() => (true, "keychain".to_string()),
+        Ok(_) => match provider
+            .env_var()
+            .and_then(|name| env::var(name).ok())
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(_) => (true, "env".to_string()),
+            None => (false, String::new()),
+        },
+        Err(error) => match provider
+            .env_var()
+            .and_then(|name| env::var(name).ok())
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(_) => (true, "env".to_string()),
+            None => (false, error.to_string()),
+        },
+    }
+}
+
 impl AgentSettings {
-    /// Build the adapter for one run. Missing key for a remote provider is
-    /// not an error here: local OpenAI-compatible servers (Ollama) need none.
+    fn from_settings(settings: &AppSettings) -> Self {
+        let model = if settings.model.trim().is_empty() {
+            settings.provider.default_model().to_string()
+        } else {
+            settings.model.trim().to_string()
+        };
+        Self {
+            provider: settings.provider,
+            base_url: settings.resolved_base_url(),
+            model,
+            latency_ms: 0,
+        }
+    }
+
+    fn provider_key(&self) -> Result<Option<String>, String> {
+        resolve_provider_key(self.provider)
+    }
+
+    /// Build the adapter for one run. Mock stays offline; OpenCode Zen/Go
+    /// use their OpenAI chat-completions endpoints and their own keys.
     fn build_adapter(&self) -> Result<Box<dyn ModelAdapter>, String> {
-        match self.kind {
-            AgentKind::Mock => Ok(Box::new(MockAdapter::with_latency(Duration::from_millis(
+        if self.provider == AiProvider::Mock {
+            return Ok(Box::new(MockAdapter::with_latency(Duration::from_millis(
                 self.latency_ms,
-            )))),
-            AgentKind::OpenAiCompat => {
-                let model = self
-                    .model
-                    .clone()
-                    .ok_or("--agent-adapter openai-compat requiere --agent-model <nombre>")?;
-                let api_key = env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|key| !key.is_empty());
-                Ok(Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig {
-                    base_url: self.base_url.clone(),
-                    api_key,
-                    model,
-                    timeout: AGENT_TIMEOUT,
-                    extra_headers: Vec::new(),
-                })))
+            ))));
+        }
+        let model = self.model.trim();
+        if model.is_empty() {
+            return Err(format!(
+                "the {} provider needs a model id",
+                self.provider.key()
+            ));
+        }
+        let api_key = self.provider_key()?;
+        let mut extra_headers = Vec::new();
+        if matches!(self.provider, AiProvider::OpenCode | AiProvider::OpenCodeGo) {
+            extra_headers.push((
+                "User-Agent".to_string(),
+                "narra-desktop/0.0 (Narra)".to_string(),
+            ));
+            if self.provider == AiProvider::OpenCodeGo {
+                // OpenCode Go asks clients for a stable session id for
+                // routing/caching; this run is one conversation.
+                let session = format!(
+                    "narra-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or(0)
+                );
+                extra_headers.push(("x-opencode-session".to_string(), session));
             }
         }
+        let base_url = self
+            .provider
+            .fixed_base_url()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.base_url.clone());
+        Ok(Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig {
+            base_url,
+            api_key,
+            model: model.to_string(),
+            timeout: AGENT_TIMEOUT,
+            extra_headers,
+        })))
     }
 }
 
@@ -8376,6 +9241,9 @@ struct Args {
     report_after_ms: Option<u64>,
     dump_after_ms: Option<u64>,
     agent: AgentSettings,
+    /// An explicit `--agent-*` flag wins over persisted settings for this
+    /// run (headless verification and one-off real-provider tests).
+    agent_explicit: bool,
     /// UI language (M6 slice 9): `--lang en|es`; default from the
     /// environment (`LC_ALL`/`LANG`), English when undeterminable.
     lang: Lang,
@@ -8395,6 +9263,8 @@ fn parse_args() -> Result<Args, String> {
     let mut report_after_ms = None;
     let mut dump_after_ms = None;
     let mut agent = AgentSettings::default();
+    let mut agent_explicit = false;
+    let mut base_url_given = false;
     let mut lang = Lang::detect();
     let mut debug_metrics = false;
 
@@ -8449,22 +9319,27 @@ fn parse_args() -> Result<Args, String> {
             }
             // Agent review adapter (M6 slice 3). Key never from argv.
             "--agent-adapter" => {
-                agent.kind = match value.as_str() {
-                    "mock" => AgentKind::Mock,
-                    "openai-compat" => AgentKind::OpenAiCompat,
-                    other => {
-                        return Err(format!(
-                            "--agent-adapter inválido: {other} (mock|openai-compat)"
-                        ));
-                    }
-                }
+                agent.provider = AiProvider::parse(value).ok_or_else(|| {
+                    format!(
+                        "--agent-adapter inválido: {value} (mock|openai-compat|opencode|opencode-go)"
+                    )
+                })?;
+                agent_explicit = true;
             }
-            "--agent-base-url" => agent.base_url = value.clone(),
-            "--agent-model" => agent.model = Some(value.clone()),
+            "--agent-base-url" => {
+                agent.base_url = value.clone();
+                base_url_given = true;
+                agent_explicit = true;
+            }
+            "--agent-model" => {
+                agent.model = value.clone();
+                agent_explicit = true;
+            }
             "--agent-latency" => {
                 agent.latency_ms = value
                     .parse()
-                    .map_err(|_| format!("--agent-latency inválido: {value}"))?
+                    .map_err(|_| format!("--agent-latency inválido: {value}"))?;
+                agent_explicit = true;
             }
             "--lang" => {
                 lang = Lang::from_key(value)
@@ -8478,6 +9353,13 @@ fn parse_args() -> Result<Args, String> {
     if project.is_some() && fixture_given {
         return Err("usa --fixture o --project, no ambos".to_string());
     }
+    if !base_url_given {
+        agent.base_url = agent
+            .provider
+            .fixed_base_url()
+            .unwrap_or(LOCAL_DEFAULT_BASE_URL)
+            .to_string();
+    }
 
     Ok(Args {
         fixture,
@@ -8488,6 +9370,7 @@ fn parse_args() -> Result<Args, String> {
         report_after_ms,
         dump_after_ms,
         agent,
+        agent_explicit,
         lang,
         debug_metrics,
     })
@@ -8585,7 +9468,15 @@ fn run() -> Result<(), String> {
     let diff_steps = args.diff_steps;
     let report_after_ms = args.report_after_ms;
     let dump_after_ms = args.dump_after_ms;
-    let agent_settings = args.agent;
+    // Persisted provider settings are the default; explicit CLI flags win
+    // for a single run (headless tests and one-off real-provider checks).
+    let app_settings = AppSettings::load();
+    let settings_error = app_settings.error.clone();
+    let agent_settings = if args.agent_explicit {
+        args.agent
+    } else {
+        AgentSettings::from_settings(&app_settings)
+    };
     let lang = args.lang;
     let debug_metrics_flag = args.debug_metrics;
     Application::new()
@@ -8597,6 +9488,7 @@ fn run() -> Result<(), String> {
                 KeyBinding::new("cmd-g", NextScene, None),
                 KeyBinding::new("cmd-shift-g", PrevScene, None),
                 KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
                 // caret movement
                 KeyBinding::new("left", MoveLeft, None),
                 KeyBinding::new("right", MoveRight, None),
@@ -8771,6 +9663,8 @@ fn run() -> Result<(), String> {
                 agent_cancel: None,
                 agent_generation: 0,
                 agent_settings: agent_settings.clone(),
+                app_settings,
+                settings: None,
                 propose: ProposeView::new(),
                 propose_bar: ProposeBar::default(),
                 focus_bar: FocusBar::default(),
@@ -8796,6 +9690,10 @@ fn run() -> Result<(), String> {
                     // M6 slice 9: the reducers follow the startup language.
                     view.agent.lang = lang;
                     view.propose.lang = lang;
+                    if let Some(error) = settings_error {
+                        view.notice =
+                            Some(view.tf("notice.settings_invalid", &[("error", &error)]));
+                    }
                     // M9 slice 6: periodic crash-safety backups.
                     view.start_autosave(window, cx);
                     window.focus(&view.focus_handle(cx));
@@ -8837,7 +9735,7 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!(
-                "uso: narra-app [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]\n      [--agent-adapter mock|openai-compat] [--agent-model <nombre>] [--agent-base-url <url>] [--agent-latency <ms>]"
+                "uso: narra-app [--fixture <ruta> | --project <ruta>] [--steps <n>] [--report-after-ms <ms>] [--dump-after-ms <ms>]\n      [--agent-adapter mock|openai-compat|opencode|opencode-go] [--agent-model <nombre>] [--agent-base-url <url>] [--agent-latency <ms>]"
             );
             ExitCode::FAILURE
         }
