@@ -76,6 +76,14 @@ pub fn parse(text: &str) -> Vec<Element> {
             elements.push(element(ElementKind::Boneyard, number, line));
             continue;
         }
+        // A standalone single-line boneyard (`/* … */`) is writer-private
+        // too; mixed lines with inline boneyards stay in their line text
+        // (documented limitation), but a whole-line comment never escapes
+        // into derived output such as PDF exports.
+        if line.trim_start().starts_with("/*") && line.trim_end().ends_with("*/") {
+            elements.push(element(ElementKind::Boneyard, number, line));
+            continue;
+        }
 
         // Title page: only at the very start, keys end with a colon.
         if index == 0 || (in_title_page && prev_line_was_title(&elements)) {
@@ -464,6 +472,18 @@ mod tests {
         assert_eq!(got[6], (ElementKind::Boneyard, "INT. OCULTA - DÍA"));
         // Scene inside boneyard must not be indexed.
         assert!(got.iter().all(|e| e.kind != ElementKind::SceneHeading));
+    }
+
+    #[test]
+    fn single_line_boneyard_is_private_content() {
+        // A whole-line comment must never be classified as action: derived
+        // output (PDF export) would print writer-private text.
+        let got = kinds("Acción.\n\n/* oculta: final alternativo */\n\nOtra acción.\n");
+        assert_eq!(got[2].kind, ElementKind::Boneyard);
+        // Mixed lines keep their text (documented limitation).
+        let mixed = kinds("Marta entra. /* nota */\n");
+        assert_eq!(mixed[0].kind, ElementKind::Action);
+        assert!(mixed[0].text.contains("nota"));
     }
 
     #[test]

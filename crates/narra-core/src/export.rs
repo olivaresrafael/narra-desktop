@@ -12,6 +12,8 @@
 //! - exported files are artifacts, never canonical project content, so
 //!   they are written outside the document tree the editor lists.
 
+pub mod pdf;
+
 use crate::fountain::{self, ElementKind};
 use crate::manifest::Manifest;
 

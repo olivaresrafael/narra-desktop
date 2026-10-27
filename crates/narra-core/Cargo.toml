@@ -27,6 +27,8 @@ similar.workspace = true
 sha2.workspace = true
 # OS secret storage for provider tokens (M5 slice 2, D-022, MIT/Apache-2.0).
 keyring.workspace = true
+# Screenplay PDF export (M7, Spike G-2; D-025): see the workspace note.
+pdf-writer.workspace = true
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 uuid = { version = "1", features = ["v4"] }

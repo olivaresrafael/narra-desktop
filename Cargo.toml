@@ -29,3 +29,9 @@ sha2 = "0.10"
 # target-gates each platform's store: Apple Keychain on macOS, which is all
 # the MVP compiles for).
 keyring = "4"
+# PDF output for screenplay export (M7, Spike G-2): a minimal, low-level PDF
+# writer from the Typst project (MIT OR Apache-2.0, both GPL-3.0 compatible
+# per D-015). Chosen over a typesetting engine because screenplay pagination
+# is deterministic fixed-pitch layout we own and test; hand-rolling PDF syntax
+# would put a corruption risk on the one artifact that must open everywhere.
+pdf-writer = "0.15"
