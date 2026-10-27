@@ -35,6 +35,12 @@ impl GitStatus {
             .unwrap_or_default();
         let mut files = HashMap::new();
         for entry in entries {
+            // App-managed workflow state and generated exports are not
+            // narrative changes; the human Git surface never asks the writer
+            // to commit `.narra` backups or PDF artifacts.
+            if entry.path.starts_with(".narra/") || entry.path.starts_with("exports/") {
+                continue;
+            }
             let status = display_status(&entry);
             if status != WorktreeStatus::Unmodified {
                 files.insert(entry.path, status);
@@ -206,6 +212,34 @@ mod tests {
         );
         assert_eq!(status.changed_count(), 4);
         assert_eq!(status.dir_status("research"), None);
+    }
+
+    #[test]
+    fn internal_state_and_exports_are_hidden_from_the_human_surface() {
+        let status = GitStatus::from_status(
+            None,
+            vec![
+                entry(
+                    ".narra/backups/screenplay__main.fountain~",
+                    WorktreeStatus::Unmodified,
+                    WorktreeStatus::Untracked,
+                ),
+                entry(
+                    "exports/main.pdf",
+                    WorktreeStatus::Unmodified,
+                    WorktreeStatus::Untracked,
+                ),
+                entry(
+                    "screenplay/main.fountain",
+                    WorktreeStatus::Unmodified,
+                    WorktreeStatus::Modified,
+                ),
+            ],
+        );
+        assert_eq!(status.changed_count(), 1);
+        assert!(status.file_status("screenplay/main.fountain").is_some());
+        assert!(status.file_status(".narra/backups/x").is_none());
+        assert!(status.file_status("exports/main.pdf").is_none());
     }
 
     #[test]

@@ -167,7 +167,7 @@ use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
-use narra_core::git::WorktreeStatus;
+use narra_core::git::{Commit, OpOptions, Repository, WorktreeStatus};
 use narra_core::provider::SecretStore;
 use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
@@ -329,7 +329,7 @@ const IDLE_GAP_MS: f64 = 500.0;
 /// Explorer panel (M6 slice 1): width and colors. The panel renders only in
 /// `--project` mode, so fixture-mode geometry — the verified spike driver —
 /// stays byte-for-byte unchanged.
-const EXPLORER_W: f32 = 220.0;
+const EXPLORER_W: f32 = 250.0;
 /// Explorer state colors (M10 S3c): type is an icon, color is state.
 /// Line-number gutter (M9 slice 3): fixed column before the text.
 /// Outline rows rendered in the explorer (M8 slice 3). The panel has no
@@ -760,6 +760,54 @@ enum GitMessage {
         request: u64,
         result: Result<GitStatus, String>,
     },
+    History {
+        result: Result<Vec<Commit>, String>,
+    },
+    Commit {
+        result: Result<(), String>,
+    },
+    Init {
+        result: Result<(), String>,
+    },
+}
+
+/// “Guardar versión” dialog state (M13).
+#[derive(Debug, Clone)]
+struct GitCommitState {
+    message: String,
+    error: String,
+    busy: bool,
+}
+
+/// Small tooltip view used across the human Git surface.
+struct GitTooltip {
+    command: String,
+    description: String,
+}
+
+impl gpui::Render for GitTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(280.0))
+            .p_2()
+            .bg(rgb(theme::explorer_bg()))
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_sm()
+            .child(
+                div()
+                    .text_color(rgb(theme::cue_fg()))
+                    .child(format!("↳ {}", self.command)),
+            )
+            .child(
+                div()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.description.clone()),
+            )
+    }
 }
 
 /// Message from the project-search worker thread. The generation identifies
@@ -1500,6 +1548,13 @@ struct Editor {
     context_menu: Option<ContextMenuState>,
     /// What the open context menu acts on (editor, explorer file/folder, tab).
     context_target: Option<ContextTarget>,
+    /// Human Git surface (M13): recent commits, commit prompt and busy flag.
+    git_history: Vec<Commit>,
+    git_history_loading: bool,
+    git_history_error: String,
+    git_history_stale: bool,
+    git_commit: Option<GitCommitState>,
+    git_busy: bool,
     /// Right-hand surface: Chat (M12) or the older review/proposal activity.
     right_tab: RightTab,
     /// Conversational workspace state (M12).
@@ -1704,6 +1759,7 @@ impl Editor {
         if self.git_panel_open {
             self.explorer_open = true;
             self.refresh_git_now(cx);
+            self.request_git_history(cx);
         }
         cx.notify();
     }
@@ -1745,6 +1801,7 @@ impl Editor {
             || self.context_menu.is_some()
             || self.rename.is_some()
             || self.delete_prompt.is_some()
+            || self.git_commit.is_some()
         {
             return;
         }
@@ -2769,6 +2826,7 @@ impl Editor {
             || self.context_menu.is_some()
             || self.rename.is_some()
             || self.delete_prompt.is_some()
+            || self.git_commit.is_some()
         {
             return;
         }
@@ -3189,6 +3247,7 @@ impl Editor {
             || self.context_menu.is_some()
             || self.rename.is_some()
             || self.delete_prompt.is_some()
+            || self.git_commit.is_some()
         {
             return;
         }
@@ -5935,6 +5994,7 @@ impl Editor {
             || self.palette.is_some()
             || self.rename.is_some()
             || self.delete_prompt.is_some()
+            || self.git_commit.is_some()
         {
             return false;
         }
@@ -6593,7 +6653,9 @@ impl Editor {
             let _ = tx.send(GitMessage::Done { request, result });
         });
         Self::spawn_message_pump(cx, rx, move |view, message| {
-            let GitMessage::Done { request, result } = message;
+            let GitMessage::Done { request, result } = message else {
+                return false;
+            };
             if request != view.git_request {
                 // A newer refresh (or a project switch) superseded this one.
                 return true;
@@ -6601,7 +6663,12 @@ impl Editor {
             view.git_pending = false;
             view.git_refreshed_at = Some(Instant::now());
             match result {
-                Ok(git) => view.git = git,
+                Ok(git) => {
+                    if git.available && view.git_history.is_empty() {
+                        view.git_history_stale = true;
+                    }
+                    view.git = git;
+                }
                 Err(error) => {
                     view.git = GitStatus {
                         error,
@@ -6611,6 +6678,408 @@ impl Editor {
             }
             true
         });
+    }
+
+    fn request_git_history(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        if !self.git.available {
+            self.git_history.clear();
+            self.git_history_error.clear();
+            return;
+        }
+        self.git_history_loading = true;
+        self.git_history_error.clear();
+        self.git_history_stale = false;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(10));
+            let result = Repository::open(&root, options.clone())
+                .and_then(|repository| repository.log(8, options))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::History { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::History { result } = message else {
+                return false;
+            };
+            view.git_history_loading = false;
+            match result {
+                Ok(commits) => view.git_history = commits,
+                Err(error) => view.git_history_error = error,
+            }
+            true
+        });
+    }
+
+    fn open_git_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.git.available {
+            self.notice = Some(self.t("git.no_repo").to_string());
+            cx.notify();
+            return;
+        }
+        if self.dirty_tab_count() > 0 {
+            self.notice = Some(self.t("git.save_files_first").to_string());
+            cx.notify();
+            return;
+        }
+        if self.git.files.is_empty() {
+            self.notice = Some(self.t("git.nothing_to_save").to_string());
+            cx.notify();
+            return;
+        }
+        if self.app_settings.git_name.trim().is_empty()
+            || self.app_settings.git_email.trim().is_empty()
+        {
+            self.notice = Some(self.t("git.identity_missing").to_string());
+            self.open_git_settings(cx);
+            return;
+        }
+        self.git_commit = Some(GitCommitState {
+            message: String::new(),
+            error: String::new(),
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn open_git_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            // The settings action needs a window; this helper is also called
+            // from non-key paths, so it opens the modal state directly.
+            let provider = self.app_settings.provider;
+            let (key_present, key_source) = provider_key_status(provider);
+            self.settings = Some(SettingsState {
+                section: SettingsSection::Git,
+                provider,
+                base_url: provider
+                    .fixed_base_url()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.app_settings.base_url.clone()),
+                model: self.app_settings.model.clone(),
+                key_input: String::new(),
+                key_present,
+                key_source,
+                field: SettingsField::GitName,
+                error: String::new(),
+                status: String::new(),
+                models: provider
+                    .known_models()
+                    .iter()
+                    .map(|model| model.to_string())
+                    .collect(),
+                models_request: 0,
+                fetching_models: false,
+                language: self.app_settings.language,
+                theme: self.app_settings.theme,
+                font_size: self.app_settings.font_size,
+                word_wrap: self.app_settings.word_wrap,
+                line_numbers: self.app_settings.line_numbers,
+                show_config_files: self.app_settings.show_config_files,
+                git_name: self.app_settings.git_name.clone(),
+                git_email: self.app_settings.git_email.clone(),
+            });
+        } else if let Some(settings) = self.settings.as_mut() {
+            settings.section = SettingsSection::Git;
+        }
+        cx.notify();
+    }
+
+    fn git_commit_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text
+            .chars()
+            .filter(|character| !character.is_control() || *character == ' ')
+            .collect();
+        if let Some(state) = self.git_commit.as_mut() {
+            state.message.push_str(&cleaned);
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn git_commit_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.git_commit.as_mut() {
+            if let Some(last) = state.message.chars().last() {
+                let len = state.message.len();
+                state.message.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn submit_git_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.git_commit.as_ref() else {
+            return;
+        };
+        if state.busy {
+            return;
+        }
+        let message = state.message.trim().to_string();
+        if message.is_empty() {
+            let error = self.t("git.commit_message_required").to_string();
+            if let Some(state) = self.git_commit.as_mut() {
+                state.error = error;
+            }
+            cx.notify();
+            return;
+        }
+        let name = self.app_settings.git_name.trim().to_string();
+        let email = self.app_settings.git_email.trim().to_string();
+        if name.is_empty() || email.is_empty() {
+            let error = self.t("git.identity_missing").to_string();
+            if let Some(state) = self.git_commit.as_mut() {
+                state.error = error;
+            }
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let paths: Vec<String> = self.git.files.keys().cloned().collect();
+        if paths.is_empty() {
+            let message = self.t("git.nothing_to_save").to_string();
+            if let Some(state) = self.git_commit.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(state) = self.git_commit.as_mut() {
+            state.busy = true;
+            state.error.clear();
+        }
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(15));
+            let result = (|| {
+                let repository =
+                    Repository::open(&root, options.clone()).map_err(|error| error.to_string())?;
+                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                repository
+                    .stage(&refs, options.clone())
+                    .map_err(|error| error.to_string())?;
+                repository
+                    .commit(&message, &name, &email, options)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })();
+            let _ = tx.send(GitMessage::Commit { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Commit { result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(()) => {
+                    view.git_commit = None;
+                    view.notice = Some(view.t("git.version_saved").to_string());
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                }
+                Err(error) => {
+                    let message = view.tf("git.commit_failed", &[("error", &error)]);
+                    if let Some(state) = view.git_commit.as_mut() {
+                        state.busy = false;
+                        state.error = message;
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn init_git_repo(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        if self.git_busy {
+            return;
+        }
+        let root = project.root().to_path_buf();
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(15));
+            let result = Repository::init(&root, options)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::Init { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Init { result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(()) => {
+                    view.notice = Some(view.t("git.init_done").to_string());
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                }
+                Err(error) => {
+                    view.notice = Some(view.tf("git.init_failed", &[("error", &error)]));
+                }
+            }
+            true
+        });
+    }
+
+    fn git_tooltip(
+        &self,
+        cx: &mut Context<Self>,
+        command: &str,
+        description: impl Into<String>,
+    ) -> gpui::AnyView {
+        cx.new(|_| GitTooltip {
+            command: command.to_string(),
+            description: description.into(),
+        })
+        .into()
+    }
+
+    fn git_status_key(status: WorktreeStatus) -> &'static str {
+        match status {
+            WorktreeStatus::Modified => "git.status.modified",
+            WorktreeStatus::Added => "git.status.added",
+            WorktreeStatus::Untracked => "git.status.new",
+            WorktreeStatus::Deleted => "git.status.deleted",
+            WorktreeStatus::Renamed => "git.status.renamed",
+            WorktreeStatus::Copied => "git.status.copied",
+            WorktreeStatus::Conflicted => "git.status.conflict",
+            WorktreeStatus::Unknown | WorktreeStatus::Unmodified => "git.status.unknown",
+        }
+    }
+
+    fn git_commit_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.git_commit.as_ref().expect("overlay only when open");
+        let changed = self.git.changed_count();
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("git.commit_title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.tf("git.commit_files", &[("n", &changed.to_string())])),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.tf(
+                                "git.commit_author",
+                                &[
+                                    ("name", &self.app_settings.git_name),
+                                    ("email", &self.app_settings.git_email),
+                                ],
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("git-commit-message")
+                            .min_h(px(42.0))
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(theme::bg()))
+                            .border_1()
+                            .border_color(rgb(theme::default_fg()))
+                            .text_color(rgb(if state.message.is_empty() {
+                                theme::gutter_fg()
+                            } else {
+                                theme::default_fg()
+                            }))
+                            .child(format!(
+                                "{}▌",
+                                if state.message.is_empty() {
+                                    self.t("git.commit_placeholder").to_string()
+                                } else {
+                                    state.message.clone()
+                                }
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("git.commit_help")),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("git-save-version")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(if state.busy {
+                                        theme::gutter_fg()
+                                    } else {
+                                        theme::status_bg()
+                                    }))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(if state.busy {
+                                        self.t("git.saving")
+                                    } else {
+                                        self.t("git.commit_save")
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.submit_git_commit(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("git-commit-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.commit_cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.git_busy {
+                                            this.git_commit = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     // ---- crash-safety backups and the quit guard (M9 slice 6) -----------
@@ -6804,6 +7273,13 @@ impl Editor {
         }
         if self.delete_prompt.is_some() {
             self.delete_prompt = None;
+            cx.notify();
+            return;
+        }
+        if self.git_commit.is_some() {
+            if !self.git_busy {
+                self.git_commit = None;
+            }
             cx.notify();
             return;
         }
@@ -7062,6 +7538,10 @@ impl Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.git_commit.is_some() {
+            self.git_commit_backspace(cx);
+            return;
+        }
         if self.chat.focused {
             self.chat.backspace();
             cx.notify();
@@ -7193,6 +7673,10 @@ impl Editor {
         if self.delete_prompt.is_some() {
             self.delete_prompt = None;
             cx.notify();
+            return;
+        }
+        if self.git_commit.is_some() {
+            self.submit_git_commit(cx);
             return;
         }
         if self.chat.focused {
@@ -7702,6 +8186,13 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.git_commit.is_some() {
+            if !self.git_busy {
+                self.git_commit = None;
+            }
+            cx.notify();
+            return;
+        }
         if self.chat.focused {
             self.chat.focused = false;
             cx.notify();
@@ -8172,7 +8663,11 @@ impl Editor {
                         Ok(message) => {
                             // Entity dropped (window closed) → stop pumping.
                             let done = view
-                                .update(cx, |view, _| apply(view, message))
+                                .update(cx, |view, cx| {
+                                    let done = apply(view, message);
+                                    cx.notify();
+                                    done
+                                })
                                 .unwrap_or(true);
                             if done {
                                 return;
@@ -10613,6 +11108,11 @@ impl Editor {
         } else {
             theme::gutter_fg()
         };
+        let git_tip = self.git_tooltip(
+            cx,
+            "git status",
+            self.tf("git.tip.status_bar", &[("n", &changes.to_string())]),
+        );
         div()
             .id("bottom-bar")
             .h(px(26.0))
@@ -10680,7 +11180,8 @@ impl Editor {
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_toggle_git_panel(&ToggleGitPanel, window, cx)
-                    })),
+                    }))
+                    .tooltip(move |_, _| git_tip.clone()),
             )
             .child(
                 div()
@@ -10808,9 +11309,9 @@ impl Editor {
         bar.into_any_element()
     }
 
-    /// Minimal read-only Git panel (M10 S3c): branch, ahead/behind and the
-    /// changed files. Toggled from the bottom bar; commit/push stay future
-    /// work with explicit confirmation.
+    /// Human Git panel (M13): plain-language changes, one-step version save,
+    /// recent history and command tooltips. No Git jargon is required to use
+    /// the primary actions, but every tooltip names the underlying command.
     fn git_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut panel = div()
             .id("git-panel")
@@ -10821,12 +11322,9 @@ impl Editor {
             .overflow_y_scroll()
             .bg(rgb(theme::explorer_bg()))
             .border_r_1()
-            .border_color(rgb(theme::explorer_border()));
-        let branch = if self.git.available {
-            self.git.branch_label()
-        } else {
-            self.t("panel.git_none").to_string()
-        };
+            .border_color(rgb(theme::explorer_border()))
+            .text_sm();
+        let changes = self.git.changed_count();
         panel = panel.child(
             div()
                 .px_2()
@@ -10834,80 +11332,261 @@ impl Editor {
                 .flex()
                 .items_center()
                 .gap_1()
-                .text_sm()
-                .text_color(rgb(theme::status_fg()))
-                .child(icon(
-                    "git-branch",
-                    if self.git.available {
-                        theme::default_fg()
-                    } else {
-                        theme::status_fg()
-                    },
-                    14.0,
-                ))
-                .child(div().flex_1().overflow_hidden().child(branch))
+                .text_color(rgb(theme::default_fg()))
+                .child(icon("git-branch", theme::default_fg(), 14.0))
+                .child(div().flex_1().child(self.t("git.changes")))
                 .child(
                     div()
-                        .text_color(rgb(theme::status_fg()))
-                        .child(self.git.changed_count().to_string()),
+                        .text_xs()
+                        .text_color(rgb(if changes > 0 {
+                            theme::git_modified_fg()
+                        } else {
+                            theme::git_added_fg()
+                        }))
+                        .child(changes.to_string()),
                 ),
         );
         if !self.git.available {
+            let tip = self.git_tooltip(cx, "git init", self.t("git.tip.init").to_string());
+            panel = panel
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(self.t("git.no_repo")),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("git.no_repo_hint")),
+                )
+                .child(
+                    div()
+                        .id("git-init")
+                        .mx_2()
+                        .my_1()
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(theme::status_bg()))
+                        .text_color(rgb(theme::default_fg()))
+                        .cursor_pointer()
+                        .tooltip(move |_, _| tip.clone())
+                        .child(self.t("git.init"))
+                        .on_click(cx.listener(|this, _, _, cx| this.init_git_repo(cx))),
+                );
             if !self.git.error.is_empty() {
                 panel = panel.child(
                     div()
                         .px_2()
                         .py_1()
-                        .text_sm()
                         .text_color(rgb(theme::agent_err_fg()))
                         .child(self.git.error.clone()),
                 );
             }
             return panel.into_any_element();
         }
-        if self.git.files.is_empty() {
-            panel = panel.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .text_color(rgb(theme::git_added_fg()))
-                    .child(self.t("panel.git_clean")),
-            );
-            return panel.into_any_element();
-        }
-        let mut paths: Vec<&String> = self.git.files.keys().collect();
-        paths.sort();
-        for (index, path) in paths.into_iter().enumerate() {
-            let Some(status) = self.git.file_status(path) else {
-                continue;
-            };
-            let kind = FileKind::from_path(path);
-            let path_owned = path.clone();
-            panel = panel.child(
-                div()
-                    .id(("git-file", index))
-                    .px_2()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_sm()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .cursor_pointer()
-                    .text_color(rgb(theme::status_fg()))
-                    .child(icon(kind.icon_name(), git_color(status), 14.0))
-                    .child(div().flex_1().overflow_hidden().child(path_owned.clone()))
-                    .child(
+        let branch = if self.git.branch.is_empty() {
+            self.t("git.detached").to_string()
+        } else {
+            self.git.branch.clone()
+        };
+        let branch_tip = self.git_tooltip(cx, "git branch", self.t("git.tip.branch").to_string());
+        panel = panel.child(
+            div()
+                .id("git-branch-row")
+                .px_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .text_color(rgb(theme::status_fg()))
+                .tooltip(move |_, _| branch_tip.clone())
+                .child(format!("{}: {branch}", self.t("git.draft")))
+                .when(self.git.ahead > 0, |row| {
+                    row.child(format!(" · {} ↑", self.git.ahead))
+                })
+                .when(self.git.behind > 0, |row| {
+                    row.child(format!(" · {} ↓", self.git.behind))
+                }),
+        );
+        let summary = if changes == 0 {
+            self.t("git.clean").to_string()
+        } else {
+            self.tf("git.summary", &[("n", &changes.to_string())])
+        };
+        panel = panel.child(
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(rgb(if changes > 0 {
+                    theme::git_modified_fg()
+                } else {
+                    theme::git_added_fg()
+                }))
+                .child(summary),
+        );
+        let commit_tip = self.git_tooltip(cx, "git commit", self.t("git.tip.commit").to_string());
+        let log_tip = self.git_tooltip(cx, "git log", self.t("git.tip.log").to_string());
+        panel = panel.child(
+            div()
+                .px_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .when(changes > 0, |row| {
+                    row.child(
                         div()
-                            .text_color(rgb(git_color(status)))
-                            .child(git_letter(status)),
+                            .id("git-save-version-action")
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::default_fg()))
+                            .cursor_pointer()
+                            .tooltip(move |_, _| commit_tip.clone())
+                            .child(self.t("git.save_version"))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_git_commit(cx))),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_path(&path_owned, window, cx)
-                    })),
+                })
+                .child(
+                    div()
+                        .id("git-history-action")
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::status_fg()))
+                        .tooltip(move |_, _| log_tip.clone())
+                        .child(self.t("git.history"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_git_history(cx);
+                        })),
+                ),
+        );
+        if changes == 0 {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_color(rgb(theme::git_added_fg()))
+                    .child(self.t("git.clean")),
             );
+        } else {
+            let mut paths: Vec<&String> = self.git.files.keys().collect();
+            paths.sort();
+            for (index, path) in paths.into_iter().enumerate() {
+                let Some(status) = self.git.file_status(path) else {
+                    continue;
+                };
+                let label = self.t(Self::git_status_key(status));
+                let path_owned = path.clone();
+                let tip = self.git_tooltip(cx, "git status", format!("{label}: {path}"));
+                panel = panel.child(
+                    div()
+                        .id(("git-file", index))
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::status_fg()))
+                        .tooltip(move |_, _| tip.clone())
+                        .child(icon(
+                            FileKind::from_path(path).icon_name(),
+                            git_color(status),
+                            14.0,
+                        ))
+                        .child(div().flex_1().overflow_hidden().child(path_owned.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(git_color(status)))
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_path(&path_owned, window, cx)
+                        })),
+                );
+            }
+        }
+        panel = panel.child(
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(rgb(theme::gutter_fg()))
+                .child(self.t("git.recent")),
+        );
+        if self.git_history_loading {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("git.loading_history")),
+            );
+        } else if !self.git_history_error.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::agent_err_fg()))
+                    .child(self.git_history_error.clone()),
+            );
+        } else if self.git_history.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("git.no_history")),
+            );
+        } else {
+            for (index, commit) in self.git_history.iter().take(8).enumerate() {
+                let tip = self.git_tooltip(
+                    cx,
+                    "git log",
+                    format!(
+                        "{} · {}",
+                        short_id(&commit.id),
+                        self.t("git.tip.log_detail")
+                    ),
+                );
+                panel = panel.child(
+                    div()
+                        .id(("git-commit", index))
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_xs()
+                        .tooltip(move |_, _| tip.clone())
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_color(rgb(theme::default_fg()))
+                                .child(commit.subject.clone()),
+                        )
+                        .child(div().text_color(rgb(theme::gutter_fg())).child(format!(
+                            "{} · {}",
+                            short_id(&commit.id),
+                            commit.date.get(..10).unwrap_or(&commit.date)
+                        ))),
+                );
+            }
         }
         panel.into_any_element()
     }
@@ -11855,15 +12534,29 @@ impl Editor {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let history = self
+                .git_history
+                .iter()
+                .take(8)
+                .map(|commit| {
+                    format!(
+                        "{{\"id\":\"{}\",\"subject\":\"{}\"}}",
+                        escape_json(&short_id(&commit.id)),
+                        escape_json(&commit.subject)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
                 "{{\"available\":{},\"branch\":\"{}\",\"ahead\":{},\"behind\":{},\
-                 \"changed\":{},\"files\":[{}],\"error\":\"{}\"}}",
+                 \"changed\":{},\"files\":[{}],\"history\":[{}],\"error\":\"{}\"}}",
                 self.git.available,
                 escape_json(&self.git.branch),
                 self.git.ahead,
                 self.git.behind,
                 self.git.changed_count(),
                 files,
+                history,
                 escape_json(&self.git.error),
             )
         };
@@ -12783,6 +13476,10 @@ impl EntityInputHandler for Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.git_commit.is_some() {
+            self.git_commit_input(new_text, cx);
+            return;
+        }
         if self.chat.focused {
             self.chat.push_input(new_text);
             cx.notify();
@@ -12912,6 +13609,10 @@ impl EntityInputHandler for Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.git_commit.is_some() {
+            self.git_commit_input(new_text, cx);
+            return;
+        }
         if self.chat.focused {
             self.chat.push_input(new_text);
             cx.notify();
@@ -13020,6 +13721,9 @@ impl Render for Editor {
         self.refresh_element_kinds(cx);
         self.maybe_request_pages(cx);
         self.maybe_refresh_git(cx);
+        if self.git_history_stale && !self.git_history_loading && self.git.available {
+            self.request_git_history(cx);
+        }
         theme::set_system_dark(matches!(
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -13276,6 +13980,9 @@ impl Render for Editor {
             .when(self.rename.is_some(), |root| root.child(self.rename_overlay(cx)))
             .when(self.delete_prompt.is_some(), |root| {
                 root.child(self.delete_overlay(cx))
+            })
+            .when(self.git_commit.is_some(), |root| {
+                root.child(self.git_commit_overlay(cx))
             })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
@@ -13895,6 +14602,12 @@ fn run() -> Result<(), String> {
                 palette: None,
                 context_menu: None,
                 context_target: None,
+                git_history: Vec::new(),
+                git_history_loading: false,
+                git_history_error: String::new(),
+                git_history_stale: false,
+                git_commit: None,
+                git_busy: false,
                 right_tab: RightTab::Chat,
                 chat: ChatUiState::new(ChatMode::Plan),
                 chat_generation: 0,
