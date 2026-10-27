@@ -256,6 +256,10 @@ actions!(
         OpenProject,
         NewProject,
         ClearRecentProjects,
+        // tabs (M10 slice 3b)
+        CloseTab,
+        NextTab,
+        PrevTab,
     ]
 );
 
@@ -466,6 +470,21 @@ struct NewProjectDraft {
     title: String,
     kind: ProjectType,
     lang: Lang,
+}
+
+/// What to do once the unsaved-changes prompt is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingUnsaved {
+    Quit,
+    CloseTab(usize),
+}
+
+/// The generalized save/discard/cancel prompt (M9 slice 6, generalized for
+/// tabs in M10 S3b). `dirty` is how many documents the operation would lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnsavedPrompt {
+    action: PendingUnsaved,
+    dirty: usize,
 }
 
 /// Message from the project-search worker thread. The generation identifies
@@ -1031,18 +1050,51 @@ impl DocumentState {
     }
 }
 
-/// The workspace: project-level state plus the active document (S3a).
+/// One editor tab (M10 S3b).
 ///
-/// The document lives in one field so the tab refactor can later hold a
-/// vector of `DocumentState`s and swap the active one without touching the
-/// project-level surfaces.
+/// The active tab's document lives in `Editor::doc` so the editor code keeps
+/// working on one active document. Every inactive tab owns its document here;
+/// switching tabs swaps the two. Exactly one tab (the active one) has `None`.
+struct Tab {
+    document: Option<DocumentState>,
+}
+
+/// Next/previous tab with wrap-around, or `None` when there is nowhere to go.
+fn next_tab_index(active: usize, len: usize, forward: bool) -> Option<usize> {
+    if len < 2 || active >= len {
+        return None;
+    }
+    Some(if forward {
+        (active + 1) % len
+    } else {
+        (active + len - 1) % len
+    })
+}
+
+/// Tab that becomes active when `active` is closed: the right neighbour when
+/// there is one, otherwise the left neighbour. `None` when it was the last tab.
+fn close_target_index(active: usize, len: usize) -> Option<usize> {
+    if len < 2 || active >= len {
+        return None;
+    }
+    Some(if active + 1 < len {
+        active + 1
+    } else {
+        active - 1
+    })
+}
+
+/// The workspace: project-level state plus the active document (S3a/S3b).
 struct Editor {
     doc: DocumentState,
+    /// Tab strip order; the active tab's slot is `None` (its state is `doc`).
+    tabs: Vec<Tab>,
+    active_tab: usize,
 
     /// Autosave loop started (M9 slice 6).
     autosave_started: bool,
-    /// The unsaved-changes prompt is open (⌘Q with a dirty buffer).
-    quit_prompt: bool,
+    /// The unsaved-changes prompt, when open (quit or close a dirty tab).
+    unsaved_prompt: Option<UnsavedPrompt>,
     /// Append the performance metrics to the status bar (--debug-metrics).
     debug_metrics: bool,
     /// The New File modal, when open (M10 slice 2).
@@ -1124,6 +1176,127 @@ impl Focusable for Editor {
 }
 
 impl Editor {
+    // ---- tabs (M10 S3b) --------------------------------------------------
+
+    fn tab_document(&self, index: usize) -> Option<&DocumentState> {
+        if index == self.active_tab {
+            Some(&self.doc)
+        } else {
+            self.tabs.get(index).and_then(|tab| tab.document.as_ref())
+        }
+    }
+
+    fn tab_path(&self, index: usize) -> &str {
+        self.tab_document(index)
+            .map(|doc| doc.path.as_str())
+            .unwrap_or("")
+    }
+
+    fn tab_is_dirty(&self, index: usize) -> bool {
+        self.tab_document(index)
+            .is_some_and(DocumentState::is_dirty)
+    }
+
+    fn dirty_tab_count(&self) -> usize {
+        (0..self.tabs.len())
+            .filter(|&index| self.tab_is_dirty(index))
+            .count()
+    }
+
+    fn find_tab(&self, path: &str) -> Option<usize> {
+        (0..self.tabs.len()).find(|&index| self.tab_path(index) == path)
+    }
+
+    fn tab_title(&self, index: usize) -> String {
+        let path = self.tab_path(index);
+        if path.is_empty() {
+            self.t("tab.untitled").to_string()
+        } else {
+            path.rsplit('/').next().unwrap_or(path).to_string()
+        }
+    }
+
+    /// Swap the active document with an inactive tab, preserving selection,
+    /// undo, scroll and find/diff state for both. Returns false for the
+    /// already-active or an invalid index.
+    fn activate_tab(&mut self, index: usize) -> bool {
+        if index == self.active_tab || index >= self.tabs.len() {
+            return false;
+        }
+        let Some(next) = self.tabs[index].document.take() else {
+            return false;
+        };
+        let current = std::mem::replace(&mut self.doc, next);
+        self.tabs[self.active_tab].document = Some(current);
+        self.active_tab = index;
+        // A debounce timer from the previous document must not block this
+        // document's first highlight refresh.
+        self.doc.elements_timer = false;
+        // A diff kept open per tab must describe this document, not the one
+        // we just left.
+        if self.doc.diff.open {
+            self.recompute_diff();
+        }
+        self.check_backup_notice();
+        true
+    }
+
+    fn open_new_tab(&mut self, doc: DocumentState) {
+        let current = std::mem::replace(&mut self.doc, doc);
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            debug_assert!(tab.document.is_none(), "active tab owns no document");
+            tab.document = Some(current);
+        }
+        self.tabs.push(Tab { document: None });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    /// Open a loaded document. The single clean blank tab left after closing
+    /// the last document is reused instead of accumulating empty tabs.
+    fn open_document_tab(&mut self, doc: DocumentState) {
+        if self.tabs.len() == 1 && self.doc.path.is_empty() && !self.doc.is_dirty() {
+            self.doc = doc;
+        } else {
+            self.open_new_tab(doc);
+        }
+    }
+
+    /// Remove a tab and return its document (the active one when closing the
+    /// active tab). The active slot always keeps a document: closing the last
+    /// tab leaves a clean blank one.
+    fn close_tab_at(&mut self, index: usize) -> Option<DocumentState> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+        if self.tabs.len() == 1 {
+            let old = std::mem::replace(&mut self.doc, DocumentState::new(String::new(), ""));
+            self.active_tab = 0;
+            return Some(old);
+        }
+        if index == self.active_tab {
+            let target = close_target_index(index, self.tabs.len())?;
+            let target_doc = self.tabs[target].document.take()?;
+            let old = std::mem::replace(&mut self.doc, target_doc);
+            self.tabs.remove(index);
+            self.active_tab = if target > index { target - 1 } else { target };
+            if self.doc.diff.open {
+                self.recompute_diff();
+            }
+            Some(old)
+        } else {
+            let removed = self.tabs.remove(index);
+            if index < self.active_tab {
+                self.active_tab -= 1;
+            }
+            removed.document
+        }
+    }
+
+    fn reset_tabs(&mut self) {
+        self.tabs = vec![Tab { document: None }];
+        self.active_tab = 0;
+    }
+
     fn caret(&self) -> usize {
         if self.doc.reversed {
             self.doc.selected.start
@@ -2186,6 +2359,7 @@ impl Editor {
             || self.focus_bar.open
             || self.new_file.is_some()
             || self.new_project.is_some()
+            || self.unsaved_prompt.is_some()
         {
             return;
         }
@@ -2226,8 +2400,8 @@ impl Editor {
     /// ⌘N / File → New File…: open the kind/name/format dialog; pressing it
     /// again closes it.
     fn on_new_file(&mut self, _: &NewFile, _window: &mut Window, cx: &mut Context<Self>) {
-        // One modal owns the keyboard at a time (M10 slice 2b).
-        if self.new_project.is_some() {
+        // One modal/prompt owns the keyboard at a time.
+        if self.new_project.is_some() || self.unsaved_prompt.is_some() {
             return;
         }
         if self.new_file.is_some() {
@@ -2294,7 +2468,7 @@ impl Editor {
                 let created = self.tf("notice.created", &[("path", &path)]);
                 match project.read_document(&path) {
                     Ok(text) => {
-                        self.load_document(path.clone(), text);
+                        self.open_document_tab(DocumentState::new(path.clone(), &text));
                         window.focus(&self.focus_handle(cx));
                         self.notice = Some(created);
                     }
@@ -2460,7 +2634,7 @@ impl Editor {
     /// quit prompt also own the keyboard, so the menu cannot start a second
     /// flow behind them.
     fn can_switch_project(&mut self) -> bool {
-        if self.quit_prompt {
+        if self.unsaved_prompt.is_some() {
             return false;
         }
         if self.new_file.is_some() || self.new_project.is_some() {
@@ -2471,7 +2645,7 @@ impl Editor {
             self.notice = Some(self.t("notice.project_agent_running").to_string());
             return false;
         }
-        if self.project.is_some() && self.dirty() {
+        if self.project.is_some() && self.dirty_tab_count() > 0 {
             self.notice = Some(self.t("notice.dirty_project_switch").to_string());
             return false;
         }
@@ -2615,7 +2789,10 @@ impl Editor {
         self.focus_bar = FocusBar::default();
         self.review_focus.clear();
         self.new_file = None;
-        self.quit_prompt = false;
+        self.unsaved_prompt = None;
+        // A project switch starts from one tab: the new project's default
+        // screenplay. The previous project's tabs are not carried over.
+        self.reset_tabs();
         self.doc.backup_path = None;
         self.doc.backup_saved_at = None;
         self.doc.backup_error = None;
@@ -3008,6 +3185,7 @@ impl Editor {
         self.doc.pages_pending = true;
         self.doc.pages_requested_at = Some(Instant::now());
         let generation = self.doc.pages_generation;
+        let document = self.doc.path.clone();
         let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -3017,13 +3195,29 @@ impl Editor {
             let _ = tx.send(pages);
         });
         Self::spawn_message_pump(cx, rx, move |view, pages| {
-            view.doc.pages_pending = false;
-            if view.doc.pages_generation == generation {
-                view.doc.page_count = Some(pages);
-                view.doc.pages_dirty = false;
-            }
+            view.apply_page_count(&document, generation, pages);
             true
         });
+    }
+
+    /// Apply a page-count result to the document that requested it, even if
+    /// the user switched tabs while the worker was running. A closed tab is
+    /// simply dropped.
+    fn apply_page_count(&mut self, path: &str, generation: u64, pages: usize) {
+        let doc = if self.doc.path == path {
+            Some(&mut self.doc)
+        } else {
+            self.tabs
+                .iter_mut()
+                .find_map(|tab| tab.document.as_mut().filter(|doc| doc.path == path))
+        };
+        if let Some(doc) = doc {
+            doc.pages_pending = false;
+            if doc.pages_generation == generation {
+                doc.page_count = Some(pages);
+                doc.pages_dirty = false;
+            }
+        }
     }
 
     // ---- crash-safety backups and the quit guard (M9 slice 6) -----------
@@ -3052,22 +3246,52 @@ impl Editor {
     }
 
     fn autosave(&mut self, _cx: &mut Context<Self>) {
-        if !self.dirty() {
-            return;
-        }
         let Some(project) = self.project.as_ref() else {
             return;
         };
         let root = project.root().to_path_buf();
-        let document = self.doc.path.clone();
-        let text = self.full_text();
-        match narra_core::backup::write_backup(&root, &document, &text) {
-            Ok(path) => {
-                self.doc.backup_path = Some(path.display().to_string());
-                self.doc.backup_saved_at = Some(Instant::now());
-                self.doc.backup_error = None;
+        // Every dirty tab gets a recovery copy, not only the visible one.
+        let mut work: Vec<(String, String)> = Vec::new();
+        if self.doc.is_dirty() && !self.doc.path.is_empty() {
+            work.push((self.doc.path.clone(), self.full_text()));
+        }
+        for tab in &self.tabs {
+            if let Some(doc) = tab.document.as_ref()
+                && doc.is_dirty()
+                && !doc.path.is_empty()
+            {
+                work.push((doc.path.clone(), doc.buffer.slice(0..doc.buffer.doc_len())));
             }
-            Err(error) => self.doc.backup_error = Some(error.to_string()),
+        }
+        for (document, text) in work {
+            match narra_core::backup::write_backup(&root, &document, &text) {
+                Ok(path) => {
+                    if document == self.doc.path {
+                        self.doc.backup_path = Some(path.display().to_string());
+                        self.doc.backup_saved_at = Some(Instant::now());
+                        self.doc.backup_error = None;
+                    } else if let Some(doc) = self
+                        .tabs
+                        .iter_mut()
+                        .find_map(|tab| tab.document.as_mut().filter(|doc| doc.path == document))
+                    {
+                        doc.backup_path = Some(path.display().to_string());
+                        doc.backup_saved_at = Some(Instant::now());
+                        doc.backup_error = None;
+                    }
+                }
+                Err(error) => {
+                    if document == self.doc.path {
+                        self.doc.backup_error = Some(error.to_string());
+                    } else if let Some(doc) = self
+                        .tabs
+                        .iter_mut()
+                        .find_map(|tab| tab.document.as_mut().filter(|doc| doc.path == document))
+                    {
+                        doc.backup_error = Some(error.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -3171,40 +3395,117 @@ impl Editor {
         self.doc.revision = self.doc.revision.saturating_add(1);
     }
 
-    /// ⌘Q (M9 slice 6): never lose unsaved work silently. A dirty buffer
-    /// opens the save/discard/cancel prompt; a clean buffer quits.
+    /// ⌘Q (M9 slice 6, tabs in S3b): never lose unsaved work silently. Any
+    /// dirty tab opens the save/discard/cancel prompt; a clean workspace
+    /// quits. Pressing the action again while the prompt is open dismisses it.
     fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.quit_prompt {
-            self.quit_prompt = false;
+        if self.unsaved_prompt.is_some() {
+            self.unsaved_prompt = None;
             cx.notify();
             return;
         }
-        if self.dirty() {
-            self.quit_prompt = true;
-            cx.notify();
-            return;
-        }
-        self.finish_quit(cx);
-    }
-
-    fn quit_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_save(&Save, window, cx);
-        self.quit_prompt = false;
-        if self.dirty() {
-            // Save refused or failed: keep the window, the notice explains.
+        let dirty = self.dirty_tab_count();
+        if dirty > 0 {
+            self.unsaved_prompt = Some(UnsavedPrompt {
+                action: PendingUnsaved::Quit,
+                dirty,
+            });
             cx.notify();
             return;
         }
         self.finish_quit(cx);
     }
 
-    fn quit_discard(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.quit_prompt = false;
-        self.finish_quit(cx);
+    /// Close the active tab (⌘W) or a clicked tab. A dirty tab goes through
+    /// the prompt; a clean tab closes immediately, keeping the editor on a
+    /// neighbour (or a blank tab when it was the last one).
+    fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() || self.unsaved_prompt.is_some() {
+            return;
+        }
+        if self.tab_is_dirty(index) {
+            self.unsaved_prompt = Some(UnsavedPrompt {
+                action: PendingUnsaved::CloseTab(index),
+                dirty: 1,
+            });
+            cx.notify();
+            return;
+        }
+        self.close_tab_at(index);
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
     }
 
-    fn quit_cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.quit_prompt = false;
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_close_tab(self.active_tab, window, cx);
+    }
+
+    fn switch_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unsaved_prompt.is_some() {
+            return;
+        }
+        let Some(index) = next_tab_index(self.active_tab, self.tabs.len(), forward) else {
+            return;
+        };
+        if self.activate_tab(index) {
+            window.focus(&self.focus_handle(cx));
+            cx.notify();
+        }
+    }
+
+    fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_tab(true, window, cx);
+    }
+
+    fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_tab(false, window, cx);
+    }
+
+    /// Save branch of the prompt: save every affected document, then finish
+    /// the pending action. A failed save keeps the prompt/operation blocked.
+    fn prompt_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.unsaved_prompt else {
+            return;
+        };
+        match prompt.action {
+            PendingUnsaved::Quit => {
+                if self.save_all_tabs(window, cx) {
+                    self.unsaved_prompt = None;
+                    self.finish_quit(cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            PendingUnsaved::CloseTab(index) => {
+                if self.save_tab(index, window, cx) {
+                    self.unsaved_prompt = None;
+                    self.close_tab_at(index);
+                    window.focus(&self.focus_handle(cx));
+                    cx.notify();
+                } else {
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Discard branch: drop the affected buffer(s) without writing.
+    fn prompt_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.unsaved_prompt.take() else {
+            return;
+        };
+        match prompt.action {
+            PendingUnsaved::Quit => self.finish_quit(cx),
+            PendingUnsaved::CloseTab(index) => {
+                self.close_tab_at(index);
+                window.focus(&self.focus_handle(cx));
+                cx.notify();
+            }
+        }
+    }
+
+    fn prompt_cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.unsaved_prompt = None;
         cx.notify();
     }
 
@@ -3214,9 +3515,25 @@ impl Editor {
     }
 
     /// The unsaved-changes prompt: a centered card over the window with save
-    /// / discard / cancel. The keyboard is owned by the prompt while open
-    /// (typing cannot reach the buffer).
+    /// / discard / cancel. It owns the keyboard while open (typing cannot
+    /// reach the buffer) and spells out how many documents are at stake.
     fn quit_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let dirty = self.unsaved_prompt.map(|prompt| prompt.dirty).unwrap_or(0);
+        let body = if dirty > 1 {
+            self.tf("quit.body_many", &[("n", &dirty.to_string())])
+        } else {
+            self.t("quit.body").to_string()
+        };
+        let save_label = if dirty > 1 {
+            self.t("quit.save_all")
+        } else {
+            self.t("quit.save")
+        };
+        let discard_label = if dirty > 1 {
+            self.t("quit.discard_all")
+        } else {
+            self.t("quit.discard")
+        };
         div()
             .absolute()
             .size_full()
@@ -3226,7 +3543,7 @@ impl Editor {
             .bg(rgba(0x00000099))
             .child(
                 div()
-                    .w(px(480.0))
+                    .w(px(520.0))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -3239,7 +3556,7 @@ impl Editor {
                             .text_color(rgb(DEFAULT_FG))
                             .child(self.t("quit.title")),
                     )
-                    .child(div().text_color(rgb(STATUS_FG)).child(self.t("quit.body")))
+                    .child(div().text_color(rgb(STATUS_FG)).child(body))
                     .child(
                         div()
                             .flex()
@@ -3252,9 +3569,9 @@ impl Editor {
                                     .bg(rgb(0x37373d))
                                     .text_color(rgb(DEFAULT_FG))
                                     .cursor_pointer()
-                                    .child(self.t("quit.save"))
+                                    .child(save_label)
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.quit_save(window, cx)
+                                        this.prompt_save(window, cx)
                                     })),
                             )
                             .child(
@@ -3265,9 +3582,9 @@ impl Editor {
                                     .bg(rgb(0x37373d))
                                     .text_color(rgb(AGENT_ERR_FG))
                                     .cursor_pointer()
-                                    .child(self.t("quit.discard"))
+                                    .child(discard_label)
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.quit_discard(window, cx)
+                                        this.prompt_discard(window, cx)
                                     })),
                             )
                             .child(
@@ -3280,7 +3597,7 @@ impl Editor {
                                     .cursor_pointer()
                                     .child(self.t("quit.cancel"))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.quit_cancel(window, cx)
+                                        this.prompt_cancel(window, cx)
                                     })),
                             ),
                     ),
@@ -3288,7 +3605,7 @@ impl Editor {
     }
 
     fn on_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.quit_prompt {
+        if self.unsaved_prompt.is_some() {
             return;
         }
         if self.new_file.is_some() {
@@ -3383,8 +3700,8 @@ impl Editor {
     ) {
         // The unsaved-changes prompt owns enter (M9 slice 6): the default
         // button is "save and close" (macOS convention), Esc cancels.
-        if self.quit_prompt {
-            self.quit_save(window, cx);
+        if self.unsaved_prompt.is_some() {
+            self.prompt_save(window, cx);
             return;
         }
         // The New File modal creates on enter (M10 slice 2).
@@ -3823,8 +4140,8 @@ impl Editor {
         // Escape closes whichever bar owns the keystrokes (single bar model:
         // find, the instruction bar and the focus bar are never open at the
         // same time). The unsaved-changes prompt wins over all of them.
-        if self.quit_prompt {
-            self.quit_prompt = false;
+        if self.unsaved_prompt.is_some() {
+            self.unsaved_prompt = None;
             cx.notify();
             return;
         }
@@ -3974,37 +4291,41 @@ impl Editor {
         self.notice = None;
     }
 
-    /// Explorer click: load the selected document. Unsaved changes block the
-    /// switch explicitly (save with ⌘S first) — editor state is never dropped
-    /// silently, which is the M6 acceptance rule.
-    /// Open a document from the explorer tree (M9 slice 4). Same
-    /// clean-buffer gate as before, addressed by path now that folders and
-    /// files share the panel.
-    fn select_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open a document as a tab, or activate its existing tab. Unsaved state
+    /// is preserved in the tab being left; tabs make switching safe, so the
+    /// old document-switch refusal no longer applies here.
+    fn open_document_path(&mut self, path: &str) -> Result<(), String> {
         if path == self.doc.path {
-            return;
+            return Ok(());
+        }
+        if let Some(index) = self.find_tab(path) {
+            self.activate_tab(index);
+            return Ok(());
         }
         let Some(project) = self.project.clone() else {
-            return;
+            return Err(self.t("notice.fixture_no_project").to_string());
         };
-        if self.dirty() {
-            self.notice = Some(self.t("notice.dirty_switch").to_string());
-            cx.notify();
-            return;
-        }
-        match project.read_document(path) {
-            Ok(text) => {
-                self.load_document(path.to_string(), text);
+        let text = project.read_document(path).map_err(|error| {
+            self.tf(
+                "notice.open_failed",
+                &[("path", path), ("error", &error.to_string())],
+            )
+        })?;
+        self.open_document_tab(DocumentState::new(path.to_string(), &text));
+        self.check_backup_notice();
+        Ok(())
+    }
+
+    /// Explorer click: open the selected document in a tab (or activate its
+    /// tab). A document with unsaved changes is kept in its tab, not dropped.
+    fn select_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.open_document_path(path) {
+            Ok(()) => {
                 // A click re-targets typing (and IME composition) at the
                 // buffer.
                 window.focus(&self.focus_handle(cx));
             }
-            Err(error) => {
-                self.notice = Some(self.tf(
-                    "notice.open_failed",
-                    &[("path", path), ("error", &error.to_string())],
-                ));
-            }
+            Err(message) => self.notice = Some(message),
         }
         cx.notify();
     }
@@ -4017,6 +4338,80 @@ impl Editor {
         cx.notify();
     }
 
+    /// Save one tab: the active tab goes through the normal save path (diff
+    /// refresh and notice included); an inactive tab is written from its own
+    /// buffer without activating it. A failed save leaves the tab dirty.
+    fn save_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if index == self.active_tab {
+            self.on_save(&Save, window, cx);
+            return !self.doc.is_dirty();
+        }
+        let Some(doc) = self.tabs.get(index).and_then(|tab| tab.document.as_ref()) else {
+            return false;
+        };
+        if !doc.is_dirty() {
+            return true;
+        }
+        if doc.path.is_empty() {
+            self.notice = Some(self.t("notice.no_document").to_string());
+            return false;
+        }
+        let path = doc.path.clone();
+        let text = doc.buffer.slice(0..doc.buffer.doc_len());
+        let base = doc.base_text.clone();
+        let revision = doc.revision;
+        let Some(project) = self.project.clone() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            return false;
+        };
+        if text == base {
+            if let Some(doc) = self
+                .tabs
+                .get_mut(index)
+                .and_then(|tab| tab.document.as_mut())
+            {
+                doc.saved_revision = revision;
+            }
+            return true;
+        }
+        match project.write_document(&path, &text) {
+            Ok(()) => {
+                if let Some(doc) = self
+                    .tabs
+                    .get_mut(index)
+                    .and_then(|tab| tab.document.as_mut())
+                {
+                    doc.base_text = text.clone();
+                    doc.saved_revision = revision;
+                    doc.diff.base_lines = text.split('\n').map(str::to_string).collect();
+                    doc.backup_path = None;
+                    doc.backup_saved_at = None;
+                    doc.backup_error = None;
+                }
+                let _ = narra_core::backup::remove_backup(project.root(), &path);
+                self.notice = Some(self.tf("notice.saved", &[("path", &path)]));
+                true
+            }
+            Err(error) => {
+                self.notice = Some(self.tf(
+                    "notice.save_failed",
+                    &[("path", &path), ("error", &error.to_string())],
+                ));
+                false
+            }
+        }
+    }
+
+    /// Save every dirty tab in order; stop at the first failure.
+    fn save_all_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        for index in 0..self.tabs.len() {
+            if self.tab_is_dirty(index) && !self.save_tab(index, window, cx) {
+                return false;
+            }
+        }
+        self.dirty_tab_count() == 0
+    }
+
     /// ⌘S: write the buffer through the boundary-checked project IO. The
     /// canonical file changes only here, on an explicit save — never by an
     /// agent action and never as a side effect of switching documents.
@@ -4026,6 +4421,11 @@ impl Editor {
             cx.notify();
             return;
         };
+        if self.doc.path.is_empty() {
+            self.notice = Some(self.t("notice.no_document").to_string());
+            cx.notify();
+            return;
+        }
         let text = self.full_text();
         if text == self.doc.base_text {
             // Converged back (e.g. undo to the original): clear the dirty
@@ -4471,6 +4871,13 @@ impl Editor {
             cx.notify();
             return;
         };
+        // Tabs make it possible to have notes active while the screenplay is
+        // open elsewhere; never export the wrong buffer under the guion name.
+        if self.doc.path != project.manifest().default_screenplay_path {
+            self.notice = Some(self.t("notice.export_screenplay").to_string());
+            cx.notify();
+            return;
+        }
         let root = project.root().to_string_lossy().into_owned();
         let manifest = project.manifest().clone();
         let stem = Path::new(&manifest.default_screenplay_path)
@@ -4692,19 +5099,8 @@ impl Editor {
             self.ensure_caret_visible();
             return;
         }
-        if self.dirty() {
-            self.notice = Some(self.t("notice.dirty_switch").to_string());
-            cx.notify();
-            return;
-        }
-        let Some(project) = self.project.clone() else {
-            self.notice = Some(self.t("notice.fixture_no_project").to_string());
-            cx.notify();
-            return;
-        };
-        match project.read_document(&hit.document) {
-            Ok(text) => {
-                self.load_document(hit.document.clone(), text);
+        match self.open_document_path(&hit.document) {
+            Ok(()) => {
                 let offset = self.offset_for_line_column(hit.line, hit.column);
                 self.set_caret(offset, false);
                 self.search.open = false;
@@ -4715,11 +5111,8 @@ impl Editor {
                 cx.notify();
                 self.ensure_caret_visible();
             }
-            Err(error) => {
-                self.notice = Some(self.tf(
-                    "notice.open_failed",
-                    &[("path", &hit.document), ("error", &error.to_string())],
-                ));
+            Err(message) => {
+                self.notice = Some(message);
                 cx.notify();
             }
         }
@@ -4943,6 +5336,26 @@ impl Editor {
             cx.notify();
             return;
         };
+        // The proposal names its target document. With tabs the writer may
+        // have switched elsewhere; activate the target and refuse a dirty
+        // target buffer, because applying writes the canonical file and a
+        // stale buffer must never be left looking current.
+        let target = self.propose.target.clone();
+        if target.is_empty() {
+            self.notice = Some(self.t("notice.nothing_to_apply").to_string());
+            cx.notify();
+            return;
+        }
+        if let Err(message) = self.open_document_path(&target) {
+            self.notice = Some(message);
+            cx.notify();
+            return;
+        }
+        if self.dirty() {
+            self.notice = Some(self.t("notice.apply_target_dirty").to_string());
+            cx.notify();
+            return;
+        }
         // The selected subset (M6 slice 6): all selected → None (apply-all,
         // the core's canonical path); a subset → Some(indices); nothing
         // selected → explicit refusal (applying nothing would rewrite the
@@ -5466,6 +5879,68 @@ impl Editor {
         }
     }
 
+    /// Tab strip (M10 S3b): one tab per open document, active tab highlighted,
+    /// dirty tabs dotted. Clicking a title activates it; the close button
+    /// asks for confirmation when that tab (or the active buffer) is dirty.
+    fn tab_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut bar = div()
+            .id("tab-bar")
+            .h(px(30.0))
+            .w_full()
+            .flex()
+            .overflow_x_scroll()
+            .bg(rgb(EXPLORER_BG))
+            .border_b_1()
+            .border_color(rgb(EXPLORER_BORDER));
+        for index in 0..self.tabs.len() {
+            let active = index == self.active_tab;
+            let title = self.tab_title(index);
+            let dirty = self.tab_is_dirty(index);
+            let label = if dirty { format!("{title} •") } else { title };
+            let tab = div()
+                .id(("tab", index))
+                .w(px(190.0))
+                .h_full()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .border_r_1()
+                .border_color(rgb(EXPLORER_BORDER))
+                .bg(rgb(if active { BG } else { EXPLORER_BG }))
+                .child(
+                    div()
+                        .id(("tab-title", index))
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .text_color(rgb(if active { DEFAULT_FG } else { STATUS_FG }))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if this.activate_tab(index) {
+                                window.focus(&this.focus_handle(cx));
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("tab-close", index))
+                        .px_1()
+                        .cursor_pointer()
+                        .text_color(rgb(if active { STATUS_FG } else { GUTTER_FG }))
+                        .child("×")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.request_close_tab(index, window, cx)
+                        })),
+                );
+            bar = bar.child(tab);
+        }
+        bar.into_any_element()
+    }
+
     /// Explorer panel (M6 slice 1): one row per project document. Clicking
     /// loads it (`select_path`); the active document is highlighted to mirror
     /// `doc_path`. Long paths clip at the panel edge (status bar shows the
@@ -5517,7 +5992,9 @@ impl Editor {
             let label = if row.is_dir {
                 format!("{} {}", if row.collapsed { "▸" } else { "▾" }, row.name)
             } else {
-                let dirty = selected && self.dirty();
+                let dirty = self
+                    .find_tab(&row.path)
+                    .is_some_and(|tab| self.tab_is_dirty(tab));
                 format!("{}{}", row.name, if dirty { " •" } else { "" })
             };
             let color = if selected {
@@ -6246,6 +6723,56 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let recents_error = self.recents.error().unwrap_or("").to_string();
+        let unsaved_dump = match self.unsaved_prompt {
+            Some(prompt) => {
+                let (action, tab) = match prompt.action {
+                    PendingUnsaved::Quit => ("quit", "null".to_string()),
+                    PendingUnsaved::CloseTab(index) => ("close_tab", index.to_string()),
+                };
+                format!(
+                    "{{\"open\":true,\"action\":\"{action}\",\"tab\":{tab},\"dirty\":{}}}",
+                    prompt.dirty
+                )
+            }
+            None => "{\"open\":false,\"action\":\"\",\"tab\":null,\"dirty\":0}".to_string(),
+        };
+        let tabs_dump = (0..self.tabs.len())
+            .filter_map(|index| {
+                let doc = self.tab_document(index)?;
+                let caret = if doc.reversed {
+                    doc.selected.start
+                } else {
+                    doc.selected.end
+                };
+                let position = doc.buffer.position_at(caret);
+                let kind = match FileKind::from_path(&doc.path) {
+                    FileKind::Fountain => "fountain",
+                    FileKind::Markdown => "markdown",
+                    FileKind::Yaml => "yaml",
+                    FileKind::Other => "other",
+                };
+                Some(format!(
+                    "{{\"path\":\"{}\",\"title\":\"{}\",\"kind\":\"{}\",\
+                     \"dirty\":{},\"active\":{},\"revision\":{},\"saved_revision\":{},\
+                     \"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],\
+                     \"undo\":{},\"redo\":{}}}",
+                    escape_json(&doc.path),
+                    escape_json(&self.tab_title(index)),
+                    kind,
+                    doc.is_dirty(),
+                    index == self.active_tab,
+                    doc.revision,
+                    doc.saved_revision,
+                    position.line + 1,
+                    position.col,
+                    doc.selected.start,
+                    doc.selected.end,
+                    doc.undo_stack.len(),
+                    doc.redo_stack.len(),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let tree_rows: Vec<String> = explorer::build_rows(&self.explorer, &self.collapsed)
             .iter()
             .map(|row| {
@@ -6388,7 +6915,8 @@ impl Editor {
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"new_file\":{},\"new_project\":{},\
+                 \"unsaved\":{},\
+                 \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
                  \"backup\":{{\"path\":\"{}\",\"saved\":{},\"error\":\"{}\"}},\
@@ -6442,9 +6970,12 @@ impl Editor {
                 .page_count
                 .map(|pages| pages.to_string())
                 .unwrap_or_else(|| "null".to_string()),
-            self.quit_prompt,
+            self.unsaved_prompt.is_some(),
+            unsaved_dump,
             new_file_dump,
             new_project_dump,
+            tabs_dump,
+            self.active_tab,
             escape_json(&project_dump),
             recents_dump,
             escape_json(&recents_error),
@@ -6504,6 +7035,7 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
         }));
     }
     file_items.push(gpui::MenuItem::separator());
+    file_items.push(gpui::MenuItem::action(label("menu.close_tab"), CloseTab));
     file_items.push(gpui::MenuItem::action(label("menu.save"), Save));
     file_items.push(gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf));
 
@@ -6535,6 +7067,9 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
         menu(
             "menu.view",
             vec![
+                gpui::MenuItem::action(label("menu.prev_tab"), PrevTab),
+                gpui::MenuItem::action(label("menu.next_tab"), NextTab),
+                gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.toggle_diff"), ToggleDiff),
                 gpui::MenuItem::action(label("menu.language"), ToggleLang),
             ],
@@ -6786,7 +7321,7 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         // The unsaved-changes prompt owns the keyboard (M9 slice 6).
-        if self.quit_prompt {
+        if self.unsaved_prompt.is_some() {
             return;
         }
         // The New File modal owns typing while open (M10 slice 2).
@@ -7059,6 +7594,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_new_project))
             .on_action(cx.listener(Self::on_open_recent))
             .on_action(cx.listener(Self::on_clear_recents))
+            // tabs (M10 slice 3b)
+            .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_next_tab))
+            .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -7131,8 +7670,16 @@ impl Render for Editor {
                     .child(
                         div()
                             .flex_1()
-                            .relative()
-                            // Click-to-caret for the buffer list (the diff list is
+                            .flex()
+                            .flex_col()
+                            .when(self.project.is_some(), |column| {
+                                column.child(self.tab_bar(cx))
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .relative()
+                                    // Click-to-caret for the buffer list (the diff list is
                             // read-only and ignores clicks in the handler).
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_buffer_click))
                             .on_mouse_move(cx.listener(Self::on_mouse_drag))
@@ -7185,8 +7732,9 @@ impl Render for Editor {
                                         }
                                     },
                                 )
-                                .absolute()
-                                .size_full(),
+                                        .absolute()
+                                        .size_full(),
+                                    ),
                             ),
                     )
                     // Review/proposal panel (M6 slice 3/4): right column of
@@ -7196,7 +7744,9 @@ impl Render for Editor {
                         body.child(self.agent_panel())
                     }),
             )
-            .when(self.quit_prompt, |root| root.child(self.quit_overlay(cx)))
+            .when(self.unsaved_prompt.is_some(), |root| {
+                root.child(self.quit_overlay(cx))
+            })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
             })
@@ -7555,6 +8105,11 @@ fn run() -> Result<(), String> {
             // the new-project dialog (native save panel for the location).
             KeyBinding::new("cmd-o", OpenProject, None),
             KeyBinding::new("cmd-shift-n", NewProject, None),
+            // tabs (M10 slice 3b): ⌘W closes the active tab, ⌘⇧[/] walk the
+            // strip; unsaved tabs get the save/discard/cancel prompt.
+            KeyBinding::new("cmd-w", CloseTab, None),
+            KeyBinding::new("cmd-shift-[", PrevTab, None),
+            KeyBinding::new("cmd-shift-]", NextTab, None),
             // editing
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", DeleteText, None),
@@ -7626,8 +8181,10 @@ fn run() -> Result<(), String> {
 
         let entity = cx.new(|cx| Editor {
             doc: DocumentState::new(doc_path, &content),
+            tabs: vec![Tab { document: None }],
+            active_tab: 0,
             autosave_started: false,
-            quit_prompt: false,
+            unsaved_prompt: None,
             debug_metrics: debug_metrics_flag,
             new_file: None,
             new_project: None,
@@ -7831,6 +8388,25 @@ mod tests {
 
     // visual_row_starts tests require a Window, so they're integration-tested
     // via the live click verification (B-2) and the wrapped-caret live run below.
+
+    #[test]
+    fn tab_navigation_wraps_and_handles_one_tab() {
+        assert_eq!(next_tab_index(0, 3, true), Some(1));
+        assert_eq!(next_tab_index(2, 3, true), Some(0));
+        assert_eq!(next_tab_index(0, 3, false), Some(2));
+        assert_eq!(next_tab_index(1, 3, false), Some(0));
+        assert_eq!(next_tab_index(0, 1, true), None);
+        assert_eq!(next_tab_index(3, 3, true), None);
+    }
+
+    #[test]
+    fn closing_a_tab_picks_the_right_neighbour_or_left_at_the_end() {
+        assert_eq!(close_target_index(0, 3), Some(1));
+        assert_eq!(close_target_index(1, 3), Some(2));
+        assert_eq!(close_target_index(2, 3), Some(1));
+        assert_eq!(close_target_index(0, 1), None);
+        assert_eq!(close_target_index(1, 1), None);
+    }
 
     #[test]
     fn document_state_seeds_the_save_and_diff_base() {

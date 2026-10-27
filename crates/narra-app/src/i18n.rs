@@ -294,9 +294,43 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Save before closing, or discard the changes.",
         "Guarda antes de cerrar o descarta los cambios.",
     ),
+    (
+        "quit.body_many",
+        "{n} documents have unsaved changes.",
+        "{n} documentos tienen cambios sin guardar.",
+    ),
     ("quit.save", "Save and close", "Guardar y cerrar"),
+    (
+        "quit.save_all",
+        "Save all and close",
+        "Guardar todo y cerrar",
+    ),
     ("quit.discard", "Discard and close", "Descartar y cerrar"),
+    (
+        "quit.discard_all",
+        "Discard all and close",
+        "Descartar todo y cerrar",
+    ),
     ("quit.cancel", "Cancel", "Cancelar"),
+    ("tab.untitled", "Untitled", "Sin título"),
+    ("menu.close_tab", "Close Tab", "Cerrar pestaña"),
+    ("menu.next_tab", "Next Tab", "Pestaña siguiente"),
+    ("menu.prev_tab", "Previous Tab", "Pestaña anterior"),
+    (
+        "notice.no_document",
+        "no document is open to save",
+        "no hay un documento abierto para guardar",
+    ),
+    (
+        "notice.export_screenplay",
+        "open the screenplay tab to export the PDF",
+        "abre la pestaña del guion para exportar el PDF",
+    ),
+    (
+        "notice.apply_target_dirty",
+        "the proposal target has unsaved changes: save it before applying",
+        "el destino de la propuesta tiene cambios sin guardar: guárdalo antes de aplicar",
+    ),
     // --- new file (M10 slice 2) ------------------------------------------
     ("newfile.title", "New file", "Nuevo archivo"),
     ("newfile.name", "Name:", "Nombre:"),
