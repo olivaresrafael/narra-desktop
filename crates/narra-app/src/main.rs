@@ -1254,7 +1254,7 @@ impl Editor {
     /// undo, scroll and find/diff state for both. Returns false for the
     /// already-active or an invalid index.
     fn activate_tab(&mut self, index: usize) -> bool {
-        if index == self.active_tab || index >= self.tabs.len() {
+        if self.unsaved_prompt.is_some() || index == self.active_tab || index >= self.tabs.len() {
             return false;
         }
         let Some(next) = self.tabs[index].document.take() else {
@@ -2496,8 +2496,8 @@ impl Editor {
     }
 
     fn open_new_file(&mut self, cx: &mut Context<Self>) {
-        // The New Project dialog owns the workspace while it is open.
-        if self.new_project.is_some() {
+        // The New Project dialog or the unsaved prompt owns the workspace.
+        if self.new_project.is_some() || self.unsaved_prompt.is_some() {
             return;
         }
         if self.project.is_none() {
@@ -2617,6 +2617,8 @@ impl Editor {
             .items_center()
             .justify_center()
             .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
                     .w(px(560.0))
@@ -3138,6 +3140,8 @@ impl Editor {
             .items_center()
             .justify_center()
             .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
                     .w(px(600.0))
@@ -3622,6 +3626,13 @@ impl Editor {
                 }
             }
             PendingUnsaved::CloseTab(index) => {
+                if index >= self.tabs.len() {
+                    // Defensive: a stale index must cancel, never delete a
+                    // different tab that happened to take the slot.
+                    self.unsaved_prompt = None;
+                    cx.notify();
+                    return;
+                }
                 if self.save_tab(index, window, cx) {
                     self.unsaved_prompt = None;
                     self.close_tab_at(index);
@@ -3686,6 +3697,11 @@ impl Editor {
             .items_center()
             .justify_center()
             .bg(rgba(0x00000099))
+            // A full-screen interactive backdrop swallows clicks so the
+            // editor/explorer behind a prompt cannot switch tabs or close
+            // documents while the prompt is open.
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
                     .w(px(520.0))
@@ -4440,6 +4456,9 @@ impl Editor {
     /// is preserved in the tab being left; tabs make switching safe, so the
     /// old document-switch refusal no longer applies here.
     fn open_document_path(&mut self, path: &str) -> Result<(), String> {
+        if self.unsaved_prompt.is_some() {
+            return Err(self.t("notice.finish_dialog").to_string());
+        }
         if path == self.doc.path {
             return Ok(());
         }
@@ -4464,6 +4483,9 @@ impl Editor {
     /// Explorer click: open the selected document in a tab (or activate its
     /// tab). A document with unsaved changes is kept in its tab, not dropped.
     fn select_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unsaved_prompt.is_some() {
+            return;
+        }
         match self.open_document_path(path) {
             Ok(()) => {
                 // A click re-targets typing (and IME composition) at the
@@ -4477,6 +4499,9 @@ impl Editor {
 
     /// Collapse/expand a folder in the explorer tree (M9 slice 4).
     fn toggle_folder(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.unsaved_prompt.is_some() {
+            return;
+        }
         if !self.collapsed.remove(path) {
             self.collapsed.insert(path.to_string());
         }
@@ -5285,6 +5310,9 @@ impl Editor {
 
     /// Click on an outline row (M8 slice 3): jump to that scene's heading.
     fn select_outline(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unsaved_prompt.is_some() {
+            return;
+        }
         self.refresh_scenes();
         let Some(&line) = self.doc.scene_lines.get(index) else {
             return;
@@ -5298,7 +5326,7 @@ impl Editor {
 
     /// Click on a result row: select it and open it.
     fn select_search_hit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.search.hits.len() {
+        if self.unsaved_prompt.is_some() || index >= self.search.hits.len() {
             return;
         }
         self.search.selected = index;
@@ -7226,7 +7254,7 @@ impl Editor {
                     "{{\"path\":\"{}\",\"title\":\"{}\",\"kind\":\"{}\",\
                      \"dirty\":{},\"active\":{},\"revision\":{},\"saved_revision\":{},\
                      \"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],\
-                     \"undo\":{},\"redo\":{}}}",
+                     \"scroll_item\":{},\"undo\":{},\"redo\":{}}}",
                     escape_json(&doc.path),
                     escape_json(&self.tab_title(index)),
                     kind,
@@ -7238,6 +7266,7 @@ impl Editor {
                     position.col,
                     doc.selected.start,
                     doc.selected.end,
+                    doc.list_state.logical_scroll_top().item_ix,
                     doc.undo_stack.len(),
                     doc.redo_stack.len(),
                 ))
@@ -8971,6 +9000,22 @@ mod tests {
         assert_eq!(doc.buffer.line_count(), 3);
         assert_eq!(doc.diff.base_lines, vec!["uno", "dos", ""]);
         assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn scroll_state_is_owned_by_each_document() {
+        let first = DocumentState::new("a.fountain".to_string(), "1\n2\n3\n4\n5");
+        let second = DocumentState::new("b.fountain".to_string(), "1\n2\n3\n4\n5");
+        first.list_state.scroll_to(gpui::ListOffset {
+            item_ix: 3,
+            offset_in_item: px(0.0),
+        });
+        assert_eq!(first.list_state.logical_scroll_top().item_ix, 3);
+        assert_eq!(
+            second.list_state.logical_scroll_top().item_ix,
+            0,
+            "one document's scroll never leaks into another"
+        );
     }
 
     #[test]
