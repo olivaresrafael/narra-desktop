@@ -33,6 +33,7 @@ pub mod git;
 pub mod manifest;
 pub mod project;
 pub mod provider;
+pub mod search;
 
 pub use document::{DocumentError, read_document, resolve_within, write_document};
 pub use fountain::{Element as FountainElement, ElementKind, parse as parse_fountain};
