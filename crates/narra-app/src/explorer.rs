@@ -124,6 +124,26 @@ pub fn build_rows(paths: &[String], collapsed: &HashSet<String>) -> Vec<Row> {
     rows
 }
 
+/// Project-internal files hidden from the explorer by default (M10 S4c).
+/// `.narra/` is never listed by `Project::list_documents`; the explicit
+/// prefix check keeps this rule honest if that changes.
+pub fn is_config_path(path: &str) -> bool {
+    matches!(
+        path,
+        "project.yaml" | "agents.yaml" | "AGENTS.md" | ".gitignore"
+    ) || path.starts_with(".narra/")
+}
+
+/// Documents the writer should see: narrative content only, unless the user
+/// explicitly opted into seeing configuration files.
+pub fn visible_paths(paths: &[String], show_config_files: bool) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| show_config_files || !is_config_path(path))
+        .cloned()
+        .collect()
+}
+
 /// Parent directory of a project-relative path (`""` at the root).
 fn parent_of(path: &str) -> &str {
     path.rsplit_once('/')
@@ -274,6 +294,29 @@ mod tests {
         assert_eq!(FileKind::Fountain.icon_name(), "clapperboard");
         assert_eq!(FileKind::Yaml.icon_name(), "sliders-horizontal");
         assert_eq!(FileKind::Other.icon_name(), "file");
+    }
+
+    #[test]
+    fn config_paths_are_hidden_unless_requested() {
+        let paths = vec![
+            "AGENTS.md".to_string(),
+            "agents.yaml".to_string(),
+            "bible/world.md".to_string(),
+            "project.yaml".to_string(),
+            ".narra/backups/x~".to_string(),
+            "screenplay/main.fountain".to_string(),
+        ];
+        let visible = visible_paths(&paths, false);
+        assert_eq!(
+            visible,
+            vec![
+                "bible/world.md".to_string(),
+                "screenplay/main.fountain".to_string()
+            ]
+        );
+        assert_eq!(visible_paths(&paths, true), paths);
+        assert!(is_config_path("project.yaml"));
+        assert!(!is_config_path("notes/decisions.md"));
     }
 
     #[test]

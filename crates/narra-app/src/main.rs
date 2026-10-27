@@ -59,7 +59,7 @@
 //!         --agent-model <nombre>              (required for openai-compat)
 //!         --agent-base-url <url>              (default: local Ollama)
 //!         --agent-latency <ms>                (simulated mock latency)
-//!       M6 slice 4 (proposals): ⌘P opens the instruction bar, enter runs
+//!       M6 slice 4 (proposals): ⌘K opens the instruction bar, enter runs
 //!       scene_edit for the caret's scene and the panel shows the stored
 //!       proposal's diff; ⌘⇧Enter applies (two-step: arm, then apply),
 //!       ⌘⌫ rejects. M6 slice 5 (review focus): ⌘⇧R opens the focus bar,
@@ -122,9 +122,11 @@ mod git_status;
 mod i18n;
 mod new_file;
 mod new_project;
+mod project_settings;
 mod recent;
 mod screenplay;
 mod settings;
+mod theme;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -148,8 +150,8 @@ use gpui::{
     App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ShapedLine, TextRun, Timer, UTF16Selection,
-    Window, WindowBounds, WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb,
-    rgba, size, svg,
+    Window, WindowAppearance, WindowBounds, WindowOptions, actions, canvas, div, list, point,
+    prelude::*, px, rgb, rgba, size, svg,
 };
 use i18n::Lang;
 use narra_core::agent::{
@@ -164,8 +166,10 @@ use narra_core::git::WorktreeStatus;
 use narra_core::provider::SecretStore;
 use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
+use project_settings::{ProjectField, ProjectSettingsState};
 use recent::RecentProjects;
-use settings::{AiProvider, AppSettings};
+use settings::{AiProvider, AppSettings, LanguageSetting};
+use theme::ThemeMode;
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
@@ -174,6 +178,10 @@ actions!(
         // windows and navigation
         Quit,
         OpenSettings,
+        OpenProjectSettings,
+        ToggleConfigFiles,
+        QuickOpen,
+        CommandPalette,
         NextScene,
         PrevScene,
         // caret movement
@@ -288,14 +296,12 @@ struct OpenRecentProject {
 /// Baseline line height. Wrapping (slice 3) makes non-hot rows variable-height
 /// (`list` measures each); this constant still sizes the caret, the hot-row
 /// single-line fallback, and the list overdraw.
-const LINE_HEIGHT: f32 = 18.0;
 /// Lines moved by PageUp/PageDown (M9 slice 2): roughly one screenful at
 /// the default editor size.
 const PAGE_LINES: i64 = 30;
 
 /// Explicit so that cursor x-positions (shaped manually) match rendered rows.
 /// 14 px == `text_sm` (0.875 rem), which slice 1 used.
-const TEXT_SIZE: f32 = 14.0;
 const FONT_FAMILY: &str = "Menlo";
 /// `px_2` on every row.
 const ROW_PADDING_X: f32 = 8.0;
@@ -310,42 +316,14 @@ const STATUS_BAR_H: f32 = 26.0;
 /// from frame statistics, so interactive sessions do not pollute the samples.
 const IDLE_GAP_MS: f64 = 500.0;
 
-const BG: u32 = 0x1e1e1e;
-const STATUS_BG: u32 = 0x2d2d2d;
-const STATUS_FG: u32 = 0xa3a3a3;
-const DEFAULT_FG: u32 = 0xd4d4d4;
-const SCENE_FG: u32 = 0x4ade80;
-const CUE_FG: u32 = 0x7dd3fc;
-const TRANSITION_FG: u32 = 0xfbbf24;
-const NOTE_FG: u32 = 0xc4b5fd;
-const SECTION_FG: u32 = 0xf9a8d4;
-const CURSOR_FG: u32 = 0xffffff;
-const SELECTION_BG: u32 = 0x3311ff30;
 /// Find-match highlight (all matches) and the current match — slice 3.
-const MATCH_BG: u32 = 0x3366cc40;
-const MATCH_CURRENT_BG: u32 = 0xeab30855;
 /// Find bar background (distinct from the status bar) and text colors.
-const FIND_BG: u32 = 0x252526;
-const FIND_FG: u32 = 0xd4d4d4;
-const FIND_DIM_FG: u32 = 0x808080;
 /// Explorer panel (M6 slice 1): width and colors. The panel renders only in
 /// `--project` mode, so fixture-mode geometry — the verified spike driver —
 /// stays byte-for-byte unchanged.
 const EXPLORER_W: f32 = 220.0;
-const EXPLORER_BG: u32 = 0x252526;
-const EXPLORER_BORDER: u32 = 0x3c3c3c;
-const DOC_SELECTED_BG: u32 = 0x37373d;
 /// Explorer state colors (M10 S3c): type is an icon, color is state.
-const DIRTY_FG: u32 = 0xfbbf24;
-const GIT_MODIFIED_FG: u32 = 0xfbbf24;
-const GIT_ADDED_FG: u32 = 0x4ade80;
-const GIT_DELETED_FG: u32 = 0xf87171;
-const GIT_RENAMED_FG: u32 = 0x7dd3fc;
-const GIT_CONFLICT_FG: u32 = 0xfb923c;
 /// Line-number gutter (M9 slice 3): fixed column before the text.
-const GUTTER_W: f32 = 44.0;
-const GUTTER_FG: u32 = 0x6a6a6a;
-const ACTIVE_LINE_BG: u32 = 0x2a2a2e;
 /// Outline rows rendered in the explorer (M8 slice 3). The panel has no
 /// scrollbar yet; the remainder is reported as "… N more".
 const OUTLINE_VISIBLE_ROWS: usize = 120;
@@ -359,14 +337,8 @@ const AGENT_VISIBLE_LINES: usize = 20;
 /// Hard cap on one review task (`scene_review`): model latency included.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Error/cancelled text in the agent panel.
-const AGENT_ERR_FG: u32 = 0xf48771;
 /// Diff view colors (slice 3, M1-3b): added/removed row backgrounds and the
 /// line-label gutter text.
-const DIFF_ADD_BG: u32 = 0x16321f;
-const DIFF_ADD_LABEL: u32 = 0x7ee08a;
-const DIFF_REMOVE_BG: u32 = 0x3a1a1f;
-const DIFF_REMOVE_LABEL: u32 = 0xe08a95;
-const DIFF_CONTEXT_LABEL: u32 = 0x606060;
 /// Which find field owns keystrokes while the bar is open (single-focus
 /// spike compromise — see the module header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -500,11 +472,41 @@ enum SettingsField {
     BaseUrl,
     Model,
     ApiKey,
+    GitName,
+    GitEmail,
+}
+
+/// Sidebar section of the Preferences dialog (M10 S4c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Editor,
+    Ai,
+    Git,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 4] = [
+        SettingsSection::General,
+        SettingsSection::Editor,
+        SettingsSection::Ai,
+        SettingsSection::Git,
+    ];
+
+    fn i18n_key(self) -> &'static str {
+        match self {
+            SettingsSection::General => "settings.section.general",
+            SettingsSection::Editor => "settings.section.editor",
+            SettingsSection::Ai => "settings.section.ai",
+            SettingsSection::Git => "settings.section.git",
+        }
+    }
 }
 
 /// The settings modal (M10 S4). `key_input` is transient; only Save writes it
 /// to the OS keychain. Everything else is persisted non-secret settings.
 struct SettingsState {
+    section: SettingsSection,
     provider: AiProvider,
     base_url: String,
     model: String,
@@ -517,11 +519,20 @@ struct SettingsState {
     models: Vec<String>,
     models_request: u64,
     fetching_models: bool,
+    language: LanguageSetting,
+    theme: ThemeMode,
+    font_size: u16,
+    word_wrap: bool,
+    line_numbers: bool,
+    show_config_files: bool,
+    git_name: String,
+    git_email: String,
 }
 
 impl std::fmt::Debug for SettingsState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SettingsState")
+            .field("section", &self.section)
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
@@ -540,6 +551,14 @@ impl std::fmt::Debug for SettingsState {
             .field("status", &self.status)
             .field("models", &self.models.len())
             .field("fetching_models", &self.fetching_models)
+            .field("language", &self.language)
+            .field("theme", &self.theme)
+            .field("font_size", &self.font_size)
+            .field("word_wrap", &self.word_wrap)
+            .field("line_numbers", &self.line_numbers)
+            .field("show_config_files", &self.show_config_files)
+            .field("git_name", &self.git_name)
+            .field("git_email", &self.git_email)
             .finish()
     }
 }
@@ -549,6 +568,127 @@ enum SettingsMessage {
         request: u64,
         result: Result<Vec<String>, String>,
     },
+}
+
+/// Quick-open / command-palette mode (M10 S5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteMode {
+    Files,
+    Commands,
+}
+
+impl PaletteMode {
+    fn key(self) -> &'static str {
+        match self {
+            PaletteMode::Files => "files",
+            PaletteMode::Commands => "commands",
+        }
+    }
+}
+
+/// The single overlay backing ⌘P (files) and ⌘⇧P (commands).
+#[derive(Debug)]
+struct PaletteState {
+    mode: PaletteMode,
+    query: String,
+    selected: usize,
+}
+
+/// Commands exposed by the palette. Menus and keybindings remain the primary
+/// surfaces; the palette is a discoverable index over the same handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteCommand {
+    OpenSettings,
+    OpenProjectSettings,
+    NewFile,
+    NewProject,
+    OpenProject,
+    Save,
+    ExportPdf,
+    ToggleExplorer,
+    ToggleAgentPanel,
+    ToggleGitPanel,
+    ToggleConfigFiles,
+    Find,
+    ProjectSearch,
+    ToggleDiff,
+    ReviewScene,
+    Propose,
+    CloseTab,
+    NextTab,
+    PrevTab,
+}
+
+impl PaletteCommand {
+    const ALL: [PaletteCommand; 19] = [
+        PaletteCommand::OpenSettings,
+        PaletteCommand::OpenProjectSettings,
+        PaletteCommand::NewFile,
+        PaletteCommand::NewProject,
+        PaletteCommand::OpenProject,
+        PaletteCommand::Save,
+        PaletteCommand::ExportPdf,
+        PaletteCommand::ToggleExplorer,
+        PaletteCommand::ToggleAgentPanel,
+        PaletteCommand::ToggleGitPanel,
+        PaletteCommand::ToggleConfigFiles,
+        PaletteCommand::Find,
+        PaletteCommand::ProjectSearch,
+        PaletteCommand::ToggleDiff,
+        PaletteCommand::ReviewScene,
+        PaletteCommand::Propose,
+        PaletteCommand::CloseTab,
+        PaletteCommand::NextTab,
+        PaletteCommand::PrevTab,
+    ];
+
+    fn label_key(self) -> &'static str {
+        match self {
+            PaletteCommand::OpenSettings => "menu.settings",
+            PaletteCommand::OpenProjectSettings => "menu.project_settings",
+            PaletteCommand::NewFile => "menu.new_file",
+            PaletteCommand::NewProject => "menu.new_project",
+            PaletteCommand::OpenProject => "menu.open_project",
+            PaletteCommand::Save => "menu.save",
+            PaletteCommand::ExportPdf => "menu.export_pdf",
+            PaletteCommand::ToggleExplorer => "menu.toggle_explorer",
+            PaletteCommand::ToggleAgentPanel => "menu.toggle_agent",
+            PaletteCommand::ToggleGitPanel => "menu.toggle_git",
+            PaletteCommand::ToggleConfigFiles => "menu.show_config_files",
+            PaletteCommand::Find => "menu.find",
+            PaletteCommand::ProjectSearch => "menu.project_search",
+            PaletteCommand::ToggleDiff => "menu.toggle_diff",
+            PaletteCommand::ReviewScene => "menu.review",
+            PaletteCommand::Propose => "menu.propose",
+            PaletteCommand::CloseTab => "menu.close_tab",
+            PaletteCommand::NextTab => "menu.next_tab",
+            PaletteCommand::PrevTab => "menu.prev_tab",
+        }
+    }
+
+    fn shortcut(self) -> &'static str {
+        match self {
+            PaletteCommand::OpenSettings => "⌘,",
+            PaletteCommand::OpenProjectSettings => "⇧⌘,",
+            PaletteCommand::NewFile => "⌘N",
+            PaletteCommand::NewProject => "⇧⌘N",
+            PaletteCommand::OpenProject => "⌘O",
+            PaletteCommand::Save => "⌘S",
+            PaletteCommand::ExportPdf => "⌘E",
+            PaletteCommand::ToggleExplorer => "⌘B",
+            PaletteCommand::ToggleAgentPanel => "⇧⌘A",
+            PaletteCommand::ToggleGitPanel => "⌥⌘G",
+            PaletteCommand::ToggleConfigFiles => "",
+            PaletteCommand::Find => "⌘F",
+            PaletteCommand::ProjectSearch => "⇧⌘F",
+            PaletteCommand::ToggleDiff => "⌘D",
+            PaletteCommand::ReviewScene => "⌘R",
+            PaletteCommand::Propose => "⌘K",
+            PaletteCommand::CloseTab => "⌘W",
+            PaletteCommand::NextTab => "⇧⌘]",
+            PaletteCommand::PrevTab => "⇧⌘[",
+        }
+    }
 }
 
 /// What to do once the unsaved-changes prompt is resolved.
@@ -669,17 +809,17 @@ fn is_character_cue(line: &str) -> bool {
 
 fn line_color(line: &str) -> Rgba {
     if is_scene_heading(line) {
-        rgb(SCENE_FG)
+        rgb(theme::scene_fg())
     } else if line.starts_with('#') {
-        rgb(SECTION_FG)
+        rgb(theme::section_fg())
     } else if line.starts_with("[[") {
-        rgb(NOTE_FG)
+        rgb(theme::note_fg())
     } else if line.ends_with("TO:") || line.starts_with("FUNDIDO") {
-        rgb(TRANSITION_FG)
+        rgb(theme::transition_fg())
     } else if is_character_cue(line) {
-        rgb(CUE_FG)
+        rgb(theme::cue_fg())
     } else {
-        rgb(DEFAULT_FG)
+        rgb(theme::default_fg())
     }
 }
 
@@ -708,14 +848,17 @@ fn shape_line(window: &Window, text: &str) -> ShapedLine {
     let run = TextRun {
         len: text.len(),
         font: gpui::font(FONT_FAMILY),
-        color: rgb(DEFAULT_FG).into(),
+        color: rgb(theme::default_fg()).into(),
         background_color: None,
         underline: None,
         strikethrough: None,
     };
-    window
-        .text_system()
-        .shape_line(text.to_string().into(), px(TEXT_SIZE), &[run], None)
+    window.text_system().shape_line(
+        text.to_string().into(),
+        px(theme::text_size()),
+        &[run],
+        None,
+    )
 }
 
 fn x_for_index(window: &Window, text: &str, col: usize) -> Pixels {
@@ -1116,8 +1259,12 @@ impl DocumentState {
             pages_generation: 0,
             scenes_dirty: true,
             current_scene: 0,
-            list_state: ListState::new(line_count, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
-            diff_list_state: ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0)),
+            list_state: ListState::new(
+                line_count,
+                ListAlignment::Top,
+                px(theme::line_height() * 2.0),
+            ),
+            diff_list_state: ListState::new(0, ListAlignment::Top, px(theme::line_height() * 2.0)),
             find: FindState::default(),
             diff: DiffState {
                 base_lines: text.split('\n').map(str::to_string).collect(),
@@ -1261,9 +1408,17 @@ struct Editor {
     app_settings: AppSettings,
     /// The Settings modal, when open (S4).
     settings: Option<SettingsState>,
+    /// The Project Settings form, when open (S4c).
+    project_settings: Option<ProjectSettingsState>,
+    /// Quick open (⌘P) / command palette (⌘⇧P), when open (S5).
+    palette: Option<PaletteState>,
+    /// Show `project.yaml`/`AGENTS.md`/`agents.yaml` in the explorer (S4c).
+    show_config_files: bool,
+    /// Soft-wrap long lines (S4c); the geometry still uses `wrap_width`.
+    word_wrap: bool,
     /// Proposal surface state (M6 slice 4). Pure reducer — see agent_view.
     propose: ProposeView,
-    /// Instruction bar for ⌘P (M6 slice 4).
+    /// Instruction bar for ⌘K (M6 slice 4; moved from ⌘P in M10 S5).
     propose_bar: ProposeBar,
     /// Reviewer-focus bar for ⌘⇧R (M6 slice 5).
     focus_bar: FocusBar,
@@ -1325,6 +1480,8 @@ impl Editor {
     fn activate_tab(&mut self, index: usize) -> bool {
         if self.unsaved_prompt.is_some()
             || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
             || index == self.active_tab
             || index >= self.tabs.len()
         {
@@ -1463,21 +1620,27 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.unsaved_prompt.is_some() || self.new_file.is_some() || self.new_project.is_some() {
+        if self.unsaved_prompt.is_some()
+            || self.new_file.is_some()
+            || self.new_project.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+        {
             return;
         }
-        let provider = self.agent_settings.provider;
+        let provider = self.app_settings.provider;
         let (key_present, key_source) = provider_key_status(provider);
         let base_url = provider
             .fixed_base_url()
             .map(str::to_string)
-            .unwrap_or_else(|| self.agent_settings.base_url.clone());
-        let model = if self.agent_settings.model.trim().is_empty() {
+            .unwrap_or_else(|| self.app_settings.base_url.clone());
+        let model = if self.app_settings.model.trim().is_empty() {
             provider.default_model().to_string()
         } else {
-            self.agent_settings.model.clone()
+            self.app_settings.model.clone()
         };
         self.settings = Some(SettingsState {
+            section: SettingsSection::General,
             provider,
             base_url,
             model,
@@ -1494,6 +1657,14 @@ impl Editor {
                 .collect(),
             models_request: 0,
             fetching_models: false,
+            language: self.app_settings.language,
+            theme: self.app_settings.theme,
+            font_size: self.app_settings.font_size,
+            word_wrap: self.app_settings.word_wrap,
+            line_numbers: self.app_settings.line_numbers,
+            show_config_files: self.app_settings.show_config_files,
+            git_name: self.app_settings.git_name.clone(),
+            git_email: self.app_settings.git_email.clone(),
         });
         cx.notify();
     }
@@ -1539,6 +1710,8 @@ impl Editor {
                 SettingsField::BaseUrl => state.base_url.push_str(&cleaned),
                 SettingsField::Model => state.model.push_str(&cleaned),
                 SettingsField::ApiKey => state.key_input.push_str(&cleaned),
+                SettingsField::GitName => state.git_name.push_str(&cleaned),
+                SettingsField::GitEmail => state.git_email.push_str(&cleaned),
             }
             state.error.clear();
             state.status.clear();
@@ -1552,6 +1725,8 @@ impl Editor {
                 SettingsField::BaseUrl => &mut state.base_url,
                 SettingsField::Model => &mut state.model,
                 SettingsField::ApiKey => &mut state.key_input,
+                SettingsField::GitName => &mut state.git_name,
+                SettingsField::GitEmail => &mut state.git_email,
             };
             if let Some(last) = target.chars().last() {
                 let len = target.len();
@@ -1565,15 +1740,25 @@ impl Editor {
 
     fn settings_cycle_field(&mut self, forward: bool, cx: &mut Context<Self>) {
         if let Some(state) = self.settings.as_mut() {
-            let fields: &[SettingsField] = if state.provider.fixed_base_url().is_some() {
-                &[SettingsField::Model, SettingsField::ApiKey]
-            } else {
-                &[
-                    SettingsField::BaseUrl,
-                    SettingsField::Model,
-                    SettingsField::ApiKey,
-                ]
+            let fields: &[SettingsField] = match state.section {
+                SettingsSection::Ai => {
+                    if state.provider.fixed_base_url().is_some() {
+                        &[SettingsField::Model, SettingsField::ApiKey]
+                    } else {
+                        &[
+                            SettingsField::BaseUrl,
+                            SettingsField::Model,
+                            SettingsField::ApiKey,
+                        ]
+                    }
+                }
+                SettingsSection::Git => &[SettingsField::GitName, SettingsField::GitEmail],
+                SettingsSection::General | SettingsSection::Editor => &[],
             };
+            if fields.is_empty() {
+                cx.notify();
+                return;
+            }
             let current = fields
                 .iter()
                 .position(|field| *field == state.field)
@@ -1646,6 +1831,14 @@ impl Editor {
             provider,
             base_url: base_url.clone(),
             model: model.clone(),
+            language: state.language,
+            theme: state.theme,
+            font_size: state.font_size,
+            word_wrap: state.word_wrap,
+            line_numbers: state.line_numbers,
+            show_config_files: state.show_config_files,
+            git_name: state.git_name.trim().to_string(),
+            git_email: state.git_email.trim().to_string(),
             error: None,
         };
         if let Err(error) = app_settings.save() {
@@ -1655,6 +1848,9 @@ impl Editor {
             cx.notify();
             return;
         }
+        let language_changed = self.lang != app_settings.language.resolved();
+        let old_font_size = self.app_settings.font_size;
+        let old_line_numbers = self.app_settings.line_numbers;
         self.app_settings = app_settings;
         self.agent_settings = AgentSettings {
             provider,
@@ -1662,6 +1858,35 @@ impl Editor {
             model,
             latency_ms: self.agent_settings.latency_ms,
         };
+        theme::set_mode(self.app_settings.theme);
+        theme::set_font_size(self.app_settings.font_size);
+        theme::set_line_numbers(self.app_settings.line_numbers);
+        self.show_config_files = self.app_settings.show_config_files;
+        self.word_wrap = self.app_settings.word_wrap;
+        if old_font_size != self.app_settings.font_size
+            || old_line_numbers != self.app_settings.line_numbers
+        {
+            self.doc.list_state = ListState::new(
+                self.doc.buffer.lines().len(),
+                ListAlignment::Top,
+                px(theme::line_height() * 2.0),
+            );
+            for tab in &mut self.tabs {
+                if let Some(doc) = tab.document.as_mut() {
+                    doc.list_state = ListState::new(
+                        doc.buffer.lines().len(),
+                        ListAlignment::Top,
+                        px(theme::line_height() * 2.0),
+                    );
+                }
+            }
+        }
+        if language_changed {
+            self.lang = self.app_settings.language.resolved();
+            self.agent.lang = self.lang;
+            self.propose.lang = self.lang;
+            self.refresh_menus(cx);
+        }
         self.settings = None;
         self.notice = Some(self.tf(
             "notice.settings_saved",
@@ -1798,123 +2023,348 @@ impl Editor {
     /// fixed mask and the dump only reports presence/source.
     fn settings_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.settings.as_ref().expect("overlay only when open");
-        let mut providers = div().flex().flex_wrap().gap_2();
-        for (index, provider) in AiProvider::ALL.into_iter().enumerate() {
-            let selected = provider == state.provider;
-            providers = providers.child(
-                div()
-                    .id(("settings-provider", index))
-                    .px_3()
-                    .py_1()
-                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
-                    .border_1()
-                    .border_color(rgb(if selected {
-                        DEFAULT_FG
-                    } else {
-                        EXPLORER_BORDER
-                    }))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
-                    .cursor_pointer()
-                    .child(self.t(provider.i18n_key()))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.settings_set_provider(provider, cx)),
-                    ),
-            );
-        }
         let field = |id: &'static str, text: String, active: bool| {
             div()
                 .id(id)
                 .flex_1()
                 .px_2()
                 .py_1()
-                .bg(rgb(0x1e1e20))
+                .bg(rgb(theme::explorer_bg()))
                 .border_1()
-                .border_color(rgb(if active { DEFAULT_FG } else { EXPLORER_BORDER }))
-                .text_color(rgb(DEFAULT_FG))
+                .border_color(rgb(if active {
+                    theme::default_fg()
+                } else {
+                    theme::explorer_border()
+                }))
+                .text_color(rgb(theme::default_fg()))
                 .child(text)
         };
-        let fixed_base = state.provider.fixed_base_url();
-        let base_text = if fixed_base.is_some() {
-            state.base_url.clone()
-        } else {
-            format!("{}▌", state.base_url)
-        };
-        let key_text = if !state.key_input.is_empty() {
-            format!("{}▌", "•".repeat(state.key_input.chars().count().min(32)))
-        } else if state.key_present {
-            format!(
-                "•••••••• ({})",
-                self.t(if state.key_source == "env" {
-                    "settings.key_source_env"
+        let chip = |id: (&'static str, usize), label: String, selected: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .bg(rgb(if selected {
+                    theme::doc_selected_bg()
                 } else {
-                    "settings.key_source_keychain"
-                })
-            )
-        } else {
-            self.t("settings.key_empty").to_string()
+                    theme::explorer_bg()
+                }))
+                .border_1()
+                .border_color(rgb(if selected {
+                    theme::default_fg()
+                } else {
+                    theme::explorer_border()
+                }))
+                .text_color(rgb(if selected {
+                    theme::default_fg()
+                } else {
+                    theme::status_fg()
+                }))
+                .cursor_pointer()
+                .child(label)
         };
-        let key_active = state.field == SettingsField::ApiKey;
-        let model_active = state.field == SettingsField::Model;
-        let base_active = state.field == SettingsField::BaseUrl;
-        let mut model_list = div()
-            .id("settings-models")
-            .h(px(112.0))
-            .w_full()
-            .overflow_y_scroll()
-            .border_1()
-            .border_color(rgb(EXPLORER_BORDER));
-        for (index, model) in state.models.iter().enumerate() {
-            let selected = model == &state.model;
-            let choice = model.clone();
-            model_list = model_list.child(
+        let toggle = |id: &'static str, label: String, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgb(theme::explorer_bg()))
+                .border_1()
+                .border_color(rgb(theme::explorer_border()))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(36.0))
+                        .text_color(rgb(if on {
+                            theme::git_added_fg()
+                        } else {
+                            theme::status_fg()
+                        }))
+                        .child(if on {
+                            self.t("settings.on")
+                        } else {
+                            self.t("settings.off")
+                        }),
+                )
+                .child(div().text_color(rgb(theme::default_fg())).child(label))
+        };
+        let mut tabs = div().flex().gap_1();
+        for (index, section) in SettingsSection::ALL.into_iter().enumerate() {
+            let selected = section == state.section;
+            tabs = tabs.child(
                 div()
-                    .id(("settings-model", index))
-                    .px_2()
+                    .id(("settings-section", index))
+                    .px_3()
                     .py_1()
-                    .text_sm()
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::explorer_bg()
+                    }))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
                     .cursor_pointer()
-                    .bg(rgb(if selected { DOC_SELECTED_BG } else { 0x1e1e20 }))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
-                    .child(choice.clone())
+                    .child(self.t(section.i18n_key()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.settings.as_mut() {
-                            state.model = choice.clone();
-                            state.field = SettingsField::Model;
+                            state.section = section;
                             state.error.clear();
+                            state.status.clear();
                         }
                         cx.notify();
                     })),
             );
         }
-        div()
-            .absolute()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x00000099))
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
-            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
-            .child(
+
+        let content = match state.section {
+            SettingsSection::General => {
+                let mut languages = div().flex().flex_wrap().gap_1();
+                for (index, language) in LanguageSetting::ALL.into_iter().enumerate() {
+                    languages = languages.child(
+                        chip(
+                            ("settings-language", index),
+                            self.t(language.i18n_key()).to_string(),
+                            state.language == language,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(state) = this.settings.as_mut() {
+                                state.language = language;
+                                state.status.clear();
+                            }
+                            cx.notify();
+                        })),
+                    );
+                }
+                let mut themes = div().flex().flex_wrap().gap_1();
+                for (index, mode) in ThemeMode::ALL.into_iter().enumerate() {
+                    themes = themes.child(
+                        chip(
+                            ("settings-theme", index),
+                            self.t(mode.i18n_key()).to_string(),
+                            state.theme == mode,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(state) = this.settings.as_mut() {
+                                state.theme = mode;
+                                state.status.clear();
+                            }
+                            cx.notify();
+                        })),
+                    );
+                }
                 div()
-                    .w(px(720.0))
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .p_4()
-                    .bg(rgb(0x252526))
-                    .border_1()
-                    .border_color(rgb(EXPLORER_BORDER))
                     .child(
                         div()
-                            .text_color(rgb(DEFAULT_FG))
-                            .child(self.t("settings.title")),
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("settings.language")),
                     )
+                    .child(languages)
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("settings.theme")),
+                    )
+                    .child(themes)
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("settings.general_hint")),
+                    )
+            }
+            SettingsSection::Editor => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(110.0))
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("settings.font_size")),
+                        )
+                        .child(
+                            div()
+                                .id("settings-font-minus")
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(theme::explorer_bg()))
+                                .border_1()
+                                .border_color(rgb(theme::explorer_border()))
+                                .cursor_pointer()
+                                .child("−")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(state) = this.settings.as_mut() {
+                                        state.font_size = state.font_size.saturating_sub(1).max(12);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .w(px(42.0))
+                                .text_color(rgb(theme::default_fg()))
+                                .child(format!("{} pt", state.font_size)),
+                        )
+                        .child(
+                            div()
+                                .id("settings-font-plus")
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(theme::explorer_bg()))
+                                .border_1()
+                                .border_color(rgb(theme::explorer_border()))
+                                .cursor_pointer()
+                                .child("+")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(state) = this.settings.as_mut() {
+                                        state.font_size = (state.font_size + 1).min(24);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    toggle(
+                        "settings-word-wrap",
+                        self.t("settings.word_wrap").to_string(),
+                        state.word_wrap,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(state) = this.settings.as_mut() {
+                            state.word_wrap = !state.word_wrap;
+                        }
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    toggle(
+                        "settings-line-numbers",
+                        self.t("settings.line_numbers").to_string(),
+                        state.line_numbers,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(state) = this.settings.as_mut() {
+                            state.line_numbers = !state.line_numbers;
+                        }
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    toggle(
+                        "settings-config-files",
+                        self.t("settings.show_config_files").to_string(),
+                        state.show_config_files,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(state) = this.settings.as_mut() {
+                            state.show_config_files = !state.show_config_files;
+                        }
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("settings.editor_hint")),
+                ),
+            SettingsSection::Ai => {
+                let mut providers = div().flex().flex_wrap().gap_2();
+                for (index, provider) in AiProvider::ALL.into_iter().enumerate() {
+                    let selected = provider == state.provider;
+                    providers = providers.child(
+                        chip(
+                            ("settings-provider", index),
+                            self.t(provider.i18n_key()).to_string(),
+                            selected,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings_set_provider(provider, cx)
+                        })),
+                    );
+                }
+                let fixed_base = state.provider.fixed_base_url();
+                let base_text = if fixed_base.is_some() {
+                    state.base_url.clone()
+                } else {
+                    format!("{}▌", state.base_url)
+                };
+                let key_text = if !state.key_input.is_empty() {
+                    format!("{}▌", "•".repeat(state.key_input.chars().count().min(32)))
+                } else if state.key_present {
+                    format!(
+                        "•••••••• ({})",
+                        self.t(if state.key_source == "env" {
+                            "settings.key_source_env"
+                        } else {
+                            "settings.key_source_keychain"
+                        })
+                    )
+                } else {
+                    self.t("settings.key_empty").to_string()
+                };
+                let key_active = state.field == SettingsField::ApiKey;
+                let model_active = state.field == SettingsField::Model;
+                let base_active = state.field == SettingsField::BaseUrl;
+                let mut model_list = div()
+                    .id("settings-models")
+                    .h(px(112.0))
+                    .w_full()
+                    .overflow_y_scroll()
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()));
+                for (index, model) in state.models.iter().enumerate() {
+                    let selected = model == &state.model;
+                    let choice = model.clone();
+                    model_list = model_list.child(
+                        div()
+                            .id(("settings-model", index))
+                            .px_2()
+                            .py_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .bg(rgb(if selected {
+                                theme::doc_selected_bg()
+                            } else {
+                                theme::explorer_bg()
+                            }))
+                            .text_color(rgb(if selected {
+                                theme::default_fg()
+                            } else {
+                                theme::status_fg()
+                            }))
+                            .child(choice.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(state) = this.settings.as_mut() {
+                                    state.model = choice.clone();
+                                    state.field = SettingsField::Model;
+                                    state.error.clear();
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
                     .child(providers)
                     .when(state.provider == AiProvider::Mock, |card| {
                         card.child(
                             div()
-                                .text_color(rgb(STATUS_FG))
+                                .text_color(rgb(theme::status_fg()))
                                 .child(self.t("settings.mock_hint")),
                         )
                     })
@@ -1925,8 +2375,8 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .w(px(90.0))
-                                    .text_color(rgb(STATUS_FG))
+                                    .w(px(110.0))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("settings.base_url")),
                             )
                             .child(if fixed_base.is_some() {
@@ -1934,7 +2384,7 @@ impl Editor {
                                     .flex_1()
                                     .px_2()
                                     .py_1()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(base_text)
                                     .into_any_element()
                             } else {
@@ -1955,8 +2405,8 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .w(px(90.0))
-                                    .text_color(rgb(STATUS_FG))
+                                    .w(px(110.0))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("settings.model")),
                             )
                             .child(
@@ -1982,8 +2432,8 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .w(px(90.0))
-                                    .text_color(rgb(STATUS_FG))
+                                    .w(px(110.0))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("settings.api_key")),
                             )
                             .child(
@@ -2002,7 +2452,7 @@ impl Editor {
                                     .px_2()
                                     .py_1()
                                     .cursor_pointer()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("settings.clear_key"))
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.settings_clear_key(cx)),
@@ -2011,55 +2461,150 @@ impl Editor {
                     )
                     .child(
                         div()
-                            .text_color(rgb(GUTTER_FG))
+                            .text_color(rgb(theme::gutter_fg()))
                             .child(self.t("settings.key_hint")),
                     )
                     .child(model_list)
                     .child(
                         div()
-                            .text_color(rgb(GUTTER_FG))
+                            .text_color(rgb(theme::gutter_fg()))
                             .child(self.t("settings.model_route_hint")),
                     )
+            }
+            SettingsSection::Git => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(110.0))
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("settings.git_name")),
+                        )
+                        .child(
+                            field(
+                                "settings-git-name",
+                                format!("{}▌", state.git_name),
+                                state.field == SettingsField::GitName,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.settings.as_mut() {
+                                    state.field = SettingsField::GitName;
+                                }
+                                cx.notify();
+                            })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(110.0))
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("settings.git_email")),
+                        )
+                        .child(
+                            field(
+                                "settings-git-email",
+                                format!("{}▌", state.git_email),
+                                state.field == SettingsField::GitEmail,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.settings.as_mut() {
+                                    state.field = SettingsField::GitEmail;
+                                }
+                                cx.notify();
+                            })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("settings.git_hint")),
+                ),
+        };
+
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(760.0))
+                    .id("settings-card")
+                    .max_h(px(640.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("settings.title")),
+                    )
+                    .child(tabs)
+                    .child(content)
                     .when(!state.error.is_empty(), |card| {
                         card.child(
                             div()
-                                .text_color(rgb(AGENT_ERR_FG))
+                                .text_color(rgb(theme::agent_err_fg()))
                                 .child(state.error.clone()),
                         )
                     })
                     .when(!state.status.is_empty(), |card| {
-                        card.child(div().text_color(rgb(STATUS_FG)).child(state.status.clone()))
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(state.status.clone()),
+                        )
                     })
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .child(
-                                div()
-                                    .id("settings-fetch")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(DEFAULT_FG))
-                                    .cursor_pointer()
-                                    .child(if state.fetching_models {
-                                        self.t("settings.fetching")
-                                    } else {
-                                        self.t("settings.fetch_models")
-                                    })
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| {
+                            .when(state.section == SettingsSection::Ai, |row| {
+                                row.child(
+                                    div()
+                                        .id("settings-fetch")
+                                        .px_3()
+                                        .py_1()
+                                        .bg(rgb(theme::status_bg()))
+                                        .text_color(rgb(theme::default_fg()))
+                                        .cursor_pointer()
+                                        .child(if state.fetching_models {
+                                            self.t("settings.fetching")
+                                        } else {
+                                            self.t("settings.fetch_models")
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
                                             this.settings_fetch_models(cx)
-                                        }),
-                                    ),
-                            )
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("settings-save")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(DEFAULT_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
                                     .cursor_pointer()
                                     .child(self.t("settings.save"))
                                     .on_click(cx.listener(|this, _, _, cx| this.settings_save(cx))),
@@ -2069,8 +2614,8 @@ impl Editor {
                                     .id("settings-cancel")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(STATUS_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
                                     .cursor_pointer()
                                     .child(self.t("settings.cancel"))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2078,6 +2623,754 @@ impl Editor {
                                         cx.notify();
                                     })),
                             ),
+                    ),
+            )
+    }
+
+    // ---- project settings and file visibility (M10 S4c) -----------------
+
+    /// Project menu / explorer gear: open the validated `project.yaml` form.
+    fn on_open_project_settings(
+        &mut self,
+        _: &OpenProjectSettings,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.project_settings.is_some() {
+            self.project_settings = None;
+            cx.notify();
+            return;
+        }
+        if self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.new_file.is_some()
+            || self.new_project.is_some()
+            || self.palette.is_some()
+        {
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            self.notice = Some(self.t("notice.fixture_no_project_short").to_string());
+            cx.notify();
+            return;
+        };
+        self.project_settings = Some(ProjectSettingsState::new(project));
+        cx.notify();
+    }
+
+    fn on_toggle_config_files(
+        &mut self,
+        _: &ToggleConfigFiles,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_config_files = !self.show_config_files;
+        self.app_settings.show_config_files = self.show_config_files;
+        if let Some(state) = self.settings.as_mut() {
+            state.show_config_files = self.show_config_files;
+        }
+        if let Err(error) = self.app_settings.save() {
+            self.notice = Some(self.tf("notice.settings_save_failed", &[("error", &error)]));
+        } else {
+            self.notice = Some(
+                self.t(if self.show_config_files {
+                    "notice.config_files_shown"
+                } else {
+                    "notice.config_files_hidden"
+                })
+                .to_string(),
+            );
+        }
+        cx.notify();
+    }
+
+    fn project_settings_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.project_settings.as_mut() {
+            state.input(text);
+        }
+        cx.notify();
+    }
+
+    fn project_settings_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.project_settings.as_mut() {
+            state.backspace();
+        }
+        cx.notify();
+    }
+
+    fn project_settings_cycle_field(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(state) = self.project_settings.as_mut() {
+            state.cycle_field(forward);
+        }
+        cx.notify();
+    }
+
+    fn project_settings_save(&mut self, cx: &mut Context<Self>) {
+        let lang = self.lang;
+        let Some(state) = self.project_settings.clone() else {
+            return;
+        };
+        let Some(project) = self.project.as_mut() else {
+            self.notice = Some(i18n::tr(lang, "notice.fixture_no_project_short").to_string());
+            cx.notify();
+            return;
+        };
+        match state.save(project) {
+            Ok(()) => {
+                self.project_settings = None;
+                self.notice = Some(i18n::tr(lang, "notice.project_settings_saved").to_string());
+            }
+            Err(error) => {
+                if let Some(state) = self.project_settings.as_mut() {
+                    state.error =
+                        i18n::tf(lang, "project_settings.save_failed", &[("error", &error)]);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn project_settings_open_yaml(&mut self, cx: &mut Context<Self>) {
+        self.project_settings = None;
+        if let Err(error) = self.open_document_path("project.yaml") {
+            self.notice = Some(error);
+        }
+        cx.notify();
+    }
+
+    fn project_settings_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self
+            .project_settings
+            .as_ref()
+            .expect("overlay only when open");
+        let field = |id: &'static str, text: String, active: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .px_2()
+                .py_1()
+                .bg(rgb(theme::explorer_bg()))
+                .border_1()
+                .border_color(rgb(if active {
+                    theme::default_fg()
+                } else {
+                    theme::explorer_border()
+                }))
+                .text_color(rgb(theme::default_fg()))
+                .child(text)
+        };
+        let mut kinds = div().flex().flex_wrap().gap_1();
+        for (index, kind) in [
+            ProjectType::Feature,
+            ProjectType::Series,
+            ProjectType::WebSeries,
+            ProjectType::Short,
+            ProjectType::Microdrama,
+            ProjectType::Other,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let selected = kind == state.project_type;
+            kinds = kinds.child(
+                div()
+                    .id(("project-kind", index))
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::explorer_bg()
+                    }))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::explorer_border()
+                    }))
+                    .cursor_pointer()
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
+                    .child(self.t(project_type_i18n(kind)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.project_settings.as_mut() {
+                            state.project_type = kind;
+                            state.field = ProjectField::Type;
+                            state.error.clear();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut screenplay_choices = div().flex().flex_col().gap_1();
+        let mut screenplays: Vec<&String> = self
+            .explorer
+            .iter()
+            .filter(|path| FileKind::from_path(path) == FileKind::Fountain)
+            .collect();
+        screenplays.sort();
+        if screenplays.is_empty() {
+            screenplay_choices = screenplay_choices.child(
+                div()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("project_settings.no_screenplays")),
+            );
+        }
+        for (index, path) in screenplays.into_iter().enumerate() {
+            let selected = path == &state.default_screenplay;
+            let choice = path.clone();
+            screenplay_choices = screenplay_choices.child(
+                div()
+                    .id(("project-screenplay", index))
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::explorer_bg()
+                    }))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
+                    .cursor_pointer()
+                    .child(choice.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.project_settings.as_mut() {
+                            state.default_screenplay = choice.clone();
+                            state.field = ProjectField::DefaultScreenplay;
+                            state.error.clear();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .id("project-settings-card")
+                    .w(px(680.0))
+                    .max_h(px(640.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("project_settings.title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("project_settings.hint")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(120.0))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("project_settings.name")),
+                            )
+                            .child(
+                                field(
+                                    "project-title-field",
+                                    format!("{}▌", state.title),
+                                    state.field == ProjectField::Title,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(state) = this.project_settings.as_mut() {
+                                            state.field = ProjectField::Title;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("project_settings.kind")),
+                    )
+                    .child(kinds)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(120.0))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("project_settings.primary_language")),
+                            )
+                            .child(
+                                field(
+                                    "project-language-field",
+                                    format!("{}▌", state.primary_language),
+                                    state.field == ProjectField::PrimaryLanguage,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(state) = this.project_settings.as_mut() {
+                                            state.field = ProjectField::PrimaryLanguage;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(120.0))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("project_settings.additional_languages")),
+                            )
+                            .child(
+                                field(
+                                    "project-additional-languages",
+                                    format!("{}▌", state.additional_languages),
+                                    state.field == ProjectField::AdditionalLanguages,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(state) = this.project_settings.as_mut() {
+                                            state.field = ProjectField::AdditionalLanguages;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("project_settings.additional_hint")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("project_settings.default_screenplay")),
+                    )
+                    .child(screenplay_choices)
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .when(!state.status.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(state.status.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("project-settings-save")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("project_settings.save"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.project_settings_save(cx)
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("project-settings-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("project_settings.cancel"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.project_settings = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("project-settings-yaml")
+                                    .px_3()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("project_settings.open_yaml"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.project_settings_open_yaml(cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    // ---- quick open and command palette (M10 S5) ------------------------
+
+    fn on_quick_open(&mut self, _: &QuickOpen, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::Files, cx);
+    }
+
+    fn on_command_palette(
+        &mut self,
+        _: &CommandPalette,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_palette(PaletteMode::Commands, cx);
+    }
+
+    fn open_palette(&mut self, mode: PaletteMode, cx: &mut Context<Self>) {
+        if self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.new_file.is_some()
+            || self.new_project.is_some()
+        {
+            return;
+        }
+        if let Some(state) = self.palette.as_mut()
+            && state.mode == mode
+        {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
+        self.palette = Some(PaletteState {
+            mode,
+            query: String::new(),
+            selected: 0,
+        });
+        cx.notify();
+    }
+
+    fn palette_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .collect();
+        if let Some(state) = self.palette.as_mut() {
+            state.query.push_str(&cleaned);
+            state.selected = 0;
+        }
+        cx.notify();
+    }
+
+    fn palette_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.palette.as_mut() {
+            if let Some(last) = state.query.chars().last() {
+                let len = state.query.len();
+                state.query.truncate(len - last.len_utf8());
+            }
+            state.selected = 0;
+        }
+        cx.notify();
+    }
+
+    fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = match self.palette.as_ref().map(|state| state.mode) {
+            Some(PaletteMode::Files) => self.palette_files().len(),
+            Some(PaletteMode::Commands) => self.palette_commands().len(),
+            None => 0,
+        };
+        if let Some(state) = self.palette.as_mut()
+            && count > 0
+        {
+            let current = state.selected.min(count - 1) as isize;
+            state.selected = (current + delta).clamp(0, count as isize - 1) as usize;
+        }
+        cx.notify();
+    }
+
+    fn palette_files(&self) -> Vec<String> {
+        let Some(state) = self.palette.as_ref() else {
+            return Vec::new();
+        };
+        let query = state.query.trim().to_lowercase();
+        filter_palette_paths(
+            explorer::visible_paths(&self.explorer, self.show_config_files),
+            &query,
+        )
+    }
+
+    fn palette_commands(&self) -> Vec<PaletteCommand> {
+        let Some(state) = self.palette.as_ref() else {
+            return Vec::new();
+        };
+        let query = state.query.trim().to_lowercase();
+        PaletteCommand::ALL
+            .into_iter()
+            .filter(|command| {
+                query.is_empty() || self.t(command.label_key()).to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn palette_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.palette.as_ref() else {
+            return;
+        };
+        let selected = state.selected;
+        let mode = state.mode;
+        match mode {
+            PaletteMode::Files => {
+                let Some(path) = self.palette_files().get(selected).cloned() else {
+                    return;
+                };
+                self.palette = None;
+                self.select_path(&path, window, cx);
+            }
+            PaletteMode::Commands => {
+                let Some(command) = self.palette_commands().get(selected).copied() else {
+                    return;
+                };
+                self.palette = None;
+                self.dispatch_palette_command(command, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn dispatch_palette_command(
+        &mut self,
+        command: PaletteCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            PaletteCommand::OpenSettings => {
+                self.on_open_settings(&OpenSettings, window, cx);
+            }
+            PaletteCommand::OpenProjectSettings => {
+                self.on_open_project_settings(&OpenProjectSettings, window, cx);
+            }
+            PaletteCommand::NewFile => self.on_new_file(&NewFile, window, cx),
+            PaletteCommand::NewProject => self.on_new_project(&NewProject, window, cx),
+            PaletteCommand::OpenProject => self.on_open_project(&OpenProject, window, cx),
+            PaletteCommand::Save => self.on_save(&Save, window, cx),
+            PaletteCommand::ExportPdf => self.on_export_pdf(&ExportPdf, window, cx),
+            PaletteCommand::ToggleExplorer => {
+                self.on_toggle_explorer(&ToggleExplorer, window, cx);
+            }
+            PaletteCommand::ToggleAgentPanel => {
+                self.on_toggle_agent_panel(&ToggleAgentPanel, window, cx);
+            }
+            PaletteCommand::ToggleGitPanel => {
+                self.on_toggle_git_panel(&ToggleGitPanel, window, cx);
+            }
+            PaletteCommand::ToggleConfigFiles => {
+                self.on_toggle_config_files(&ToggleConfigFiles, window, cx);
+            }
+            PaletteCommand::Find => self.on_toggle_find(&ToggleFind, window, cx),
+            PaletteCommand::ProjectSearch => {
+                self.on_project_search(&ProjectSearch, window, cx);
+            }
+            PaletteCommand::ToggleDiff => self.on_toggle_diff(&ToggleDiff, window, cx),
+            PaletteCommand::ReviewScene => self.on_review_scene(&ReviewScene, window, cx),
+            PaletteCommand::Propose => self.on_open_propose(&OpenPropose, window, cx),
+            PaletteCommand::CloseTab => self.on_close_tab(&CloseTab, window, cx),
+            PaletteCommand::NextTab => self.on_next_tab(&NextTab, window, cx),
+            PaletteCommand::PrevTab => self.on_prev_tab(&PrevTab, window, cx),
+        }
+    }
+
+    fn palette_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.palette.as_ref().expect("overlay only when open");
+        let title = match state.mode {
+            PaletteMode::Files => self.t("palette.files_title"),
+            PaletteMode::Commands => self.t("palette.commands_title"),
+        };
+        let placeholder = match state.mode {
+            PaletteMode::Files => self.t("palette.placeholder_files"),
+            PaletteMode::Commands => self.t("palette.placeholder_commands"),
+        };
+        let mut list = div()
+            .id("palette-list")
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        match state.mode {
+            PaletteMode::Files => {
+                for (index, path) in self.palette_files().iter().enumerate() {
+                    let selected = index == state.selected;
+                    let kind = FileKind::from_path(path);
+                    let path_owned = path.clone();
+                    list = list.child(
+                        div()
+                            .id(("palette-file", index))
+                            .px_3()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                            .child(icon(
+                                kind.icon_name(),
+                                if selected {
+                                    theme::default_fg()
+                                } else {
+                                    theme::status_fg()
+                                },
+                                14.0,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(if selected {
+                                        theme::default_fg()
+                                    } else {
+                                        theme::status_fg()
+                                    }))
+                                    .child(path_owned.clone()),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.palette = None;
+                                this.select_path(&path_owned, window, cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            PaletteMode::Commands => {
+                for (index, command) in self.palette_commands().iter().enumerate() {
+                    let selected = index == state.selected;
+                    let command = *command;
+                    list = list.child(
+                        div()
+                            .id(("palette-command", index))
+                            .px_3()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(rgb(if selected {
+                                        theme::default_fg()
+                                    } else {
+                                        theme::status_fg()
+                                    }))
+                                    .child(self.t(command.label_key())),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::gutter_fg()))
+                                    .child(command.shortcut()),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.palette = None;
+                                this.dispatch_palette_command(command, window, cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+        }
+        let empty = match state.mode {
+            PaletteMode::Files => self.palette_files().is_empty(),
+            PaletteMode::Commands => self.palette_commands().is_empty(),
+        };
+        if empty {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("palette.no_results")),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .pt(px(72.0))
+            .flex()
+            .justify_center()
+            .items_start()
+            .bg(rgba(0x00000080))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .text_sm()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(format!(
+                                "{}▌",
+                                if state.query.is_empty() {
+                                    placeholder
+                                } else {
+                                    state.query.as_str()
+                                },
+                            )),
+                    )
+                    .child(list)
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("palette.hint")),
                     ),
             )
     }
@@ -2155,11 +3448,13 @@ impl Editor {
                     .map(|g| (g.index, f32::from(g.position.x)))
             })
             .collect();
-        let wrap_width =
-            f32::from((bounds.size.width - px(ROW_PADDING_X * 2.0 + GUTTER_W)).max(px(0.0)));
+        let wrap_width = f32::from(
+            (bounds.size.width - px(ROW_PADDING_X * 2.0 + theme::gutter_width())).max(px(0.0)),
+        );
         let rows = wrap_row_starts(&glyphs, wrap_width);
-        let visual_row =
-            (((position.y - bounds.top()) / px(LINE_HEIGHT)).floor() as usize).min(rows.len() - 1);
+        let visual_row = (((position.y - bounds.top()) / px(theme::line_height())).floor()
+            as usize)
+            .min(rows.len() - 1);
         // Glyph x positions are absolute on the un-wrapped line, but wrapping
         // restarts each visual row at x = 0: shift the probe by the x of the
         // row's first glyph.
@@ -2168,7 +3463,8 @@ impl Editor {
             .find(|(index, _)| *index >= rows[visual_row])
             .map(|(_, x)| *x)
             .unwrap_or(0.0);
-        let x = f32::from(position.x - bounds.left() - px(ROW_PADDING_X + GUTTER_W)) + row_start_x;
+        let x = f32::from(position.x - bounds.left() - px(ROW_PADDING_X + theme::gutter_width()))
+            + row_start_x;
         let col = shaped.closest_index_for_x(px(x)).min(text.len());
         // Snap down to a grapheme boundary: a combining mark's glyph index can
         // land inside one.
@@ -2269,11 +3565,11 @@ impl Editor {
             return;
         };
         let viewport = self.doc.list_state.viewport_bounds();
-        let edge = px(LINE_HEIGHT);
+        let edge = px(theme::line_height());
         if event.position.y < viewport.top() + edge {
-            self.doc.list_state.scroll_by(px(-LINE_HEIGHT));
+            self.doc.list_state.scroll_by(px(-theme::line_height()));
         } else if event.position.y > viewport.bottom() - edge {
-            self.doc.list_state.scroll_by(px(LINE_HEIGHT));
+            self.doc.list_state.scroll_by(px(theme::line_height()));
         }
         let Some(offset) = self.offset_for_point(event.position, window) else {
             return;
@@ -2762,12 +4058,20 @@ impl Editor {
     }
 
     fn on_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.palette_move(-1, cx);
+            return;
+        }
         self.move_vert(-1, false, window);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.palette_move(1, cx);
+            return;
+        }
         self.move_vert(1, false, window);
         cx.notify();
         self.ensure_caret_visible();
@@ -3164,8 +4468,15 @@ impl Editor {
     }
 
     fn on_cycle_element(&mut self, _: &CycleElement, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
         if self.settings.is_some() {
             self.settings_cycle_field(true, cx);
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings_cycle_field(true, cx);
             return;
         }
         self.cycle_element(true);
@@ -3179,8 +4490,15 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.palette.is_some() {
+            return;
+        }
         if self.settings.is_some() {
             self.settings_cycle_field(false, cx);
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings_cycle_field(false, cx);
             return;
         }
         self.cycle_element(false);
@@ -3297,14 +4615,22 @@ impl Editor {
                     .id(kind.key())
                     .px_3()
                     .py_1()
-                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::explorer_bg()
+                    }))
                     .border_1()
                     .border_color(rgb(if selected {
-                        DEFAULT_FG
+                        theme::default_fg()
                     } else {
-                        EXPLORER_BORDER
+                        theme::explorer_border()
                     }))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
                     .cursor_pointer()
                     .child(self.t(kind.i18n_key()))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3336,12 +4662,12 @@ impl Editor {
                     .flex_col()
                     .gap_3()
                     .p_4()
-                    .bg(rgb(0x252526))
+                    .bg(rgb(theme::explorer_bg()))
                     .border_1()
-                    .border_color(rgb(EXPLORER_BORDER))
+                    .border_color(rgb(theme::explorer_border()))
                     .child(
                         div()
-                            .text_color(rgb(DEFAULT_FG))
+                            .text_color(rgb(theme::default_fg()))
                             .child(self.t("newfile.title")),
                     )
                     .child(kinds)
@@ -3352,15 +4678,15 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("newfile.name")),
                             )
                             .child(
                                 div()
                                     .flex_1()
-                                    .bg(rgb(0x1e1e20))
+                                    .bg(rgb(theme::bg()))
                                     .px_2()
-                                    .text_color(rgb(DEFAULT_FG))
+                                    .text_color(rgb(theme::default_fg()))
                                     .child(format!("{}▌", state.name)),
                             ),
                     )
@@ -3371,20 +4697,20 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("newfile.format")),
                             )
-                            .child(div().text_color(rgb(DEFAULT_FG)).child(format)),
+                            .child(div().text_color(rgb(theme::default_fg())).child(format)),
                     )
                     .child(
                         div()
-                            .text_color(rgb(STATUS_FG))
+                            .text_color(rgb(theme::status_fg()))
                             .child(self.t("newfile.formats_hint")),
                     )
                     .when(!state.error.is_empty(), |card| {
                         card.child(
                             div()
-                                .text_color(rgb(AGENT_ERR_FG))
+                                .text_color(rgb(theme::agent_err_fg()))
                                 .child(state.error.clone()),
                         )
                     })
@@ -3397,8 +4723,8 @@ impl Editor {
                                     .id("new-file-create")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(DEFAULT_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
                                     .cursor_pointer()
                                     .child(self.t("newfile.create"))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3410,8 +4736,8 @@ impl Editor {
                                     .id("new-file-cancel")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(STATUS_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
                                     .cursor_pointer()
                                     .child(self.t("newfile.cancel"))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3430,7 +4756,11 @@ impl Editor {
     /// quit prompt also own the keyboard, so the menu cannot start a second
     /// flow behind them.
     fn can_switch_project(&mut self) -> bool {
-        if self.unsaved_prompt.is_some() || self.settings.is_some() {
+        if self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+        {
             return false;
         }
         if self.new_file.is_some() || self.new_project.is_some() {
@@ -3793,14 +5123,22 @@ impl Editor {
                     .id(kind.as_str())
                     .px_3()
                     .py_1()
-                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::explorer_bg()
+                    }))
                     .border_1()
                     .border_color(rgb(if selected {
-                        DEFAULT_FG
+                        theme::default_fg()
                     } else {
-                        EXPLORER_BORDER
+                        theme::explorer_border()
                     }))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
                     .cursor_pointer()
                     .child(self.t(new_project::type_i18n_key(kind)))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3822,14 +5160,22 @@ impl Editor {
                     .id(lang.key())
                     .px_3()
                     .py_1()
-                    .bg(rgb(if selected { 0x3d3d44 } else { 0x2f2f34 }))
+                    .bg(rgb(if selected {
+                        theme::doc_selected_bg()
+                    } else {
+                        theme::explorer_bg()
+                    }))
                     .border_1()
                     .border_color(rgb(if selected {
-                        DEFAULT_FG
+                        theme::default_fg()
                     } else {
-                        EXPLORER_BORDER
+                        theme::explorer_border()
                     }))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
                     .cursor_pointer()
                     .child(lang.name())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3859,12 +5205,12 @@ impl Editor {
                     .flex_col()
                     .gap_3()
                     .p_4()
-                    .bg(rgb(0x252526))
+                    .bg(rgb(theme::explorer_bg()))
                     .border_1()
-                    .border_color(rgb(EXPLORER_BORDER))
+                    .border_color(rgb(theme::explorer_border()))
                     .child(
                         div()
-                            .text_color(rgb(DEFAULT_FG))
+                            .text_color(rgb(theme::default_fg()))
                             .child(self.t("newproject.title")),
                     )
                     .child(
@@ -3874,15 +5220,15 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("newproject.name")),
                             )
                             .child(
                                 div()
                                     .flex_1()
-                                    .bg(rgb(0x1e1e20))
+                                    .bg(rgb(theme::bg()))
                                     .px_2()
-                                    .text_color(rgb(DEFAULT_FG))
+                                    .text_color(rgb(theme::default_fg()))
                                     .child(format!("{}▌", state.title)),
                             ),
                     )
@@ -3894,7 +5240,7 @@ impl Editor {
                             .child(
                                 div()
                                     .pt_1()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("newproject.type")),
                             )
                             .child(kinds),
@@ -3906,20 +5252,24 @@ impl Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(rgb(STATUS_FG))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("newproject.language")),
                             )
                             .child(languages),
                     )
-                    .child(div().text_color(rgb(STATUS_FG)).child(if state.picking {
-                        self.t("newproject.waiting")
-                    } else {
-                        self.t("newproject.hint")
-                    }))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(if state.picking {
+                                self.t("newproject.waiting")
+                            } else {
+                                self.t("newproject.hint")
+                            }),
+                    )
                     .when(!state.error.is_empty(), |card| {
                         card.child(
                             div()
-                                .text_color(rgb(AGENT_ERR_FG))
+                                .text_color(rgb(theme::agent_err_fg()))
                                 .child(state.error.clone()),
                         )
                     })
@@ -3932,8 +5282,8 @@ impl Editor {
                                     .id("new-project-create")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(DEFAULT_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
                                     .cursor_pointer()
                                     .child(self.t("newproject.create"))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3945,8 +5295,8 @@ impl Editor {
                                     .id("new-project-cancel")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(STATUS_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
                                     .cursor_pointer()
                                     .child(self.t("newproject.cancel"))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -4246,7 +5596,7 @@ impl Editor {
         self.doc.list_state = ListState::new(
             self.doc.buffer.line_count(),
             ListAlignment::Top,
-            px(LINE_HEIGHT * 2.0),
+            px(theme::line_height() * 2.0),
         );
         // The restored text diverges from the canonical base: mark it dirty
         // without touching the canonical file.
@@ -4258,8 +5608,18 @@ impl Editor {
     /// dirty tab opens the save/discard/cancel prompt; a clean workspace
     /// quits. Pressing the action again while the prompt is open dismisses it.
     fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
         if self.settings.is_some() {
             self.settings = None;
+            cx.notify();
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings = None;
             cx.notify();
             return;
         }
@@ -4284,7 +5644,12 @@ impl Editor {
     /// the prompt; a clean tab closes immediately, keeping the editor on a
     /// neighbour (or a blank tab when it was the last one).
     fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() || self.unsaved_prompt.is_some() || self.settings.is_some() {
+        if index >= self.tabs.len()
+            || self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+        {
             return;
         }
         if self.tab_is_dirty(index) {
@@ -4424,15 +5789,15 @@ impl Editor {
                     .flex_col()
                     .gap_3()
                     .p_4()
-                    .bg(rgb(0x252526))
+                    .bg(rgb(theme::explorer_bg()))
                     .border_1()
-                    .border_color(rgb(EXPLORER_BORDER))
+                    .border_color(rgb(theme::explorer_border()))
                     .child(
                         div()
-                            .text_color(rgb(DEFAULT_FG))
+                            .text_color(rgb(theme::default_fg()))
                             .child(self.t("quit.title")),
                     )
-                    .child(div().text_color(rgb(STATUS_FG)).child(body))
+                    .child(div().text_color(rgb(theme::status_fg())).child(body))
                     .child(
                         div()
                             .flex()
@@ -4442,8 +5807,8 @@ impl Editor {
                                     .id("quit-save")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(DEFAULT_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
                                     .cursor_pointer()
                                     .child(save_label)
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -4455,8 +5820,8 @@ impl Editor {
                                     .id("quit-discard")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(AGENT_ERR_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::agent_err_fg()))
                                     .cursor_pointer()
                                     .child(discard_label)
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -4468,8 +5833,8 @@ impl Editor {
                                     .id("quit-cancel")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(0x37373d))
-                                    .text_color(rgb(STATUS_FG))
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
                                     .cursor_pointer()
                                     .child(self.t("quit.cancel"))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -4484,8 +5849,16 @@ impl Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.palette.is_some() {
+            self.palette_backspace(cx);
+            return;
+        }
         if self.settings.is_some() {
             self.settings_backspace(cx);
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings_backspace(cx);
             return;
         }
         if self.new_file.is_some() {
@@ -4558,7 +5931,11 @@ impl Editor {
     }
 
     fn on_delete(&mut self, _: &DeleteText, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+        if self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.unsaved_prompt.is_some()
+        {
             return;
         }
         if self.doc.selected.is_empty() {
@@ -4587,8 +5964,16 @@ impl Editor {
             self.prompt_save(window, cx);
             return;
         }
+        if self.palette.is_some() {
+            self.palette_activate(window, cx);
+            return;
+        }
         if self.settings.is_some() {
             self.settings_save(cx);
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings_save(cx);
             return;
         }
         // The New File modal creates on enter (M10 slice 2).
@@ -4655,7 +6040,11 @@ impl Editor {
     }
 
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+        if self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.unsaved_prompt.is_some()
+        {
             return;
         }
         self.undo();
@@ -4664,7 +6053,11 @@ impl Editor {
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+        if self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.unsaved_prompt.is_some()
+        {
             return;
         }
         self.redo();
@@ -4673,7 +6066,11 @@ impl Editor {
     }
 
     fn on_copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+        if self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.unsaved_prompt.is_some()
+        {
             return;
         }
         if !self.doc.selected.is_empty() {
@@ -4683,7 +6080,11 @@ impl Editor {
     }
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.unsaved_prompt.is_some() {
+        if self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+            || self.unsaved_prompt.is_some()
+        {
             return;
         }
         if !self.doc.selected.is_empty() {
@@ -4938,7 +6339,7 @@ impl Editor {
         self.doc.diff_list_state = ListState::new(
             self.doc.diff.rows.len(),
             ListAlignment::Top,
-            px(LINE_HEIGHT * 2.0),
+            px(theme::line_height() * 2.0),
         );
         let cursor = self.doc.diff.cursor;
         self.doc.diff_list_state.scroll_to_reveal_item(cursor);
@@ -4994,20 +6395,23 @@ impl Editor {
             return div();
         };
         let (label_color, bg) = match row.label {
-            '+' => (rgb(DIFF_ADD_LABEL), Some(DIFF_ADD_BG)),
-            '-' => (rgb(DIFF_REMOVE_LABEL), Some(DIFF_REMOVE_BG)),
-            _ => (rgb(DIFF_CONTEXT_LABEL), None),
+            '+' => (rgb(theme::diff_add_label()), Some(theme::diff_add_bg())),
+            '-' => (
+                rgb(theme::diff_remove_label()),
+                Some(theme::diff_remove_bg()),
+            ),
+            _ => (rgb(theme::diff_context_label()), None),
         };
         let mut element = div()
             .px_2()
-            .h(px(LINE_HEIGHT))
+            .h(px(theme::line_height()))
             .flex()
             .items_center()
             .whitespace_nowrap()
             .font_family(FONT_FAMILY)
-            .text_size(px(TEXT_SIZE));
+            .text_size(px(theme::text_size()));
         if ix == self.doc.diff.cursor {
-            element = element.bg(rgba(SELECTION_BG));
+            element = element.bg(rgba(theme::selection_bg()));
         } else if let Some(color) = bg {
             element = element.bg(rgb(color));
         }
@@ -5018,7 +6422,11 @@ impl Editor {
                     .text_color(label_color)
                     .child(row.label.to_string()),
             )
-            .child(div().text_color(rgb(STATUS_FG)).child(row.text.clone()))
+            .child(
+                div()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(row.text.clone()),
+            )
     }
 
     // ---- find bar actions ------------------------------------------------
@@ -5044,8 +6452,18 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.palette.is_some() {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
         if self.settings.is_some() {
             self.settings = None;
+            cx.notify();
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings = None;
             cx.notify();
             return;
         }
@@ -5181,14 +6599,15 @@ impl Editor {
         self.doc.list_state = ListState::new(
             self.doc.buffer.line_count(),
             ListAlignment::Top,
-            px(LINE_HEIGHT * 2.0),
+            px(theme::line_height() * 2.0),
         );
         self.doc.find = FindState::default();
         self.doc.diff = DiffState {
             base_lines: text.split('\n').map(str::to_string).collect(),
             ..DiffState::default()
         };
-        self.doc.diff_list_state = ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 2.0));
+        self.doc.diff_list_state =
+            ListState::new(0, ListAlignment::Top, px(theme::line_height() * 2.0));
         // A freshly loaded document has no unsaved edits of its own.
         self.doc.revision = 0;
         self.doc.saved_revision = 0;
@@ -5199,7 +6618,11 @@ impl Editor {
     /// is preserved in the tab being left; tabs make switching safe, so the
     /// old document-switch refusal no longer applies here.
     fn open_document_path(&mut self, path: &str) -> Result<(), String> {
-        if self.unsaved_prompt.is_some() || self.settings.is_some() {
+        if self.unsaved_prompt.is_some()
+            || self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.palette.is_some()
+        {
             return Err(self.t("notice.finish_dialog").to_string());
         }
         if path == self.doc.path {
@@ -5634,7 +7057,7 @@ impl Editor {
         }
     }
 
-    /// ⌘P submit: run `scene_edit` for the caret's scene with the typed
+    /// ⌘K submit: run `scene_edit` for the caret's scene with the typed
     /// instruction on a worker thread (same pump as the review). On success
     /// the worker also loads the persisted record and pre-renders its hunks,
     /// so the panel shows exactly what apply would write.
@@ -5658,7 +7081,7 @@ impl Editor {
         self.launch_propose(root, scene_number, instruction, settings, cancel, cx);
     }
 
-    /// Start a `scene_edit` run with explicit inputs (fresh ⌘P or ⌘⌥R
+    /// Start a `scene_edit` run with explicit inputs (fresh ⌘K or ⌘⌥R
     /// retry): resolve the configured role, begin the proposal state and
     /// spawn the worker; on success the worker loads the persisted record.
     fn launch_propose(
@@ -6101,7 +7524,7 @@ impl Editor {
         }
     }
 
-    /// ⌘P: toggle the instruction bar (proposal for the caret's scene). The
+    /// ⌘K: toggle the instruction bar (proposal for the caret's scene). The
     /// bar borrows the single focus (spike compromise): the find bar closes
     /// when it opens and vice versa.
     fn on_open_propose(&mut self, _: &OpenPropose, _window: &mut Window, cx: &mut Context<Self>) {
@@ -6468,9 +7891,9 @@ impl Editor {
             .flex_col()
             .gap_2()
             .p_3()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_l_1()
-            .border_color(rgb(EXPLORER_BORDER))
+            .border_color(rgb(theme::explorer_border()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .child(
@@ -6478,13 +7901,13 @@ impl Editor {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .text_color(rgb(DEFAULT_FG))
-                    .child(icon("message-square", CUE_FG, 14.0))
+                    .text_color(rgb(theme::default_fg()))
+                    .child(icon("message-square", theme::cue_fg(), 14.0))
                     .child(self.t("panel.agent_title")),
             )
             .child(
                 div()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(self.t("panel.agent_empty")),
             )
             .into_any_element()
@@ -6506,16 +7929,16 @@ impl Editor {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_l_1()
-            .border_color(rgb(EXPLORER_BORDER))
+            .border_color(rgb(theme::explorer_border()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .child(
                 div()
                     .px_2()
                     .py_1()
-                    .text_color(rgb(DEFAULT_FG))
+                    .text_color(rgb(theme::default_fg()))
                     .child(self.tf(
                         "panel.review_title",
                         &[
@@ -6529,36 +7952,46 @@ impl Editor {
             panel = panel.child(
                 div()
                     .px_2()
-                    .text_color(rgb(FIND_FG))
+                    .text_color(rgb(theme::find_fg()))
                     .child(self.tf("panel.focus", &[("focus", &self.agent.focus)])),
             );
         }
         // The configured role (M6 slice 7): which persona reviewed and
         // where that configuration came from.
         if !self.agent.role.is_empty() {
-            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(self.tf(
-                "panel.role",
-                &[
-                    ("role", &self.agent.role),
-                    (
-                        "source",
-                        role_source_label(self.lang, &self.agent.role_source),
-                    ),
-                ],
-            )));
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(theme::find_fg()))
+                    .child(self.tf(
+                        "panel.role",
+                        &[
+                            ("role", &self.agent.role),
+                            (
+                                "source",
+                                role_source_label(self.lang, &self.agent.role_source),
+                            ),
+                        ],
+                    )),
+            );
         }
         if !self.agent.stage.is_empty() {
             panel = panel.child(
                 div()
                     .px_2()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(self.agent.stage.clone()),
             );
         }
-        panel = panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(self.tf(
-            "panel.sources",
-            &[("n", &self.agent.sources.len().to_string())],
-        )));
+        panel = panel.child(
+            div()
+                .px_2()
+                .text_color(rgb(theme::status_fg()))
+                .child(self.tf(
+                    "panel.sources",
+                    &[("n", &self.agent.sources.len().to_string())],
+                )),
+        );
         for (ix, source) in self.agent.sources.iter().enumerate() {
             panel = panel.child(
                 div()
@@ -6566,7 +7999,7 @@ impl Editor {
                     .px_2()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(format!("{} · {}", source.kind, source.location)),
             );
         }
@@ -6582,7 +8015,7 @@ impl Editor {
             panel = panel.child(
                 div()
                     .px_2()
-                    .text_color(rgb(DEFAULT_FG))
+                    .text_color(rgb(theme::default_fg()))
                     .child(text.to_string()),
             );
         }
@@ -6593,11 +8026,11 @@ impl Editor {
             panel = panel.child(
                 div()
                     .px_2()
-                    .text_color(rgb(AGENT_ERR_FG))
+                    .text_color(rgb(theme::agent_err_fg()))
                     .child(self.agent.error.clone()),
             );
         }
-        panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(
+        panel.child(div().px_2().text_color(rgb(theme::status_fg())).child(
             if matches!(
                 self.agent.status,
                 AgentStatus::Failed | AgentStatus::Cancelled
@@ -6622,16 +8055,16 @@ impl Editor {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_l_1()
-            .border_color(rgb(EXPLORER_BORDER))
+            .border_color(rgb(theme::explorer_border()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .child(
                 div()
                     .px_2()
                     .py_1()
-                    .text_color(rgb(DEFAULT_FG))
+                    .text_color(rgb(theme::default_fg()))
                     .child(self.tf(
                         "panel.proposal_title",
                         &[
@@ -6641,33 +8074,43 @@ impl Editor {
                     )),
             );
         if !self.propose.id.is_empty() {
-            panel = panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(self.tf(
-                "panel.proposal_meta",
-                &[
-                    ("id", &short_id(&self.propose.id)),
-                    ("target", &self.propose.target),
-                    ("n", &self.propose.hunks.to_string()),
-                ],
-            )));
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.tf(
+                        "panel.proposal_meta",
+                        &[
+                            ("id", &short_id(&self.propose.id)),
+                            ("target", &self.propose.target),
+                            ("n", &self.propose.hunks.to_string()),
+                        ],
+                    )),
+            );
         }
         // The configured role (M6 slice 7): which persona proposed.
         if !self.propose.role.is_empty() {
-            panel = panel.child(div().px_2().text_color(rgb(FIND_FG)).child(self.tf(
-                "panel.role",
-                &[
-                    ("role", &self.propose.role),
-                    (
-                        "source",
-                        role_source_label(self.lang, &self.propose.role_source),
-                    ),
-                ],
-            )));
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_color(rgb(theme::find_fg()))
+                    .child(self.tf(
+                        "panel.role",
+                        &[
+                            ("role", &self.propose.role),
+                            (
+                                "source",
+                                role_source_label(self.lang, &self.propose.role_source),
+                            ),
+                        ],
+                    )),
+            );
         }
         if !self.propose.stage.is_empty() {
             panel = panel.child(
                 div()
                     .px_2()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(self.propose.stage.clone()),
             );
         }
@@ -6684,9 +8127,9 @@ impl Editor {
         {
             let (label, text) = line;
             let mut color = match label {
-                '+' => 0x7ecf8f,
-                '-' => AGENT_ERR_FG,
-                _ => STATUS_FG,
+                '+' => theme::diff_add_label(),
+                '-' => theme::agent_err_fg(),
+                _ => theme::status_fg(),
             };
             let mut prefix = format!("{label}");
             if *label == '#' {
@@ -6702,16 +8145,16 @@ impl Editor {
                 // The cursor row is highlighted so ⌥←/⌥→/⌥Enter have a
                 // visible target.
                 color = if ix == self.propose.hunk_cursor {
-                    DEFAULT_FG
+                    theme::default_fg()
                 } else {
-                    STATUS_FG
+                    theme::status_fg()
                 };
             } else if !hunk_ix
                 .and_then(|ix| self.propose.selected.get(ix).copied())
                 .unwrap_or(true)
             {
                 // Deselected hunk body: dimmed, it will not be applied.
-                color = 0x6a6a6a;
+                color = theme::gutter_fg();
             }
             panel = panel.child(
                 div()
@@ -6729,7 +8172,7 @@ impl Editor {
             panel = panel.child(
                 div()
                     .px_2()
-                    .text_color(rgb(AGENT_ERR_FG))
+                    .text_color(rgb(theme::agent_err_fg()))
                     .child(self.propose.error.clone()),
             );
         }
@@ -6743,7 +8186,7 @@ impl Editor {
         } else {
             self.t("panel.proposal_hint")
         };
-        panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(hint))
+        panel.child(div().px_2().text_color(rgb(theme::status_fg())).child(hint))
     }
 
     /// Search results panel (M8 slice 2): replaces the explorer while a
@@ -6770,15 +8213,15 @@ impl Editor {
             .flex_col()
             .overflow_hidden()
             .overflow_y_scroll()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_r_1()
-            .border_color(rgb(EXPLORER_BORDER))
+            .border_color(rgb(theme::explorer_border()))
             .child(
                 div()
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(title),
             );
         for (index, hit) in self.search.hits.iter().enumerate() {
@@ -6791,8 +8234,12 @@ impl Editor {
                     .text_sm()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
-                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
                     .cursor_pointer()
                     .child(format!("{}:{} · {}", hit.document, hit.line, hit.preview))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -6812,20 +8259,20 @@ impl Editor {
     /// heuristics before the first classification pass.
     fn element_color(&self, ix: usize, text: &str) -> Rgba {
         match self.element_kind(ix) {
-            Some(FountainKind::SceneHeading) => rgb(SCENE_FG),
-            Some(FountainKind::Character) => rgb(CUE_FG),
-            Some(FountainKind::Parenthetical) => rgb(0x9aa4b2),
-            Some(FountainKind::Dialogue) => rgb(DEFAULT_FG),
-            Some(FountainKind::Transition) => rgb(TRANSITION_FG),
-            Some(FountainKind::Section) => rgb(SECTION_FG),
-            Some(FountainKind::Synopsis) => rgb(0x7a7a7a),
-            Some(FountainKind::Note) => rgb(NOTE_FG),
-            Some(FountainKind::Boneyard) => rgb(GUTTER_FG),
+            Some(FountainKind::SceneHeading) => rgb(theme::scene_fg()),
+            Some(FountainKind::Character) => rgb(theme::cue_fg()),
+            Some(FountainKind::Parenthetical) => rgb(theme::status_fg()),
+            Some(FountainKind::Dialogue) => rgb(theme::default_fg()),
+            Some(FountainKind::Transition) => rgb(theme::transition_fg()),
+            Some(FountainKind::Section) => rgb(theme::section_fg()),
+            Some(FountainKind::Synopsis) => rgb(theme::gutter_fg()),
+            Some(FountainKind::Note) => rgb(theme::note_fg()),
+            Some(FountainKind::Boneyard) => rgb(theme::gutter_fg()),
             Some(FountainKind::Lyric)
             | Some(FountainKind::Action)
             | Some(FountainKind::Centered)
             | Some(FountainKind::TitlePage)
-            | Some(FountainKind::PageBreak) => rgb(DEFAULT_FG),
+            | Some(FountainKind::PageBreak) => rgb(theme::default_fg()),
             None => line_color(text),
         }
     }
@@ -6844,12 +8291,12 @@ impl Editor {
         let changes = self.git.changed_count();
         let git_tint = if self.git.available {
             if changes > 0 {
-                GIT_MODIFIED_FG
+                theme::git_modified_fg()
             } else {
-                GIT_ADDED_FG
+                theme::git_added_fg()
             }
         } else {
-            GUTTER_FG
+            theme::gutter_fg()
         };
         div()
             .id("bottom-bar")
@@ -6859,26 +8306,26 @@ impl Editor {
             .items_center()
             .gap_2()
             .px_2()
-            .bg(rgb(STATUS_BG))
+            .bg(rgb(theme::status_bg()))
             .text_sm()
             .whitespace_nowrap()
-            .text_color(rgb(STATUS_FG))
+            .text_color(rgb(theme::status_fg()))
             .child(
                 div()
                     .id("bar-explorer")
                     .p_1()
                     .cursor_pointer()
                     .text_color(rgb(if self.explorer_open {
-                        DEFAULT_FG
+                        theme::default_fg()
                     } else {
-                        STATUS_FG
+                        theme::status_fg()
                     }))
                     .child(icon(
                         "panel-left",
                         if self.explorer_open {
-                            DEFAULT_FG
+                            theme::default_fg()
                         } else {
-                            STATUS_FG
+                            theme::status_fg()
                         },
                         15.0,
                     ))
@@ -6890,7 +8337,7 @@ impl Editor {
                 div()
                     .max_w(px(180.0))
                     .overflow_hidden()
-                    .text_color(rgb(DEFAULT_FG))
+                    .text_color(rgb(theme::default_fg()))
                     .child(title),
             )
             .child(div().flex_1().overflow_hidden().child(status))
@@ -6899,7 +8346,7 @@ impl Editor {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .text_color(rgb(CUE_FG))
+                    .text_color(rgb(theme::cue_fg()))
                     .child(div().child(format!("{lang} · {}", self.t("bar.language_native")))),
             )
             .child(
@@ -6928,9 +8375,9 @@ impl Editor {
                     .child(icon(
                         "message-square",
                         if self.agent_panel_open {
-                            CUE_FG
+                            theme::cue_fg()
                         } else {
-                            STATUS_FG
+                            theme::status_fg()
                         },
                         15.0,
                     ))
@@ -6951,9 +8398,9 @@ impl Editor {
             .w_full()
             .flex()
             .overflow_x_scroll()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_b_1()
-            .border_color(rgb(EXPLORER_BORDER));
+            .border_color(rgb(theme::explorer_border()));
         for index in 0..self.tabs.len() {
             let active = index == self.active_tab;
             let path = self.tab_path(index).to_string();
@@ -6962,9 +8409,11 @@ impl Editor {
             let label = if dirty { format!("{title} •") } else { title };
             let kind = FileKind::from_path(&path);
             let git = self.git.file_status(&path);
-            let icon_color =
-                git.map(git_color)
-                    .unwrap_or(if active { DEFAULT_FG } else { STATUS_FG });
+            let icon_color = git.map(git_color).unwrap_or(if active {
+                theme::default_fg()
+            } else {
+                theme::status_fg()
+            });
             let mut title_row = div()
                 .id(("tab-title", index))
                 .flex_1()
@@ -6974,7 +8423,11 @@ impl Editor {
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .cursor_pointer()
-                .text_color(rgb(if active { DEFAULT_FG } else { STATUS_FG }))
+                .text_color(rgb(if active {
+                    theme::default_fg()
+                } else {
+                    theme::status_fg()
+                }))
                 .child(icon(kind.icon_name(), icon_color, 14.0))
                 .child(div().overflow_hidden().whitespace_nowrap().child(label));
             if let Some(status) = git {
@@ -6994,8 +8447,12 @@ impl Editor {
                 .gap_1()
                 .px_2()
                 .border_r_1()
-                .border_color(rgb(EXPLORER_BORDER))
-                .bg(rgb(if active { BG } else { EXPLORER_BG }))
+                .border_color(rgb(theme::explorer_border()))
+                .bg(rgb(if active {
+                    theme::bg()
+                } else {
+                    theme::explorer_bg()
+                }))
                 .child(title_row.on_click(cx.listener(move |this, _, window, cx| {
                     if this.activate_tab(index) {
                         window.focus(&this.focus_handle(cx));
@@ -7007,8 +8464,20 @@ impl Editor {
                         .id(("tab-close", index))
                         .px_1()
                         .cursor_pointer()
-                        .text_color(rgb(if active { STATUS_FG } else { GUTTER_FG }))
-                        .child(icon("x", if active { STATUS_FG } else { GUTTER_FG }, 12.0))
+                        .text_color(rgb(if active {
+                            theme::status_fg()
+                        } else {
+                            theme::gutter_fg()
+                        }))
+                        .child(icon(
+                            "x",
+                            if active {
+                                theme::status_fg()
+                            } else {
+                                theme::gutter_fg()
+                            },
+                            12.0,
+                        ))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.request_close_tab(index, window, cx)
                         })),
@@ -7029,9 +8498,9 @@ impl Editor {
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_r_1()
-            .border_color(rgb(EXPLORER_BORDER));
+            .border_color(rgb(theme::explorer_border()));
         let branch = if self.git.available {
             self.git.branch_label()
         } else {
@@ -7045,20 +8514,20 @@ impl Editor {
                 .items_center()
                 .gap_1()
                 .text_sm()
-                .text_color(rgb(STATUS_FG))
+                .text_color(rgb(theme::status_fg()))
                 .child(icon(
                     "git-branch",
                     if self.git.available {
-                        DEFAULT_FG
+                        theme::default_fg()
                     } else {
-                        STATUS_FG
+                        theme::status_fg()
                     },
                     14.0,
                 ))
                 .child(div().flex_1().overflow_hidden().child(branch))
                 .child(
                     div()
-                        .text_color(rgb(STATUS_FG))
+                        .text_color(rgb(theme::status_fg()))
                         .child(self.git.changed_count().to_string()),
                 ),
         );
@@ -7069,7 +8538,7 @@ impl Editor {
                         .px_2()
                         .py_1()
                         .text_sm()
-                        .text_color(rgb(AGENT_ERR_FG))
+                        .text_color(rgb(theme::agent_err_fg()))
                         .child(self.git.error.clone()),
                 );
             }
@@ -7081,7 +8550,7 @@ impl Editor {
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(rgb(GIT_ADDED_FG))
+                    .text_color(rgb(theme::git_added_fg()))
                     .child(self.t("panel.git_clean")),
             );
             return panel.into_any_element();
@@ -7106,7 +8575,7 @@ impl Editor {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .cursor_pointer()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(icon(kind.icon_name(), git_color(status), 14.0))
                     .child(div().flex_1().overflow_hidden().child(path_owned.clone()))
                     .child(
@@ -7146,23 +8615,34 @@ impl Editor {
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .bg(rgb(EXPLORER_BG))
+            .bg(rgb(theme::explorer_bg()))
             .border_r_1()
-            .border_color(rgb(EXPLORER_BORDER))
+            .border_color(rgb(theme::explorer_border()))
             .child(
                 div()
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .flex()
                     .items_center()
                     .child(div().flex_1().child(title))
                     .child(
                         div()
+                            .id("project-settings")
+                            .px_1()
+                            .text_color(rgb(theme::status_fg()))
+                            .cursor_pointer()
+                            .child(icon("sliders-horizontal", theme::status_fg(), 14.0))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_open_project_settings(&OpenProjectSettings, window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
                             .id("new-file")
                             .px_1()
-                            .text_color(rgb(DEFAULT_FG))
+                            .text_color(rgb(theme::default_fg()))
                             .cursor_pointer()
                             .child("+")
                             .on_click(cx.listener(|this, _, _, cx| this.open_new_file(cx))),
@@ -7171,7 +8651,10 @@ impl Editor {
         // Tree rows (M9 slice 4 / S3c): type is an icon, color is state.
         // Dirty is an accent dot; Git status tints the icon and adds a letter
         // so the information does not depend on color alone.
-        let rows: Vec<Row> = explorer::build_rows(&self.explorer, &self.collapsed);
+        let rows: Vec<Row> = explorer::build_rows(
+            &explorer::visible_paths(&self.explorer, self.show_config_files),
+            &self.collapsed,
+        );
         for (index, row) in rows.iter().enumerate() {
             let selected = !row.is_dir && row.path == self.doc.path;
             let dirty = !row.is_dir
@@ -7183,7 +8666,11 @@ impl Editor {
             } else {
                 self.git.file_status(&row.path)
             };
-            let base_color = if selected { DEFAULT_FG } else { STATUS_FG };
+            let base_color = if selected {
+                theme::default_fg()
+            } else {
+                theme::status_fg()
+            };
             let icon_color = git.map(git_color).unwrap_or(base_color);
             let icon_name = if row.is_dir {
                 row.folder_kind.icon_name()
@@ -7208,7 +8695,7 @@ impl Editor {
                         .child(label),
                 );
             if dirty {
-                content = content.child(div().text_color(rgb(DIRTY_FG)).child("•"));
+                content = content.child(div().text_color(rgb(theme::dirty_fg())).child("•"));
             }
             if let Some(status) = git {
                 content = content.child(
@@ -7228,7 +8715,7 @@ impl Editor {
                     .text_sm()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
                     .cursor_pointer()
                     .child(content)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -7250,7 +8737,7 @@ impl Editor {
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(rgb(STATUS_FG))
+                    .text_color(rgb(theme::status_fg()))
                     .child(self.tf(
                         "panel.outline_title",
                         &[("n", &self.doc.outline.len().to_string())],
@@ -7267,8 +8754,12 @@ impl Editor {
                         .text_sm()
                         .overflow_hidden()
                         .whitespace_nowrap()
-                        .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
-                        .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                        .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                        .text_color(rgb(if selected {
+                            theme::default_fg()
+                        } else {
+                            theme::status_fg()
+                        }))
                         .cursor_pointer()
                         .child(format!("{} · {}", index + 1, heading))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -7282,7 +8773,7 @@ impl Editor {
                         .px_2()
                         .py_1()
                         .text_sm()
-                        .text_color(rgb(STATUS_FG))
+                        .text_color(rgb(theme::status_fg()))
                         .child(self.tf(
                             "panel.outline_more",
                             &[("n", &(self.doc.outline.len() - visible).to_string())],
@@ -7401,10 +8892,18 @@ impl Editor {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(div().text_color(rgb(FIND_DIM_FG)).child(label.to_string()))
                 .child(
                     div()
-                        .text_color(rgb(if active { FIND_FG } else { FIND_DIM_FG }))
+                        .text_color(rgb(theme::find_dim_fg()))
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(if active {
+                            theme::find_fg()
+                        } else {
+                            theme::find_dim_fg()
+                        }))
                         .child(format!("{value}{}", marker(active))),
                 )
         };
@@ -7415,7 +8914,7 @@ impl Editor {
             .gap_3()
             .px_2()
             .h(px(STATUS_BAR_H))
-            .bg(rgb(FIND_BG))
+            .bg(rgb(theme::find_bg()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
@@ -7429,10 +8928,10 @@ impl Editor {
                 self.doc.find.replacement.clone(),
                 self.doc.find.field == FindField::Replacement,
             ))
-            .child(div().text_color(rgb(FIND_FG)).child(counter))
+            .child(div().text_color(rgb(theme::find_fg())).child(counter))
             .child(
                 div()
-                    .text_color(rgb(FIND_DIM_FG))
+                    .text_color(rgb(theme::find_dim_fg()))
                     .child(self.t("find.hint")),
             )
     }
@@ -7449,23 +8948,23 @@ impl Editor {
             .gap_3()
             .px_2()
             .h(px(STATUS_BAR_H))
-            .bg(rgb(FIND_BG))
+            .bg(rgb(theme::find_bg()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
             .child(
                 div()
-                    .text_color(rgb(FIND_DIM_FG))
+                    .text_color(rgb(theme::find_dim_fg()))
                     .child(self.t("proposebar.label")),
             )
             .child(
                 div()
-                    .text_color(rgb(FIND_FG))
+                    .text_color(rgb(theme::find_fg()))
                     .child(format!("{}▌", self.propose_bar.instruction)),
             )
             .child(
                 div()
-                    .text_color(rgb(FIND_DIM_FG))
+                    .text_color(rgb(theme::find_dim_fg()))
                     .child(self.t("proposebar.hint")),
             )
     }
@@ -7481,23 +8980,23 @@ impl Editor {
             .gap_3()
             .px_2()
             .h(px(STATUS_BAR_H))
-            .bg(rgb(FIND_BG))
+            .bg(rgb(theme::find_bg()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
             .child(
                 div()
-                    .text_color(rgb(FIND_DIM_FG))
+                    .text_color(rgb(theme::find_dim_fg()))
                     .child(self.t("searchbar.label")),
             )
             .child(
                 div()
-                    .text_color(rgb(FIND_FG))
+                    .text_color(rgb(theme::find_fg()))
                     .child(format!("{}▌", self.search.query)),
             )
             .child(
                 div()
-                    .text_color(rgb(FIND_DIM_FG))
+                    .text_color(rgb(theme::find_dim_fg()))
                     .child(self.t("searchbar.hint")),
             )
     }
@@ -7518,21 +9017,21 @@ impl Editor {
             .gap_3()
             .px_2()
             .h(px(STATUS_BAR_H))
-            .bg(rgb(FIND_BG))
+            .bg(rgb(theme::find_bg()))
             .text_sm()
             .font_family(FONT_FAMILY)
             .whitespace_nowrap()
             .child(
                 div()
-                    .text_color(rgb(FIND_DIM_FG))
+                    .text_color(rgb(theme::find_dim_fg()))
                     .child(self.t("focusbar.label")),
             )
             .child(
                 div()
-                    .text_color(rgb(FIND_FG))
+                    .text_color(rgb(theme::find_fg()))
                     .child(format!("{}▌", self.focus_bar.focus)),
             )
-            .child(div().text_color(rgb(FIND_DIM_FG)).child(hint))
+            .child(div().text_color(rgb(theme::find_dim_fg())).child(hint))
     }
 
     /// Render a line that has only a caret (no selection, no IME, no matches)
@@ -7568,10 +9067,10 @@ impl Editor {
             let segment_text = &text[start..end];
             let mut row_div = div()
                 .font_family(FONT_FAMILY)
-                .text_size(px(TEXT_SIZE))
+                .text_size(px(theme::text_size()))
                 .text_color(color)
                 .when(italic, |row| row.italic())
-                .h(px(LINE_HEIGHT))
+                .h(px(theme::line_height()))
                 .flex()
                 .items_center();
 
@@ -7649,12 +9148,12 @@ impl Editor {
         let base = div()
             .px_2()
             .font_family(FONT_FAMILY)
-            .text_size(px(TEXT_SIZE))
+            .text_size(px(theme::text_size()))
             .text_color(self.element_color(ix, text))
             .when(self.element_kind(ix) == Some(FountainKind::Lyric), |row| {
                 row.italic()
             })
-            .when(ix == caret_line, |row| row.bg(rgb(ACTIVE_LINE_BG)));
+            .when(ix == caret_line, |row| row.bg(rgb(theme::active_line_bg())));
 
         // Cold row: no caret/selection/IME/matches -> gutter + wrapped text.
         if selection_here.is_none()
@@ -7680,7 +9179,7 @@ impl Editor {
         }
 
         let mut row = base
-            .h(px(LINE_HEIGHT))
+            .h(px(theme::line_height()))
             .flex()
             .items_center()
             .whitespace_nowrap()
@@ -7726,14 +9225,14 @@ impl Editor {
             });
             let mut segment = div().whitespace_nowrap();
             if selected {
-                segment = segment.bg(rgba(SELECTION_BG));
+                segment = segment.bg(rgba(theme::selection_bg()));
             } else if let Some((_, is_current)) = match_state {
                 // Selection wins over highlight; the current match is louder
                 // than the rest.
                 segment = segment.bg(rgba(if *is_current {
-                    MATCH_CURRENT_BG
+                    theme::match_current_bg()
                 } else {
-                    MATCH_BG
+                    theme::match_bg()
                 }));
             }
             if composing {
@@ -7969,7 +9468,10 @@ impl Editor {
             format!(
                 "{{\"open\":true,\"provider\":\"{}\",\"model\":\"{}\",\
                  \"base_url\":\"{}\",\"key_present\":{},\"key_source\":\"{}\",\
-                 \"models\":{},\"fetching\":{},\"error\":\"{}\"}}",
+                 \"models\":{},\"fetching\":{},\"error\":\"{}\",\
+                 \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
+                 \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
+                 \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\"}}",
                 state.provider.key(),
                 escape_json(&state.model),
                 escape_json(&state.base_url),
@@ -7978,16 +9480,64 @@ impl Editor {
                 state.models.len(),
                 state.fetching_models,
                 escape_json(&state.error),
+                state.language.key(),
+                state.theme.key(),
+                theme::resolved_key(),
+                state.font_size,
+                state.word_wrap,
+                state.line_numbers,
+                state.show_config_files,
+                self.project_settings.is_some(),
+                escape_json(
+                    &self
+                        .project
+                        .as_ref()
+                        .map(|project| project.manifest().title.clone())
+                        .unwrap_or_default()
+                ),
             )
         } else {
             format!(
                 "{{\"open\":false,\"provider\":\"{}\",\"model\":\"{}\",\
                  \"base_url\":\"{}\",\"key_present\":false,\"key_source\":\"\",\
-                 \"models\":0,\"fetching\":false,\"error\":\"\"}}",
+                 \"models\":0,\"fetching\":false,\"error\":\"\",\
+                 \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
+                 \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
+                 \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\"}}",
                 self.agent_settings.provider.key(),
                 escape_json(&self.agent_settings.model),
                 escape_json(&self.agent_settings.base_url),
+                self.app_settings.language.key(),
+                self.app_settings.theme.key(),
+                theme::resolved_key(),
+                self.app_settings.font_size,
+                self.app_settings.word_wrap,
+                self.app_settings.line_numbers,
+                self.app_settings.show_config_files,
+                self.project_settings.is_some(),
+                escape_json(
+                    &self
+                        .project
+                        .as_ref()
+                        .map(|project| project.manifest().title.clone())
+                        .unwrap_or_default()
+                ),
             )
+        };
+        let palette_dump = if let Some(state) = self.palette.as_ref() {
+            let count = match state.mode {
+                PaletteMode::Files => self.palette_files().len(),
+                PaletteMode::Commands => self.palette_commands().len(),
+            };
+            format!(
+                "{{\"open\":true,\"mode\":\"{}\",\"query\":\"{}\",\"selected\":{},\"results\":{}}}",
+                state.mode.key(),
+                escape_json(&state.query),
+                state.selected,
+                count,
+            )
+        } else {
+            "{\"open\":false,\"mode\":\"\",\"query\":\"\",\"selected\":0,\"results\":0}".to_string()
         };
         let unsaved_dump = match self.unsaved_prompt {
             Some(prompt) => {
@@ -8040,27 +9590,30 @@ impl Editor {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let tree_rows: Vec<String> = explorer::build_rows(&self.explorer, &self.collapsed)
-            .iter()
-            .map(|row| {
-                let kind = match row.kind {
-                    FileKind::Fountain => "fountain",
-                    FileKind::Markdown => "markdown",
-                    FileKind::Yaml => "yaml",
-                    FileKind::Other => "other",
-                };
-                format!(
-                    "{{\"path\":\"{}\",\"name\":\"{}\",\"depth\":{},\"dir\":{},\
+        let tree_rows: Vec<String> = explorer::build_rows(
+            &explorer::visible_paths(&self.explorer, self.show_config_files),
+            &self.collapsed,
+        )
+        .iter()
+        .map(|row| {
+            let kind = match row.kind {
+                FileKind::Fountain => "fountain",
+                FileKind::Markdown => "markdown",
+                FileKind::Yaml => "yaml",
+                FileKind::Other => "other",
+            };
+            format!(
+                "{{\"path\":\"{}\",\"name\":\"{}\",\"depth\":{},\"dir\":{},\
                      \"collapsed\":{},\"kind\":\"{}\"}}",
-                    escape_json(&row.path),
-                    escape_json(&row.name),
-                    row.depth,
-                    row.is_dir,
-                    row.collapsed,
-                    kind,
-                )
-            })
-            .collect();
+                escape_json(&row.path),
+                escape_json(&row.name),
+                row.depth,
+                row.is_dir,
+                row.collapsed,
+                kind,
+            )
+        })
+        .collect();
         let search_dump = format!(
             "{{\"open\":{},\"query\":\"{}\",\"searched\":\"{}\",\"hits\":{},\
              \"selected\":{},\"truncated\":{},\"scanned\":{},\"skipped\":{},\
@@ -8182,7 +9735,7 @@ impl Editor {
                 "\"document\":\"{}\",\"language\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\
+                 \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
                  \"workspace\":{},\
@@ -8243,6 +9796,7 @@ impl Editor {
             git_dump,
             panels_dump,
             settings_dump,
+            palette_dump,
             new_file_dump,
             new_project_dump,
             tabs_dump,
@@ -8267,7 +9821,11 @@ impl Editor {
 fn cursor_element() -> gpui::Div {
     // The negative right margin keeps the cursor's flow width at zero so the
     // text after the caret is not pushed sideways.
-    div().w(px(2.0)).mr(px(-2.0)).h_full().bg(rgb(CURSOR_FG))
+    div()
+        .w(px(2.0))
+        .mr(px(-2.0))
+        .h_full()
+        .bg(rgb(theme::cursor_fg()))
 }
 
 /// Install the native macOS menus (M10 slice 1). Labels come from the i18n
@@ -8321,6 +9879,13 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
         ),
         menu("menu.file", file_items),
         menu(
+            "menu.project",
+            vec![
+                gpui::MenuItem::action(label("menu.project_settings"), OpenProjectSettings),
+                gpui::MenuItem::action(label("menu.show_config_files"), ToggleConfigFiles),
+            ],
+        ),
+        menu(
             "menu.edit",
             vec![
                 gpui::MenuItem::action(label("menu.undo"), Undo),
@@ -8347,6 +9912,10 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.toggle_git"), ToggleGitPanel),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.toggle_diff"), ToggleDiff),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action(label("menu.quick_open"), QuickOpen),
+                gpui::MenuItem::action(label("menu.command_palette"), CommandPalette),
+                gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.language"), ToggleLang),
             ],
         ),
@@ -8370,16 +9939,62 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
 
 /// Line-number gutter cell (M9 slice 3): fixed width, right-aligned digits.
 fn gutter_element(ix: usize, active: bool) -> gpui::Div {
+    if !theme::line_numbers() {
+        return div().w(px(0.0)).flex_none();
+    }
     div()
-        .w(px(GUTTER_W))
+        .w(px(theme::gutter_width()))
         .flex_none()
         .pr_2()
         .text_align(gpui::TextAlign::Right)
-        .text_color(rgb(if active { STATUS_FG } else { GUTTER_FG }))
+        .text_color(rgb(if active {
+            theme::status_fg()
+        } else {
+            theme::gutter_fg()
+        }))
         .child(format!("{}", ix + 1))
 }
 
 /// Explorer file-type colors (M9 slice 4).
+/// Rank quick-open paths: filename prefix matches first, then path
+/// substring matches; empty query lists the first 80 sorted paths.
+fn filter_palette_paths(paths: Vec<String>, query: &str) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        let mut paths = paths;
+        paths.sort();
+        paths.truncate(80);
+        return paths;
+    }
+    let mut starts = Vec::new();
+    let mut contains = Vec::new();
+    for path in paths {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_lowercase();
+        if name.starts_with(&query) {
+            starts.push(path);
+        } else if path.to_lowercase().contains(&query) {
+            contains.push(path);
+        }
+    }
+    starts.sort();
+    contains.sort();
+    starts.extend(contains);
+    starts.truncate(80);
+    starts
+}
+
+/// Localized project kind label for the Project Settings form.
+fn project_type_i18n(kind: ProjectType) -> &'static str {
+    match kind {
+        ProjectType::Feature => "project.type.feature",
+        ProjectType::Series => "project.type.series",
+        ProjectType::WebSeries => "project.type.web_series",
+        ProjectType::Short => "project.type.short",
+        ProjectType::Microdrama => "project.type.microdrama",
+        ProjectType::Other => "project.type.other",
+    }
+}
+
 fn language_name(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("fountain") => "Fountain",
@@ -8391,12 +10006,12 @@ fn language_name(path: &str) -> &'static str {
 
 fn git_color(status: WorktreeStatus) -> u32 {
     match status {
-        WorktreeStatus::Modified => GIT_MODIFIED_FG,
-        WorktreeStatus::Added | WorktreeStatus::Untracked => GIT_ADDED_FG,
-        WorktreeStatus::Deleted => GIT_DELETED_FG,
-        WorktreeStatus::Renamed | WorktreeStatus::Copied => GIT_RENAMED_FG,
-        WorktreeStatus::Conflicted => GIT_CONFLICT_FG,
-        WorktreeStatus::Unmodified | WorktreeStatus::Unknown => STATUS_FG,
+        WorktreeStatus::Modified => theme::git_modified_fg(),
+        WorktreeStatus::Added | WorktreeStatus::Untracked => theme::git_added_fg(),
+        WorktreeStatus::Deleted => theme::git_deleted_fg(),
+        WorktreeStatus::Renamed | WorktreeStatus::Copied => theme::git_renamed_fg(),
+        WorktreeStatus::Conflicted => theme::git_conflict_fg(),
+        WorktreeStatus::Unmodified | WorktreeStatus::Unknown => theme::status_fg(),
     }
 }
 
@@ -8651,8 +10266,16 @@ impl EntityInputHandler for Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.palette.is_some() {
+            self.palette_input(new_text, cx);
+            return;
+        }
         if self.settings.is_some() {
             self.settings_input(new_text, cx);
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings_input(new_text, cx);
             return;
         }
         // The New File modal owns typing while open (M10 slice 2).
@@ -8755,8 +10378,16 @@ impl EntityInputHandler for Editor {
         if self.unsaved_prompt.is_some() {
             return;
         }
+        if self.palette.is_some() {
+            self.palette_input(new_text, cx);
+            return;
+        }
         if self.settings.is_some() {
             self.settings_input(new_text, cx);
+            return;
+        }
+        if self.project_settings.is_some() {
+            self.project_settings_input(new_text, cx);
             return;
         }
         // IME while the find bar is open: commit into the active field with
@@ -8850,6 +10481,10 @@ impl Render for Editor {
         self.refresh_element_kinds(cx);
         self.maybe_request_pages(cx);
         self.maybe_refresh_git(cx);
+        theme::set_system_dark(matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        ));
 
         // The probe is driven by a timer scheduled from here, never by
         // notifying during render (see `advance_probe`).
@@ -8870,9 +10505,13 @@ impl Render for Editor {
         } else {
             0.0
         };
-        self.wrap_width = (window.viewport_size().width
-            - px(explorer_w + agent_w + ROW_PADDING_X * 2.0 + GUTTER_W))
-        .max(px(200.0));
+        self.wrap_width = if !self.word_wrap {
+            px(100_000.0)
+        } else {
+            (window.viewport_size().width
+                - px(explorer_w + agent_w + ROW_PADDING_X * 2.0 + theme::gutter_width()))
+            .max(px(200.0))
+        };
 
         let focus = self.focus_handle.clone();
         let entity = cx.entity();
@@ -8882,7 +10521,7 @@ impl Render for Editor {
             .relative()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(theme::bg()))
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::next_scene))
             .on_action(cx.listener(Self::prev_scene))
@@ -8940,6 +10579,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_toggle_agent_panel))
             .on_action(cx.listener(Self::on_toggle_git_panel))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_project_settings))
+            .on_action(cx.listener(Self::on_toggle_config_files))
+            .on_action(cx.listener(Self::on_quick_open))
+            .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -9077,6 +10720,12 @@ impl Render for Editor {
             })
             .when(self.settings.is_some(), |root| {
                 root.child(self.settings_overlay(cx))
+            })
+            .when(self.project_settings.is_some(), |root| {
+                root.child(self.project_settings_overlay(cx))
+            })
+            .when(self.palette.is_some(), |root| {
+                root.child(self.palette_overlay(cx))
             })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
@@ -9244,9 +10893,11 @@ struct Args {
     /// An explicit `--agent-*` flag wins over persisted settings for this
     /// run (headless verification and one-off real-provider tests).
     agent_explicit: bool,
-    /// UI language (M6 slice 9): `--lang en|es`; default from the
-    /// environment (`LC_ALL`/`LANG`), English when undeterminable.
+    /// UI language (M6 slice 9): `--lang en|es`; default from persisted
+    /// settings, then the environment (`LC_ALL`/`LANG`), English otherwise.
     lang: Lang,
+    /// True when `--lang` was passed, so persisted settings do not override it.
+    lang_explicit: bool,
     /// Append the performance metrics to the status bar (on-screen debugging;
     /// the report/dump always carry them).
     debug_metrics: bool,
@@ -9266,6 +10917,7 @@ fn parse_args() -> Result<Args, String> {
     let mut agent_explicit = false;
     let mut base_url_given = false;
     let mut lang = Lang::detect();
+    let mut lang_explicit = false;
     let mut debug_metrics = false;
 
     let mut i = 0;
@@ -9343,7 +10995,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--lang" => {
                 lang = Lang::from_key(value)
-                    .ok_or_else(|| format!("--lang inválido: {value} (en|es)"))?
+                    .ok_or_else(|| format!("--lang inválido: {value} (en|es)"))?;
+                lang_explicit = true;
             }
             other => return Err(format!("argumento desconocido: {other}")),
         }
@@ -9372,6 +11025,7 @@ fn parse_args() -> Result<Args, String> {
         agent,
         agent_explicit,
         lang,
+        lang_explicit,
         debug_metrics,
     })
 }
@@ -9477,7 +11131,16 @@ fn run() -> Result<(), String> {
     } else {
         AgentSettings::from_settings(&app_settings)
     };
-    let lang = args.lang;
+    let lang = if args.lang_explicit {
+        args.lang
+    } else {
+        app_settings.language.resolved()
+    };
+    let initial_show_config_files = app_settings.show_config_files;
+    let initial_word_wrap = app_settings.word_wrap;
+    theme::set_mode(app_settings.theme);
+    theme::set_font_size(app_settings.font_size);
+    theme::set_line_numbers(app_settings.line_numbers);
     let debug_metrics_flag = args.debug_metrics;
     Application::new()
         .with_assets(assets::Assets)
@@ -9489,6 +11152,9 @@ fn run() -> Result<(), String> {
                 KeyBinding::new("cmd-shift-g", PrevScene, None),
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-shift-,", OpenProjectSettings, None),
+                KeyBinding::new("cmd-p", QuickOpen, None),
+                KeyBinding::new("cmd-shift-p", CommandPalette, None),
                 // caret movement
                 KeyBinding::new("left", MoveLeft, None),
                 KeyBinding::new("right", MoveRight, None),
@@ -9585,7 +11251,7 @@ fn run() -> Result<(), String> {
                 // proposals (M6 slice 4): cmd-p opens the instruction bar,
                 // cmd-shift-enter applies the ready proposal (two-step: arm,
                 // then apply), cmd-backspace rejects it.
-                KeyBinding::new("cmd-p", OpenPropose, None),
+                KeyBinding::new("cmd-k", OpenPropose, None),
                 KeyBinding::new("cmd-shift-enter", ApplyProposal, None),
                 KeyBinding::new("cmd-backspace", RejectProposal, None),
                 // review focus (M6 slice 5): cmd-shift-r opens the focus bar;
@@ -9665,6 +11331,10 @@ fn run() -> Result<(), String> {
                 agent_settings: agent_settings.clone(),
                 app_settings,
                 settings: None,
+                project_settings: None,
+                palette: None,
+                show_config_files: initial_show_config_files,
+                word_wrap: initial_word_wrap,
                 propose: ProposeView::new(),
                 propose_bar: ProposeBar::default(),
                 focus_bar: FocusBar::default(),
@@ -9937,6 +11607,32 @@ mod tests {
         first.saved_revision = 0;
         assert!(!first.is_dirty());
         assert!(second.is_dirty());
+    }
+
+    #[test]
+    fn quick_open_ranks_filename_prefix_matches_first() {
+        let paths = vec![
+            "notes/decisions.md".to_string(),
+            "bible/desire.md".to_string(),
+            "screenplay/main.fountain".to_string(),
+            "notes/old-decisions.md".to_string(),
+        ];
+        assert_eq!(
+            filter_palette_paths(paths.clone(), "dec"),
+            vec![
+                "notes/decisions.md".to_string(),
+                "notes/old-decisions.md".to_string()
+            ]
+        );
+        assert_eq!(
+            filter_palette_paths(paths.clone(), "des"),
+            vec!["bible/desire.md".to_string()]
+        );
+        assert_eq!(
+            filter_palette_paths(paths, "MAIN"),
+            vec!["screenplay/main.fountain".to_string()]
+        );
+        assert!(filter_palette_paths(Vec::new(), "x").is_empty());
     }
 
     #[test]

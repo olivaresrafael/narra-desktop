@@ -100,6 +100,19 @@ impl Project {
         Ok(document::create_document(&self.root, relative, contents)?)
     }
 
+    /// Replace `project.yaml` from a validated manifest (M10 S4c).
+    ///
+    /// The caller builds the manifest from the Project Settings form; the
+    /// serializer validates it before anything is written, and the document
+    /// write is atomic. Unknown/invalid data can never be introduced through
+    /// this path, and a failed write leaves the previous manifest intact.
+    pub fn update_manifest(&mut self, manifest: Manifest) -> Result<(), ProjectError> {
+        let text = manifest::serialize_manifest(&manifest)?;
+        document::write_document(&self.root, MANIFEST_FILE, &text)?;
+        self.manifest = manifest;
+        Ok(())
+    }
+
     /// Scan the canonical narrative sources and rebuild the derived index.
     ///
     /// The index is a convenience only; source files remain authoritative
@@ -346,6 +359,32 @@ mod tests {
         let root = temp_root();
         let error = open_project(&root).expect_err("empty dir");
         assert!(matches!(error, ProjectError::NotFound(_)));
+    }
+
+    #[test]
+    fn update_manifest_validates_and_preserves_identity() {
+        let root = temp_root();
+        let mut project =
+            create_project(&root, "Antes", ProjectType::Feature, "es").expect("create");
+        let id = project.manifest().project_id;
+        let created = project.manifest().created_at.clone();
+        let mut manifest = project.manifest().clone();
+        manifest.title = "Después".to_string();
+        manifest.project_type = ProjectType::Series;
+        project.update_manifest(manifest).expect("update");
+        let reopened = open_project(&root).expect("reopen");
+        assert_eq!(reopened.manifest().title, "Después");
+        assert_eq!(reopened.manifest().project_type, ProjectType::Series);
+        assert_eq!(reopened.manifest().project_id, id);
+        assert_eq!(reopened.manifest().created_at, created);
+
+        // Invalid manifests are rejected before writing: the file keeps the
+        // last valid content.
+        let mut invalid = project.manifest().clone();
+        invalid.primary_language = "not a tag!".to_string();
+        assert!(project.update_manifest(invalid).is_err());
+        let again = open_project(&root).expect("reopen after rejection");
+        assert_eq!(again.manifest().title, "Después");
     }
 
     #[test]
