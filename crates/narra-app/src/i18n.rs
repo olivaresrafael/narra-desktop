@@ -392,6 +392,38 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "enter proposes · esc closes · ⌘⇧Enter applies · ⌥←/⌥→ hunks · ⌥Enter toggles",
         "enter propone · esc cierra · ⌘⇧Enter aplica · ⌥←/⌥→ hunks · ⌥Enter alterna",
     ),
+    ("searchbar.label", "Project:", "Proyecto:"),
+    (
+        "searchbar.hint",
+        "enter searches · enter opens · ⌘↑/⌘↓ moves · esc clears",
+        "enter busca · enter abre · ⌘↑/⌘↓ mueve · esc limpia",
+    ),
+    (
+        "panel.search_title",
+        "Results ({n}) · “{query}”",
+        "Resultados ({n}) · «{query}»",
+    ),
+    ("panel.search_truncated", " (truncated)", " (truncado)"),
+    (
+        "notice.search_done",
+        "{n} results in {docs} documents",
+        "{n} resultados en {docs} documentos",
+    ),
+    (
+        "notice.search_empty",
+        "no results for “{query}”",
+        "sin resultados para «{query}»",
+    ),
+    (
+        "notice.search_failed",
+        "search failed: {error}",
+        "búsqueda fallida: {error}",
+    ),
+    (
+        "notice.search_open",
+        "opened {document}:{line}",
+        "abierto {document}:{line}",
+    ),
     ("focusbar.label", "Focus:", "Foco:"),
     (
         "focusbar.hint_general",

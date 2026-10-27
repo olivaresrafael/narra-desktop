@@ -75,6 +75,10 @@
 //!       M7 slice 4 (export): ⌘E writes the current buffer as a PDF to
 //!       `<root>/exports/<screenplay>.pdf` through the core layout engine
 //!       (worker thread; the dump reports `export`).
+//!       M8 slice 2 (project search): ⌘⇧F opens the project-search bar;
+//!       enter scans every project document on a worker (narra-core
+//!       `search`), results replace the explorer, ⌘↑/⌘↓ move and enter (or
+//!       a click) opens the match; the dump reports `search`.
 //!
 //! Bar note (spike scope): one focus handle serves the document and the
 //! single-line bars (find, propose instruction, review focus) — while a
@@ -182,6 +186,10 @@ actions!(
         ToggleLang,
         // export (M7 slice 4)
         ExportPdf,
+        // project search (M8 slice 2)
+        ProjectSearch,
+        SearchPrev,
+        SearchNext,
     ]
 );
 
@@ -324,6 +332,30 @@ struct ExportOutcome {
     out: String,
     bytes: usize,
     pages: usize,
+}
+
+/// Project-wide search state (M8 slice 2): the bar, the last report and the
+/// selected result. The report comes from `narra_core::search` on a worker.
+#[derive(Debug, Default)]
+struct SearchState {
+    open: bool,
+    query: String,
+    /// The query the current hits belong to (Enter opens instead of
+    /// re-searching while the query is unchanged).
+    searched: String,
+    hits: Vec<narra_core::search::SearchHit>,
+    selected: usize,
+    truncated: bool,
+    scanned: usize,
+    skipped: usize,
+}
+
+/// Message from the project-search worker thread.
+enum SearchMessage {
+    Done {
+        query: String,
+        result: Result<narra_core::search::SearchReport, String>,
+    },
 }
 
 /// Diff view state (slice 3, M1-3b). The base is a snapshot of the file as
@@ -817,6 +849,8 @@ struct Editor {
     lang: Lang,
     /// Last PDF export outcome (M7 slice 4).
     export: ExportState,
+    /// Project-wide search (M8 slice 2).
+    search: SearchState,
     /// Agent review panel state (M6 slice 3). Pure reducer — see agent_view.
     agent: AgentState,
     /// Cancellation token for the in-flight agent task (review or propose;
@@ -1468,6 +1502,14 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.search.open {
+            if let Some(last) = self.search.query.chars().last() {
+                let len = self.search.query.len();
+                self.search.query.truncate(len - last.len_utf8());
+            }
+            cx.notify();
+            return;
+        }
         if self.propose_bar.open {
             // Grapheme-aware erase, same standard as the find field.
             if let Some(last) = self.propose_bar.instruction.chars().last() {
@@ -1537,6 +1579,12 @@ impl Editor {
         // proposal (M6 slice 4).
         if self.propose_bar.open {
             self.submit_proposal(cx);
+            return;
+        }
+        // While the search bar owns keystrokes, enter searches (first press)
+        // and opens the selected result (second press, query unchanged).
+        if self.search.open {
+            self.submit_search(cx);
             return;
         }
         // While the focus bar owns keystrokes, enter commits the focus and
@@ -1922,6 +1970,13 @@ impl Editor {
         // same time).
         if self.find.open {
             self.close_find(cx);
+        } else if self.search.open {
+            // Escape clears the project-search results and closes the bar.
+            self.search.open = false;
+            self.search.query.clear();
+            self.search.hits.clear();
+            self.search.searched.clear();
+            cx.notify();
         } else if self.propose_bar.open {
             self.propose_bar.open = false;
             self.propose_bar.instruction.clear();
@@ -2555,6 +2610,206 @@ impl Editor {
         });
     }
 
+    // ---- project search (M8 slice 2) -------------------------------------
+
+    /// ⌘⇧F: toggle the project-search bar. Like the other bars it owns the
+    /// single focus; opening it closes the find/instruction/focus bars and
+    /// pre-fills the last query. Closing clears the results.
+    fn on_project_search(
+        &mut self,
+        _: &ProjectSearch,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open {
+            self.close_find(cx);
+        }
+        if self.propose_bar.open {
+            self.propose_bar.open = false;
+            self.propose_bar.instruction.clear();
+        }
+        if self.focus_bar.open {
+            self.focus_bar.open = false;
+            self.focus_bar.focus.clear();
+        }
+        self.search.open = !self.search.open;
+        if self.search.open {
+            self.search.query = self.search.searched.clone();
+        } else {
+            self.search.query.clear();
+            self.search.hits.clear();
+            self.search.searched.clear();
+        }
+        cx.notify();
+    }
+
+    fn on_search_prev(&mut self, _: &SearchPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        self.search_move(-1);
+        cx.notify();
+    }
+
+    fn on_search_next(&mut self, _: &SearchNext, _window: &mut Window, cx: &mut Context<Self>) {
+        self.search_move(1);
+        cx.notify();
+    }
+
+    fn search_move(&mut self, delta: isize) {
+        let len = self.search.hits.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.search.selected.min(len - 1) as isize;
+        self.search.selected = (current + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Enter in the search bar: the first Enter runs the query on a worker
+    /// thread; pressing it again with the query unchanged opens the selected
+    /// result (the same two-step shape as the proposal surface).
+    fn submit_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.query.trim().to_string();
+        if query.is_empty() {
+            self.search.hits.clear();
+            self.search.searched.clear();
+            self.search.truncated = false;
+            self.search.selected = 0;
+            cx.notify();
+            return;
+        }
+        if query == self.search.searched && !self.search.hits.is_empty() {
+            self.open_search_hit(cx);
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let thread_query = query.clone();
+        std::thread::spawn(move || {
+            let result = narra_core::search::search(&project, &thread_query)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(SearchMessage::Done {
+                query: thread_query,
+                result,
+            });
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let SearchMessage::Done { query, result } = message;
+            match result {
+                Ok(report) => {
+                    view.search.selected = 0;
+                    view.search.truncated = report.truncated;
+                    view.search.scanned = report.documents_scanned;
+                    view.search.skipped = report.documents_skipped;
+                    view.search.searched = query.clone();
+                    view.search.hits = report.hits;
+                    let empty = view.search.hits.is_empty();
+                    view.notice = Some(if empty {
+                        view.tf("notice.search_empty", &[("query", &query)])
+                    } else {
+                        view.tf(
+                            "notice.search_done",
+                            &[
+                                ("n", &view.search.hits.len().to_string()),
+                                ("docs", &view.search.scanned.to_string()),
+                            ],
+                        )
+                    });
+                }
+                Err(error) => {
+                    view.search.hits.clear();
+                    view.search.searched.clear();
+                    view.notice = Some(view.tf("notice.search_failed", &[("error", &error)]));
+                }
+            }
+            true
+        });
+    }
+
+    /// Open the selected result: move the caret to its line/column. A
+    /// different document is loaded from disk — and switching is refused
+    /// while the open document has unsaved changes (the established rule),
+    /// never silently discarding the buffer.
+    fn open_search_hit(&mut self, cx: &mut Context<Self>) {
+        let Some(hit) = self.search.hits.get(self.search.selected).cloned() else {
+            return;
+        };
+        let notice = self.tf(
+            "notice.search_open",
+            &[("document", &hit.document), ("line", &hit.line.to_string())],
+        );
+        if hit.document == self.doc_path {
+            let offset = self.offset_for_line_column(hit.line, hit.column);
+            self.set_caret(offset, false);
+            self.search.open = false;
+            self.search.query.clear();
+            self.search.hits.clear();
+            self.search.searched.clear();
+            self.notice = Some(notice);
+            cx.notify();
+            self.ensure_caret_visible();
+            return;
+        }
+        if self.dirty() {
+            self.notice = Some(self.t("notice.dirty_switch").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        };
+        match project.read_document(&hit.document) {
+            Ok(text) => {
+                self.load_document(hit.document.clone(), text);
+                let offset = self.offset_for_line_column(hit.line, hit.column);
+                self.set_caret(offset, false);
+                self.search.open = false;
+                self.search.query.clear();
+                self.search.hits.clear();
+                self.search.searched.clear();
+                self.notice = Some(notice);
+                cx.notify();
+                self.ensure_caret_visible();
+            }
+            Err(error) => {
+                self.notice = Some(self.tf(
+                    "notice.open_failed",
+                    &[("path", &hit.document), ("error", &error.to_string())],
+                ));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Byte offset for a 1-based line and character column, clamped to the
+    /// line (the buffer can be shorter than the hit, e.g. after edits).
+    fn offset_for_line_column(&self, line: usize, column: usize) -> usize {
+        let index = line
+            .saturating_sub(1)
+            .min(self.buffer.line_count().saturating_sub(1));
+        let range = self.buffer.line_content_range(index);
+        let text = &self.buffer.lines()[index];
+        let byte = text
+            .char_indices()
+            .nth(column.saturating_sub(1))
+            .map(|(offset, _)| offset)
+            .unwrap_or(text.len());
+        (range.start + byte).min(range.end)
+    }
+
+    /// Click on a result row: select it and open it.
+    fn select_search_hit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.search.hits.len() {
+            return;
+        }
+        self.search.selected = index;
+        self.open_search_hit(cx);
+        window.focus(&self.focus_handle(cx));
+    }
+
     /// Fold one proposal message into the view state; when the task ends,
     /// keep the notice bar in sync with the outcome.
     fn apply_propose_message(&mut self, message: ProposeMessage, done: bool) {
@@ -3174,11 +3429,71 @@ impl Editor {
         panel.child(div().px_2().text_color(rgb(STATUS_FG)).child(hint))
     }
 
+    /// Search results panel (M8 slice 2): replaces the explorer while a
+    /// search report is on screen. Clicking a row opens the document at the
+    /// match; ⌘↑/⌘↓ move the selection and Enter opens it.
+    fn search_results_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.tf(
+            "panel.search_title",
+            &[
+                ("n", &self.search.hits.len().to_string()),
+                ("query", &self.search.searched),
+            ],
+        );
+        let title = if self.search.truncated {
+            format!("{title}{}", self.t("panel.search_truncated"))
+        } else {
+            title
+        };
+        let mut panel = div()
+            .id("search-results")
+            .w(px(EXPLORER_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(EXPLORER_BG))
+            .border_r_1()
+            .border_color(rgb(EXPLORER_BORDER))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgb(STATUS_FG))
+                    .child(title),
+            );
+        for (index, hit) in self.search.hits.iter().enumerate() {
+            let selected = index == self.search.selected;
+            panel = panel.child(
+                div()
+                    .id(("hit", index))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .when(selected, |row| row.bg(rgb(DOC_SELECTED_BG)))
+                    .text_color(rgb(if selected { DEFAULT_FG } else { STATUS_FG }))
+                    .cursor_pointer()
+                    .child(format!("{}:{} · {}", hit.document, hit.line, hit.preview))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_search_hit(index, window, cx)
+                    })),
+            );
+        }
+        panel
+    }
+
     /// Explorer panel (M6 slice 1): one row per project document. Clicking
     /// loads it (`select_doc`); the active document is highlighted to mirror
     /// `doc_path`. Long paths clip at the panel edge (status bar shows the
-    /// full path).
-    fn explorer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// full path). While a search report is on screen the results replace
+    /// it (M8 slice 2).
+    fn explorer_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if !self.search.hits.is_empty() {
+            return self.search_results_panel(cx).into_any_element();
+        }
         let title = self
             .project
             .as_ref()
@@ -3220,7 +3535,7 @@ impl Editor {
                     ),
             );
         }
-        panel
+        panel.into_any_element()
     }
 
     fn status_text(&self) -> String {
@@ -3379,6 +3694,38 @@ impl Editor {
                 div()
                     .text_color(rgb(FIND_DIM_FG))
                     .child(self.t("proposebar.hint")),
+            )
+    }
+
+    /// Project-search bar (M8 slice 2): one field, same single-focus
+    /// compromise. Enter searches (again to open the selected result);
+    /// results render in the left panel.
+    fn search_bar(&self) -> gpui::Div {
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_2()
+            .h(px(STATUS_BAR_H))
+            .bg(rgb(FIND_BG))
+            .text_sm()
+            .font_family(FONT_FAMILY)
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .text_color(rgb(FIND_DIM_FG))
+                    .child(self.t("searchbar.label")),
+            )
+            .child(
+                div()
+                    .text_color(rgb(FIND_FG))
+                    .child(format!("{}▌", self.search.query)),
+            )
+            .child(
+                div()
+                    .text_color(rgb(FIND_DIM_FG))
+                    .child(self.t("searchbar.hint")),
             )
     }
 
@@ -3711,6 +4058,34 @@ impl Editor {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let search_results: Vec<String> = self
+            .search
+            .hits
+            .iter()
+            .map(|hit| {
+                format!(
+                    "{{\"document\":\"{}\",\"line\":{},\"column\":{},\"preview\":\"{}\"}}",
+                    escape_json(&hit.document),
+                    hit.line,
+                    hit.column,
+                    escape_json(&hit.preview),
+                )
+            })
+            .collect();
+        let search_dump = format!(
+            "{{\"open\":{},\"query\":\"{}\",\"searched\":\"{}\",\"hits\":{},\
+             \"selected\":{},\"truncated\":{},\"scanned\":{},\"skipped\":{},\
+             \"results\":[{}]}}",
+            self.search.open,
+            escape_json(&self.search.query),
+            escape_json(&self.search.searched),
+            self.search.hits.len(),
+            self.search.selected,
+            self.search.truncated,
+            self.search.scanned,
+            self.search.skipped,
+            search_results.join(","),
+        );
         let export_dump = format!(
             "{{\"out\":\"{}\",\"bytes\":{},\"pages\":{},\"error\":\"{}\"}}",
             escape_json(&self.export.out),
@@ -3815,7 +4190,7 @@ impl Editor {
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
-                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"lang\":\"{}\"}}"
+                 \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\"lang\":\"{}\"}}"
             ),
             self.buffer.line_count(),
             len,
@@ -3855,6 +4230,7 @@ impl Editor {
             focus_bar_dump,
             proposal_dump,
             export_dump,
+            search_dump,
             self.lang.key(),
         )
     }
@@ -4082,6 +4458,17 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
+        // Search bar (M8 slice 2) owns keystrokes while open: single line,
+        // control chars out, same rules as the other bars.
+        if self.search.open {
+            let cleaned: String = new_text
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect();
+            self.search.query.push_str(&cleaned);
+            cx.notify();
+            return;
+        }
         // Instruction bar owns keystrokes while open (M6 slice 4): the text
         // becomes the proposal instruction, single line, control chars out.
         if self.propose_bar.open {
@@ -4303,6 +4690,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_toggle_lang))
             // export (M7 slice 4)
             .on_action(cx.listener(Self::on_export_pdf))
+            // project search (M8 slice 2)
+            .on_action(cx.listener(Self::on_project_search))
+            .on_action(cx.listener(Self::on_search_prev))
+            .on_action(cx.listener(Self::on_search_next))
             .child(
                 div()
                     .id("status")
@@ -4318,6 +4709,7 @@ impl Render for Editor {
                     .child(status),
             )
             .when(self.find.open, |bar| bar.child(self.find_bar()))
+            .when(self.search.open, |bar| bar.child(self.search_bar()))
             .when(self.propose_bar.open, |bar| bar.child(self.propose_bar()))
             .when(self.focus_bar.open, |bar| bar.child(self.focus_bar()))
             .child(
@@ -4735,6 +5127,11 @@ fn run() -> Result<(), String> {
             KeyBinding::new("cmd-alt-l", ToggleLang, None),
             // export (M7 slice 4): cmd-e writes exports/<screenplay>.pdf.
             KeyBinding::new("cmd-e", ExportPdf, None),
+            // project search (M8 slice 2): cmd-shift-f searches every
+            // project document; cmd-up/down move through the results.
+            KeyBinding::new("cmd-shift-f", ProjectSearch, None),
+            KeyBinding::new("cmd-up", SearchPrev, None),
+            KeyBinding::new("cmd-down", SearchNext, None),
         ]);
 
         cx.observe_keystrokes({
@@ -4769,6 +5166,7 @@ fn run() -> Result<(), String> {
             notice: None,
             lang,
             export: ExportState::default(),
+            search: SearchState::default(),
             agent: AgentState::new(),
             agent_cancel: None,
             agent_settings: agent_settings.clone(),
