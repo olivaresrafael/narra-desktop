@@ -33,6 +33,7 @@ pub mod export;
 pub mod fountain;
 pub mod git;
 pub mod manifest;
+pub mod markdown;
 pub mod project;
 pub mod provider;
 pub mod search;
@@ -43,6 +44,7 @@ pub use manifest::{
     MANIFEST_SCHEMA_VERSION, Manifest, ManifestError, ProjectType, parse_manifest,
     serialize_manifest,
 };
+pub use markdown::{Block as MarkdownBlock, InlineSpan, MarkdownDocument};
 pub use project::{
     DEFAULT_SCREENPLAY, MANIFEST_FILE, Project, ProjectError, ProjectIndex, SceneRef,
     TEMPLATE_DIRS, create_project, open_project,

@@ -1304,6 +1304,28 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Switch to this parallel draft.",
         "Cambiar a este borrador paralelo.",
     ),
+    ("preview.code", "Code", "Código"),
+    ("preview.preview", "Preview", "Vista previa"),
+    (
+        "preview.read_only",
+        "Read-only preview · edit in Code",
+        "Vista previa de solo lectura · edita en Código",
+    ),
+    (
+        "preview.empty",
+        "Nothing to preview yet.",
+        "Nada que previsualizar todavía.",
+    ),
+    (
+        "preview.tip",
+        "⌘⌥P — Show Markdown with formatting. The file is never modified.",
+        "⌘⌥P — Muestra el Markdown con formato. El archivo nunca se modifica.",
+    ),
+    (
+        "menu.toggle_preview",
+        "Toggle Markdown Preview",
+        "Alternar vista previa de Markdown",
+    ),
     ("github.section", "GitHub", "GitHub"),
     (
         "github.loading",

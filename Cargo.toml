@@ -29,6 +29,11 @@ sha2 = "0.10"
 # target-gates each platform's store: Apple Keychain on macOS, which is all
 # the MVP compiles for).
 keyring = "4"
+# Markdown preview (M14a, D-033): event-based CommonMark/GFM parser from the
+# rustdoc project (MIT, actively maintained). Hand-rolling tables, nested
+# emphasis and code fences would add a parsing surface we cannot validate;
+# the canonical Markdown files stay plain text and this parser is read-only.
+pulldown-cmark = { version = "0.13", default-features = false }
 # PDF output for screenplay export (M7, Spike G-2): a minimal, low-level PDF
 # writer from the Typst project (MIT OR Apache-2.0, both GPL-3.0 compatible
 # per D-015). Chosen over a typesetting engine because screenplay pagination

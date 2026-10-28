@@ -122,6 +122,7 @@ mod context_menu;
 mod explorer;
 mod git_status;
 mod i18n;
+mod markdown_view;
 mod new_file;
 mod new_project;
 mod project_settings;
@@ -168,6 +169,7 @@ use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentio
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::git::{Branch, Commit, OpOptions, Repository, WorktreeStatus};
+use narra_core::markdown::MarkdownDocument;
 use narra_core::provider::{
     GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest, NewRepository, SecretStore,
 };
@@ -227,6 +229,8 @@ actions!(
         ReplaceAll,
         // diff view (slice 3, M1-3b)
         ToggleDiff,
+        // Markdown preview (M14a, D-033)
+        TogglePreview,
         // agent review (M6 slice 3)
         ReviewScene,
         CancelReview,
@@ -636,6 +640,7 @@ enum PaletteCommand {
     Find,
     ProjectSearch,
     ToggleDiff,
+    TogglePreview,
     ReviewScene,
     Propose,
     CloseTab,
@@ -644,7 +649,7 @@ enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    const ALL: [PaletteCommand; 19] = [
+    const ALL: [PaletteCommand; 20] = [
         PaletteCommand::OpenSettings,
         PaletteCommand::OpenProjectSettings,
         PaletteCommand::NewFile,
@@ -659,6 +664,7 @@ impl PaletteCommand {
         PaletteCommand::Find,
         PaletteCommand::ProjectSearch,
         PaletteCommand::ToggleDiff,
+        PaletteCommand::TogglePreview,
         PaletteCommand::ReviewScene,
         PaletteCommand::Propose,
         PaletteCommand::CloseTab,
@@ -682,6 +688,7 @@ impl PaletteCommand {
             PaletteCommand::Find => "menu.find",
             PaletteCommand::ProjectSearch => "menu.project_search",
             PaletteCommand::ToggleDiff => "menu.toggle_diff",
+            PaletteCommand::TogglePreview => "menu.toggle_preview",
             PaletteCommand::ReviewScene => "menu.review",
             PaletteCommand::Propose => "menu.propose",
             PaletteCommand::CloseTab => "menu.close_tab",
@@ -706,6 +713,7 @@ impl PaletteCommand {
             PaletteCommand::Find => "⌘F",
             PaletteCommand::ProjectSearch => "⇧⌘F",
             PaletteCommand::ToggleDiff => "⌘D",
+            PaletteCommand::TogglePreview => "⌥⌘P",
             PaletteCommand::ReviewScene => "⌘R",
             PaletteCommand::Propose => "⌘K",
             PaletteCommand::CloseTab => "⌘W",
@@ -1450,6 +1458,13 @@ struct DocumentState {
     /// Scroll state for the diff view (its own list, sized to the rows).
     diff_list_state: ListState,
 
+    /// Read-only Markdown preview (M14a, D-033). Per document/tab: the
+    /// source stays untouched and toggling back restores editing in place.
+    preview: bool,
+    /// Derived blocks for the preview. Rebuilt when the toggle opens; while
+    /// the preview is active edits are rejected, so it cannot go stale.
+    preview_document: MarkdownDocument,
+
     /// Find/replace bar (slice 3). While `open`, keystrokes route here
     /// instead of the buffer (single-focus spike compromise).
     find: FindState,
@@ -1512,6 +1527,8 @@ impl DocumentState {
             ),
             diff_list_state: ListState::new(0, ListAlignment::Top, px(theme::line_height() * 2.0)),
             find: FindState::default(),
+            preview: false,
+            preview_document: MarkdownDocument::default(),
             diff: DiffState {
                 base_lines: text.split('\n').map(str::to_string).collect(),
                 ..DiffState::default()
@@ -3631,6 +3648,9 @@ impl Editor {
                 self.on_project_search(&ProjectSearch, window, cx);
             }
             PaletteCommand::ToggleDiff => self.on_toggle_diff(&ToggleDiff, window, cx),
+            PaletteCommand::TogglePreview => {
+                self.on_toggle_preview(&TogglePreview, window, cx);
+            }
             PaletteCommand::ReviewScene => self.on_review_scene(&ReviewScene, window, cx),
             PaletteCommand::Propose => self.on_open_propose(&OpenPropose, window, cx),
             PaletteCommand::CloseTab => self.on_close_tab(&CloseTab, window, cx),
@@ -3938,6 +3958,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.doc.preview {
+            return;
+        }
         if self.context_menu.is_some() {
             self.context_menu = None;
             cx.notify();
@@ -5693,7 +5716,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         self.delete_word(true);
@@ -5707,7 +5735,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         self.delete_word(false);
@@ -5747,7 +5780,12 @@ impl Editor {
     }
 
     fn on_move_line_up(&mut self, _: &MoveLineUp, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         self.move_line(-1);
@@ -5761,7 +5799,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         self.move_line(1);
@@ -5790,7 +5833,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         self.duplicate_line(true);
@@ -5804,7 +5852,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         self.duplicate_line(false);
@@ -5814,7 +5867,12 @@ impl Editor {
 
     /// ⌘⇧K: delete the caret's line (VSCode parity).
     fn on_delete_line(&mut self, _: &DeleteLine, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.doc.find.open || self.search.open || self.propose_bar.open || self.focus_bar.open {
+        if self.doc.find.open
+            || self.search.open
+            || self.propose_bar.open
+            || self.focus_bar.open
+            || self.doc.preview
+        {
             return;
         }
         let position = self.doc.buffer.position_at(self.caret());
@@ -5944,6 +6002,9 @@ impl Editor {
             self.project_settings_cycle_field(true, cx);
             return;
         }
+        if self.doc.preview {
+            return;
+        }
         self.cycle_element(true);
         cx.notify();
         self.ensure_caret_visible();
@@ -5964,6 +6025,9 @@ impl Editor {
         }
         if self.project_settings.is_some() {
             self.project_settings_cycle_field(false, cx);
+            return;
+        }
+        if self.doc.preview {
             return;
         }
         self.cycle_element(false);
@@ -9515,6 +9579,9 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.doc.preview {
+            return;
+        }
         if self.doc.selected.is_empty() {
             let caret = self.caret();
             let previous = self.doc.buffer.prev_boundary(caret);
@@ -9534,6 +9601,7 @@ impl Editor {
             || self.project_settings.is_some()
             || self.palette.is_some()
             || self.unsaved_prompt.is_some()
+            || self.doc.preview
         {
             return;
         }
@@ -9657,6 +9725,9 @@ impl Editor {
             self.submit_focus(cx);
             return;
         }
+        if self.doc.preview {
+            return;
+        }
         // Smart Enter (M9 slice 5): a scene heading, transition or section
         // needs the blank separator line Fountain's block structure uses,
         // so Enter inserts it and lands on the line below; everything else
@@ -9683,6 +9754,7 @@ impl Editor {
             || self.project_settings.is_some()
             || self.palette.is_some()
             || self.unsaved_prompt.is_some()
+            || self.doc.preview
         {
             return;
         }
@@ -9696,6 +9768,7 @@ impl Editor {
             || self.project_settings.is_some()
             || self.palette.is_some()
             || self.unsaved_prompt.is_some()
+            || self.doc.preview
         {
             return;
         }
@@ -9723,6 +9796,7 @@ impl Editor {
             || self.project_settings.is_some()
             || self.palette.is_some()
             || self.unsaved_prompt.is_some()
+            || self.doc.preview
         {
             return;
         }
@@ -9747,6 +9821,9 @@ impl Editor {
     /// open; cmd-alt-f opens it with the replacement field focused. A
     /// non-single-line selection prefills the query on first open.
     fn open_find(&mut self, with_replacement: bool, cx: &mut Context<Self>) {
+        if self.doc.preview {
+            self.doc.preview = false;
+        }
         let selection = if self.doc.selected.is_empty() {
             String::new()
         } else {
@@ -9971,6 +10048,9 @@ impl Editor {
     /// Open the diff view (cmd-d). The base is seeded from the loaded file
     /// the first time; the cursor and scroll reset to the first hunk.
     fn open_diff(&mut self, cx: &mut Context<Self>) {
+        if self.doc.preview {
+            self.doc.preview = false;
+        }
         if !self.doc.diff.open {
             self.doc.diff.open = true;
         }
@@ -10228,6 +10308,113 @@ impl Editor {
         } else {
             self.open_diff(cx);
         }
+    }
+
+    // ---- Markdown preview (M14a, D-033) ----------------------------------
+
+    fn active_is_markdown(&self) -> bool {
+        FileKind::from_path(&self.doc.path) == FileKind::Markdown
+    }
+
+    /// Toggle the read-only preview for the active tab. The source buffer is
+    /// never touched; the derived blocks are rebuilt from the current text
+    /// each time the preview opens.
+    fn set_preview(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on && !self.active_is_markdown() {
+            return;
+        }
+        if on {
+            let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
+            self.doc.preview_document = MarkdownDocument::parse(&text);
+            self.doc.diff.open = false;
+            self.doc.find.open = false;
+            self.doc.find.matches.clear();
+            self.doc.find.current = 0;
+        }
+        self.doc.preview = on;
+        cx.notify();
+    }
+
+    fn on_toggle_preview(
+        &mut self,
+        _: &TogglePreview,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_preview(!self.doc.preview, cx);
+    }
+
+    /// Slim per-document toolbar for Markdown. The toggle is per tab because
+    /// `preview` lives in `DocumentState`; switching tabs keeps each document
+    /// in the mode the writer left it in.
+    fn document_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let preview = self.doc.preview;
+        let tip = self.git_tooltip(cx, "⌘⌥P", self.t("preview.tip").to_string());
+        let code_tip = tip.clone();
+        let code_active = !preview;
+        let preview_active = preview;
+        div()
+            .id("document-toolbar")
+            .h(px(28.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .bg(rgb(theme::explorer_bg()))
+            .border_b_1()
+            .border_color(rgb(theme::explorer_border()))
+            .text_xs()
+            .child(
+                div()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(language_name(&self.doc.path)),
+            )
+            .when(preview, |row| {
+                row.child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("preview.read_only")),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("preview-code")
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(code_active, |button| {
+                        button
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::default_fg()))
+                    })
+                    .when(!code_active, |button| {
+                        button.text_color(rgb(theme::status_fg()))
+                    })
+                    .tooltip(move |_, _| code_tip.clone())
+                    .child(self.t("preview.code"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_preview(false, cx))),
+            )
+            .child(
+                div()
+                    .id("preview-mode")
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(preview_active, |button| {
+                        button
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::default_fg()))
+                    })
+                    .when(!preview_active, |button| {
+                        button.text_color(rgb(theme::status_fg()))
+                    })
+                    .tooltip(move |_, _| tip.clone())
+                    .child(self.t("preview.preview"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_preview(true, cx))),
+            )
+            .into_any_element()
     }
 
     // ---- find probe (slice 3 measurement) ---------------------------------
@@ -11341,6 +11528,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.doc.preview {
+            return;
+        }
         if !self.propose.can_apply() {
             self.notice = Some(self.t("notice.nothing_to_apply").to_string());
             cx.notify();
@@ -11885,6 +12075,9 @@ impl Editor {
     }
 
     fn chat_apply_proposal(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.preview {
+            return;
+        }
         let Some(project) = self.project.as_ref() else {
             self.notice = Some(self.t("notice.fixture_no_project_short").to_string());
             cx.notify();
@@ -14966,7 +15159,7 @@ impl Editor {
                 };
                 Some(format!(
                     "{{\"path\":\"{}\",\"title\":\"{}\",\"kind\":\"{}\",\
-                     \"dirty\":{},\"active\":{},\"revision\":{},\"saved_revision\":{},\
+                     \"dirty\":{},\"active\":{},\"preview\":{},\"revision\":{},\"saved_revision\":{},\
                      \"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],\
                      \"scroll_item\":{},\"undo\":{},\"redo\":{}}}",
                     escape_json(&doc.path),
@@ -14974,6 +15167,7 @@ impl Editor {
                     kind,
                     doc.is_dirty(),
                     index == self.active_tab,
+                    doc.preview,
                     doc.revision,
                     doc.saved_revision,
                     position.line + 1,
@@ -15130,7 +15324,7 @@ impl Editor {
                 "\"removed\":{},\"cursor\":{},\"buffer_hash\":\"{}\"}},",
                 "\"ime\":{{\"marked\":{},\"composing\":{}}},",
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
-                "\"document\":\"{}\",\"language\":\"{}\",\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
+                "\"document\":\"{}\",\"language\":\"{}\",\"preview\":{{\"active\":{},\"blocks\":{}}},\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
                  \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
@@ -15176,6 +15370,8 @@ impl Editor {
             click_offset_dump,
             escape_json(&self.doc.path),
             language_name(&self.doc.path),
+            self.doc.preview,
+            self.doc.preview_document.blocks.len(),
             self.dirty(),
             notice_dump,
             explorer_dump,
@@ -15318,6 +15514,7 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.toggle_git"), ToggleGitPanel),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.toggle_diff"), ToggleDiff),
+                gpui::MenuItem::action(label("menu.toggle_preview"), TogglePreview),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action(label("menu.quick_open"), QuickOpen),
                 gpui::MenuItem::action(label("menu.command_palette"), CommandPalette),
@@ -15829,6 +16026,9 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
+        if self.doc.preview {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -15918,6 +16118,9 @@ impl EntityInputHandler for Editor {
         if self.doc.find.open {
             self.find_input(new_text);
             cx.notify();
+            return;
+        }
+        if self.doc.preview {
             return;
         }
         let range = range_utf16
@@ -16133,6 +16336,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_replace_current))
             .on_action(cx.listener(Self::on_replace_all))
             .on_action(cx.listener(Self::on_toggle_diff))
+            .on_action(cx.listener(Self::on_toggle_preview))
             // agent review (M6 slice 3)
             .on_action(cx.listener(Self::on_review_scene))
             .on_action(cx.listener(Self::on_cancel_review))
@@ -16180,6 +16384,10 @@ impl Render for Editor {
                             .when(self.project.is_some(), |column| {
                                 column.child(self.tab_bar(cx))
                             })
+                            .when(
+                                self.project.is_some() && self.active_is_markdown(),
+                                |column| column.child(self.document_toolbar(cx)),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -16204,7 +16412,13 @@ impl Render for Editor {
                                     .size_full(),
                                 )
                             })
-                            .when(!self.doc.diff.open, |host| {
+                            .when(!self.doc.diff.open && self.doc.preview, |host| {
+                                host.child(markdown_view::render(
+                                    &self.doc.preview_document,
+                                    self.lang,
+                                ))
+                            })
+                            .when(!self.doc.diff.open && !self.doc.preview, |host| {
                                 host.child(
                                     list(self.doc.list_state.clone(), {
                                         let entity = entity.clone();
@@ -16895,6 +17109,7 @@ fn run() -> Result<(), String> {
                 // diff view (slice 3, M1-3b): cmd-d toggles, cmd-g/shift-g walk
                 // hunks while it is open.
                 KeyBinding::new("cmd-d", ToggleDiff, None),
+                KeyBinding::new("cmd-alt-p", TogglePreview, None),
                 // agent review (M6 slice 3): cmd-r reviews the caret's scene,
                 // cmd-. cancels the run. The review panel scrolls with
                 // ctrl-up/down when no search results are on screen (M9 slice 2
