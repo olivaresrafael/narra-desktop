@@ -188,15 +188,18 @@ impl Buffer {
         let position = self.position_at(offset);
         let line = &self.lines[position.line];
         if position.col < line.len() {
+            // The last grapheme of a line has no *following* grapheme start:
+            // the next boundary is the line end itself. Returning `offset`
+            // there made the end-of-line boundary look invalid, so clicks and
+            // Delete at the last character snapped back before it.
             let next = line
                 .grapheme_indices(true)
                 .map(|(ix, _)| ix)
-                .find(|ix| *ix > position.col);
-            return next.map_or(offset, |ix| {
-                self.offset_at(Position {
-                    line: position.line,
-                    col: ix,
-                })
+                .find(|ix| *ix > position.col)
+                .unwrap_or(line.len());
+            return self.offset_at(Position {
+                line: position.line,
+                col: next,
             });
         }
         if position.line + 1 < self.lines.len() {
@@ -498,6 +501,30 @@ mod tests {
     }
 
     #[test]
+    fn next_boundary_reaches_line_and_document_ends() {
+        let buffer = Buffer::new("alpha\nbeta");
+        // From the start of the last grapheme, the next boundary is the end
+        // of the line (the bug snapped it back to the same offset).
+        assert_eq!(buffer.next_boundary(4), 5);
+        // The end of a line crosses to the start of the next one.
+        assert_eq!(buffer.next_boundary(5), 6);
+        // From the last grapheme of the last line, the document end.
+        assert_eq!(buffer.next_boundary(9), 10);
+        assert_eq!(buffer.next_boundary(10), 10);
+
+        // A decomposed grapheme is one boundary: 0 -> 3, never inside it.
+        let decomposed = Buffer::new("e\u{0301}x");
+        assert_eq!(decomposed.next_boundary(0), 3);
+        assert_eq!(decomposed.next_boundary(3), 4);
+        assert_eq!(decomposed.next_boundary(4), 4);
+
+        // Empty lines still cross to the next line start.
+        let empty = Buffer::new("a\n\nb");
+        assert_eq!(empty.next_boundary(1), 2);
+        assert_eq!(empty.next_boundary(2), 3);
+    }
+
+    #[test]
     fn vertical_move_clamps_column() {
         let buffer = Buffer::new("largo texto\nab\nmucho texto");
         let offset = buffer.offset_at(Position { line: 0, col: 9 });
@@ -727,11 +754,15 @@ mod tests {
         assert_eq!(buffer.word_left(6), 0);
         // ⌥→ inside a word: that word's end.
         assert_eq!(buffer.word_right(2), 5);
+        // ⌥→ from the start of a word's last character reaches its end
+        // (previously `next_boundary` returned the same offset and looped).
+        assert_eq!(buffer.word_right(4), 5);
         // ⌥→ from the space after a word: the end of the next word.
         assert_eq!(buffer.word_right(5), 10);
         // Inner apostrophes keep `don't` whole.
         let dont_start = "Marta dijo: ".len();
         assert_eq!(buffer.word_right(dont_start), dont_start + 5);
+        assert_eq!(buffer.word_right(dont_start + 4), dont_start + 5);
         assert_eq!(buffer.word_left(dont_start + 4), dont_start);
         // Crossing a newline walks to the previous line's last word.
         let two_lines = Buffer::new("primera\nsegunda\n");
