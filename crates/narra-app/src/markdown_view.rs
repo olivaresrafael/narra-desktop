@@ -45,7 +45,7 @@ pub fn render(document: &MarkdownDocument, lang: Lang) -> AnyElement {
 
 fn render_block(block: &Block, index: usize) -> Div {
     match block {
-        Block::Heading { level, spans } => {
+        Block::Heading { level, spans, .. } => {
             let factor = match level {
                 1 => 1.75,
                 2 => 1.45,

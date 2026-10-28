@@ -1753,6 +1753,43 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Resultados ({n}) · «{query}»",
     ),
     ("panel.outline_title", "Scenes ({n})", "Escenas ({n})"),
+    (
+        "panel.outline_title_sections",
+        "Sections ({n})",
+        "Secciones ({n})",
+    ),
+    ("panel.outline_title_keys", "Keys ({n})", "Claves ({n})"),
+    (
+        "panel.diagnostics_title",
+        "Problems ({n})",
+        "Problemas ({n})",
+    ),
+    ("panel.diagnostics_more", "… {n} more", "… {n} más"),
+    (
+        "diagnostic.fountain.empty_document",
+        "The screenplay is empty.",
+        "El guion está vacío.",
+    ),
+    (
+        "diagnostic.fountain.unclosed_boneyard",
+        "Boneyard comment is not closed.",
+        "El comentario boneyard no está cerrado.",
+    ),
+    (
+        "diagnostic.fountain.unclosed_note",
+        "Note is not closed.",
+        "La nota no está cerrada.",
+    ),
+    (
+        "diagnostic.markdown.unclosed_code_fence",
+        "Code block is not closed.",
+        "El bloque de código no está cerrado.",
+    ),
+    (
+        "diagnostic.markdown.empty_heading",
+        "Heading has no text.",
+        "El título no tiene texto.",
+    ),
     ("panel.outline_more", "… {n} more", "… {n} más"),
     ("panel.search_truncated", " (truncated)", " (truncado)"),
     (

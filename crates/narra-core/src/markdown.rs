@@ -38,6 +38,8 @@ pub struct InlineSpan {
 pub enum Block {
     Heading {
         level: u8,
+        /// 0-based source line where the heading starts.
+        line: usize,
         spans: Vec<InlineSpan>,
     },
     Paragraph {
@@ -81,9 +83,19 @@ impl MarkdownDocument {
         options.insert(Options::ENABLE_STRIKETHROUGH);
         options.insert(Options::ENABLE_TASKLISTS);
         let parser = Parser::new_ext(source, options);
-        let mut builder = Builder::default();
-        for event in parser {
-            builder.event(event);
+        let mut line_starts = vec![0usize];
+        line_starts.extend(
+            source
+                .char_indices()
+                .filter(|(_, character)| *character == '\n')
+                .map(|(index, _)| index + 1),
+        );
+        let mut builder = Builder {
+            line_starts,
+            ..Builder::default()
+        };
+        for (event, range) in parser.into_offset_iter() {
+            builder.event(event, range.start);
         }
         builder.finish()
     }
@@ -113,6 +125,7 @@ enum Container {
     Paragraph(Vec<InlineSpan>),
     Heading {
         level: u8,
+        line: usize,
         spans: Vec<InlineSpan>,
     },
     Item {
@@ -151,14 +164,16 @@ struct Builder {
     italic: usize,
     strike: usize,
     links: Vec<String>,
+    /// Byte offsets of line starts, for headings/symbols.
+    line_starts: Vec<usize>,
     /// Text the parser emitted outside a block (malformed input only).
     loose: Vec<InlineSpan>,
 }
 
 impl Builder {
-    fn event(&mut self, event: Event<'_>) {
+    fn event(&mut self, event: Event<'_>, offset: usize) {
         match event {
-            Event::Start(tag) => self.start(tag),
+            Event::Start(tag) => self.start(tag, offset),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.push_text(&text),
             Event::Code(text) => self.push_styled(
@@ -198,7 +213,7 @@ impl Builder {
         }
     }
 
-    fn start(&mut self, tag: Tag<'_>) {
+    fn start(&mut self, tag: Tag<'_>, offset: usize) {
         match tag {
             Tag::Paragraph => {
                 // Paragraphs inside an item or a quote share that container:
@@ -227,6 +242,7 @@ impl Builder {
             }
             Tag::Heading { level, .. } => self.stack.push(Container::Heading {
                 level: level as u8,
+                line: self.line_for(offset),
                 spans: Vec::new(),
             }),
             Tag::BlockQuote(_) => {
@@ -326,6 +342,12 @@ impl Builder {
         }
     }
 
+    fn line_for(&self, offset: usize) -> usize {
+        self.line_starts
+            .partition_point(|start| *start <= offset)
+            .saturating_sub(1)
+    }
+
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph => {
@@ -346,10 +368,10 @@ impl Builder {
                 }
             }
             TagEnd::Heading(_) => {
-                if let Some(Container::Heading { level, spans }) = self.stack.pop() {
+                if let Some(Container::Heading { level, line, spans }) = self.stack.pop() {
                     let spans = trim_spans(spans);
                     if !spans.is_empty() {
-                        self.blocks.push(Block::Heading { level, spans });
+                        self.blocks.push(Block::Heading { level, line, spans });
                     }
                 }
             }
@@ -488,10 +510,10 @@ impl Builder {
         while let Some(container) = self.stack.pop() {
             match container {
                 Container::Paragraph(spans) => self.emit_paragraph(spans),
-                Container::Heading { level, spans } => {
+                Container::Heading { level, line, spans } => {
                     let spans = trim_spans(spans);
                     if !spans.is_empty() {
-                        self.blocks.push(Block::Heading { level, spans });
+                        self.blocks.push(Block::Heading { level, line, spans });
                     }
                 }
                 Container::Item {
@@ -595,10 +617,11 @@ mod tests {
             "# Título\n\nUna **negrita** y *cursiva* con `code` y [enlace](https://example.com).\n",
         );
         assert_eq!(document.blocks.len(), 2);
-        let Block::Heading { level, spans } = &document.blocks[0] else {
+        let Block::Heading { level, spans, line } = &document.blocks[0] else {
             panic!("expected heading");
         };
         assert_eq!(*level, 1);
+        assert_eq!(*line, 0);
         assert_eq!(text_of(spans), "Título");
         let Block::Paragraph { spans } = &document.blocks[1] else {
             panic!("expected paragraph");

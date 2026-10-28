@@ -32,6 +32,7 @@ pub mod entities;
 pub mod export;
 pub mod fountain;
 pub mod git;
+pub mod language;
 pub mod manifest;
 pub mod markdown;
 pub mod project;
@@ -40,6 +41,10 @@ pub mod search;
 
 pub use document::{DocumentError, read_document, resolve_within, write_document};
 pub use fountain::{Element as FountainElement, ElementKind, parse as parse_fountain};
+pub use language::{
+    Diagnostic as LanguageDiagnostic, LanguageId, LanguageReport, OutlineItem,
+    Severity as DiagnosticSeverity, Symbol as LanguageSymbol,
+};
 pub use manifest::{
     MANIFEST_SCHEMA_VERSION, Manifest, ManifestError, ProjectType, parse_manifest,
     serialize_manifest,

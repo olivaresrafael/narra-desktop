@@ -169,6 +169,9 @@ use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentio
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::git::{Branch, Commit, OpOptions, Repository, WorktreeStatus};
+use narra_core::language::{
+    self, Diagnostic, LanguageId, LanguageReport, Severity as DiagnosticSeverity,
+};
 use narra_core::markdown::MarkdownDocument;
 use narra_core::provider::{
     GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest, NewRepository, SecretStore,
@@ -1424,9 +1427,16 @@ struct DocumentState {
     redo_stack: Vec<Edit>,
 
     scene_lines: Vec<usize>,
-    /// Document outline (M8 slice 3): (line index, heading text) for the
-    /// open document, refreshed with the scene scan.
+    /// Document outline (M8 slice 3; M14b for Markdown/YAML): (line index,
+    /// heading text) for the open document.
     outline: Vec<(usize, String)>,
+    /// Outline lines aligned with `outline`, used for click/highlight.
+    outline_lines: Vec<usize>,
+    /// Outline nesting levels aligned with `outline`.
+    outline_levels: Vec<u8>,
+    /// Derived language report (outline, symbols, diagnostics) for the open
+    /// document. Rebuilt when the document becomes dirty.
+    language: LanguageReport,
     /// Element kind per line for the open document (M9 slice 5), from the
     /// derived Fountain parser; drives the full screenplay highlighting.
     element_kinds: Vec<FountainKind>,
@@ -1506,6 +1516,9 @@ impl DocumentState {
             redo_stack: Vec::new(),
             scene_lines: Vec::new(),
             outline: Vec::new(),
+            outline_lines: Vec::new(),
+            outline_levels: Vec::new(),
+            language: LanguageReport::empty(LanguageId::PlainText),
             element_kinds: Vec::new(),
             elements_dirty: true,
             elements_parsed_at: None,
@@ -5194,17 +5207,60 @@ impl Editor {
         if !self.doc.scenes_dirty {
             return;
         }
-        self.doc.outline = self
-            .doc
-            .buffer
-            .lines()
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| is_scene_heading(line))
-            .map(|(ix, line)| (ix, line.trim().to_string()))
-            .collect();
-        self.doc.scene_lines = self.doc.outline.iter().map(|(line, _)| *line).collect();
+        // Fountain keeps the cheap M8 scene scan: a full fountain::parse on
+        // the 19k-line fixture costs ~2.2 ms, which would put a full parse on
+        // every keystroke. The language contract still exposes Fountain
+        // outline/symbols/diagnostics for a future debounced pass.
+        if FileKind::from_path(&self.doc.path) == FileKind::Fountain {
+            self.doc.outline = self
+                .doc
+                .buffer
+                .lines()
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| is_scene_heading(line))
+                .map(|(ix, line)| (ix, line.trim().to_string()))
+                .collect();
+            self.doc.outline_lines = self.doc.outline.iter().map(|(line, _)| *line).collect();
+            self.doc.outline_levels = vec![1; self.doc.outline.len()];
+            self.doc.scene_lines = self.doc.outline_lines.clone();
+            self.doc.language = LanguageReport::empty(LanguageId::Fountain);
+            self.doc.scenes_dirty = false;
+            return;
+        }
+        let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
+        let report = language::analyze(&self.doc.path, &text);
+        let mut outline = Vec::new();
+        let mut outline_lines = Vec::new();
+        let mut outline_levels = Vec::new();
+        for item in &report.outline {
+            outline.push((item.line, item.title.clone()));
+            outline_lines.push(item.line);
+            outline_levels.push(item.level);
+        }
+        self.doc.scene_lines = Vec::new();
+        self.doc.outline = outline;
+        self.doc.outline_lines = outline_lines;
+        self.doc.outline_levels = outline_levels;
+        self.doc.language = report;
         self.doc.scenes_dirty = false;
+    }
+
+    /// UI copy for known diagnostic codes; unknown diagnostics keep the
+    /// parser/provider detail as a technical fallback.
+    fn diagnostic_text(&self, diagnostic: &Diagnostic) -> String {
+        match diagnostic.code.as_str() {
+            "fountain.empty_document" => self.t("diagnostic.fountain.empty_document").to_string(),
+            "fountain.unclosed_boneyard" => {
+                self.t("diagnostic.fountain.unclosed_boneyard").to_string()
+            }
+            "fountain.unclosed_note" => self.t("diagnostic.fountain.unclosed_note").to_string(),
+            "markdown.unclosed_code_fence" => self
+                .t("diagnostic.markdown.unclosed_code_fence")
+                .to_string(),
+            "markdown.empty_heading" => self.t("diagnostic.markdown.empty_heading").to_string(),
+            _ => diagnostic.message.clone(),
+        }
     }
 
     /// Refresh the line classification for the screenplay highlighting (M9
@@ -11381,7 +11437,7 @@ impl Editor {
             return;
         }
         self.refresh_scenes();
-        let Some(&line) = self.doc.scene_lines.get(index) else {
+        let Some(&line) = self.doc.outline_lines.get(index) else {
             return;
         };
         let offset = self.doc.buffer.line_content_range(line).start;
@@ -14175,28 +14231,35 @@ impl Editor {
                     ),
             );
         }
-        // Document outline (M8 slice 3): the open document's scene headings.
-        // Clicking a row jumps to that scene; the caret's scene is marked.
+        // Document outline (M8 slice 3; M14b for Markdown/YAML). Fountain
+        // keeps its scene list, Markdown shows headings and YAML top-level
+        // keys. Clicking a row jumps to that source line; the caret's
+        // section is highlighted.
         if !self.doc.outline.is_empty() {
             let caret_line = self.doc.buffer.position_at(self.caret()).line;
-            let current_scene = scene_number_at(&self.doc.scene_lines, caret_line);
+            let current_outline = scene_number_at(&self.doc.outline_lines, caret_line);
+            let title_key = match self.doc.language.language {
+                LanguageId::Markdown => "panel.outline_title_sections",
+                LanguageId::Yaml => "panel.outline_title_keys",
+                _ => "panel.outline_title",
+            };
             panel = panel.child(
                 div()
                     .px_2()
                     .py_1()
                     .text_sm()
                     .text_color(rgb(theme::status_fg()))
-                    .child(self.tf(
-                        "panel.outline_title",
-                        &[("n", &self.doc.outline.len().to_string())],
-                    )),
+                    .child(self.tf(title_key, &[("n", &self.doc.outline.len().to_string())])),
             );
             let visible = OUTLINE_VISIBLE_ROWS.min(self.doc.outline.len());
             for (index, (_, heading)) in self.doc.outline.iter().take(visible).enumerate() {
-                let selected = current_scene == Some(index + 1);
+                let selected = current_outline == Some(index + 1);
+                let level = self.doc.outline_levels.get(index).copied().unwrap_or(1);
+                let indent = (level.saturating_sub(1) as f32) * 10.0;
                 panel = panel.child(
                     div()
-                        .id(("scene", index))
+                        .id(("outline", index))
+                        .ml(px(indent))
                         .px_2()
                         .py_1()
                         .text_sm()
@@ -14226,6 +14289,49 @@ impl Editor {
                             "panel.outline_more",
                             &[("n", &(self.doc.outline.len() - visible).to_string())],
                         )),
+                );
+            }
+        }
+        if !self.doc.language.diagnostics.is_empty() {
+            let total = self.doc.language.diagnostics.len();
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::git_modified_fg()))
+                    .child(self.tf("panel.diagnostics_title", &[("n", &total.to_string())])),
+            );
+            for (index, diagnostic) in self.doc.language.diagnostics.iter().take(4).enumerate() {
+                let color = match diagnostic.severity {
+                    DiagnosticSeverity::Error => theme::agent_err_fg(),
+                    DiagnosticSeverity::Warning => theme::git_modified_fg(),
+                    DiagnosticSeverity::Info => theme::status_fg(),
+                };
+                panel = panel.child(
+                    div()
+                        .id(("diagnostic", index))
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(color))
+                        .child(format!(
+                            "⚠ L{} · {}",
+                            diagnostic.line + 1,
+                            self.diagnostic_text(diagnostic)
+                        )),
+                );
+            }
+            if total > 4 {
+                panel = panel.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(
+                            self.tf("panel.diagnostics_more", &[("n", &(total - 4).to_string())]),
+                        ),
                 );
             }
         }
@@ -14905,6 +15011,68 @@ impl Editor {
                 )
             })
             .collect();
+        let language_dump = {
+            let report = &self.doc.language;
+            let outline = report
+                .outline
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{{\"kind\":\"{}\",\"level\":{},\"line\":{},\"title\":\"{}\"}}",
+                        item.kind.key(),
+                        item.level,
+                        item.line + 1,
+                        escape_json(&item.title)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let symbols = report
+                .symbols
+                .iter()
+                .take(200)
+                .map(|symbol| {
+                    let detail = symbol
+                        .detail
+                        .as_deref()
+                        .map(|detail| format!("\"{}\"", escape_json(detail)))
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"kind\":\"{}\",\"name\":\"{}\",\"line\":{},\"column\":{},\"detail\":{}}}",
+                        symbol.kind.key(),
+                        escape_json(&symbol.name),
+                        symbol.line + 1,
+                        symbol.column + 1,
+                        detail
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let diagnostics = report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    format!(
+                        "{{\"severity\":\"{}\",\"code\":\"{}\",\"message\":\"{}\",\"line\":{},\"column\":{},\"end_line\":{},\"end_column\":{}}}",
+                        diagnostic.severity.key(),
+                        escape_json(&diagnostic.code),
+                        escape_json(&diagnostic.message),
+                        diagnostic.line + 1,
+                        diagnostic.column + 1,
+                        diagnostic.end_line + 1,
+                        diagnostic.end_column + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"id\":\"{}\",\"outline\":[{}],\"symbols\":[{}],\"diagnostics\":[{}]}}",
+                report.language.key(),
+                outline,
+                symbols,
+                diagnostics
+            )
+        };
         let search_results: Vec<String> = self
             .search
             .hits
@@ -15326,7 +15494,7 @@ impl Editor {
                 "\"click\":{{\"x\":{},\"y\":{},\"line\":{},\"top\":{},\"item_h\":{},\"offset\":{}}},",
                 "\"document\":\"{}\",\"language\":\"{}\",\"preview\":{{\"active\":{},\"blocks\":{}}},\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
-                 \"outline\":[{}],\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
+                 \"outline\":[{}],\"language\":{},\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
                  \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
                  \"rename\":{},\"delete_prompt\":{},\"chat\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
@@ -15381,6 +15549,7 @@ impl Editor {
             export_dump,
             search_dump,
             outline_dump.join(","),
+            language_dump,
             tree_rows.join(","),
             entities_dump,
             self.doc
