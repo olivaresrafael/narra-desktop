@@ -11157,7 +11157,10 @@ impl Editor {
             .items_center()
             .whitespace_nowrap()
             .font_family(FONT_FAMILY)
-            .text_size(px(theme::text_size()));
+            .text_size(px(theme::text_size()))
+            // Match the editor rows: the default GPUI line box is taller than
+            // the 18 px row and `items_center` would push the diff text up.
+            .line_height(px(theme::line_height()));
         if ix == self.doc.diff.cursor {
             element = element.bg(rgba(theme::selection_bg()));
         } else if let Some(color) = bg {
@@ -15942,6 +15945,11 @@ impl Editor {
             .px_2()
             .font_family(FONT_FAMILY)
             .text_size(px(theme::text_size()))
+            // Keep the text line box equal to `theme::line_height()`. GPUI's
+            // default is 1.618× the font size (22.5 px at 14 pt), so cold
+            // rows measured taller than the 18 px hot/caret rows and selecting
+            // a line shifted its glyphs up when the row became fixed-height.
+            .line_height(px(theme::line_height()))
             .text_color(self.element_color(ix, text))
             .when(self.element_kind(ix) == Some(FountainKind::Lyric), |row| {
                 row.italic()
