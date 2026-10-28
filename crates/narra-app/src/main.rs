@@ -501,14 +501,16 @@ enum SettingsSection {
     Editor,
     Ai,
     Git,
+    Agents,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 4] = [
+    const ALL: [SettingsSection; 5] = [
         SettingsSection::General,
         SettingsSection::Editor,
         SettingsSection::Ai,
         SettingsSection::Git,
+        SettingsSection::Agents,
     ];
 
     fn i18n_key(self) -> &'static str {
@@ -517,6 +519,7 @@ impl SettingsSection {
             SettingsSection::Editor => "settings.section.editor",
             SettingsSection::Ai => "settings.section.ai",
             SettingsSection::Git => "settings.section.git",
+            SettingsSection::Agents => "settings.section.agents",
         }
     }
 }
@@ -548,6 +551,10 @@ struct SettingsState {
     github_token_input: String,
     github_token_present: bool,
     github_token_source: String,
+    /// Effective roles loaded for the Agentes tab (built-ins + packages +
+    /// project config). Read-only here; installation is file-based.
+    agents: Vec<roles::Role>,
+    agents_error: String,
 }
 
 impl std::fmt::Debug for SettingsState {
@@ -995,6 +1002,8 @@ fn short_id(id: &str) -> String {
 fn role_source_label(lang: Lang, source: &str) -> &'static str {
     match source {
         "project" => i18n::tr(lang, "role.project"),
+        "user_package" => i18n::tr(lang, "role.user_package"),
+        "project_package" => i18n::tr(lang, "role.project_package"),
         _ => i18n::tr(lang, "role.builtin"),
     }
 }
@@ -1978,6 +1987,7 @@ impl Editor {
         } else {
             self.app_settings.model.clone()
         };
+        let (agents, agents_error) = self.load_effective_agents();
         self.settings = Some(SettingsState {
             section: SettingsSection::General,
             provider,
@@ -2007,7 +2017,32 @@ impl Editor {
             github_token_input: String::new(),
             github_token_present: github_token_status().0,
             github_token_source: github_token_status().1,
+            agents,
+            agents_error,
         });
+        cx.notify();
+    }
+
+    /// Effective roles for the Agentes tab: built-ins, user packages,
+    /// project packages and `agents.yaml`. File-based installation only;
+    /// the tab is a read-only visibility surface.
+    fn load_effective_agents(&self) -> (Vec<roles::Role>, String) {
+        let Some(project) = self.project.as_ref() else {
+            return (Vec::new(), String::new());
+        };
+        match roles::load_roles_with_packages(project.root(), Some(&recent::config_dir())) {
+            Ok(agents) => (agents, String::new()),
+            Err(error) => (Vec::new(), error.to_string()),
+        }
+    }
+
+    fn reload_settings_agents(&mut self, cx: &mut Context<Self>) {
+        let (agents, agents_error) = self.load_effective_agents();
+        if let Some(state) = self.settings.as_mut() {
+            state.agents = agents;
+            state.agents_error = agents_error;
+            state.status.clear();
+        }
         cx.notify();
     }
 
@@ -2101,7 +2136,7 @@ impl Editor {
                     SettingsField::GitEmail,
                     SettingsField::GitHubToken,
                 ],
-                SettingsSection::General | SettingsSection::Editor => &[],
+                SettingsSection::General | SettingsSection::Editor | SettingsSection::Agents => &[],
             };
             if fields.is_empty() {
                 cx.notify();
@@ -2980,6 +3015,97 @@ impl Editor {
                         .text_color(rgb(theme::gutter_fg()))
                         .child(self.t("settings.git_hint")),
                 ),
+            SettingsSection::Agents => {
+                let mut body = div().flex().flex_col().gap_2().child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("settings.agents_hint")),
+                );
+                if !state.agents_error.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_color(rgb(theme::agent_err_fg()))
+                            .child(state.agents_error.clone()),
+                    );
+                } else if state.agents.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("settings.agents_empty")),
+                    );
+                } else {
+                    let mut list = div()
+                        .id("settings-agents-list")
+                        .max_h(px(360.0))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_1();
+                    for (index, role) in state.agents.iter().enumerate() {
+                        let version = role
+                            .version
+                            .as_deref()
+                            .map(|version| format!("v{version}"))
+                            .unwrap_or_else(|| "—".to_string());
+                        list = list.child(
+                            div()
+                                .id(("settings-agent", index))
+                                .p_2()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .border_1()
+                                .border_color(rgb(theme::explorer_border()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_color(rgb(theme::default_fg()))
+                                                .child(format!("{} · {}", role.name, role.id)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(theme::gutter_fg()))
+                                                .child(version),
+                                        ),
+                                )
+                                .child(div().text_xs().text_color(rgb(theme::status_fg())).child(
+                                    format!(
+                                        "{} · {} · {}",
+                                        role_source_label(self.lang, role.origin_key()),
+                                        self.t("role.trust.instructions"),
+                                        role.tasks.join(", ")
+                                    ),
+                                ))
+                                .when(role.description.is_some(), |card| {
+                                    card.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::gutter_fg()))
+                                            .child(role.description.clone().unwrap_or_default()),
+                                    )
+                                }),
+                        );
+                    }
+                    body = body.child(list);
+                }
+                body.child(
+                    div()
+                        .id("settings-agents-reload")
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(theme::status_bg()))
+                        .text_color(rgb(theme::status_fg()))
+                        .cursor_pointer()
+                        .child(self.t("settings.agents_reload"))
+                        .on_click(cx.listener(|this, _, _, cx| this.reload_settings_agents(cx))),
+                )
+            }
         };
 
         div()
@@ -7912,6 +8038,7 @@ impl Editor {
             // from non-key paths, so it opens the modal state directly.
             let provider = self.app_settings.provider;
             let (key_present, key_source) = provider_key_status(provider);
+            let (agents, agents_error) = self.load_effective_agents();
             self.settings = Some(SettingsState {
                 section: SettingsSection::Git,
                 provider,
@@ -7944,6 +8071,8 @@ impl Editor {
                 github_token_input: String::new(),
                 github_token_present: github_token_status().0,
                 github_token_source: github_token_status().1,
+                agents,
+                agents_error,
             });
         } else if let Some(settings) = self.settings.as_mut() {
             settings.section = SettingsSection::Git;
@@ -10939,7 +11068,11 @@ impl Editor {
         // editor-reviewer role as configured in `agents.yaml`. A broken
         // role config refuses the run explicitly — never a silent
         // fallback to the built-in persona.
-        let role = match roles::resolve_default(Path::new(&root), SceneReviewTask::KIND) {
+        let role = match roles::resolve_default_with_packages(
+            Path::new(&root),
+            Some(&recent::config_dir()),
+            SceneReviewTask::KIND,
+        ) {
             Ok(role) => role,
             Err(error) => {
                 self.notice =
@@ -11052,7 +11185,11 @@ impl Editor {
         // The configured role (M6 slice 7): edits run under the writer
         // role as configured in `agents.yaml`; a broken config refuses the
         // run explicitly instead of silently changing the persona.
-        let role = match roles::resolve_default(Path::new(&root), SceneEditTask::KIND) {
+        let role = match roles::resolve_default_with_packages(
+            Path::new(&root),
+            Some(&recent::config_dir()),
+            SceneEditTask::KIND,
+        ) {
             Ok(role) => role,
             Err(error) => {
                 self.notice =
@@ -15175,7 +15312,8 @@ impl Editor {
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
                  \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\",\
-                 \"github_key_present\":{},\"github_key_source\":\"{}\"}}",
+                 \"github_key_present\":{},\"github_key_source\":\"{}\",\
+                 \"agents\":{},\"agents_error\":\"{}\"}}",
                 state.provider.key(),
                 escape_json(&state.model),
                 escape_json(&state.base_url),
@@ -15201,6 +15339,8 @@ impl Editor {
                 ),
                 state.github_token_present,
                 escape_json(&state.github_token_source),
+                state.agents.len(),
+                escape_json(&state.agents_error),
             )
         } else {
             format!(
@@ -15210,7 +15350,8 @@ impl Editor {
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
                  \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\",\
-                 \"github_key_present\":{},\"github_key_source\":\"{}\"}}",
+                 \"github_key_present\":{},\"github_key_source\":\"{}\",\
+                 \"agents\":0,\"agents_error\":\"\"}}",
                 self.agent_settings.provider.key(),
                 escape_json(&self.agent_settings.model),
                 escape_json(&self.agent_settings.base_url),

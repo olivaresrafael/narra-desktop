@@ -156,6 +156,39 @@ event and in the final output's `data.tools` audit (decision + outcome),
 including the denials: the model sees why it was refused, and the audit is
 the record of what actually ran — not the model's claims.
 
+### Agent packages (M15)
+
+Agents can be extended without changing core code. A package is a directory
+with one `agent.yaml`; only instruction-only packages are accepted in this
+version (`trust: tools` is rejected):
+
+```yaml
+schema_version: 1
+api_version: 1
+id: documentalista
+name: Documentalista
+version: 1.0.0
+description: Contrasta datos y fuentes del proyecto.
+instructions: |
+  Contrastas datos y citas siempre la fuente concreta.
+tasks:
+  - scene_review
+trust: instructions
+```
+
+- Project scope: `<project>/.narra/agents/<id>/agent.yaml`.
+- User scope: `<user-config>/agents/<id>/agent.yaml` (default
+  `~/Library/Application Support/Narra/agents`; override the base with
+  `NARRA_CONFIG_DIR`).
+- Precedence: built-in < user package < project package < `<project>/agents.yaml`.
+- Inspect effective roles (including origin, version and trust):
+
+```sh
+cargo run -p narra-harness -- roles <project-root> --user-dir <config-dir>
+```
+
+The desktop surfaces the same list read-only in **Ajustes → Agentes**.
+
 ### GitHub provider (M5 slices 1–3)
 
 Remote provider integration starts with GitHub (D-018). The token is a

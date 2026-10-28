@@ -14,7 +14,7 @@
 //!   narra-harness brief <project-root> [options]
 //!   narra-harness propose <project-root> --scene <n> --instruction <texto> [options]
 //!   narra-harness review <project-root> --scene <n> [--focus <texto>] [options]
-//!   narra-harness roles <project-root>
+//!   narra-harness roles <project-root> [--user-dir <config-dir>]
 //!   narra-harness export <project-root> [--format fountain|pdf] [--out <ruta>]
 //!   narra-harness proposals <project-root> [list]
 //!   narra-harness proposals <project-root> show <proposal-id>
@@ -104,7 +104,7 @@ fn main() -> ExitCode {
 
     // Role listing: local config only, no adapter, no network.
     if let Command::Roles { root } = &parsed.command {
-        return run_roles(root);
+        return run_roles(root, parsed.user_dir.as_deref());
     }
 
     // Export is local-only (M7): no token, no network, no model adapter.
@@ -175,9 +175,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let user_dir = parsed.user_dir.clone();
     let result = match parsed.command {
         Command::Brief { root, role } => {
-            match resolve_task_role(&root, role.as_deref(), ProjectBriefTask::KIND) {
+            match resolve_task_role(
+                &root,
+                role.as_deref(),
+                ProjectBriefTask::KIND,
+                user_dir.as_deref(),
+            ) {
                 Ok(role) => ProjectBriefTask::new(root).with_role(role).run(
                     adapter.as_ref(),
                     &options,
@@ -191,7 +197,12 @@ fn main() -> ExitCode {
             scene,
             instruction,
             role,
-        } => match resolve_task_role(&root, role.as_deref(), SceneEditTask::KIND) {
+        } => match resolve_task_role(
+            &root,
+            role.as_deref(),
+            SceneEditTask::KIND,
+            user_dir.as_deref(),
+        ) {
             Ok(role) => SceneEditTask::new(root, scene, instruction)
                 .with_role(role)
                 .run(adapter.as_ref(), &options, &mut emit),
@@ -202,7 +213,12 @@ fn main() -> ExitCode {
             scene,
             focus,
             role,
-        } => match resolve_task_role(&root, role.as_deref(), SceneReviewTask::KIND) {
+        } => match resolve_task_role(
+            &root,
+            role.as_deref(),
+            SceneReviewTask::KIND,
+            user_dir.as_deref(),
+        ) {
             Ok(role) => SceneReviewTask::new(root, scene, focus)
                 .with_role(role)
                 .run(adapter.as_ref(), &options, &mut emit),
@@ -286,9 +302,9 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "uso: narra-harness brief <project-root> [--role <id>] [--timeout <seg>] [--latency <ms>]
        [--adapter mock|openai-compat] [--base-url <url>] [--model <nombre>] [--stream]
-     narra-harness propose <project-root> --scene <n> --instruction <texto> [--role <id>] [mismas opciones]
-     narra-harness review <project-root> --scene <n> [--focus <texto>] [--role <id>] [mismas opciones]
-     narra-harness roles <project-root>
+     narra-harness propose <project-root> --scene <n> --instruction <texto> [--role <id>] [--user-dir <config-dir>] [mismas opciones]
+     narra-harness review <project-root> --scene <n> [--focus <texto>] [--role <id>] [--user-dir <config-dir>] [mismas opciones]
+     narra-harness roles <project-root> [--user-dir <config-dir>]
      narra-harness export <project-root> [--format fountain|pdf] [--out <ruta>]
      narra-harness proposals <project-root> [list]
      narra-harness proposals <project-root> show <id>
@@ -320,6 +336,9 @@ struct Parsed {
     adapter: AdapterChoice,
     stream: bool,
     provider: ProviderOptions,
+    /// User config directory for instruction-only agent packages
+    /// (`<dir>/agents/<id>/agent.yaml`). `None` disables user packages.
+    user_dir: Option<String>,
 }
 
 /// Options for the `provider` subcommands.
@@ -590,6 +609,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut instruction: Option<String> = None;
     let mut focus: Option<String> = None;
     let mut role: Option<String> = None;
+    let mut user_dir: Option<String> = None;
     let mut hunks: Option<Vec<usize>> = None;
     let mut export_format: Option<ExportFormat> = None;
     let mut export_out: Option<String> = None;
@@ -685,6 +705,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--role" => {
                 let value = iter.next().ok_or("--role requiere un valor")?;
                 role = Some((*value).clone());
+            }
+            "--user-dir" => {
+                let value = iter.next().ok_or("--user-dir requiere un valor")?;
+                user_dir = Some((*value).clone());
             }
             "--hunks" => {
                 let value = iter.next().ok_or("--hunks requiere un valor")?;
@@ -1073,6 +1097,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         adapter,
         stream,
         provider: ProviderOptions { api_url },
+        user_dir,
     })
 }
 
@@ -1120,10 +1145,12 @@ fn resolve_task_role(
     root: &str,
     requested: Option<&str>,
     task_kind: &str,
+    user_dir: Option<&str>,
 ) -> Result<Role, AgentError> {
+    let user_config = user_dir.map(Path::new);
     let resolved = match requested {
-        Some(id) => roles::resolve_role(Path::new(root), id),
-        None => roles::resolve_default(Path::new(root), task_kind),
+        Some(id) => roles::resolve_role_with_packages(Path::new(root), user_config, id),
+        None => roles::resolve_default_with_packages(Path::new(root), user_config, task_kind),
     };
     resolved.map_err(AgentError::Roles)
 }
@@ -1202,8 +1229,8 @@ fn run_export(root: &str, format: ExportFormat, out: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_roles(root: &str) -> ExitCode {
-    match roles::load_roles(Path::new(root)) {
+fn run_roles(root: &str, user_dir: Option<&str>) -> ExitCode {
+    match roles::load_roles_with_packages(Path::new(root), user_dir.map(Path::new)) {
         Ok(effective) => match serde_json::to_string_pretty(&effective) {
             Ok(json) => {
                 println!("{json}");

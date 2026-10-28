@@ -27,6 +27,8 @@ use thiserror::Error;
 
 use crate::document::{self, DocumentError};
 
+use super::package::{self, AgentPackage, PackageError, PackageOrigin, PackageTrust};
+
 /// The project-level role configuration file (relative to the root).
 pub const CONFIG_PATH: &str = "agents.yaml";
 
@@ -53,6 +55,8 @@ pub enum RolesError {
     Parse(String),
     #[error(transparent)]
     Document(#[from] DocumentError),
+    #[error(transparent)]
+    Package(#[from] PackageError),
 }
 
 /// Where the effective role came from (auditable in dumps and `roles`
@@ -61,7 +65,12 @@ pub enum RolesError {
 #[serde(rename_all = "snake_case")]
 pub enum RoleOrigin {
     Builtin,
+    /// Existing `agents.yaml` at the project root.
     Project,
+    /// Instruction-only package under the user config directory.
+    UserPackage,
+    /// Instruction-only package under `<project>/.narra/agents`.
+    ProjectPackage,
 }
 
 /// A configured role: persona + permission profile (+ optional model hint).
@@ -77,7 +86,15 @@ pub struct Role {
     pub tasks: Vec<String>,
     /// Optional provider/model hint — never a credential.
     pub model: Option<String>,
-    /// Whether this effective role is built in or comes from `agents.yaml`.
+    /// Optional package description (project roles keep it absent).
+    pub description: Option<String>,
+    /// Package version, when the role came from a package.
+    pub version: Option<String>,
+    /// Trust level. Only `instructions` is executable today; packages that
+    /// request tools are rejected during discovery.
+    pub trust: PackageTrust,
+    /// Whether this effective role is built in, comes from `agents.yaml` or
+    /// from a project/user package.
     pub origin: RoleOrigin,
 }
 
@@ -92,6 +109,8 @@ impl Role {
         match self.origin {
             RoleOrigin::Builtin => "builtin",
             RoleOrigin::Project => "project",
+            RoleOrigin::UserPackage => "user_package",
+            RoleOrigin::ProjectPackage => "project_package",
         }
     }
 
@@ -149,6 +168,9 @@ pub fn builtin_roles() -> Vec<Role> {
         instructions: instructions.to_string(),
         tasks: tasks.iter().map(|task| task.to_string()).collect(),
         model: None,
+        description: None,
+        version: None,
+        trust: PackageTrust::Instructions,
         origin: RoleOrigin::Builtin,
     })
     .collect()
@@ -172,8 +194,29 @@ pub fn role_by_id<'a>(roles: &'a [Role], id: &str) -> Option<&'a Role> {
 
 /// Effective roles for a project: the built-ins, overridden and extended
 /// by `<root>/agents.yaml` when it exists. A missing file is not an error.
+/// Package discovery is opt-in through [`load_roles_with_packages`].
 pub fn load_roles(root: &Path) -> Result<Vec<Role>, RolesError> {
+    load_roles_with_packages(root, None)
+}
+
+/// Effective roles including instruction-only packages.
+///
+/// Precedence (later wins): built-in < user package < project package <
+/// `<root>/agents.yaml`. Package problems are explicit errors; a missing
+/// package directory is simply empty.
+pub fn load_roles_with_packages(
+    root: &Path,
+    user_config_dir: Option<&Path>,
+) -> Result<Vec<Role>, RolesError> {
     let mut roles = builtin_roles();
+    if let Some(config_dir) = user_config_dir {
+        let user_dir = package::user_packages_dir(config_dir);
+        let packages = package::discover(&user_dir, "", PackageOrigin::User)?;
+        merge_packages(&mut roles, packages);
+    }
+    let packages = package::discover(root, package::PROJECT_PACKAGES_DIR, PackageOrigin::Project)?;
+    merge_packages(&mut roles, packages);
+
     let text = match document::read_document(root, CONFIG_PATH) {
         Ok(text) => text,
         Err(DocumentError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -190,9 +233,19 @@ pub fn load_roles(root: &Path) -> Result<Vec<Role>, RolesError> {
     Ok(roles)
 }
 
-/// The role with `id` as configured in `root` (built-in or project).
+/// The role with `id` as configured in `root` (built-in, project config or
+/// project package).
 pub fn resolve_role(root: &Path, id: &str) -> Result<Role, RolesError> {
-    let roles = load_roles(root)?;
+    resolve_role_with_packages(root, None, id)
+}
+
+/// The role with `id`, including user packages when `user_agents_dir` is set.
+pub fn resolve_role_with_packages(
+    root: &Path,
+    user_config_dir: Option<&Path>,
+    id: &str,
+) -> Result<Role, RolesError> {
+    let roles = load_roles_with_packages(root, user_config_dir)?;
     role_by_id(&roles, id).cloned().ok_or_else(|| {
         RolesError::Parse(format!(
             "unknown role `{id}` (known: {})",
@@ -208,9 +261,42 @@ pub fn resolve_role(root: &Path, id: &str) -> Result<Role, RolesError> {
 /// The default role for `task_kind` as configured in `root`. Explicit
 /// errors for a broken config or a missing role — never a silent fallback.
 pub fn resolve_default(root: &Path, task_kind: &str) -> Result<Role, RolesError> {
+    resolve_default_with_packages(root, None, task_kind)
+}
+
+/// The default role for `task_kind`, including user packages when set.
+pub fn resolve_default_with_packages(
+    root: &Path,
+    user_config_dir: Option<&Path>,
+    task_kind: &str,
+) -> Result<Role, RolesError> {
     let id = default_role_for(task_kind)
         .ok_or_else(|| RolesError::Parse(format!("no default role for task kind `{task_kind}`")))?;
-    resolve_role(root, id)
+    resolve_role_with_packages(root, user_config_dir, id)
+}
+
+/// Convert discovered packages into roles and apply precedence.
+fn merge_packages(roles: &mut Vec<Role>, packages: Vec<AgentPackage>) {
+    for package in packages {
+        let role = Role {
+            id: package.id,
+            name: package.name,
+            instructions: package.instructions,
+            tasks: package.tasks,
+            model: package.model,
+            description: package.description,
+            version: Some(package.version),
+            trust: package.trust,
+            origin: match package.origin {
+                PackageOrigin::User => RoleOrigin::UserPackage,
+                PackageOrigin::Project => RoleOrigin::ProjectPackage,
+            },
+        };
+        match roles.iter_mut().find(|existing| existing.id == role.id) {
+            Some(existing) => *existing = role,
+            None => roles.push(role),
+        }
+    }
 }
 
 /// Apply `<root>/agents.yaml` contents on top of `roles`: an entry whose
@@ -355,6 +441,9 @@ fn merge_project_roles(roles: &mut Vec<Role>, text: &str) -> Result<(), RolesErr
             instructions: instructions.to_string(),
             tasks,
             model,
+            description: None,
+            version: None,
+            trust: PackageTrust::Instructions,
             origin: RoleOrigin::Project,
         };
         match builtin_ix {
@@ -642,6 +731,79 @@ mod tests {
         assert!(error.to_string().contains("no default role"), "{error}");
     }
 
+    fn package_text(id: &str, name: &str) -> String {
+        format!(
+            "schema_version: 1\napi_version: 1\nid: {id}\nname: {name}\nversion: 2.0.0\ndescription: Paquete de prueba.\ninstructions: Revisa con criterio.\ntasks:\n  - scene_review\ntrust: instructions\n"
+        )
+    }
+
+    #[test]
+    fn project_and_user_packages_merge_with_explicit_precedence() {
+        let project = project_empty();
+        let user = project_empty();
+        let user_dir = user.path().join("agents/documentalista");
+        std::fs::create_dir_all(&user_dir).expect("user dir");
+        std::fs::write(
+            user_dir.join("agent.yaml"),
+            package_text("documentalista", "Usuario"),
+        )
+        .expect("user package");
+        let project_dir = project.path().join(".narra/agents/documentalista");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            project_dir.join("agent.yaml"),
+            package_text("documentalista", "Proyecto"),
+        )
+        .expect("project package");
+
+        let roles = load_roles_with_packages(project.path(), Some(user.path())).expect("packages");
+        let role = role_by_id(&roles, "documentalista").expect("package role");
+        assert_eq!(role.name, "Proyecto");
+        assert_eq!(role.origin, RoleOrigin::ProjectPackage);
+        assert_eq!(role.version.as_deref(), Some("2.0.0"));
+        assert_eq!(role.trust, PackageTrust::Instructions);
+        assert_eq!(role.description.as_deref(), Some("Paquete de prueba."));
+
+        std::fs::write(
+            project.path().join(CONFIG_PATH),
+            "roles:\n  - id: documentalista\n    name: Config\n    instructions: Manda el archivo.\n    tasks: [scene_review]\n",
+        )
+        .expect("agents.yaml");
+        let roles = load_roles_with_packages(project.path(), Some(user.path())).expect("config");
+        let role = role_by_id(&roles, "documentalista").expect("config role");
+        assert_eq!(role.name, "Config");
+        assert_eq!(role.origin, RoleOrigin::Project);
+        assert_eq!(role.version, None);
+    }
+
+    #[test]
+    fn a_user_package_can_add_a_role_without_project_files() {
+        let project = project_empty();
+        let user = project_empty();
+        let dir = user.path().join("agents/pep");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("agent.yaml"), package_text("pep", "Pep")).expect("package");
+        let roles = load_roles_with_packages(project.path(), Some(user.path())).expect("user pkg");
+        let role = role_by_id(&roles, "pep").expect("pep");
+        assert_eq!(role.origin, RoleOrigin::UserPackage);
+        assert!(role.allows("scene_review"));
+    }
+
+    #[test]
+    fn packages_requesting_tools_are_rejected() {
+        let project = project_empty();
+        let user = project_empty();
+        let dir = user.path().join("agents/runner");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("agent.yaml"),
+            package_text("runner", "Runner").replace("trust: instructions", "trust: tools"),
+        )
+        .expect("package");
+        let error = load_roles_with_packages(project.path(), Some(user.path()))
+            .expect_err("tools rejected");
+        assert!(error.to_string().contains("executable tools"), "{error}");
+    }
     #[test]
     fn system_with_appends_the_persona_to_the_fixed_base() {
         let roles = builtin_roles();

@@ -17,6 +17,7 @@ pub mod brief;
 pub mod chat;
 pub mod mock;
 pub mod openai_compat;
+pub mod package;
 pub mod proposal;
 pub mod roles;
 mod scene;
@@ -33,6 +34,9 @@ pub use chat::{
 pub use mock::MockAdapter;
 pub use openai_compat::{
     LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig, fetch_model_ids,
+};
+pub use package::{
+    AgentPackage, PACKAGE_FILE, PROJECT_PACKAGES_DIR, PackageError, PackageOrigin, PackageTrust,
 };
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use roles::{Role, RoleOrigin, RolesError};

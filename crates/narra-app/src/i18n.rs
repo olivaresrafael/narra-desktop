@@ -823,6 +823,23 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("settings.section.editor", "Editor", "Editor"),
     ("settings.section.ai", "AI", "IA"),
     ("settings.section.git", "Versions", "Versiones"),
+    ("settings.section.agents", "Agents", "Agentes"),
+    (
+        "settings.agents_hint",
+        "Instruction-only packages from .narra/agents (project) and the user config agents/ folder. Executable tools are not supported yet.",
+        "Paquetes de solo instrucciones desde .narra/agents (proyecto) y la carpeta agents/ de la configuración de usuario. Los tools ejecutables aún no están soportados.",
+    ),
+    (
+        "settings.agents_empty",
+        "No project open or no agents installed.",
+        "No hay un proyecto abierto o no hay agentes instalados.",
+    ),
+    ("settings.agents_reload", "Reload", "Recargar"),
+    (
+        "role.trust.instructions",
+        "instructions only",
+        "solo instrucciones",
+    ),
     ("settings.language", "Language", "Idioma"),
     ("settings.language.system", "System", "Sistema"),
     ("settings.language.english", "English", "English"),
@@ -1629,6 +1646,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("role.project", "project", "proyecto"),
     ("role.builtin", "builtin", "integrado"),
+    ("role.user_package", "user package", "paquete de usuario"),
+    (
+        "role.project_package",
+        "project package",
+        "paquete del proyecto",
+    ),
     ("panel.sources", "Sources ({n})", "Fuentes ({n})"),
     (
         "panel.review_hint",
