@@ -324,6 +324,38 @@ pub fn create_project(
     })
 }
 
+/// Starter documents for the New Project **basic template** (M16 slice 8,
+/// D-044). Every file is create-only: an existing file is an explicit error
+/// and is never overwritten. The entity folders match the bible layout.
+pub fn seed_basic_template(root: &Path, primary_language: &str) -> Result<(), ProjectError> {
+    let (premise, outline) = basic_template_documents(primary_language);
+    document::create_document(root, "bible/premise.md", premise)?;
+    document::create_document(root, "structure/outline.md", outline)?;
+    for dir in ["bible/characters", "bible/locations", "bible/objects"] {
+        fs::create_dir_all(root.join(dir)).map_err(|source| ProjectError::Io {
+            path: root.join(dir),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Localized starter files for [`seed_basic_template`]. Unknown languages
+/// fall back to English, matching the manifest's English on-disk convention.
+pub fn basic_template_documents(primary_language: &str) -> (&'static str, &'static str) {
+    if primary_language == "es" {
+        (
+            "# Premisa\n\nEscribe aquí la premisa de la historia: quién, qué quiere y qué se lo impide.\n",
+            "# Escaleta\n\n## Acto I\n\n- Presentación del mundo y del protagonista.\n\n## Acto II\n\n- Conflicto y punto medio.\n\n## Acto III\n\n- Resolución.\n",
+        )
+    } else {
+        (
+            "# Premise\n\nWrite the story premise here: who wants what, and what stands in the way.\n",
+            "# Outline\n\n## Act I\n\n- Introduce the world and the protagonist.\n\n## Act II\n\n- Conflict and midpoint.\n\n## Act III\n\n- Resolution.\n",
+        )
+    }
+}
+
 /// Open an existing project: `project.yaml` must exist and validate.
 ///
 /// Validation failures are surfaced as-is; the manifest is never rewritten.
@@ -377,6 +409,33 @@ mod tests {
         // No Spanish directory names on disk (D-017).
         assert!(!root.join("guion").exists());
         assert!(!root.join("notas").exists());
+    }
+
+    #[test]
+    fn basic_template_seeds_localized_docs_and_never_overwrites() {
+        let root = temp_root();
+        create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
+        seed_basic_template(&root, "es").expect("seed");
+        let premise = std::fs::read_to_string(root.join("bible/premise.md")).expect("premise");
+        assert!(premise.starts_with("# Premisa"), "{premise}");
+        assert!(root.join("structure/outline.md").is_file());
+        assert!(root.join("bible/locations").is_dir());
+
+        let error = seed_basic_template(&root, "es").expect_err("no overwrite");
+        assert!(error.to_string().contains("premise.md"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("bible/premise.md")).expect("premise"),
+            premise
+        );
+    }
+
+    #[test]
+    fn basic_template_uses_english_for_en_or_unknown_languages() {
+        let (premise, outline) = basic_template_documents("en");
+        assert!(premise.contains("Premise"), "{premise}");
+        assert!(outline.contains("Outline"), "{outline}");
+        let (fallback, _) = basic_template_documents("fr");
+        assert!(fallback.contains("Premise"), "{fallback}");
     }
 
     #[test]

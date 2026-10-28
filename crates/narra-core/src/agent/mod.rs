@@ -20,6 +20,7 @@ pub mod openai_compat;
 pub mod package;
 pub mod proposal;
 pub mod roles;
+pub mod scaffold;
 mod scene;
 pub mod scene_edit;
 pub mod scene_review;
@@ -40,6 +41,7 @@ pub use package::{
 };
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use roles::{Role, RoleOrigin, RolesError};
+pub use scaffold::{ProjectScaffoldTask, ScaffoldError, ScaffoldFile, ScaffoldPlan, write_plan};
 pub use scene_edit::SceneEditTask;
 pub use scene_review::SceneReviewTask;
 pub use tool_loop::ToolLoopTask;

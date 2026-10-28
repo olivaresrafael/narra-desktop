@@ -16,13 +16,30 @@ use crate::{FONT_FAMILY, theme};
 /// Paint a derived Markdown document inside an independently scrollable
 /// read-only surface.
 pub fn render(document: &MarkdownDocument, lang: Lang) -> AnyElement {
-    let mut content = div()
-        .w_full()
-        .max_w(px(820.0))
-        .flex()
-        .flex_col()
-        .px_6()
-        .py_6();
+    div()
+        .id("markdown-preview")
+        .size_full()
+        .overflow_y_scroll()
+        .bg(rgb(theme::bg()))
+        .child(
+            div().w_full().flex().justify_center().child(
+                div()
+                    .w_full()
+                    .max_w(px(820.0))
+                    .px_6()
+                    .py_6()
+                    .child(blocks(document, lang)),
+            ),
+        )
+        .into_any_element()
+}
+
+/// The block column without the preview's scroll container, padding or max
+/// width. Chat messages reuse it so assistant answers render as Markdown
+/// inside their own card (M16 slice 5); the caller scopes the element ids by
+/// putting the result under an element with its own id.
+pub fn blocks(document: &MarkdownDocument, lang: Lang) -> Div {
+    let mut content = div().w_full().flex().flex_col();
     if document.blocks.is_empty() {
         content = content.child(
             div()
@@ -34,13 +51,7 @@ pub fn render(document: &MarkdownDocument, lang: Lang) -> AnyElement {
             content = content.child(render_block(block, index));
         }
     }
-    div()
-        .id("markdown-preview")
-        .size_full()
-        .overflow_y_scroll()
-        .bg(rgb(theme::bg()))
-        .child(div().w_full().flex().justify_center().child(content))
-        .into_any_element()
+    content
 }
 
 fn render_block(block: &Block, index: usize) -> Div {

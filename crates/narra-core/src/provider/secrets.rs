@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Keychain service name for all Nara-stored secrets. Overridable via
 /// environment for tests (isolated items that cannot collide with, or
@@ -179,6 +180,126 @@ impl SecretStore for MemorySecretStore {
     }
 }
 
+/// One cached answer per account.
+#[derive(Clone)]
+enum CachedEntry {
+    Present(String),
+    Absent,
+    Failed(SecretError),
+}
+
+/// Session-scoped read-through cache in front of another [`SecretStore`].
+///
+/// macOS asks for keychain access again whenever the requesting binary is not
+/// the one the item trusts. Unsigned and ad-hoc development builds change
+/// identity on every compile, and the app used to read the same accounts
+/// several times per flow. This cache reaches the wrapped store at most once
+/// per account for the life of the process, caches misses and failures too,
+/// updates the cache on writes, and lets callers [`Self::invalidate`] an
+/// account for an explicit retry.
+///
+/// The cache holds the secret in memory for the session. It never writes it to
+/// disk, argv, logs or errors, and `Debug` reports counts only.
+pub struct CachedSecretStore {
+    inner: Box<dyn SecretStore>,
+    entries: Mutex<BTreeMap<String, CachedEntry>>,
+    reads: AtomicUsize,
+}
+
+impl CachedSecretStore {
+    pub fn new(inner: Box<dyn SecretStore>) -> Self {
+        Self {
+            inner,
+            entries: Mutex::new(BTreeMap::new()),
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of reads that reached the wrapped store. The app exposes it in
+    /// its dump to prove that a flow does not re-read secrets.
+    pub fn read_count(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// The cached answer for `account` without reading the store. `None` means
+    /// the account has not been read yet in this session.
+    pub fn peek(&self, account: &str) -> Option<Result<Option<String>, SecretError>> {
+        let entries = self.entries.lock().ok()?;
+        entries.get(account).map(|entry| match entry {
+            CachedEntry::Present(secret) => Ok(Some(secret.clone())),
+            CachedEntry::Absent => Ok(None),
+            CachedEntry::Failed(error) => Err(error.clone()),
+        })
+    }
+
+    /// Forgets the cached answer so the next read reaches the store again.
+    pub fn invalidate(&self, account: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(account);
+        }
+    }
+}
+
+impl fmt::Debug for CachedSecretStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cached = self
+            .entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        f.debug_struct("CachedSecretStore")
+            .field("cached_accounts", &cached)
+            .field("reads", &self.read_count())
+            .finish()
+    }
+}
+
+impl SecretStore for CachedSecretStore {
+    fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+        // The lock is held across the read on purpose: two threads asking for
+        // the same account must not each trigger an OS prompt. Accounts are
+        // few and reads are rare, so serializing them is the safer trade.
+        let mut entries = self.entries.lock().map_err(|_| SecretError::Other {
+            detail: "secret cache poisoned".to_string(),
+        })?;
+        if let Some(entry) = entries.get(account) {
+            return match entry {
+                CachedEntry::Present(secret) => Ok(Some(secret.clone())),
+                CachedEntry::Absent => Ok(None),
+                CachedEntry::Failed(error) => Err(error.clone()),
+            };
+        }
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.get(account);
+        let entry = match &result {
+            Ok(Some(secret)) => CachedEntry::Present(secret.clone()),
+            Ok(None) => CachedEntry::Absent,
+            Err(error) => CachedEntry::Failed(error.clone()),
+        };
+        entries.insert(account.to_string(), entry);
+        result
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<(), SecretError> {
+        self.inner.set(account, secret)?;
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                account.to_string(),
+                CachedEntry::Present(secret.to_string()),
+            );
+        }
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), SecretError> {
+        self.inner.delete(account)?;
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(account.to_string(), CachedEntry::Absent);
+        }
+        Ok(())
+    }
+}
+
 /// Resolve the GitHub token: Keychain first, `GITHUB_TOKEN` env fallback
 /// (the caller passes the env value so resolution stays testable without
 /// mutating the process environment). Empty values are treated as absent.
@@ -214,6 +335,7 @@ pub fn github_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn memory_store_roundtrip_and_idempotent_delete() {
@@ -284,5 +406,122 @@ mod tests {
         let store = MemorySecretStore::default();
         let token = github_token(&store, None).expect("resolve");
         assert_eq!(token, None);
+    }
+
+    /// Store double that counts reads and can simulate a denied prompt.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemorySecretStore,
+        reads: Arc<AtomicUsize>,
+        fail: Arc<Mutex<bool>>,
+    }
+
+    impl SecretStore for CountingStore {
+        fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if *self.fail.lock().expect("fail flag") {
+                return Err(SecretError::AccessDenied {
+                    detail: "prompt denied".to_string(),
+                });
+            }
+            self.inner.get(account)
+        }
+
+        fn set(&self, account: &str, secret: &str) -> Result<(), SecretError> {
+            self.inner.set(account, secret)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.inner.delete(account)
+        }
+    }
+
+    #[test]
+    fn repeated_reads_reach_the_store_once() {
+        let store = CountingStore::default();
+        store.inner.set("opencode", "sk-test").expect("seed");
+        let reads = store.reads.clone();
+        let cache = CachedSecretStore::new(Box::new(store));
+
+        assert_eq!(
+            cache.get("opencode").expect("first"),
+            Some("sk-test".to_string())
+        );
+        assert_eq!(
+            cache.get("opencode").expect("second"),
+            Some("sk-test".to_string())
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.read_count(), 1);
+    }
+
+    #[test]
+    fn misses_and_failures_are_cached_and_invalidate_retries() {
+        let store = CountingStore::default();
+        let reads = store.reads.clone();
+        let fail = store.fail.clone();
+        let cache = CachedSecretStore::new(Box::new(store));
+
+        assert_eq!(cache.get("github").expect("miss"), None);
+        assert_eq!(cache.get("github").expect("cached miss"), None);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        *fail.lock().expect("fail flag") = true;
+        cache.invalidate("github");
+        let error = cache.get("github").expect_err("failure");
+        assert!(matches!(error, SecretError::AccessDenied { .. }), "{error}");
+        cache.get("github").expect_err("cached failure");
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+        *fail.lock().expect("fail flag") = false;
+        cache.invalidate("github");
+        assert_eq!(cache.get("github").expect("retry"), None);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn writes_update_the_cache_without_reading() {
+        let store = CountingStore::default();
+        let reads = store.reads.clone();
+        let cache = CachedSecretStore::new(Box::new(store));
+
+        cache.set("opencode", "sk-new").expect("set");
+        assert_eq!(
+            cache.get("opencode").expect("cached write"),
+            Some("sk-new".to_string())
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+        cache.delete("opencode").expect("delete");
+        assert_eq!(cache.get("opencode").expect("cached delete"), None);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn peek_never_reads_and_reports_unknown_accounts() {
+        let store = CountingStore::default();
+        store.inner.set("github", "ghp_seed").expect("seed");
+        let reads = store.reads.clone();
+        let cache = CachedSecretStore::new(Box::new(store));
+
+        assert_eq!(cache.peek("github"), None);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            cache.get("github").expect("read"),
+            Some("ghp_seed".to_string())
+        );
+        assert_eq!(cache.peek("github"), Some(Ok(Some("ghp_seed".to_string()))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn debug_reports_counts_not_values() {
+        let cache = CachedSecretStore::new(Box::new(MemorySecretStore::default()));
+        cache.set("github", "ghp_debugleak").expect("set");
+        let printed = format!("{cache:?}");
+        assert!(!printed.contains("ghp_debugleak"), "{printed}");
+        assert!(printed.contains("cached_accounts"), "{printed}");
+        assert!(printed.contains("reads"), "{printed}");
     }
 }

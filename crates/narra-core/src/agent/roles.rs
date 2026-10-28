@@ -33,7 +33,12 @@ use super::package::{self, AgentPackage, PackageError, PackageOrigin, PackageTru
 pub const CONFIG_PATH: &str = "agents.yaml";
 
 /// Task kinds a permission profile may grant (`tasks` in the file).
-pub const TASK_KINDS: [&str; 3] = ["project_brief", "scene_review", "scene_edit"];
+pub const TASK_KINDS: [&str; 4] = [
+    "project_brief",
+    "scene_review",
+    "scene_edit",
+    "project_scaffold",
+];
 
 /// Bounds: a role file is small, human-edited configuration.
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -135,7 +140,7 @@ pub fn builtin_roles() -> Vec<Role> {
             "Coordinas el trabajo del proyecto: ordenas las prioridades, pides solo el \
              contexto necesario y devuelves orientación breve, concreta y accionable. No \
              reescribes archivos sin una instrucción explícita del usuario.",
-            &["project_brief"][..],
+            &["project_brief", "project_scaffold"][..],
         ),
         (
             "writer",
@@ -180,7 +185,7 @@ pub fn builtin_roles() -> Vec<Role> {
 /// one: coordinator → brief, writer → edit, editor-reviewer → review.
 pub fn default_role_for(task_kind: &str) -> Option<&'static str> {
     match task_kind {
-        "project_brief" => Some("coordinator"),
+        "project_brief" | "project_scaffold" => Some("coordinator"),
         "scene_edit" => Some("writer"),
         "scene_review" => Some("editor-reviewer"),
         _ => None,
@@ -540,7 +545,7 @@ mod tests {
         // Permission profiles: one task kind each, matching the mapping.
         assert_eq!(
             role_by_id(&roles, "coordinator").unwrap().tasks,
-            ["project_brief"]
+            ["project_brief", "project_scaffold"]
         );
         assert_eq!(role_by_id(&roles, "writer").unwrap().tasks, ["scene_edit"]);
         assert_eq!(
@@ -554,6 +559,7 @@ mod tests {
 
         // Default role per task kind (what the workspace resolves).
         assert_eq!(default_role_for("project_brief"), Some("coordinator"));
+        assert_eq!(default_role_for("project_scaffold"), Some("coordinator"));
         assert_eq!(default_role_for("scene_edit"), Some("writer"));
         assert_eq!(default_role_for("scene_review"), Some("editor-reviewer"));
         assert_eq!(default_role_for("nope"), None);

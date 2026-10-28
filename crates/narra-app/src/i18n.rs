@@ -395,7 +395,55 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Waiting for the folder in the system panel…",
         "Esperando la carpeta en el panel del sistema…",
     ),
-    ("newproject.create", "Create", "Crear"),
+    ("newproject.create", "Create project", "Crear proyecto"),
+    (
+        "newproject.choose_folder",
+        "Choose folder…",
+        "Elegir carpeta…",
+    ),
+    ("newproject.mode", "Project base:", "Base del proyecto:"),
+    (
+        "newproject.mode.template",
+        "Basic template",
+        "Plantilla básica",
+    ),
+    ("newproject.mode.ai", "Generate with AI", "Generar con IA"),
+    ("newproject.prompt", "Prompt:", "Prompt:"),
+    (
+        "newproject.prompt_hint",
+        "Describe the story you want to start.",
+        "Describe la historia que quieres empezar.",
+    ),
+    (
+        "newproject.ai_unavailable",
+        "Configure an AI provider in Settings to generate the project base.",
+        "Configura un proveedor de IA en Ajustes para generar la base del proyecto.",
+    ),
+    (
+        "newproject.generating",
+        "Generating the project base…",
+        "Generando la base del proyecto…",
+    ),
+    (
+        "newproject.prompt_required",
+        "Describe the project for the AI.",
+        "Describe el proyecto para la IA.",
+    ),
+    (
+        "newproject.plan",
+        "Review the files before creating the project.",
+        "Revisa los archivos antes de crear el proyecto.",
+    ),
+    (
+        "newproject.scaffold_failed",
+        "The AI could not generate the project base: {error}",
+        "La IA no pudo generar la base del proyecto: {error}",
+    ),
+    (
+        "newproject.write_failed",
+        "The project was created, but some generated files could not be written: {error}",
+        "El proyecto se creó, pero no se pudieron escribir algunos archivos generados: {error}",
+    ),
     ("newproject.cancel", "Cancel", "Cancelar"),
     (
         "newproject.invalid_title",
@@ -920,6 +968,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("settings.model", "Model:", "Modelo:"),
     ("settings.api_key", "API key:", "Clave API:"),
     ("settings.key_empty", "not stored", "sin guardar"),
+    ("settings.key_unchecked", "not checked", "sin comprobar"),
+    ("settings.check_key", "Check", "Comprobar"),
     (
         "settings.key_source_keychain",
         "stored in Keychain",
@@ -932,8 +982,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "settings.key_hint",
-        "The key is written to macOS Keychain on Save; it never enters settings.json, logs or the dump.",
-        "La clave se guarda en Keychain al guardar; nunca entra en settings.json, logs ni el dump.",
+        "The key is written to macOS Keychain on Save; it never enters settings.json, logs or the dump. It is read at most once per session.",
+        "La clave se guarda en Keychain al guardar; nunca entra en settings.json, logs ni el dump. Se lee como máximo una vez por sesión.",
     ),
     ("settings.clear_key", "Clear key", "Borrar clave"),
     (

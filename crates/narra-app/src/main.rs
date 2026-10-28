@@ -125,20 +125,23 @@ mod i18n;
 mod markdown_view;
 mod new_file;
 mod new_project;
+mod panel_resize;
 mod project_settings;
 mod recent;
 mod screenplay;
+mod scrollbar;
 mod settings;
 mod theme;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -152,17 +155,18 @@ use context_menu::{ContextAction, ContextMenuItem, ContextMenuState};
 use explorer::{FileKind, Row};
 use git_status::GitStatus;
 use gpui::{
-    App, Application, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ShapedLine, StyledText, TextRun, Timer,
-    UTF16Selection, Window, WindowAppearance, WindowBounds, WindowOptions, actions, canvas, div,
-    list, point, prelude::*, px, rgb, rgba, size, svg,
+    App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementInputHandler,
+    EntityInputHandler, FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, ShapedLine,
+    StyledText, TextRun, Timer, UTF16Selection, Window, WindowAppearance, WindowBounds,
+    WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use i18n::Lang;
 use narra_core::agent::{
     AgentError, ChatAttachment, ChatMode, ChatTask, ChatThread, LOCAL_DEFAULT_BASE_URL,
-    MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig, SceneEditTask,
-    SceneReviewTask, TaskOptions, fetch_model_ids, proposal, roles,
+    MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig, ProjectScaffoldTask,
+    ScaffoldPlan, SceneEditTask, SceneReviewTask, TaskOptions, fetch_model_ids, proposal, roles,
+    write_plan,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
@@ -174,7 +178,8 @@ use narra_core::language::{
 };
 use narra_core::markdown::MarkdownDocument;
 use narra_core::provider::{
-    GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest, NewRepository, SecretStore,
+    CachedSecretStore, GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest,
+    NewRepository, OsKeychain, SecretError, SecretStore,
 };
 use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
@@ -335,18 +340,11 @@ const IDLE_GAP_MS: f64 = 500.0;
 
 /// Find-match highlight (all matches) and the current match — slice 3.
 /// Find bar background (distinct from the status bar) and text colors.
-/// Explorer panel (M6 slice 1): width and colors. The panel renders only in
-/// `--project` mode, so fixture-mode geometry — the verified spike driver —
-/// stays byte-for-byte unchanged.
-const EXPLORER_W: f32 = 250.0;
 /// Explorer state colors (M10 S3c): type is an icon, color is state.
 /// Line-number gutter (M9 slice 3): fixed column before the text.
 /// Outline rows rendered in the explorer (M8 slice 3). The panel has no
 /// scrollbar yet; the remainder is reported as "… N more".
 const OUTLINE_VISIBLE_ROWS: usize = 120;
-/// Agent review panel (M6 slice 3): right-hand column with status, context
-/// sources and a scrolled window of the review text.
-const AGENT_PANEL_W: f32 = 420.0;
 /// Review lines visible in the panel at once; `⌥↑/⌥↓` scrolls by 3 lines.
 /// Approximate chrome-free budget (the panel also shows header, sources and
 /// hints); the dump always carries the full text, so this is display-only.
@@ -460,16 +458,41 @@ struct NewFileState {
     error: String,
 }
 
+/// How a new project starts (M16 slices 8–9, D-044).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewProjectMode {
+    Template,
+    Ai,
+}
+
+/// Which dialog field owns typing. The title is the default; the AI prompt
+/// takes over when the AI mode is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewProjectField {
+    Title,
+    Prompt,
+}
+
 /// The New Project modal (M10 slice 2b): title, kind, primary language and
 /// the native save-panel phase. `picking` is true while the OS dialog owns
-/// the app; duplicate Creates cannot open two panels.
+/// the app; duplicate Creates cannot open two panels. The AI mode adds a
+/// prompt, a busy phase and a reviewable file plan (M16 slice 9).
 #[derive(Debug)]
 struct NewProjectState {
     title: String,
     kind: ProjectType,
     lang: Lang,
+    mode: NewProjectMode,
+    prompt: String,
+    field: NewProjectField,
     error: String,
     picking: bool,
+    /// AI generation in progress (the save panel has already returned).
+    busy: bool,
+    /// Target folder selected before the project exists (AI mode).
+    path: Option<PathBuf>,
+    /// Reviewable AI plan; nothing is written until the user confirms.
+    plan: Option<ScaffoldPlan>,
 }
 
 /// Snapshot of the dialog inputs handed to the async save-panel task: what
@@ -480,6 +503,8 @@ struct NewProjectDraft {
     title: String,
     kind: ProjectType,
     lang: Lang,
+    mode: NewProjectMode,
+    prompt: String,
 }
 
 /// Field the settings modal is editing. Tab/click moves it; typing and paste
@@ -534,6 +559,9 @@ struct SettingsState {
     key_input: String,
     key_present: bool,
     key_source: String,
+    /// Whether the keychain answer is known in this session. Settings opens
+    /// without reading the keychain (D-040).
+    key_checked: bool,
     field: SettingsField,
     error: String,
     status: String,
@@ -551,6 +579,11 @@ struct SettingsState {
     github_token_input: String,
     github_token_present: bool,
     github_token_source: String,
+    github_token_checked: bool,
+    /// Request ids of the explicit "check" buttons; a stale worker answer
+    /// must not overwrite a newer check.
+    key_request: u64,
+    github_request: u64,
     /// Effective roles loaded for the Agentes tab (built-ins + packages +
     /// project config). Read-only here; installation is file-based.
     agents: Vec<roles::Role>,
@@ -574,6 +607,7 @@ impl std::fmt::Debug for SettingsState {
             )
             .field("key_present", &self.key_present)
             .field("key_source", &self.key_source)
+            .field("key_checked", &self.key_checked)
             .field("field", &self.field)
             .field("error", &self.error)
             .field("status", &self.status)
@@ -597,14 +631,39 @@ impl std::fmt::Debug for SettingsState {
             )
             .field("github_token_present", &self.github_token_present)
             .field("github_token_source", &self.github_token_source)
+            .field("github_token_checked", &self.github_token_checked)
             .finish()
     }
+}
+
+/// Result of one AI project-scaffold run (M16 slice 9). The generation token
+/// prevents a stale run from landing in a reopened dialog.
+enum NewProjectMessage {
+    Plan {
+        generation: u64,
+        result: Result<ScaffoldPlan, String>,
+    },
 }
 
 enum SettingsMessage {
     Models {
         request: u64,
         result: Result<Vec<String>, String>,
+    },
+    /// The worker resolved no key for a provider that requires one.
+    MissingKey { request: u64 },
+    /// Answer to the explicit "check" action for the provider key.
+    KeyStatus {
+        request: u64,
+        provider: AiProvider,
+        present: bool,
+        source: String,
+    },
+    /// Answer to the explicit "check" action for the GitHub token.
+    GitHubStatus {
+        request: u64,
+        present: bool,
+        source: String,
     },
 }
 
@@ -999,6 +1058,24 @@ fn short_id(id: &str) -> String {
 
 /// Localizable label for a role's origin; the dump keeps the raw key
 /// (`"builtin"`/`"project"`) so machine checks never depend on wording.
+/// Content hash for the chat Markdown cache (M16 slice 5). Stored assistant
+/// turns are immutable, so the content is a stable key.
+fn markdown_key(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Native window title for a project (M16 slice 7). The project name is the
+/// only stable, user-facing label; it follows the manifest when it changes.
+fn project_window_title(title: Option<&str>) -> String {
+    match title.map(str::trim).filter(|title| !title.is_empty()) {
+        Some(title) => format!("{title} — Narra"),
+        None => "Narra".to_string(),
+    }
+}
+
 fn role_source_label(lang: Lang, source: &str) -> &'static str {
     match source {
         "project" => i18n::tr(lang, "role.project"),
@@ -1576,6 +1653,27 @@ impl DocumentState {
 /// switching tabs swaps the two. Exactly one tab (the active one) has `None`.
 struct Tab {
     document: Option<DocumentState>,
+    /// Preview tab (D-041): a single click replaces it; a double click or the
+    /// first edit pins it. A preview tab is never dirty.
+    preview: bool,
+}
+
+/// One active side-panel drag (M16 slice 3). Kept separate from
+/// `doc.dragging`, which belongs to text selection.
+#[derive(Debug, Clone, Copy)]
+struct PanelDrag {
+    target: panel_resize::Target,
+    start_x: f32,
+    start_w: f32,
+}
+
+/// One active chat-scrollbar drag (M16 slice 4).
+#[derive(Debug, Clone, Copy)]
+struct ChatScrollDrag {
+    start_y: f32,
+    start_offset: f32,
+    viewport_h: f32,
+    max_offset: f32,
 }
 
 /// Next/previous tab with wrap-around, or `None` when there is nowhere to go.
@@ -1620,12 +1718,16 @@ struct Editor {
     new_file: Option<NewFileState>,
     /// The New Project modal, when open (M10 slice 2b).
     new_project: Option<NewProjectState>,
+    /// Monotonic token for AI scaffold runs (M16 slice 9).
+    new_project_generation: u64,
     /// Recent project roots, most recent first (M10 slice 2b).
     recents: RecentProjects,
     /// Bumped on every project switch; async search/export results carry the
     /// generation they started with so stale work never touches the new
     /// workspace.
     workspace_generation: u64,
+    /// Last title written to the native window bar (M16 slice 7).
+    window_title: String,
 
     /// Local Git status against HEAD (M10 S3c): files, folder aggregates and
     /// branch/ahead/behind. Refreshed on a worker, never on the UI thread.
@@ -1637,6 +1739,12 @@ struct Editor {
     explorer_open: bool,
     agent_panel_open: bool,
     git_panel_open: bool,
+    /// Side-panel widths in logical pixels (M16 slice 3). Session-only until
+    /// the width-persistence choice in D-042 is decided.
+    explorer_w: f32,
+    right_panel_w: f32,
+    /// Active splitter drag, when the user is dragging one.
+    panel_drag: Option<PanelDrag>,
 
     focus_handle: FocusHandle,
     /// Wrap width for non-hot rows, refreshed from the viewport each frame and
@@ -1735,6 +1843,14 @@ struct Editor {
     /// Saved chat threads and whether the history list is visible.
     chat_history: Vec<ChatThread>,
     chat_history_open: bool,
+    /// Scroll state of the chat transcript (M16 slice 4); the app draws the
+    /// scrollbar because GPUI 0.2.2 paints none.
+    chat_scroll: ScrollHandle,
+    /// Active chat-scrollbar drag.
+    chat_scroll_drag: Option<ChatScrollDrag>,
+    /// Parsed Markdown for assistant turns, keyed by a content hash (M16
+    /// slice 5); cleared when the thread or project changes.
+    chat_markdown: RefCell<HashMap<u64, MarkdownDocument>>,
     /// Rename dialog, when open.
     rename: Option<FilePromptState>,
     /// Delete confirmation, when open.
@@ -1835,23 +1951,50 @@ impl Editor {
         true
     }
 
-    fn open_new_tab(&mut self, doc: DocumentState) {
+    fn open_new_tab(&mut self, doc: DocumentState, preview: bool) {
         let current = std::mem::replace(&mut self.doc, doc);
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             debug_assert!(tab.document.is_none(), "active tab owns no document");
             tab.document = Some(current);
         }
-        self.tabs.push(Tab { document: None });
+        self.tabs.push(Tab {
+            document: None,
+            preview,
+        });
         self.active_tab = self.tabs.len() - 1;
     }
 
-    /// Open a loaded document. The single clean blank tab left after closing
-    /// the last document is reused instead of accumulating empty tabs.
+    /// Open a loaded document as a regular tab. The single clean blank tab
+    /// left after closing the last document is reused instead of
+    /// accumulating empty tabs.
     fn open_document_tab(&mut self, doc: DocumentState) {
         if self.tabs.len() == 1 && self.doc.path.is_empty() && !self.doc.is_dirty() {
             self.doc = doc;
+            self.tabs[0].preview = false;
         } else {
-            self.open_new_tab(doc);
+            self.open_new_tab(doc, false);
+        }
+    }
+
+    /// Open a document in the single preview slot (D-041). The next single
+    /// click replaces it; a double click or the first edit pins it.
+    fn open_preview_document(&mut self, doc: DocumentState) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.preview) {
+            if index == self.active_tab {
+                self.doc = doc;
+            } else if self.activate_tab(index) {
+                // `activate_tab` swapped the old preview into `doc`; discard
+                // it and show the new document in the same slot.
+                self.doc = doc;
+                self.tabs[self.active_tab].preview = true;
+            }
+            return;
+        }
+        if self.tabs.len() == 1 && self.doc.path.is_empty() && !self.doc.is_dirty() {
+            self.doc = doc;
+            self.tabs[0].preview = true;
+        } else {
+            self.open_new_tab(doc, true);
         }
     }
 
@@ -1887,7 +2030,10 @@ impl Editor {
     }
 
     fn reset_tabs(&mut self) {
-        self.tabs = vec![Tab { document: None }];
+        self.tabs = vec![Tab {
+            document: None,
+            preview: false,
+        }];
         self.active_tab = 0;
     }
 
@@ -1935,6 +2081,92 @@ impl Editor {
         cx.notify();
     }
 
+    /// Start a splitter drag (M16 slice 3). The width is applied on
+    /// `on_panel_resize`, so a plain click does not move the panel.
+    fn begin_panel_resize(
+        &mut self,
+        target: panel_resize::Target,
+        x: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start_w = match target {
+            panel_resize::Target::Explorer => self.explorer_w,
+            panel_resize::Target::RightPanel => self.right_panel_w,
+        };
+        self.panel_drag = Some(PanelDrag {
+            target,
+            start_x: x,
+            start_w,
+        });
+        self.chat_scroll_drag = None;
+        // A splitter drag is not a text click; keep the editor focused so the
+        // caret does not move underneath and the chat does not keep the
+        // keyboard.
+        self.chat.focused = false;
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Apply the active drag. The pointer can leave the 6 px handle while the
+    /// button is held; the document column keeps its minimum (D-042).
+    fn on_panel_resize(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(drag) = self.chat_scroll_drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.chat_scroll_drag = None;
+                cx.notify();
+                return;
+            }
+            let delta = f32::from(event.position.y) - drag.start_y;
+            let offset =
+                scrollbar::drag_offset(drag.start_offset, delta, drag.viewport_h, drag.max_offset);
+            self.chat_scroll.set_offset(point(px(0.0), px(offset)));
+            cx.notify();
+            return;
+        }
+        let Some(drag) = self.panel_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.panel_drag = None;
+            cx.notify();
+            return;
+        }
+        let delta = f32::from(event.position.x) - drag.start_x;
+        let explorer_open = self.project.is_some() && self.explorer_open;
+        let right_open = self.agent_panel_open;
+        let width = panel_resize::drag_width(
+            drag.target,
+            drag.start_w,
+            delta,
+            f32::from(window.viewport_size().width),
+            panel_resize::Panels {
+                explorer_open,
+                right_open,
+                explorer_w: self.explorer_w,
+                right_w: self.right_panel_w,
+            },
+        );
+        match drag.target {
+            panel_resize::Target::Explorer => self.explorer_w = width,
+            panel_resize::Target::RightPanel => self.right_panel_w = width,
+        }
+        cx.notify();
+    }
+
+    fn end_panel_resize(&mut self, cx: &mut Context<Self>) {
+        let panel = self.panel_drag.take().is_some();
+        let chat_scroll = self.chat_scroll_drag.take().is_some();
+        if panel || chat_scroll {
+            cx.notify();
+        }
+    }
+
     /// Rebuild the derived bible entity index from the current project.
     /// Failures are non-fatal: the editor keeps working without mentions,
     /// and the next explicit refresh can recover.
@@ -1977,7 +2209,18 @@ impl Editor {
             return;
         }
         let provider = self.app_settings.provider;
-        let (key_present, key_source) = provider_key_status(provider);
+        // Opening Settings must not touch the keychain (D-040): show the
+        // session cache when it is known, otherwise "not checked" until the
+        // user presses Check or the key is used for the first time.
+        let (key_present, key_source, key_checked) = match cached_provider_key_status(provider) {
+            Some((present, source)) => (present, source, true),
+            None => (false, String::new(), false),
+        };
+        let (github_token_present, github_token_source, github_token_checked) =
+            match cached_github_token_status() {
+                Some((present, source)) => (present, source, true),
+                None => (false, String::new(), false),
+            };
         let base_url = provider
             .fixed_base_url()
             .map(str::to_string)
@@ -1996,6 +2239,7 @@ impl Editor {
             key_input: String::new(),
             key_present,
             key_source,
+            key_checked,
             field: SettingsField::Model,
             error: String::new(),
             status: String::new(),
@@ -2015,8 +2259,11 @@ impl Editor {
             git_name: self.app_settings.git_name.clone(),
             git_email: self.app_settings.git_email.clone(),
             github_token_input: String::new(),
-            github_token_present: github_token_status().0,
-            github_token_source: github_token_status().1,
+            github_token_present,
+            github_token_source,
+            github_token_checked,
+            key_request: 0,
+            github_request: 0,
             agents,
             agents_error,
         });
@@ -2047,7 +2294,11 @@ impl Editor {
     }
 
     fn settings_set_provider(&mut self, provider: AiProvider, cx: &mut Context<Self>) {
-        let (key_present, key_source) = provider_key_status(provider);
+        // Switching providers never reads the keychain: use the session cache.
+        let (key_present, key_source, key_checked) = match cached_provider_key_status(provider) {
+            Some((present, source)) => (present, source, true),
+            None => (false, String::new(), false),
+        };
         if let Some(state) = self.settings.as_mut() {
             state.provider = provider;
             state.base_url = provider
@@ -2066,6 +2317,7 @@ impl Editor {
             state.key_input.clear();
             state.key_present = key_present;
             state.key_source = key_source;
+            state.key_checked = key_checked;
             state.models = provider
                 .known_models()
                 .iter()
@@ -2187,7 +2439,14 @@ impl Editor {
             cx.notify();
             return;
         }
-        if provider.requires_key() && key_input.is_empty() && !state.key_present {
+        // A known-absent key is refused. An unknown answer is allowed through:
+        // Settings never reads the keychain here (D-040), and the first use
+        // reports a missing key explicitly.
+        if provider.requires_key()
+            && key_input.is_empty()
+            && state.key_checked
+            && !state.key_present
+        {
             if let Some(state) = self.settings.as_mut() {
                 state.error = i18n::tr(lang, "settings.key_required").to_string();
             }
@@ -2197,7 +2456,7 @@ impl Editor {
         if let Some(account) = provider.secret_account()
             && !key_input.is_empty()
         {
-            let store = narra_core::provider::OsKeychain::new();
+            let store = secret_cache();
             if let Err(error) = store.set(account, &key_input) {
                 if let Some(state) = self.settings.as_mut() {
                     state.error = i18n::tf(
@@ -2213,7 +2472,7 @@ impl Editor {
         if let Some(state) = self.settings.as_ref()
             && !state.github_token_input.trim().is_empty()
         {
-            let store = narra_core::provider::OsKeychain::new();
+            let store = secret_cache();
             if let Err(error) = store.set(GITHUB_TOKEN_ACCOUNT, state.github_token_input.trim()) {
                 let message = i18n::tf(
                     lang,
@@ -2321,27 +2580,8 @@ impl Editor {
         let Some(models_url) = provider.models_url(&base_url) else {
             return;
         };
-        let key = if state.key_input.trim().is_empty() {
-            match resolve_provider_key(provider) {
-                Ok(key) => key,
-                Err(error) => {
-                    if let Some(state) = self.settings.as_mut() {
-                        state.error = error;
-                    }
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            Some(state.key_input.trim().to_string())
-        };
-        if provider.requires_key() && key.is_none() {
-            if let Some(state) = self.settings.as_mut() {
-                state.error = i18n::tr(lang, "settings.key_required").to_string();
-            }
-            cx.notify();
-            return;
-        }
+        let key_input = state.key_input.trim().to_string();
+        let needs_key = provider.requires_key();
         let request = state.models_request.saturating_add(1);
         if let Some(state) = self.settings.as_mut() {
             state.models_request = request;
@@ -2352,37 +2592,70 @@ impl Editor {
         cx.notify();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            // The first keychain read happens here, never on the UI thread
+            // (D-040).
+            let key = if key_input.is_empty() {
+                match resolve_provider_key(provider) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        let _ = tx.send(SettingsMessage::Models {
+                            request,
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                }
+            } else {
+                Some(key_input)
+            };
+            if needs_key && key.is_none() {
+                let _ = tx.send(SettingsMessage::MissingKey { request });
+                return;
+            }
             let result = fetch_model_ids(&models_url, key.as_deref(), Duration::from_secs(20))
                 .map_err(|error| error.to_string());
             let _ = tx.send(SettingsMessage::Models { request, result });
         });
         Self::spawn_message_pump(cx, rx, |view, message| {
-            let SettingsMessage::Models { request, result } = message;
             let lang = view.lang;
-            if let Some(state) = view.settings.as_mut()
-                && state.models_request == request
-            {
-                state.fetching_models = false;
-                match result {
-                    Ok(mut models) => {
-                        models.sort();
-                        models.dedup();
-                        let count = models.len();
-                        state.models = models;
-                        state.status = i18n::tf(
-                            lang,
-                            "settings.models_fetched",
-                            &[("n", &count.to_string())],
-                        );
-                    }
-                    Err(error) => {
-                        state.error = i18n::tf(
-                            lang,
-                            "settings.models_failed",
-                            &[("error", &error.to_string())],
-                        );
+            match message {
+                SettingsMessage::MissingKey { request } => {
+                    if let Some(state) = view.settings.as_mut()
+                        && state.models_request == request
+                    {
+                        state.fetching_models = false;
+                        state.error = i18n::tr(lang, "settings.key_required").to_string();
                     }
                 }
+                SettingsMessage::Models { request, result } => {
+                    if let Some(state) = view.settings.as_mut()
+                        && state.models_request == request
+                    {
+                        state.fetching_models = false;
+                        match result {
+                            Ok(mut models) => {
+                                models.sort();
+                                models.dedup();
+                                let count = models.len();
+                                state.models = models;
+                                state.status = i18n::tf(
+                                    lang,
+                                    "settings.models_fetched",
+                                    &[("n", &count.to_string())],
+                                );
+                            }
+                            Err(error) => {
+                                state.error = i18n::tf(
+                                    lang,
+                                    "settings.models_failed",
+                                    &[("error", &error.to_string())],
+                                );
+                            }
+                        }
+                    }
+                }
+                // One-shot check answers have their own pumps.
+                SettingsMessage::KeyStatus { .. } | SettingsMessage::GitHubStatus { .. } => {}
             }
             true
         });
@@ -2396,7 +2669,7 @@ impl Editor {
         let Some(account) = state.provider.secret_account() else {
             return;
         };
-        let store = narra_core::provider::OsKeychain::new();
+        let store = secret_cache();
         if let Err(error) = store.delete(account) {
             if let Some(state) = self.settings.as_mut() {
                 state.error = i18n::tf(
@@ -2413,6 +2686,7 @@ impl Editor {
             state.key_input.clear();
             state.key_present = key_present;
             state.key_source = key_source;
+            state.key_checked = true;
             state.status = i18n::tr(lang, "settings.key_cleared").to_string();
             state.error.clear();
         }
@@ -2420,7 +2694,7 @@ impl Editor {
     }
 
     fn settings_clear_github_token(&mut self, cx: &mut Context<Self>) {
-        let store = narra_core::provider::OsKeychain::new();
+        let store = secret_cache();
         if let Err(error) = store.delete(GITHUB_TOKEN_ACCOUNT) {
             let message = self.tf(
                 "settings.github_key_save_failed",
@@ -2438,9 +2712,107 @@ impl Editor {
             state.github_token_input.clear();
             state.github_token_present = present;
             state.github_token_source = source;
+            state.github_token_checked = true;
             state.status = status;
             state.error.clear();
         }
+        cx.notify();
+    }
+
+    /// Explicit "check" action for the provider key (D-040). This is the only
+    /// Settings path that reads the keychain, and it runs on a worker so a
+    /// macOS prompt cannot freeze the window.
+    fn settings_check_key(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.settings.as_ref().map(|state| state.provider) else {
+            return;
+        };
+        let Some(request) = self.settings.as_mut().map(|state| {
+            state.key_request = state.key_request.saturating_add(1);
+            state.key_request
+        }) else {
+            return;
+        };
+        // An explicit Check retries a failed read (for example a denied
+        // prompt); a known present/absent answer stays cached.
+        if let Some(account) = provider.secret_account()
+            && matches!(secret_cache().peek(account), Some(Err(_)))
+        {
+            secret_cache().invalidate(account);
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (present, source) = provider_key_status(provider);
+            let _ = tx.send(SettingsMessage::KeyStatus {
+                request,
+                provider,
+                present,
+                source,
+            });
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let SettingsMessage::KeyStatus {
+                request,
+                provider,
+                present,
+                source,
+            } = message
+            else {
+                return true;
+            };
+            if let Some(state) = view.settings.as_mut()
+                && state.key_request == request
+                && state.provider == provider
+            {
+                state.key_present = present;
+                state.key_source = source;
+                state.key_checked = true;
+                state.status.clear();
+                state.error.clear();
+            }
+            true
+        });
+        cx.notify();
+    }
+
+    fn settings_check_github_token(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.settings.as_mut().map(|state| {
+            state.github_request = state.github_request.saturating_add(1);
+            state.github_request
+        }) else {
+            return;
+        };
+        if matches!(secret_cache().peek(GITHUB_TOKEN_ACCOUNT), Some(Err(_))) {
+            secret_cache().invalidate(GITHUB_TOKEN_ACCOUNT);
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (present, source) = github_token_status();
+            let _ = tx.send(SettingsMessage::GitHubStatus {
+                request,
+                present,
+                source,
+            });
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let SettingsMessage::GitHubStatus {
+                request,
+                present,
+                source,
+            } = message
+            else {
+                return true;
+            };
+            if let Some(state) = view.settings.as_mut()
+                && state.github_request == request
+            {
+                state.github_token_present = present;
+                state.github_token_source = source;
+                state.github_token_checked = true;
+                state.status.clear();
+                state.error.clear();
+            }
+            true
+        });
         cx.notify();
     }
 
@@ -2728,7 +3100,7 @@ impl Editor {
                 };
                 let key_text = if !state.key_input.is_empty() {
                     format!("{}▌", "•".repeat(state.key_input.chars().count().min(32)))
-                } else if state.key_present {
+                } else if state.key_checked && state.key_present {
                     format!(
                         "•••••••• ({})",
                         self.t(if state.key_source == "env" {
@@ -2737,6 +3109,8 @@ impl Editor {
                             "settings.key_source_keychain"
                         })
                     )
+                } else if !state.key_checked {
+                    self.t("settings.key_unchecked").to_string()
                 } else {
                     self.t("settings.key_empty").to_string()
                 };
@@ -2873,6 +3247,18 @@ impl Editor {
                             )
                             .child(
                                 div()
+                                    .id("settings-check-key")
+                                    .px_2()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("settings.check_key"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.settings_check_key(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
                                     .id("settings-clear-key")
                                     .px_2()
                                     .py_1()
@@ -2971,7 +3357,7 @@ impl Editor {
                                             state.github_token_input.chars().count().min(32)
                                         )
                                     )
-                                } else if state.github_token_present {
+                                } else if state.github_token_checked && state.github_token_present {
                                     format!(
                                         "•••••••• ({})",
                                         self.t(if state.github_token_source == "env" {
@@ -2980,6 +3366,8 @@ impl Editor {
                                             "settings.key_source_keychain"
                                         })
                                     )
+                                } else if !state.github_token_checked {
+                                    self.t("settings.key_unchecked").to_string()
                                 } else {
                                     self.t("settings.github_token_empty").to_string()
                                 },
@@ -2991,6 +3379,18 @@ impl Editor {
                                 }
                                 cx.notify();
                             })),
+                        )
+                        .child(
+                            div()
+                                .id("settings-check-github-token")
+                                .px_2()
+                                .py_1()
+                                .cursor_pointer()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("settings.check_key"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings_check_github_token(cx)
+                                })),
                         )
                         .child(
                             div()
@@ -3312,7 +3712,7 @@ impl Editor {
 
     fn project_settings_open_yaml(&mut self, cx: &mut Context<Self>) {
         self.project_settings = None;
-        if let Err(error) = self.open_document_path("project.yaml") {
+        if let Err(error) = self.open_document_path("project.yaml", true) {
             self.notice = Some(error);
         }
         cx.notify();
@@ -3739,7 +4139,7 @@ impl Editor {
                     return;
                 };
                 self.palette = None;
-                self.select_path(&path, window, cx);
+                self.select_path(&path, true, window, cx);
             }
             PaletteMode::Commands => {
                 let Some(command) = self.palette_commands().get(selected).copied() else {
@@ -3853,7 +4253,7 @@ impl Editor {
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.palette = None;
-                                this.select_path(&path_owned, window, cx);
+                                this.select_path(&path_owned, true, window, cx);
                                 cx.notify();
                             })),
                     );
@@ -4626,7 +5026,7 @@ impl Editor {
             self.explorer = paths;
         }
         self.refresh_entities();
-        if let Err(error) = self.open_document_path(&path) {
+        if let Err(error) = self.open_document_path(&path, true) {
             self.notice = Some(error);
             cx.notify();
             return;
@@ -5111,7 +5511,7 @@ impl Editor {
             {
                 let document = mention.document(&self.entities).to_string();
                 let name = mention.name(&self.entities).to_string();
-                if let Err(error) = self.open_document_path(&document) {
+                if let Err(error) = self.open_document_path(&document, true) {
                     self.notice = Some(error);
                 } else {
                     self.notice = Some(self.tf(
@@ -5241,6 +5641,15 @@ impl Editor {
         self.doc.buffer.offset_to_utf16(range.start)..self.doc.buffer.offset_to_utf16(range.end)
     }
 
+    /// Bump the document revision and pin the active preview tab: a preview
+    /// tab is never dirty, so the first edit promotes it (D-041).
+    fn bump_revision(&mut self) {
+        self.doc.revision = self.doc.revision.saturating_add(1);
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.preview = false;
+        }
+    }
+
     /// Apply an edit, record undo state, move the caret after the inserted
     /// text and invalidate the derived scene index.
     fn apply_edit(&mut self, range: Range<usize>, text: &str) -> Range<usize> {
@@ -5248,7 +5657,7 @@ impl Editor {
         let (inserted, deleted) = self.doc.buffer.replace(range.clone(), text);
         self.splice_for_edit(start, &deleted, text);
         self.metrics.borrow_mut().edits += 1;
-        self.doc.revision = self.doc.revision.saturating_add(1);
+        self.bump_revision();
         // Undo bookkeeping goes through `record_edit` so IME composition
         // updates collapse into the single open entry (one undo per session).
         record_edit(
@@ -5281,7 +5690,7 @@ impl Editor {
 
     fn after_history_edit(&mut self, caret: usize) {
         self.metrics.borrow_mut().edits += 1;
-        self.doc.revision = self.doc.revision.saturating_add(1);
+        self.bump_revision();
         self.doc.selected = caret..caret;
         self.doc.reversed = false;
         self.doc.marked = None;
@@ -6591,6 +7000,21 @@ impl Editor {
     /// document list, then reset every surface that belonged to the previous
     /// project. Reads happen before any state is touched, so a permission or
     /// manifest problem leaves the current workspace intact.
+    /// Keep the native macOS title bar in sync with the open project (M16
+    /// slice 7). Called from `render`, so create/open/rename all land here
+    /// without extra hooks.
+    fn sync_window_title(&mut self, window: &mut Window) {
+        let title = project_window_title(
+            self.project
+                .as_ref()
+                .map(|project| project.manifest().title.as_str()),
+        );
+        if self.window_title != title {
+            self.window_title = title.clone();
+            window.set_window_title(&title);
+        }
+    }
+
     fn install_project(
         &mut self,
         mut project: Project,
@@ -6636,6 +7060,9 @@ impl Editor {
             cancel.cancel();
         }
         self.chat = ChatUiState::new(ChatMode::Plan);
+        self.chat_markdown.borrow_mut().clear();
+        self.chat_scroll = ScrollHandle::new();
+        self.chat_scroll_drag = None;
         self.chat_history.clear();
         self.chat_history_open = false;
         self.right_tab = RightTab::Chat;
@@ -6712,6 +7139,7 @@ impl Editor {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
                 self.new_project = None;
+                self.new_project_generation = self.new_project_generation.saturating_add(1);
                 cx.notify();
             }
             return;
@@ -6720,12 +7148,19 @@ impl Editor {
             cx.notify();
             return;
         }
+        self.new_project_generation = self.new_project_generation.saturating_add(1);
         self.new_project = Some(NewProjectState {
             title: String::new(),
             kind: ProjectType::Feature,
             lang: self.lang,
+            mode: NewProjectMode::Template,
+            prompt: String::new(),
+            field: NewProjectField::Title,
             error: String::new(),
             picking: false,
+            busy: false,
+            path: None,
+            plan: None,
         });
         cx.notify();
     }
@@ -6769,10 +7204,24 @@ impl Editor {
             cx.notify();
             return;
         };
+        if state.mode == NewProjectMode::Ai {
+            if !self.ai_scaffold_available() {
+                self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
+                cx.notify();
+                return;
+            }
+            if state.prompt.trim().is_empty() {
+                self.set_new_project_error(self.t("newproject.prompt_required").to_string());
+                cx.notify();
+                return;
+            }
+        }
         let draft = NewProjectDraft {
             title,
             kind: state.kind,
             lang: state.lang,
+            mode: state.mode,
+            prompt: state.prompt.trim().to_string(),
         };
         let start = self.default_project_dir();
         let rx = cx.prompt_for_new_path(&start, Some(&folder));
@@ -6823,16 +7272,35 @@ impl Editor {
                     cx.notify();
                     return;
                 }
+                if draft.mode == NewProjectMode::Ai {
+                    // Nothing is created yet: the model proposes, the user
+                    // reviews and only then the project is written (D-044).
+                    self.start_new_project_scaffold(path, draft, cx);
+                    cx.notify();
+                    return;
+                }
                 match create_project(&path, &draft.title, draft.kind, draft.lang.key()) {
-                    Ok(project) => match self.install_project(project, cx) {
-                        Ok(()) => {
-                            self.new_project = None;
-                        }
-                        Err(error) => {
-                            let message = self.tf("newproject.open_failed", &[("error", &error)]);
+                    Ok(project) => {
+                        if let Err(error) =
+                            narra_core::project::seed_basic_template(&path, draft.lang.key())
+                        {
+                            let message =
+                                self.tf("newproject.failed", &[("error", &error.to_string())]);
                             self.set_new_project_error(message);
+                            cx.notify();
+                            return;
                         }
-                    },
+                        match self.install_project(project, cx) {
+                            Ok(()) => {
+                                self.new_project = None;
+                            }
+                            Err(error) => {
+                                let message =
+                                    self.tf("newproject.open_failed", &[("error", &error)]);
+                                self.set_new_project_error(message);
+                            }
+                        }
+                    }
                     Err(error) => {
                         let message =
                             self.tf("newproject.failed", &[("error", &error.to_string())]);
@@ -6844,10 +7312,198 @@ impl Editor {
         cx.notify();
     }
 
+    /// The AI option is available only with a real provider (D-044 option A);
+    /// Mock is the offline default and cannot plan a project.
+    fn ai_scaffold_available(&self) -> bool {
+        self.agent_settings.provider != AiProvider::Mock
+    }
+
+    /// Generate a reviewed plan without creating anything (M16 slice 9).
+    fn start_new_project_scaffold(
+        &mut self,
+        path: PathBuf,
+        draft: NewProjectDraft,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ai_scaffold_available() {
+            self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
+            return;
+        }
+        self.new_project_generation = self.new_project_generation.saturating_add(1);
+        let generation = self.new_project_generation;
+        if let Some(state) = self.new_project.as_mut() {
+            state.busy = true;
+            state.error.clear();
+            state.plan = None;
+            state.path = Some(path.clone());
+        }
+        cx.notify();
+        let root = path.to_string_lossy().into_owned();
+        let settings = self.agent_settings.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<ScaffoldPlan, String> {
+                let role = roles::resolve_default_with_packages(
+                    Path::new(&root),
+                    Some(&recent::config_dir()),
+                    ProjectScaffoldTask::KIND,
+                )
+                .map_err(|error| error.to_string())?;
+                let adapter = settings.build_adapter()?;
+                let task = ProjectScaffoldTask::new(
+                    root.clone(),
+                    draft.title.clone(),
+                    draft.kind,
+                    draft.lang.key(),
+                    draft.prompt.clone(),
+                )
+                .with_role(role);
+                let options = TaskOptions {
+                    timeout: AGENT_TIMEOUT,
+                    cancel: CancellationToken::new(),
+                    stream: false,
+                };
+                let output = task
+                    .run(adapter.as_ref(), &options, |_| {})
+                    .map_err(|error| error.to_string())?;
+                serde_json::from_value::<ScaffoldPlan>(output.data["plan"].clone())
+                    .map_err(|error| format!("invalid scaffold payload: {error}"))
+            })();
+            let _ = tx.send(NewProjectMessage::Plan { generation, result });
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let NewProjectMessage::Plan { generation, result } = message;
+            if generation != view.new_project_generation {
+                return true;
+            }
+            if let Some(state) = view.new_project.as_mut() {
+                state.busy = false;
+                match result {
+                    Ok(plan) => {
+                        state.plan = Some(plan);
+                        state.error.clear();
+                    }
+                    Err(error) => {
+                        state.error = i18n::tf(
+                            view.lang,
+                            "newproject.scaffold_failed",
+                            &[("error", &error)],
+                        );
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    /// Create the already-chosen folder, write the reviewed plan create-only
+    /// and open the project. A write failure rolls the generated files back;
+    /// the base project remains usable and is still opened.
+    fn create_new_project_from_plan(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.new_project.as_ref() else {
+            return;
+        };
+        if state.busy || state.picking {
+            return;
+        }
+        let Some(path) = state.path.clone() else {
+            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
+            return;
+        };
+        let Some(plan) = state.plan.clone() else {
+            return;
+        };
+        let title = new_project::clean_title(&state.title).unwrap_or_else(|| state.title.clone());
+        let kind = state.kind;
+        let lang = state.lang;
+        match create_project(&path, &title, kind, lang.key()) {
+            Ok(project) => match write_plan(&path, &plan) {
+                Ok(()) => match self.install_project(project, cx) {
+                    Ok(()) => {
+                        self.new_project = None;
+                    }
+                    Err(error) => {
+                        let message = self.tf("newproject.open_failed", &[("error", &error)]);
+                        self.set_new_project_error(message);
+                    }
+                },
+                Err(error) => {
+                    let message =
+                        self.tf("newproject.write_failed", &[("error", &error.to_string())]);
+                    match self.install_project(project, cx) {
+                        Ok(()) => {
+                            self.new_project = None;
+                            self.notice = Some(message);
+                        }
+                        Err(open_error) => {
+                            self.set_new_project_error(
+                                self.tf("newproject.open_failed", &[("error", &open_error)]),
+                            );
+                        }
+                    }
+                }
+            },
+            Err(error) => {
+                let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
+                self.set_new_project_error(message);
+            }
+        }
+        cx.notify();
+    }
+
     /// New Project dialog: title, kind, primary language, then the native
     /// destination panel. Enter opens the panel; Esc closes the dialog.
     fn new_project_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_project.as_ref().expect("overlay only when open");
+        let editable = !state.picking && !state.busy && state.plan.is_none();
+        let mut modes = div().flex().flex_wrap().gap_2();
+        for (mode, key) in [
+            (NewProjectMode::Template, "newproject.mode.template"),
+            (NewProjectMode::Ai, "newproject.mode.ai"),
+        ] {
+            let selected = state.mode == mode;
+            let enabled = editable && (mode != NewProjectMode::Ai || self.ai_scaffold_available());
+            let mut chip = div()
+                .id(key)
+                .px_3()
+                .py_1()
+                .bg(rgb(if selected {
+                    theme::doc_selected_bg()
+                } else {
+                    theme::explorer_bg()
+                }))
+                .border_1()
+                .border_color(rgb(if selected {
+                    theme::default_fg()
+                } else {
+                    theme::explorer_border()
+                }))
+                .text_color(rgb(if enabled || selected {
+                    theme::default_fg()
+                } else {
+                    theme::gutter_fg()
+                }))
+                .when(enabled, |chip| chip.cursor_pointer())
+                .child(self.t(key));
+            if enabled {
+                chip = chip.on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(state) = this.new_project.as_mut()
+                        && !state.busy
+                        && state.plan.is_none()
+                    {
+                        state.mode = mode;
+                        state.field = if mode == NewProjectMode::Ai {
+                            NewProjectField::Prompt
+                        } else {
+                            NewProjectField::Title
+                        };
+                        state.error.clear();
+                    }
+                    cx.notify();
+                }));
+            }
+            modes = modes.child(chip);
+        }
         let mut kinds = div().flex().flex_wrap().gap_2();
         for kind in new_project::TYPES {
             let selected = kind == state.kind;
@@ -6877,6 +7533,8 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
+                            && !state.busy
+                            && state.plan.is_none()
                         {
                             state.kind = kind;
                             state.error.clear();
@@ -6914,6 +7572,8 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
+                            && !state.busy
+                            && state.plan.is_none()
                         {
                             state.lang = lang;
                             state.error.clear();
@@ -6958,11 +7618,37 @@ impl Editor {
                             )
                             .child(
                                 div()
+                                    .id("new-project-title")
                                     .flex_1()
                                     .bg(rgb(theme::bg()))
                                     .px_2()
+                                    .py_1()
+                                    .border_1()
+                                    .border_color(rgb(if state.field == NewProjectField::Title {
+                                        theme::default_fg()
+                                    } else {
+                                        theme::explorer_border()
+                                    }))
                                     .text_color(rgb(theme::default_fg()))
-                                    .child(format!("{}▌", state.title)),
+                                    .child(
+                                        if state.field == NewProjectField::Title
+                                            && !state.busy
+                                            && state.plan.is_none()
+                                        {
+                                            format!("{}▌", state.title)
+                                        } else {
+                                            state.title.clone()
+                                        },
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(state) = this.new_project.as_mut()
+                                            && !state.busy
+                                            && state.plan.is_none()
+                                        {
+                                            state.field = NewProjectField::Title;
+                                        }
+                                        cx.notify();
+                                    })),
                             ),
                     )
                     .child(
@@ -6992,9 +7678,125 @@ impl Editor {
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .pt_1()
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("newproject.mode")),
+                            )
+                            .child(modes),
+                    )
+                    .when(!self.ai_scaffold_available(), |card| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::gutter_fg()))
+                                .child(self.t("newproject.ai_unavailable")),
+                        )
+                    })
+                    .when(
+                        state.mode == NewProjectMode::Ai && self.ai_scaffold_available(),
+                        |card| {
+                            card.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(theme::status_fg()))
+                                            .child(self.t("newproject.prompt")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("new-project-prompt")
+                                            .min_h(px(60.0))
+                                            .bg(rgb(theme::bg()))
+                                            .p_2()
+                                            .border_1()
+                                            .border_color(rgb(
+                                                if state.field == NewProjectField::Prompt {
+                                                    theme::default_fg()
+                                                } else {
+                                                    theme::explorer_border()
+                                                },
+                                            ))
+                                            .text_color(rgb(if state.prompt.is_empty() {
+                                                theme::gutter_fg()
+                                            } else {
+                                                theme::default_fg()
+                                            }))
+                                            .whitespace_normal()
+                                            .cursor_text()
+                                            .child(if state.prompt.is_empty() {
+                                                format!("{}▌", self.t("newproject.prompt_hint"))
+                                            } else if state.field == NewProjectField::Prompt
+                                                && !state.busy
+                                                && state.plan.is_none()
+                                            {
+                                                format!("{}▌", state.prompt)
+                                            } else {
+                                                state.prompt.clone()
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(state) = this.new_project.as_mut()
+                                                    && !state.busy
+                                                    && state.plan.is_none()
+                                                {
+                                                    state.field = NewProjectField::Prompt;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                        },
+                    )
+                    .when(state.plan.is_some(), |card| {
+                        let plan = state.plan.as_ref().expect("checked");
+                        let mut list = div()
+                            .id("new-project-plan")
+                            .max_h(px(180.0))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .border_1()
+                            .border_color(rgb(theme::explorer_border()));
+                        for file in &plan.files {
+                            let preview: String =
+                                file.content.lines().take(2).collect::<Vec<_>>().join(" ");
+                            let preview: String = preview.chars().take(160).collect();
+                            list = list.child(
+                                div()
+                                    .p_2()
+                                    .border_b_1()
+                                    .border_color(rgb(theme::explorer_border()))
+                                    .child(
+                                        div()
+                                            .text_color(rgb(theme::default_fg()))
+                                            .child(file.path.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::gutter_fg()))
+                                            .child(preview),
+                                    ),
+                            );
+                        }
+                        card.child(list)
+                    })
+                    .child(
+                        div()
                             .text_color(rgb(theme::status_fg()))
                             .child(if state.picking {
                                 self.t("newproject.waiting")
+                            } else if state.busy {
+                                self.t("newproject.generating")
+                            } else if state.plan.is_some() {
+                                self.t("newproject.plan")
                             } else {
                                 self.t("newproject.hint")
                             }),
@@ -7006,44 +7808,64 @@ impl Editor {
                                 .child(state.error.clone()),
                         )
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("new-project-create")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(theme::status_bg()))
-                                    .text_color(rgb(theme::default_fg()))
-                                    .cursor_pointer()
-                                    .child(self.t("newproject.create"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.begin_new_project(window, cx)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("new-project-cancel")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(theme::status_bg()))
-                                    .text_color(rgb(theme::status_fg()))
-                                    .cursor_pointer()
-                                    .child(self.t("newproject.cancel"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if !this
-                                            .new_project
-                                            .as_ref()
-                                            .is_some_and(|state| state.picking)
-                                        {
-                                            this.new_project = None;
-                                        }
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
+                    .child({
+                        let plan_ready = state.plan.is_some();
+                        let can_click = !state.picking && !state.busy;
+                        let label = if plan_ready {
+                            self.t("newproject.create")
+                        } else {
+                            self.t("newproject.choose_folder")
+                        };
+                        let mut primary = div()
+                            .id("new-project-create")
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(if can_click {
+                                theme::status_bg()
+                            } else {
+                                theme::explorer_bg()
+                            }))
+                            .text_color(rgb(if can_click {
+                                theme::default_fg()
+                            } else {
+                                theme::gutter_fg()
+                            }))
+                            .child(label);
+                        if can_click {
+                            primary = primary.cursor_pointer().on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    if this
+                                        .new_project
+                                        .as_ref()
+                                        .is_some_and(|state| state.plan.is_some())
+                                    {
+                                        this.create_new_project_from_plan(cx);
+                                    } else {
+                                        this.begin_new_project(window, cx);
+                                    }
+                                },
+                            ));
+                        }
+                        div().flex().gap_2().child(primary).child(
+                            div()
+                                .id("new-project-cancel")
+                                .px_3()
+                                .py_1()
+                                .bg(rgb(theme::status_bg()))
+                                .text_color(rgb(theme::status_fg()))
+                                .cursor_pointer()
+                                .child(self.t("newproject.cancel"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if !this.new_project.as_ref().is_some_and(|state| state.picking)
+                                    {
+                                        this.new_project = None;
+                                        this.new_project_generation =
+                                            this.new_project_generation.saturating_add(1);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
     }
 
@@ -8037,7 +8859,16 @@ impl Editor {
             // The settings action needs a window; this helper is also called
             // from non-key paths, so it opens the modal state directly.
             let provider = self.app_settings.provider;
-            let (key_present, key_source) = provider_key_status(provider);
+            let (key_present, key_source, key_checked) = match cached_provider_key_status(provider)
+            {
+                Some((present, source)) => (present, source, true),
+                None => (false, String::new(), false),
+            };
+            let (github_token_present, github_token_source, github_token_checked) =
+                match cached_github_token_status() {
+                    Some((present, source)) => (present, source, true),
+                    None => (false, String::new(), false),
+                };
             let (agents, agents_error) = self.load_effective_agents();
             self.settings = Some(SettingsState {
                 section: SettingsSection::Git,
@@ -8050,6 +8881,7 @@ impl Editor {
                 key_input: String::new(),
                 key_present,
                 key_source,
+                key_checked,
                 field: SettingsField::GitName,
                 error: String::new(),
                 status: String::new(),
@@ -8069,8 +8901,11 @@ impl Editor {
                 git_name: self.app_settings.git_name.clone(),
                 git_email: self.app_settings.git_email.clone(),
                 github_token_input: String::new(),
-                github_token_present: github_token_status().0,
-                github_token_source: github_token_status().1,
+                github_token_present,
+                github_token_source,
+                github_token_checked,
+                key_request: 0,
+                github_request: 0,
                 agents,
                 agents_error,
             });
@@ -9353,7 +10188,7 @@ impl Editor {
         // The restored text diverges from the canonical base: mark it dirty
         // without touching the canonical file.
         self.metrics.borrow_mut().edits += 1;
-        self.doc.revision = self.doc.revision.saturating_add(1);
+        self.bump_revision();
     }
 
     /// ⌘Q (M9 slice 6, tabs in S3b): never lose unsaved work silently. Any
@@ -9720,14 +10555,23 @@ impl Editor {
             cx.notify();
             return;
         }
-        // The New Project dialog owns its title field (M10 slice 2b).
+        // The New Project dialog owns its title/prompt field (M10 slice 2b,
+        // M16 slice 9).
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
+                && !state.busy
+                && state.plan.is_none()
             {
-                if let Some(last) = state.title.chars().last() {
-                    let len = state.title.len();
-                    state.title.truncate(len - last.len_utf8());
+                let target =
+                    if state.mode == NewProjectMode::Ai && state.field == NewProjectField::Prompt {
+                        &mut state.prompt
+                    } else {
+                        &mut state.title
+                    };
+                if let Some(last) = target.chars().last() {
+                    let len = target.len();
+                    target.truncate(len - last.len_utf8());
                 }
                 state.error.clear();
             }
@@ -10442,6 +11286,7 @@ impl Editor {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
                 self.new_project = None;
+                self.new_project_generation = self.new_project_generation.saturating_add(1);
             }
             cx.notify();
             return;
@@ -10688,10 +11533,12 @@ impl Editor {
         self.notice = None;
     }
 
-    /// Open a document as a tab, or activate its existing tab. Unsaved state
-    /// is preserved in the tab being left; tabs make switching safe, so the
-    /// old document-switch refusal no longer applies here.
-    fn open_document_path(&mut self, path: &str) -> Result<(), String> {
+    /// Open a document as a tab, or activate its existing tab. A single
+    /// explorer click opens a preview tab (`pin = false`); Quick Open, search
+    /// hits and tooling pass `pin = true`. Unsaved state is preserved in the
+    /// tab being left; tabs make switching safe, so the old document-switch
+    /// refusal no longer applies here.
+    fn open_document_path(&mut self, path: &str, pin: bool) -> Result<(), String> {
         if self.unsaved_prompt.is_some()
             || self.settings.is_some()
             || self.project_settings.is_some()
@@ -10702,10 +11549,16 @@ impl Editor {
             return Err(self.t("notice.finish_dialog").to_string());
         }
         if path == self.doc.path {
+            if pin {
+                self.tabs[self.active_tab].preview = false;
+            }
             return Ok(());
         }
         if let Some(index) = self.find_tab(path) {
             self.activate_tab(index);
+            if pin {
+                self.tabs[index].preview = false;
+            }
             return Ok(());
         }
         let Some(project) = self.project.clone() else {
@@ -10717,19 +11570,25 @@ impl Editor {
                 &[("path", path), ("error", &error.to_string())],
             )
         })?;
-        self.open_document_tab(DocumentState::new(path.to_string(), &text));
+        let doc = DocumentState::new(path.to_string(), &text);
+        if pin {
+            self.open_document_tab(doc);
+        } else {
+            self.open_preview_document(doc);
+        }
         self.check_backup_notice();
         Ok(())
     }
 
     /// Explorer click: open the selected document in a tab (or activate its
-    /// tab). A document with unsaved changes is kept in its tab, not dropped.
-    fn select_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// tab). A single click previews; a double click pins (D-041). A document
+    /// with unsaved changes is kept in its tab, not dropped.
+    fn select_path(&mut self, path: &str, pin: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.unsaved_prompt.is_some() {
             return;
         }
         self.chat.focused = false;
-        match self.open_document_path(path) {
+        match self.open_document_path(path, pin) {
             Ok(()) => {
                 // A click re-targets typing (and IME composition) at the
                 // buffer.
@@ -11533,7 +12392,7 @@ impl Editor {
             self.ensure_caret_visible();
             return;
         }
-        match self.open_document_path(&hit.document) {
+        match self.open_document_path(&hit.document, true) {
             Ok(()) => {
                 let offset = self.offset_for_line_column(hit.line, hit.column);
                 self.set_caret(offset, false);
@@ -11786,7 +12645,7 @@ impl Editor {
             cx.notify();
             return;
         }
-        if let Err(message) = self.open_document_path(&target) {
+        if let Err(message) = self.open_document_path(&target, true) {
             self.notice = Some(message);
             cx.notify();
             return;
@@ -12131,6 +12990,9 @@ impl Editor {
         self.chat.set_input(String::new());
         self.chat
             .begin_run(instruction.clone(), attachments.clone());
+        // Sending is an explicit action: show the new turn even if the reader
+        // had scrolled up. Streaming afterwards follows only while at bottom.
+        self.chat_scroll.scroll_to_bottom();
         self.chat.focused = true;
         self.agent_panel_open = true;
         self.right_tab = RightTab::Chat;
@@ -12162,10 +13024,14 @@ impl Editor {
             }
             let done = matches!(message, ChatRunMessage::Done(_));
             match message {
-                ChatRunMessage::Event(event) => view.chat.apply_event(&event),
+                ChatRunMessage::Event(event) => {
+                    view.chat.apply_event(&event);
+                    view.chat_follow_stream();
+                }
                 ChatRunMessage::Done(result) => {
                     view.chat_cancel = None;
                     view.chat.finish(result);
+                    view.chat_follow_stream();
                     view.load_chat_proposal_diffs();
                     view.save_chat_thread();
                     view.notice = Some(match view.chat.status {
@@ -12181,7 +13047,7 @@ impl Editor {
             done
         });
         window.focus(&self.focus_handle(cx));
-        cx.notify();
+        self.refresh_chat_scrollbar(cx);
     }
 
     fn chat_stop(&mut self, cx: &mut Context<Self>) {
@@ -12194,16 +13060,65 @@ impl Editor {
         cx.notify();
     }
 
+    /// Whether the transcript is at (or within two pixels of) the bottom.
+    fn chat_at_bottom(&self) -> bool {
+        scrollbar::at_bottom(
+            f32::from(self.chat_scroll.offset().y),
+            f32::from(self.chat_scroll.max_offset().height),
+        )
+    }
+
+    /// Follow new assistant text only while the reader is at the bottom;
+    /// scrolling up pauses the follow until they return (D-042).
+    fn chat_follow_stream(&mut self) {
+        if self.chat_at_bottom() {
+            self.chat_scroll.scroll_to_bottom();
+        }
+    }
+
+    /// Start a scrollbar drag from a click on the track or thumb: the click
+    /// centers the thumb under the pointer and the root move handler
+    /// translates the pointer into an offset.
+    fn begin_chat_scroll_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = self.chat_scroll.bounds();
+        let viewport_h = f32::from(bounds.size.height);
+        let max_offset = f32::from(self.chat_scroll.max_offset().height);
+        if viewport_h <= 0.0 || max_offset <= 0.0 {
+            return;
+        }
+        let pointer_y = f32::from(event.position.y) - f32::from(bounds.top());
+        let offset = scrollbar::offset_for_pointer(pointer_y, viewport_h, max_offset);
+        self.chat_scroll.set_offset(point(px(0.0), px(offset)));
+        self.chat_scroll_drag = Some(ChatScrollDrag {
+            start_y: f32::from(event.position.y),
+            start_offset: offset,
+            viewport_h,
+            max_offset,
+        });
+        self.panel_drag = None;
+        self.chat.focused = false;
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
     fn chat_new_thread(&mut self, cx: &mut Context<Self>) {
         if self.chat.status == ChatStatus::Running {
             return;
         }
         let mode = self.chat.mode();
         self.chat = ChatUiState::new(mode);
+        self.chat_markdown.borrow_mut().clear();
+        self.chat_scroll = ScrollHandle::new();
+        self.chat_scroll_drag = None;
         self.chat.focused = true;
         self.chat_history_open = false;
         self.right_tab = RightTab::Chat;
-        cx.notify();
+        self.refresh_chat_scrollbar(cx);
     }
 
     fn chat_toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -12225,10 +13140,14 @@ impl Editor {
             return;
         };
         self.chat = ChatUiState::from_thread(thread);
+        self.chat_markdown.borrow_mut().clear();
+        self.chat_scroll = ScrollHandle::new();
+        self.chat_scroll_drag = None;
+        self.chat_scroll.scroll_to_bottom();
         self.chat_history_open = false;
         self.right_tab = RightTab::Chat;
         self.load_chat_proposal_diffs();
-        cx.notify();
+        self.refresh_chat_scrollbar(cx);
     }
 
     fn save_chat_thread(&mut self) {
@@ -12414,11 +13333,98 @@ impl Editor {
             .into_any_element()
     }
 
+    /// A 6 px handle between a side panel and the document column. The width
+    /// lives in `explorer_w`/`right_panel_w`; the drag itself is handled by the
+    /// root `on_mouse_move` (M16 slice 3).
+    fn panel_splitter(
+        &self,
+        target: panel_resize::Target,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = match target {
+            panel_resize::Target::Explorer => "explorer-splitter",
+            panel_resize::Target::RightPanel => "right-splitter",
+        };
+        div()
+            .id(id)
+            .w(px(panel_resize::SPLITTER_W))
+            .h_full()
+            .flex_none()
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .bg(rgb(theme::explorer_bg()))
+            .child(div().w(px(1.0)).h_full().bg(rgb(theme::explorer_border())))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.begin_panel_resize(target, f32::from(event.position.x), window, cx)
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The app-drawn chat scrollbar (M16 slice 4): a 10 px gutter with a
+    /// thumb sized and positioned from the scroll handle. `None` while the
+    /// transcript fits, so no empty track is shown.
+    fn chat_scrollbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let viewport_h = f32::from(self.chat_scroll.bounds().size.height);
+        let max_offset = f32::from(self.chat_scroll.max_offset().height);
+        let offset_y = f32::from(self.chat_scroll.offset().y);
+        let thumb = scrollbar::thumb(viewport_h, max_offset, offset_y);
+        let has_thumb = thumb.is_some();
+        let mut track = div()
+            .id("chat-scrollbar")
+            .w(px(scrollbar::WIDTH))
+            .h_full()
+            .flex_none()
+            .relative()
+            .bg(rgb(if has_thumb {
+                theme::status_bg()
+            } else {
+                theme::explorer_bg()
+            }))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_chat_scroll_drag));
+        if let Some((thumb_top, thumb_h)) = thumb {
+            track = track.child(
+                div()
+                    .id("chat-scrollbar-thumb")
+                    .absolute()
+                    .top(px(thumb_top))
+                    .right(px((scrollbar::WIDTH - scrollbar::THUMB_W) / 2.0))
+                    .w(px(scrollbar::THUMB_W))
+                    .h(px(thumb_h))
+                    .bg(rgb(theme::gutter_fg()))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_chat_scroll_drag)),
+            );
+        }
+        track.into_any_element()
+    }
+
+    /// The thumb is read from the handle's last layout, so a newly loaded
+    /// thread needs one extra frame before the scrollbar appears. The same
+    /// frame is the first with the final content height, so scroll to the real
+    /// bottom then (the first `scroll_to_bottom` can run against a shorter
+    /// content).
+    fn refresh_chat_scrollbar(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            Timer::after(Duration::from_millis(16)).await;
+            view.update(cx, |view, cx| {
+                view.chat_scroll.scroll_to_bottom();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn chat_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = |key: &str| self.t(key).to_string();
         let mut panel = div()
             .id("chat-panel")
-            .w(px(AGENT_PANEL_W))
+            .w(px(self.right_panel_w))
             .h_full()
             .flex()
             .flex_col()
@@ -12435,13 +13441,18 @@ impl Editor {
             .gap_1()
             .px_2()
             .py_1()
-            .child(div().flex_1().text_color(rgb(theme::default_fg())).child(
-                if self.chat.thread.title.is_empty() {
-                    t("chat.new")
-                } else {
-                    self.chat.thread.title.clone()
-                },
-            ))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(rgb(theme::default_fg()))
+                    .child(if self.chat.thread.title.is_empty() {
+                        t("chat.new")
+                    } else {
+                        self.chat.thread.title.clone()
+                    }),
+            )
             .child(
                 div()
                     .id("chat-new")
@@ -12505,7 +13516,14 @@ impl Editor {
         let mut messages = div()
             .id("chat-messages")
             .flex_1()
+            // A flex item defaults to its content's minimum width; without
+            // this the transcript pushes the scrollbar column out of the panel.
+            .min_w(px(0.0))
+            .track_scroll(&self.chat_scroll)
             .overflow_y_scroll()
+            // Wheel scrolling moves the handle; re-render so the app-drawn
+            // thumb follows (M16 slice 4).
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .flex()
             .flex_col()
             .gap_2()
@@ -12523,9 +13541,27 @@ impl Editor {
                         .child(t("chat.empty_hint")),
                 );
         }
-        for turn in &self.chat.thread.messages {
+        for (index, turn) in self.chat.thread.messages.iter().enumerate() {
             let user = turn.role == narra_core::agent::ChatTurnRole::User;
+            // Assistant answers are Markdown; the cache keys on content so a
+            // re-render (streaming, scroll) does not re-parse every turn
+            // (M16 slice 5). Streaming text below stays plain until complete,
+            // which avoids flicker and half-written code fences.
+            let body = if user {
+                div()
+                    .whitespace_normal()
+                    .child(turn.content.clone())
+                    .into_any_element()
+            } else {
+                let key = markdown_key(&turn.content);
+                let mut cache = self.chat_markdown.borrow_mut();
+                let document = cache
+                    .entry(key)
+                    .or_insert_with(|| MarkdownDocument::parse(&turn.content));
+                markdown_view::blocks(document, self.lang).into_any_element()
+            };
             let mut card = div()
+                .id(("chat-turn", index))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -12549,7 +13585,7 @@ impl Editor {
                         .text_color(rgb(theme::gutter_fg()))
                         .child(t(if user { "chat.you" } else { "chat.assistant" })),
                 )
-                .child(div().whitespace_normal().child(turn.content.clone()));
+                .child(body);
             if !user {
                 card = card.child(
                     div()
@@ -12618,7 +13654,16 @@ impl Editor {
                     .child(self.chat.error.clone()),
             );
         }
-        panel = panel.child(messages);
+        // The scrollbar is a reserved column next to the transcript, not an
+        // overlay: the scroll container cannot swallow its clicks (M16 slice 4).
+        let transcript = div()
+            .id("chat-transcript")
+            .flex_1()
+            .flex()
+            .overflow_hidden()
+            .child(messages)
+            .child(self.chat_scrollbar(cx));
+        panel = panel.child(transcript);
         panel = panel.child(self.chat_composer(cx));
         panel.into_any_element()
     }
@@ -12877,6 +13922,8 @@ impl Editor {
             .p_2()
             .flex()
             .flex_col()
+            // The composer keeps its height while the transcript scrolls.
+            .flex_shrink_0()
             .gap_1()
             .child(attachments)
             .child(
@@ -13053,7 +14100,7 @@ impl Editor {
                 .into_any_element()
         };
         div()
-            .w(px(AGENT_PANEL_W))
+            .w(px(self.right_panel_w))
             .h_full()
             .flex()
             .flex_col()
@@ -13076,7 +14123,7 @@ impl Editor {
         };
         let mut panel = div()
             .id("agent-panel")
-            .w(px(AGENT_PANEL_W))
+            .w(px(self.right_panel_w))
             .h_full()
             .flex()
             .flex_col()
@@ -13202,7 +14249,7 @@ impl Editor {
         let status_label = self.propose_status_label();
         let mut panel = div()
             .id("proposal-panel")
-            .w(px(AGENT_PANEL_W))
+            .w(px(self.right_panel_w))
             .h_full()
             .flex()
             .flex_col()
@@ -13359,7 +14406,7 @@ impl Editor {
         };
         let mut panel = div()
             .id("search-results")
-            .w(px(EXPLORER_W))
+            .w(px(self.explorer_w))
             .h_full()
             .flex()
             .flex_col()
@@ -13561,6 +14608,7 @@ impl Editor {
             .border_color(rgb(theme::explorer_border()));
         for index in 0..self.tabs.len() {
             let active = index == self.active_tab;
+            let preview = self.tabs.get(index).is_some_and(|tab| tab.preview);
             let path = self.tab_path(index).to_string();
             let title = self.tab_title(index);
             let dirty = self.tab_is_dirty(index);
@@ -13587,7 +14635,13 @@ impl Editor {
                     theme::status_fg()
                 }))
                 .child(icon(kind.icon_name(), icon_color, 14.0))
-                .child(div().overflow_hidden().whitespace_nowrap().child(label));
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .when(preview, |label| label.italic())
+                        .child(label),
+                );
             if let Some(status) = git {
                 title_row = title_row.child(
                     div()
@@ -13855,7 +14909,7 @@ impl Editor {
     fn git_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut panel = div()
             .id("git-panel")
-            .w(px(EXPLORER_W))
+            .w(px(self.explorer_w))
             .h_full()
             .flex()
             .flex_col()
@@ -14238,7 +15292,7 @@ impl Editor {
             .unwrap_or_default();
         let mut panel = div()
             .id("explorer")
-            .w(px(EXPLORER_W))
+            .w(px(self.explorer_w))
             .h_full()
             .flex()
             .flex_col()
@@ -14347,11 +15401,12 @@ impl Editor {
                     .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
                     .cursor_pointer()
                     .child(content)
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if is_dir {
                             this.toggle_folder(&path, cx);
                         } else {
-                            this.select_path(&path, window, cx);
+                            // Single click previews; double click pins (D-041).
+                            this.select_path(&path, event.click_count() >= 2, window, cx);
                         }
                     }))
                     .on_mouse_down(
@@ -15301,24 +16356,36 @@ impl Editor {
             )
         };
         let panels_dump = format!(
-            "{{\"explorer\":{},\"agent\":{},\"git\":{}}}",
-            self.explorer_open, self.agent_panel_open, self.git_panel_open
+            "{{\"explorer\":{},\"agent\":{},\"git\":{},\"explorer_w\":{},\"right_w\":{},\"wrap_w\":{},\
+             \"chat_scroll_offset\":{},\"chat_scroll_max\":{},\"chat_at_bottom\":{},\
+             \"window_title\":\"{}\"}}",
+            self.explorer_open,
+            self.agent_panel_open,
+            self.git_panel_open,
+            self.explorer_w,
+            self.right_panel_w,
+            f32::from(self.wrap_width),
+            f32::from(self.chat_scroll.offset().y),
+            f32::from(self.chat_scroll.max_offset().height),
+            self.chat_at_bottom(),
+            escape_json(&self.window_title)
         );
         let settings_dump = if let Some(state) = self.settings.as_ref() {
             format!(
                 "{{\"open\":true,\"provider\":\"{}\",\"model\":\"{}\",\
-                 \"base_url\":\"{}\",\"key_present\":{},\"key_source\":\"{}\",\
+                 \"base_url\":\"{}\",\"key_present\":{},\"key_source\":\"{}\",\"key_checked\":{},\
                  \"models\":{},\"fetching\":{},\"error\":\"{}\",\
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
                  \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\",\
-                 \"github_key_present\":{},\"github_key_source\":\"{}\",\
-                 \"agents\":{},\"agents_error\":\"{}\"}}",
+                 \"github_key_present\":{},\"github_key_source\":\"{}\",\"github_key_checked\":{},\
+                 \"agents\":{},\"agents_error\":\"{}\",\"secret_reads\":{}}}",
                 state.provider.key(),
                 escape_json(&state.model),
                 escape_json(&state.base_url),
                 state.key_present || !state.key_input.is_empty(),
                 escape_json(&state.key_source),
+                state.key_checked,
                 state.models.len(),
                 state.fetching_models,
                 escape_json(&state.error),
@@ -15339,19 +16406,21 @@ impl Editor {
                 ),
                 state.github_token_present,
                 escape_json(&state.github_token_source),
+                state.github_token_checked,
                 state.agents.len(),
                 escape_json(&state.agents_error),
+                secret_cache().read_count(),
             )
         } else {
             format!(
                 "{{\"open\":false,\"provider\":\"{}\",\"model\":\"{}\",\
-                 \"base_url\":\"{}\",\"key_present\":false,\"key_source\":\"\",\
+                 \"base_url\":\"{}\",\"key_present\":false,\"key_source\":\"\",\"key_checked\":false,\
                  \"models\":0,\"fetching\":false,\"error\":\"\",\
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
                  \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\",\
-                 \"github_key_present\":{},\"github_key_source\":\"{}\",\
-                 \"agents\":0,\"agents_error\":\"\"}}",
+                 \"github_key_present\":{},\"github_key_source\":\"{}\",\"github_key_checked\":{},\
+                 \"agents\":0,\"agents_error\":\"\",\"secret_reads\":{}}}",
                 self.agent_settings.provider.key(),
                 escape_json(&self.agent_settings.model),
                 escape_json(&self.agent_settings.base_url),
@@ -15370,8 +16439,14 @@ impl Editor {
                         .map(|project| project.manifest().title.clone())
                         .unwrap_or_default()
                 ),
-                github_token_status().0,
-                escape_json(&github_token_status().1),
+                cached_github_token_status().is_some_and(|(present, _)| present),
+                escape_json(
+                    &cached_github_token_status()
+                        .map(|(_, source)| source)
+                        .unwrap_or_default(),
+                ),
+                cached_github_token_status().is_some(),
+                secret_cache().read_count(),
             )
         };
         let palette_dump = if let Some(state) = self.palette.as_ref() {
@@ -15468,7 +16543,7 @@ impl Editor {
                 };
                 Some(format!(
                     "{{\"path\":\"{}\",\"title\":\"{}\",\"kind\":\"{}\",\
-                     \"dirty\":{},\"active\":{},\"preview\":{},\"revision\":{},\"saved_revision\":{},\
+                     \"dirty\":{},\"active\":{},\"tab_preview\":{},\"preview\":{},\"revision\":{},\"saved_revision\":{},\
                      \"caret_line\":{},\"caret_col\":{},\"selection\":[{},{}],\
                      \"scroll_item\":{},\"undo\":{},\"redo\":{}}}",
                     escape_json(&doc.path),
@@ -15476,6 +16551,7 @@ impl Editor {
                     kind,
                     doc.is_dirty(),
                     index == self.active_tab,
+                    self.tabs[index].preview,
                     doc.preview,
                     doc.revision,
                     doc.saved_revision,
@@ -16282,7 +17358,8 @@ impl EntityInputHandler for Editor {
             cx.notify();
             return;
         }
-        // The New Project dialog owns its title field (M10 slice 2b).
+        // The New Project dialog owns its title/prompt field (M10 slice 2b,
+        // M16 slice 9).
         if self.new_project.is_some() {
             let cleaned: String = new_text
                 .chars()
@@ -16290,8 +17367,16 @@ impl EntityInputHandler for Editor {
                 .collect();
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
+                && !state.busy
+                && state.plan.is_none()
             {
-                state.title.push_str(&cleaned);
+                let target =
+                    if state.mode == NewProjectMode::Ai && state.field == NewProjectField::Prompt {
+                        &mut state.prompt
+                    } else {
+                        &mut state.title
+                    };
+                target.push_str(&cleaned);
                 state.error.clear();
             }
             cx.notify();
@@ -16533,19 +17618,38 @@ impl Render for Editor {
         // The probe is driven by a timer scheduled from here, never by
         // notifying during render (see `advance_probe`).
         self.schedule_probe_step(window, cx);
+        self.sync_window_title(window);
 
         // Wrap width for non-hot rows, refreshed from the viewport each frame.
-        // The `list` render callback reads it back through the entity. With
-        // the explorer panel open (project mode) the document area is narrower
-        // by exactly the panel width, so wrapped rows never hide under it.
-        let explorer_w = if self.project.is_some() && self.explorer_open {
-            EXPLORER_W
+        // The `list` render callback reads it back through the entity. With a
+        // side panel open the document area is narrower by the panel width and
+        // its 6 px splitter; the fitted widths keep the editor at its minimum
+        // when the window shrinks (M16 slice 3).
+        let viewport_w = f32::from(window.viewport_size().width);
+        let explorer_open = self.project.is_some() && self.explorer_open;
+        let right_open = self.agent_panel_open;
+        let (explorer_fit, right_fit) = panel_resize::fit(
+            viewport_w,
+            panel_resize::Panels {
+                explorer_open,
+                right_open,
+                explorer_w: self.explorer_w,
+                right_w: self.right_panel_w,
+            },
+        );
+        if explorer_open {
+            self.explorer_w = explorer_fit;
+        }
+        if right_open {
+            self.right_panel_w = right_fit;
+        }
+        let explorer_chrome = if explorer_open {
+            self.explorer_w + panel_resize::SPLITTER_W
         } else {
             0.0
         };
-        // The explicitly toggled agent panel narrows the document area too.
-        let agent_w = if self.agent_panel_open {
-            AGENT_PANEL_W
+        let right_chrome = if right_open {
+            self.right_panel_w + panel_resize::SPLITTER_W
         } else {
             0.0
         };
@@ -16553,7 +17657,7 @@ impl Render for Editor {
             px(100_000.0)
         } else {
             (window.viewport_size().width
-                - px(explorer_w + agent_w + ROW_PADDING_X * 2.0 + theme::gutter_width()))
+                - px(explorer_chrome + right_chrome + ROW_PADDING_X * 2.0 + theme::gutter_width()))
             .max(px(200.0))
         };
 
@@ -16567,6 +17671,18 @@ impl Render for Editor {
             .flex_col()
             .bg(rgb(theme::bg()))
             .track_focus(&self.focus_handle(cx))
+            // Side-panel splitter drag (M16 slice 3). The root receives the
+            // moves while the pointer is over any child, so the 6 px handle
+            // never needs to keep the pointer.
+            .on_mouse_move(cx.listener(Self::on_panel_resize))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_panel_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_panel_resize(cx)),
+            )
             .on_action(cx.listener(Self::next_scene))
             .on_action(cx.listener(Self::prev_scene))
             .on_action(cx.listener(Self::on_left))
@@ -16680,17 +17796,25 @@ impl Render for Editor {
                 div()
                     .flex_1()
                     .flex()
+                    // The body row clips its children: a long transcript must
+                    // scroll inside the chat panel, never grow the window
+                    // (M16 slice 2).
+                    .overflow_hidden()
                     // Body row (M6 slice 1): explorer panel (project mode
                     // only) + document area. Fixture mode has no panel, so
                     // the verified full-width spike geometry is unchanged.
                     .when(self.project.is_some() && self.explorer_open, |body| {
                         body.child(self.explorer_panel(cx))
+                            .child(self.panel_splitter(panel_resize::Target::Explorer, cx))
                     })
                     .child(
                         div()
                             .flex_1()
                             .flex()
                             .flex_col()
+                            // Keep the document column inside the body row;
+                            // its editor list already scrolls on its own.
+                            .overflow_hidden()
                             .when(self.project.is_some(), |column| {
                                 column.child(self.tab_bar(cx))
                             })
@@ -16770,7 +17894,8 @@ impl Render for Editor {
                     // Agent panel (review/proposal or the empty state): right
                     // column of the body row, toggled from the bottom bar.
                     .when(self.agent_panel_open, |body| {
-                        body.child(self.agent_panel(cx))
+                        body.child(self.panel_splitter(panel_resize::Target::RightPanel, cx))
+                            .child(self.agent_panel(cx))
                     }),
             )
             .child(self.bottom_bar(cx))
@@ -16848,17 +17973,87 @@ impl Default for AgentSettings {
 }
 
 /// Resolve a provider key without ever exposing it to settings/dump/logs.
+/// One process-wide secret cache (D-040). The OS keychain can ask for access
+/// on every read while the binary's signature is not stable, so a session
+/// reads each account at most once. The harness and tests keep their own
+/// stores; this one is only for the desktop session.
+fn secret_cache() -> &'static CachedSecretStore {
+    static CACHE: OnceLock<CachedSecretStore> = OnceLock::new();
+    CACHE.get_or_init(|| CachedSecretStore::new(Box::new(OsKeychain::new())))
+}
+
+/// True when an environment variable is set to a non-empty value. Reading the
+/// environment never touches the keychain.
+fn secret_env_present(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn provider_env_present(provider: AiProvider) -> bool {
+    provider.env_var().is_some_and(secret_env_present)
+}
+
+/// Status derived from a store answer, with the environment fallback that
+/// `resolve_secret` applies when the store has no value or fails.
+fn secret_status(result: Result<Option<String>, SecretError>, env_present: bool) -> (bool, String) {
+    match result {
+        Ok(Some(secret)) if !secret.trim().is_empty() => (true, "keychain".to_string()),
+        Ok(_) | Err(_) if env_present => (true, "env".to_string()),
+        Ok(_) => (false, String::new()),
+        Err(error) => (false, error.to_string()),
+    }
+}
+
+/// Status for displays that must not read the keychain (D-040). `None` means
+/// the session has not resolved this account yet, so the UI shows "not
+/// checked" and offers an explicit Check action.
+fn cached_secret_status(
+    cached: Option<Result<Option<String>, SecretError>>,
+    env_present: bool,
+) -> Option<(bool, String)> {
+    let env_source = || (true, "env".to_string());
+    match cached {
+        Some(Ok(Some(secret))) if !secret.trim().is_empty() => Some((true, "keychain".to_string())),
+        Some(Ok(_)) => Some(if env_present {
+            env_source()
+        } else {
+            (false, String::new())
+        }),
+        Some(Err(error)) => Some(if env_present {
+            env_source()
+        } else {
+            (false, error.to_string())
+        }),
+        None => env_present.then(env_source),
+    }
+}
+
+fn cached_provider_key_status(provider: AiProvider) -> Option<(bool, String)> {
+    let Some(account) = provider.secret_account() else {
+        return Some((false, String::new()));
+    };
+    cached_secret_status(secret_cache().peek(account), provider_env_present(provider))
+}
+
+fn cached_github_token_status() -> Option<(bool, String)> {
+    cached_secret_status(
+        secret_cache().peek(GITHUB_TOKEN_ACCOUNT),
+        secret_env_present("GITHUB_TOKEN"),
+    )
+}
+
 /// Keychain first, then the provider's environment fallback. Mock has none.
 fn resolve_provider_key(provider: AiProvider) -> Result<Option<String>, String> {
     let Some(account) = provider.secret_account() else {
         return Ok(None);
     };
-    let store = narra_core::provider::OsKeychain::new();
+    let store = secret_cache();
     let env_value = provider
         .env_var()
         .and_then(|name| env::var(name).ok())
         .filter(|value| !value.trim().is_empty());
-    let key = narra_core::provider::resolve_secret(&store, account, env_value.as_deref())
+    let key = narra_core::provider::resolve_secret(store, account, env_value.as_deref())
         .map_err(|error| error.to_string())?;
     if provider.requires_key() && key.is_none() {
         return Err(format!(
@@ -16926,32 +18121,17 @@ fn slugify(value: &str) -> String {
 }
 
 fn github_token_status() -> (bool, String) {
-    let store = narra_core::provider::OsKeychain::new();
-    match store.get(GITHUB_TOKEN_ACCOUNT) {
-        Ok(Some(secret)) if !secret.trim().is_empty() => (true, "keychain".to_string()),
-        Ok(_) => match env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(_) => (true, "env".to_string()),
-            None => (false, String::new()),
-        },
-        Err(error) => match env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(_) => (true, "env".to_string()),
-            None => (false, error.to_string()),
-        },
-    }
+    secret_status(
+        secret_cache().get(GITHUB_TOKEN_ACCOUNT),
+        secret_env_present("GITHUB_TOKEN"),
+    )
 }
 
 fn resolve_github_token() -> Result<Option<String>, String> {
-    let store = narra_core::provider::OsKeychain::new();
     let env_value = env::var("GITHUB_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    narra_core::provider::resolve_secret(&store, GITHUB_TOKEN_ACCOUNT, env_value.as_deref())
+    narra_core::provider::resolve_secret(secret_cache(), GITHUB_TOKEN_ACCOUNT, env_value.as_deref())
         .map_err(|error| error.to_string())
 }
 
@@ -16959,26 +18139,7 @@ fn provider_key_status(provider: AiProvider) -> (bool, String) {
     let Some(account) = provider.secret_account() else {
         return (false, String::new());
     };
-    let store = narra_core::provider::OsKeychain::new();
-    match store.get(account) {
-        Ok(Some(secret)) if !secret.trim().is_empty() => (true, "keychain".to_string()),
-        Ok(_) => match provider
-            .env_var()
-            .and_then(|name| env::var(name).ok())
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(_) => (true, "env".to_string()),
-            None => (false, String::new()),
-        },
-        Err(error) => match provider
-            .env_var()
-            .and_then(|name| env::var(name).ok())
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(_) => (true, "env".to_string()),
-            None => (false, error.to_string()),
-        },
-    }
+    secret_status(secret_cache().get(account), provider_env_present(provider))
 }
 
 impl AgentSettings {
@@ -17474,15 +18635,20 @@ fn run() -> Result<(), String> {
 
             let entity = cx.new(|cx| Editor {
                 doc: DocumentState::new(doc_path, &content),
-                tabs: vec![Tab { document: None }],
+                tabs: vec![Tab {
+                    document: None,
+                    preview: false,
+                }],
                 active_tab: 0,
                 autosave_started: false,
                 unsaved_prompt: None,
                 debug_metrics: debug_metrics_flag,
                 new_file: None,
                 new_project: None,
+                new_project_generation: 0,
                 recents,
                 workspace_generation: 0,
+                window_title: "Narra".to_string(),
                 git: GitStatus::default(),
                 git_pending: false,
                 git_request: 0,
@@ -17490,6 +18656,9 @@ fn run() -> Result<(), String> {
                 explorer_open: true,
                 agent_panel_open: false,
                 git_panel_open: false,
+                explorer_w: panel_resize::EXPLORER_DEFAULT_W,
+                right_panel_w: panel_resize::RIGHT_PANEL_DEFAULT_W,
+                panel_drag: None,
                 focus_handle: cx.focus_handle(),
                 wrap_width: px(800.0),
                 metrics: metrics.clone(),
@@ -17544,6 +18713,9 @@ fn run() -> Result<(), String> {
                 chat_cancel: None,
                 chat_history: Vec::new(),
                 chat_history_open: false,
+                chat_scroll: ScrollHandle::new(),
+                chat_scroll_drag: None,
+                chat_markdown: RefCell::new(HashMap::new()),
                 rename: None,
                 delete_prompt: None,
                 show_config_files: initial_show_config_files,
@@ -17628,6 +18800,73 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_cache_keys_are_content_stable() {
+        assert_eq!(markdown_key("hola"), markdown_key("hola"));
+        assert_ne!(markdown_key("hola"), markdown_key("hola "));
+    }
+
+    #[test]
+    fn window_title_uses_the_project_name() {
+        assert_eq!(
+            project_window_title(Some("Luces de Invierno")),
+            "Luces de Invierno — Narra"
+        );
+        assert_eq!(project_window_title(Some("  ")), "Narra");
+        assert_eq!(project_window_title(None), "Narra");
+    }
+
+    #[test]
+    fn secret_status_prefers_a_stored_key_over_the_environment() {
+        assert_eq!(
+            secret_status(Ok(Some("sk-stored".to_string())), true),
+            (true, "keychain".to_string())
+        );
+        assert_eq!(
+            secret_status(Ok(Some("sk-stored".to_string())), false),
+            (true, "keychain".to_string())
+        );
+    }
+
+    #[test]
+    fn secret_status_falls_back_to_the_environment_and_reports_absence_clearly() {
+        assert_eq!(secret_status(Ok(None), true), (true, "env".to_string()));
+        assert_eq!(secret_status(Ok(None), false), (false, String::new()));
+        assert_eq!(
+            secret_status(Ok(Some("   ".to_string())), false),
+            (false, String::new())
+        );
+        let denied = SecretError::AccessDenied {
+            detail: "denied".to_string(),
+        };
+        assert_eq!(
+            secret_status(Err(denied.clone()), true),
+            (true, "env".to_string())
+        );
+        assert!(
+            !secret_status(Err(denied), false).0,
+            "a failed read is not treated as a present key"
+        );
+    }
+
+    #[test]
+    fn cached_status_distinguishes_unknown_from_absent() {
+        assert_eq!(cached_secret_status(None, false), None, "not checked yet");
+        assert_eq!(
+            cached_secret_status(None, true),
+            Some((true, "env".to_string()))
+        );
+        assert_eq!(
+            cached_secret_status(Some(Ok(None)), false),
+            Some((false, String::new()))
+        );
+        assert_eq!(
+            cached_secret_status(Some(Ok(Some("sk-stored".to_string()))), true),
+            Some((true, "keychain".to_string())),
+            "the keychain answer wins over the environment for display"
+        );
+    }
 
     #[test]
     fn scene_number_at_finds_the_scene_under_the_caret() {
