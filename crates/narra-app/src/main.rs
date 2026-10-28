@@ -167,8 +167,10 @@ use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
-use narra_core::git::{Commit, OpOptions, Repository, WorktreeStatus};
-use narra_core::provider::SecretStore;
+use narra_core::git::{Branch, Commit, OpOptions, Repository, WorktreeStatus};
+use narra_core::provider::{
+    GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest, NewRepository, SecretStore,
+};
 use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
 use new_file::Kind as NewFileKind;
 use project_settings::{ProjectField, ProjectSettingsState};
@@ -482,6 +484,7 @@ enum SettingsField {
     ApiKey,
     GitName,
     GitEmail,
+    GitHubToken,
 }
 
 /// Sidebar section of the Preferences dialog (M10 S4c).
@@ -535,6 +538,9 @@ struct SettingsState {
     show_config_files: bool,
     git_name: String,
     git_email: String,
+    github_token_input: String,
+    github_token_present: bool,
+    github_token_source: String,
 }
 
 impl std::fmt::Debug for SettingsState {
@@ -567,6 +573,16 @@ impl std::fmt::Debug for SettingsState {
             .field("show_config_files", &self.show_config_files)
             .field("git_name", &self.git_name)
             .field("git_email", &self.git_email)
+            .field(
+                "github_token_input",
+                &if self.github_token_input.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("github_token_present", &self.github_token_present)
+            .field("github_token_source", &self.github_token_source)
             .finish()
     }
 }
@@ -763,6 +779,38 @@ enum GitMessage {
     History {
         result: Result<Vec<Commit>, String>,
     },
+    Branches {
+        result: Result<Vec<Branch>, String>,
+    },
+    Diff {
+        path: String,
+        result: Result<String, String>,
+    },
+    Restore {
+        path: String,
+        result: Result<(), String>,
+    },
+    BranchSwitch {
+        result: Result<(), String>,
+    },
+    BranchCreate {
+        result: Result<(), String>,
+    },
+    Remotes {
+        result: Result<Vec<(String, String)>, String>,
+    },
+    Publish {
+        result: Result<String, String>,
+    },
+    Push {
+        result: Result<(), String>,
+    },
+    Pull {
+        result: Result<(), String>,
+    },
+    PullRequest {
+        result: Result<String, String>,
+    },
     Commit {
         result: Result<(), String>,
     },
@@ -775,6 +823,56 @@ enum GitMessage {
 #[derive(Debug, Clone)]
 struct GitCommitState {
     message: String,
+    error: String,
+    busy: bool,
+    selected: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitDiffState {
+    path: String,
+    diff: String,
+    loading: bool,
+    error: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitRestoreState {
+    path: String,
+    error: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitBranchPromptState {
+    name: String,
+    error: String,
+    busy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitSyncKind {
+    Push,
+    Pull,
+}
+
+struct GitSyncState {
+    kind: GitSyncKind,
+    error: String,
+    busy: bool,
+}
+
+struct GitHubPublishState {
+    name: String,
+    private: bool,
+    error: String,
+    busy: bool,
+}
+
+struct GitHubPullRequestState {
+    title: String,
+    body: String,
+    base: String,
+    field: u8,
     error: String,
     busy: bool,
 }
@@ -859,6 +957,24 @@ fn scene_number_at(scene_lines: &[usize], caret_line: usize) -> Option<usize> {
 
 /// First 8 characters of a proposal id, for display (character-safe; never
 /// panics on short ids).
+/// Synthetic unified diff for a file that has no version in `HEAD` yet.
+/// Additions only, matching the visual language of `git diff`.
+fn added_file_diff(path: &str, text: &str) -> String {
+    let mut diff = format!("--- /dev/null\n+++ b/{path}\n");
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        diff.push_str("@@ -0,0 +0,0 @@\n");
+        return diff;
+    }
+    diff.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+    for line in lines {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -1554,6 +1670,20 @@ struct Editor {
     git_history_error: String,
     git_history_stale: bool,
     git_commit: Option<GitCommitState>,
+    git_diff: Option<GitDiffState>,
+    git_restore: Option<GitRestoreState>,
+    git_branches: Vec<Branch>,
+    git_branches_loading: bool,
+    git_branches_error: String,
+    git_branches_stale: bool,
+    git_branch_prompt: Option<GitBranchPromptState>,
+    git_remotes: Vec<(String, String)>,
+    git_remotes_loading: bool,
+    git_remotes_error: String,
+    git_remotes_stale: bool,
+    github_publish: Option<GitHubPublishState>,
+    git_sync: Option<GitSyncState>,
+    github_pr: Option<GitHubPullRequestState>,
     git_busy: bool,
     /// Right-hand surface: Chat (M12) or the older review/proposal activity.
     right_tab: RightTab,
@@ -1760,6 +1890,8 @@ impl Editor {
             self.explorer_open = true;
             self.refresh_git_now(cx);
             self.request_git_history(cx);
+            self.request_git_branches(cx);
+            self.git_remotes_stale = true;
         }
         cx.notify();
     }
@@ -1842,6 +1974,9 @@ impl Editor {
             show_config_files: self.app_settings.show_config_files,
             git_name: self.app_settings.git_name.clone(),
             git_email: self.app_settings.git_email.clone(),
+            github_token_input: String::new(),
+            github_token_present: github_token_status().0,
+            github_token_source: github_token_status().1,
         });
         cx.notify();
     }
@@ -1889,6 +2024,7 @@ impl Editor {
                 SettingsField::ApiKey => state.key_input.push_str(&cleaned),
                 SettingsField::GitName => state.git_name.push_str(&cleaned),
                 SettingsField::GitEmail => state.git_email.push_str(&cleaned),
+                SettingsField::GitHubToken => state.github_token_input.push_str(&cleaned),
             }
             state.error.clear();
             state.status.clear();
@@ -1904,6 +2040,7 @@ impl Editor {
                 SettingsField::ApiKey => &mut state.key_input,
                 SettingsField::GitName => &mut state.git_name,
                 SettingsField::GitEmail => &mut state.git_email,
+                SettingsField::GitHubToken => &mut state.github_token_input,
             };
             if let Some(last) = target.chars().last() {
                 let len = target.len();
@@ -1929,7 +2066,11 @@ impl Editor {
                         ]
                     }
                 }
-                SettingsSection::Git => &[SettingsField::GitName, SettingsField::GitEmail],
+                SettingsSection::Git => &[
+                    SettingsField::GitName,
+                    SettingsField::GitEmail,
+                    SettingsField::GitHubToken,
+                ],
                 SettingsSection::General | SettingsSection::Editor => &[],
             };
             if fields.is_empty() {
@@ -1999,6 +2140,23 @@ impl Editor {
                         "settings.key_save_failed",
                         &[("error", &error.to_string())],
                     );
+                }
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(state) = self.settings.as_ref()
+            && !state.github_token_input.trim().is_empty()
+        {
+            let store = narra_core::provider::OsKeychain::new();
+            if let Err(error) = store.set(GITHUB_TOKEN_ACCOUNT, state.github_token_input.trim()) {
+                let message = i18n::tf(
+                    lang,
+                    "settings.github_key_save_failed",
+                    &[("error", &error.to_string())],
+                );
+                if let Some(state) = self.settings.as_mut() {
+                    state.error = message;
                 }
                 cx.notify();
                 return;
@@ -2191,6 +2349,31 @@ impl Editor {
             state.key_present = key_present;
             state.key_source = key_source;
             state.status = i18n::tr(lang, "settings.key_cleared").to_string();
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn settings_clear_github_token(&mut self, cx: &mut Context<Self>) {
+        let store = narra_core::provider::OsKeychain::new();
+        if let Err(error) = store.delete(GITHUB_TOKEN_ACCOUNT) {
+            let message = self.tf(
+                "settings.github_key_save_failed",
+                &[("error", &error.to_string())],
+            );
+            if let Some(state) = self.settings.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let (present, source) = github_token_status();
+        let status = self.t("settings.github_key_cleared").to_string();
+        if let Some(state) = self.settings.as_mut() {
+            state.github_token_input.clear();
+            state.github_token_present = present;
+            state.github_token_source = source;
+            state.status = status;
             state.error.clear();
         }
         cx.notify();
@@ -2701,6 +2884,66 @@ impl Editor {
                                 cx.notify();
                             })),
                         ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(110.0))
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("settings.github_token")),
+                        )
+                        .child(
+                            field(
+                                "settings-github-token",
+                                if !state.github_token_input.is_empty() {
+                                    format!(
+                                        "{}▌",
+                                        "•".repeat(
+                                            state.github_token_input.chars().count().min(32)
+                                        )
+                                    )
+                                } else if state.github_token_present {
+                                    format!(
+                                        "•••••••• ({})",
+                                        self.t(if state.github_token_source == "env" {
+                                            "settings.key_source_env"
+                                        } else {
+                                            "settings.key_source_keychain"
+                                        })
+                                    )
+                                } else {
+                                    self.t("settings.github_token_empty").to_string()
+                                },
+                                state.field == SettingsField::GitHubToken,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.settings.as_mut() {
+                                    state.field = SettingsField::GitHubToken;
+                                }
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            div()
+                                .id("settings-clear-github-token")
+                                .px_2()
+                                .py_1()
+                                .cursor_pointer()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("settings.clear_key"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings_clear_github_token(cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("settings.github_hint")),
                 )
                 .child(
                     div()
@@ -6667,6 +6910,9 @@ impl Editor {
                     if git.available && view.git_history.is_empty() {
                         view.git_history_stale = true;
                     }
+                    if git.available && view.git_branches.is_empty() {
+                        view.git_branches_stale = true;
+                    }
                     view.git = git;
                 }
                 Err(error) => {
@@ -6674,6 +6920,800 @@ impl Editor {
                         error,
                         ..GitStatus::default()
                     };
+                }
+            }
+            true
+        });
+    }
+
+    fn request_git_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        self.git_branches_loading = true;
+        self.git_branches_error.clear();
+        self.git_branches_stale = false;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(10));
+            let result = Repository::open(&root, options.clone())
+                .and_then(|repository| repository.branches(options))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::Branches { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Branches { result } = message else {
+                return false;
+            };
+            view.git_branches_loading = false;
+            match result {
+                Ok(branches) => view.git_branches = branches,
+                Err(error) => view.git_branches_error = error,
+            }
+            true
+        });
+    }
+
+    fn open_git_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let is_new = matches!(
+            self.git.file_status(&path),
+            Some(WorktreeStatus::Added | WorktreeStatus::Untracked)
+        );
+        self.git_diff = Some(GitDiffState {
+            path: path.clone(),
+            diff: String::new(),
+            loading: true,
+            error: String::new(),
+        });
+        let project = project.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = if is_new {
+                // `git diff HEAD` cannot show an untracked file, but the
+                // writer still expects to see what they are about to save.
+                project
+                    .read_document(&path)
+                    .map(|text| added_file_diff(&path, &text))
+                    .map_err(|error| error.to_string())
+            } else {
+                let options = OpOptions::default().timeout(Duration::from_secs(10));
+                Repository::open(&root, options.clone())
+                    .and_then(|repository| {
+                        repository.diff_path(
+                            narra_core::git::DiffScope::WorktreeVsHead,
+                            &path,
+                            options,
+                        )
+                    })
+                    .map_err(|error| error.to_string())
+            };
+            let _ = tx.send(GitMessage::Diff { path, result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Diff { path, result } = message else {
+                return false;
+            };
+            if let Some(diff) = view.git_diff.as_mut()
+                && diff.path == path
+            {
+                diff.loading = false;
+                match result {
+                    Ok(text) => diff.diff = text,
+                    Err(error) => diff.error = error,
+                }
+            }
+            true
+        });
+    }
+
+    fn open_git_restore(&mut self, path: String, cx: &mut Context<Self>) {
+        self.git_restore = Some(GitRestoreState {
+            path,
+            error: String::new(),
+        });
+        cx.notify();
+    }
+
+    fn confirm_git_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.git_restore.as_ref() else {
+            return;
+        };
+        if self.doc.path == prompt.path && self.dirty() {
+            let message = self.t("git.restore_dirty").to_string();
+            if let Some(prompt) = self.git_restore.as_mut() {
+                prompt.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let path = prompt.path.clone();
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(10));
+            let result = (|| {
+                let repository =
+                    Repository::open(project.root(), options.clone()).map_err(|e| e.to_string())?;
+                let text = repository
+                    .show_file("HEAD", &path, options)
+                    .map_err(|e| e.to_string())?;
+                project
+                    .write_document(&path, &text)
+                    .map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(GitMessage::Restore { path, result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Restore { path, result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(()) => {
+                    if view.doc.path == path
+                        && let Some(project) = view.project.as_ref()
+                        && let Ok(text) = project.read_document(&path)
+                    {
+                        view.load_document(path.clone(), text);
+                    }
+                    view.git_restore = None;
+                    view.git_diff = None;
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                    view.notice = Some(view.t("git.restored").to_string());
+                }
+                Err(error) => {
+                    let message = view.tf("git.restore_failed", &[("error", &error)]);
+                    if let Some(prompt) = view.git_restore.as_mut() {
+                        prompt.error = message;
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn reload_open_documents(&mut self) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let active = if self.doc.path.is_empty() {
+            None
+        } else {
+            project
+                .read_document(&self.doc.path)
+                .ok()
+                .map(|text| (self.doc.path.clone(), text))
+        };
+        let inactive: Vec<(usize, String, String)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let doc = tab.document.as_ref()?;
+                let text = project.read_document(&doc.path).ok()?;
+                Some((index, doc.path.clone(), text))
+            })
+            .collect();
+        if let Some((path, text)) = active {
+            self.load_document(path, text);
+        }
+        for (index, path, text) in inactive {
+            self.tabs[index].document = Some(DocumentState::new(path, &text));
+        }
+    }
+
+    fn switch_git_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.dirty_tab_count() > 0 {
+            self.notice = Some(self.t("git.save_files_first").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(20));
+            let result = Repository::open(&root, options.clone())
+                .and_then(|repository| repository.checkout(&name, options))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::BranchSwitch { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::BranchSwitch { result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(()) => {
+                    view.reload_open_documents();
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                    view.notice = Some(view.t("git.branch_switched").to_string());
+                    view.git_branches_stale = true;
+                }
+                Err(error) => {
+                    view.notice = Some(view.tf("git.branch_failed", &[("error", &error)]));
+                }
+            }
+            true
+        });
+    }
+
+    fn open_branch_prompt(&mut self, cx: &mut Context<Self>) {
+        self.git_branch_prompt = Some(GitBranchPromptState {
+            name: String::new(),
+            error: String::new(),
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn branch_prompt_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text
+            .chars()
+            .filter(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ' ')
+            })
+            .collect();
+        if let Some(state) = self.git_branch_prompt.as_mut() {
+            state.name.push_str(&cleaned);
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn branch_prompt_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.git_branch_prompt.as_mut() {
+            if let Some(last) = state.name.chars().last() {
+                let len = state.name.len();
+                state.name.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn submit_branch_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.git_branch_prompt.as_ref() else {
+            return;
+        };
+        if state.busy {
+            return;
+        }
+        let name = state.name.trim().replace(' ', "-");
+        if name.is_empty() {
+            let message = self.t("git.branch_name_required").to_string();
+            if let Some(state) = self.git_branch_prompt.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        if let Some(state) = self.git_branch_prompt.as_mut() {
+            state.busy = true;
+        }
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(20));
+            let result = Repository::open(&root, options.clone())
+                .and_then(|repository| repository.checkout_new(&name, options))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::BranchCreate { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::BranchCreate { result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(()) => {
+                    view.git_branch_prompt = None;
+                    view.reload_open_documents();
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                    view.notice = Some(view.t("git.branch_created").to_string());
+                    view.git_branches_stale = true;
+                }
+                Err(error) => {
+                    let message = view.tf("git.branch_failed", &[("error", &error)]);
+                    if let Some(state) = view.git_branch_prompt.as_mut() {
+                        state.busy = false;
+                        state.error = message;
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn request_git_remotes(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        if !self.git.available {
+            self.git_remotes.clear();
+            return;
+        }
+        let root = project.root().to_path_buf();
+        self.git_remotes_loading = true;
+        self.git_remotes_error.clear();
+        self.git_remotes_stale = false;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(10));
+            let result = Repository::open(&root, options.clone())
+                .and_then(|repository| repository.remotes(options))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::Remotes { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Remotes { result } = message else {
+                return false;
+            };
+            view.git_remotes_loading = false;
+            match result {
+                Ok(remotes) => view.git_remotes = remotes,
+                Err(error) => view.git_remotes_error = error,
+            }
+            true
+        });
+    }
+
+    fn github_remote_info(&self) -> Option<(String, String, String)> {
+        let remote = self
+            .git_remotes
+            .iter()
+            .find(|(name, _)| name == "origin")
+            .or_else(|| self.git_remotes.first())?;
+        let (owner, repo) = parse_github_remote(&remote.1)?;
+        Some((remote.0.clone(), owner, repo))
+    }
+
+    fn open_github_publish(&mut self, cx: &mut Context<Self>) {
+        if resolve_github_token().ok().flatten().is_none() {
+            self.notice = Some(self.t("github.token_required").to_string());
+            self.open_git_settings(cx);
+            return;
+        }
+        let name = slugify(
+            &self
+                .project
+                .as_ref()
+                .map(|project| project.manifest().title.clone())
+                .unwrap_or_else(|| "narra-project".to_string()),
+        );
+        self.github_publish = Some(GitHubPublishState {
+            name,
+            private: true,
+            error: String::new(),
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn github_publish_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text
+            .chars()
+            .filter(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+            .collect();
+        if let Some(state) = self.github_publish.as_mut() {
+            state.name.push_str(&cleaned);
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn github_publish_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.github_publish.as_mut() {
+            if let Some(last) = state.name.chars().last() {
+                let len = state.name.len();
+                state.name.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn submit_github_publish(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.github_publish.as_ref() else {
+            return;
+        };
+        if state.busy {
+            return;
+        }
+        let name = state.name.trim().to_string();
+        let private = state.private;
+        if name.is_empty() {
+            let message = self.t("github.repo_required").to_string();
+            if let Some(state) = self.github_publish.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let token = match resolve_github_token() {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                let message = self.t("github.token_required").to_string();
+                if let Some(state) = self.github_publish.as_mut() {
+                    state.error = message;
+                }
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                if let Some(state) = self.github_publish.as_mut() {
+                    state.error = error;
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let branch = if self.git.branch.is_empty() {
+            "main".to_string()
+        } else {
+            self.git.branch.clone()
+        };
+        if let Some(state) = self.github_publish.as_mut() {
+            state.busy = true;
+            state.error.clear();
+        }
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(120));
+            let result = (|| {
+                let config =
+                    GitHubConfig::github_com(token.clone()).with_timeout(Duration::from_secs(30));
+                let client = GitHubClient::new(config);
+                let _user = client
+                    .authenticated_user()
+                    .map_err(|error| error.to_string())?;
+                let repository = client
+                    .create_repository(&NewRepository {
+                        name,
+                        private,
+                        description: Some("Narra project".to_string()),
+                        auto_init: false,
+                    })
+                    .map_err(|error| error.to_string())?;
+                let git_repository =
+                    Repository::open(&root, options.clone()).map_err(|error| error.to_string())?;
+                git_repository
+                    .add_remote("origin", &repository.clone_url, options.clone())
+                    .map_err(|error| error.to_string())?;
+                git_repository
+                    .push_with_token("origin", &branch, &token, options)
+                    .map_err(|error| error.to_string())?;
+                Ok(repository.html_url)
+            })();
+            let _ = tx.send(GitMessage::Publish { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::Publish { result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(url) => {
+                    view.github_publish = None;
+                    view.notice = Some(view.tf("github.published", &[("url", &url)]));
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                    view.git_branches_stale = true;
+                    view.git_remotes_stale = true;
+                }
+                Err(error) => {
+                    let message = view.tf("github.publish_failed", &[("error", &error)]);
+                    if let Some(state) = view.github_publish.as_mut() {
+                        state.busy = false;
+                        state.error = message;
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn open_git_sync(&mut self, kind: GitSyncKind, cx: &mut Context<Self>) {
+        if self.dirty_tab_count() > 0 {
+            self.notice = Some(self.t("git.save_files_first").to_string());
+            cx.notify();
+            return;
+        }
+        if self.github_remote_info().is_none() {
+            self.notice = Some(self.t("github.no_remote").to_string());
+            cx.notify();
+            return;
+        }
+        self.git_sync = Some(GitSyncState {
+            kind,
+            error: String::new(),
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn confirm_git_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.git_sync.as_ref() else {
+            return;
+        };
+        if state.busy {
+            return;
+        }
+        let kind = state.kind;
+        let token = match resolve_github_token() {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                let message = self.t("github.token_required").to_string();
+                if let Some(state) = self.git_sync.as_mut() {
+                    state.error = message;
+                }
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                if let Some(state) = self.git_sync.as_mut() {
+                    state.error = error;
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let Some((remote, _, _)) = self.github_remote_info() else {
+            return;
+        };
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        let branch = if self.git.branch.is_empty() {
+            "main".to_string()
+        } else {
+            self.git.branch.clone()
+        };
+        if let Some(state) = self.git_sync.as_mut() {
+            state.busy = true;
+            state.error.clear();
+        }
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let options = OpOptions::default().timeout(Duration::from_secs(120));
+            let result = (|| {
+                let repository =
+                    Repository::open(&root, options.clone()).map_err(|error| error.to_string())?;
+                match kind {
+                    GitSyncKind::Push => repository
+                        .push_with_token(&remote, &branch, &token, options)
+                        .map_err(|error| error.to_string()),
+                    GitSyncKind::Pull => repository
+                        .pull_with_token(&remote, &branch, &token, options)
+                        .map_err(|error| error.to_string()),
+                }
+            })();
+            let _ = tx.send(match kind {
+                GitSyncKind::Push => GitMessage::Push { result },
+                GitSyncKind::Pull => GitMessage::Pull { result },
+            });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let (kind, result) = match message {
+                GitMessage::Push { result } => (GitSyncKind::Push, result),
+                GitMessage::Pull { result } => (GitSyncKind::Pull, result),
+                _ => return false,
+            };
+            view.git_busy = false;
+            match result {
+                Ok(()) => {
+                    view.git_sync = None;
+                    view.notice = Some(
+                        view.t(if kind == GitSyncKind::Push {
+                            "github.pushed"
+                        } else {
+                            "github.pulled"
+                        })
+                        .to_string(),
+                    );
+                    view.git_refreshed_at = None;
+                    view.git_history_stale = true;
+                    view.git_branches_stale = true;
+                    if kind == GitSyncKind::Pull {
+                        view.reload_open_documents();
+                    }
+                }
+                Err(error) => {
+                    let message = view.tf(
+                        if kind == GitSyncKind::Push {
+                            "github.push_failed"
+                        } else {
+                            "github.pull_failed"
+                        },
+                        &[("error", &error)],
+                    );
+                    if let Some(state) = view.git_sync.as_mut() {
+                        state.busy = false;
+                        state.error = message;
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    fn open_github_pr(&mut self, cx: &mut Context<Self>) {
+        if resolve_github_token().ok().flatten().is_none() {
+            self.notice = Some(self.t("github.token_required").to_string());
+            self.open_git_settings(cx);
+            return;
+        }
+        if self.github_remote_info().is_none() {
+            self.notice = Some(self.t("github.no_remote").to_string());
+            cx.notify();
+            return;
+        }
+        let branch = if self.git.branch.is_empty() {
+            "main".to_string()
+        } else {
+            self.git.branch.clone()
+        };
+        if branch == "main" {
+            self.notice = Some(self.t("github.create_branch_first").to_string());
+            cx.notify();
+            return;
+        }
+        self.github_pr = Some(GitHubPullRequestState {
+            title: self.tf("github.pr_default_title", &[("branch", &branch)]),
+            body: String::new(),
+            base: "main".to_string(),
+            field: 0,
+            error: String::new(),
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn github_pr_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text
+            .chars()
+            .filter(|character| !character.is_control() || *character == ' ')
+            .collect();
+        if let Some(state) = self.github_pr.as_mut() {
+            match state.field {
+                0 => state.title.push_str(&cleaned),
+                1 => state.body.push_str(&cleaned),
+                _ => state.base.push_str(&cleaned),
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn github_pr_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.github_pr.as_mut() {
+            let target = match state.field {
+                0 => &mut state.title,
+                1 => &mut state.body,
+                _ => &mut state.base,
+            };
+            if let Some(last) = target.chars().last() {
+                let len = target.len();
+                target.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn submit_github_pr(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.github_pr.as_ref() else {
+            return;
+        };
+        if state.busy {
+            return;
+        }
+        let title = state.title.trim().to_string();
+        let body = state.body.trim().to_string();
+        let base = state.base.trim().to_string();
+        if title.is_empty() || base.is_empty() {
+            let message = self.t("github.pr_required").to_string();
+            if let Some(state) = self.github_pr.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let branch = if self.git.branch.is_empty() {
+            "main".to_string()
+        } else {
+            self.git.branch.clone()
+        };
+        if branch == base {
+            let message = self.t("github.pr_same_branch").to_string();
+            if let Some(state) = self.github_pr.as_mut() {
+                state.error = message;
+            }
+            cx.notify();
+            return;
+        }
+        let token = match resolve_github_token() {
+            Ok(Some(token)) => token,
+            _ => {
+                let message = self.t("github.token_required").to_string();
+                if let Some(state) = self.github_pr.as_mut() {
+                    state.error = message;
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let Some((_, owner, repo)) = self.github_remote_info() else {
+            return;
+        };
+        if let Some(state) = self.github_pr.as_mut() {
+            state.busy = true;
+            state.error.clear();
+        }
+        self.git_busy = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let config = GitHubConfig::github_com(token).with_timeout(Duration::from_secs(30));
+            let client = GitHubClient::new(config);
+            let result = client
+                .create_pull_request(
+                    &owner,
+                    &repo,
+                    &NewPullRequest {
+                        title,
+                        head: branch,
+                        base,
+                        body: (!body.is_empty()).then_some(body),
+                    },
+                )
+                .map(|pr| pr.html_url)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(GitMessage::PullRequest { result });
+        });
+        Self::spawn_message_pump(cx, rx, move |view, message| {
+            let GitMessage::PullRequest { result } = message else {
+                return false;
+            };
+            view.git_busy = false;
+            match result {
+                Ok(url) => {
+                    view.github_pr = None;
+                    let _ = std::process::Command::new("open").arg(&url).spawn();
+                    view.notice = Some(view.tf("github.pr_created", &[("url", &url)]));
+                }
+                Err(error) => {
+                    let message = view.tf("github.pr_failed", &[("error", &error)]);
+                    if let Some(state) = view.github_pr.as_mut() {
+                        state.busy = false;
+                        state.error = message;
+                    }
                 }
             }
             true
@@ -6741,6 +7781,7 @@ impl Editor {
             message: String::new(),
             error: String::new(),
             busy: false,
+            selected: self.git.files.keys().cloned().collect(),
         });
         cx.notify();
     }
@@ -6780,6 +7821,9 @@ impl Editor {
                 show_config_files: self.app_settings.show_config_files,
                 git_name: self.app_settings.git_name.clone(),
                 git_email: self.app_settings.git_email.clone(),
+                github_token_input: String::new(),
+                github_token_present: github_token_status().0,
+                github_token_source: github_token_status().1,
             });
         } else if let Some(settings) = self.settings.as_mut() {
             settings.section = SettingsSection::Git;
@@ -6804,6 +7848,18 @@ impl Editor {
             if let Some(last) = state.message.chars().last() {
                 let len = state.message.len();
                 state.message.truncate(len - last.len_utf8());
+            }
+            state.error.clear();
+        }
+        cx.notify();
+    }
+
+    fn toggle_git_commit_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.git_commit.as_mut() {
+            if state.selected.contains(path) {
+                state.selected.remove(path);
+            } else {
+                state.selected.insert(path.to_string());
             }
             state.error.clear();
         }
@@ -6840,7 +7896,11 @@ impl Editor {
             return;
         };
         let root = project.root().to_path_buf();
-        let paths: Vec<String> = self.git.files.keys().cloned().collect();
+        let paths: Vec<String> = self
+            .git_commit
+            .as_ref()
+            .map(|state| state.selected.iter().cloned().collect())
+            .unwrap_or_default();
         if paths.is_empty() {
             let message = self.t("git.nothing_to_save").to_string();
             if let Some(state) = self.git_commit.as_mut() {
@@ -6860,6 +7920,9 @@ impl Editor {
             let result = (|| {
                 let repository =
                     Repository::open(&root, options.clone()).map_err(|error| error.to_string())?;
+                repository
+                    .unstage_all(options.clone())
+                    .map_err(|error| error.to_string())?;
                 let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
                 repository
                     .stage(&refs, options.clone())
@@ -6957,9 +8020,747 @@ impl Editor {
         }
     }
 
+    fn git_diff_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.git_diff.as_ref().expect("overlay only when open");
+        let mut lines = div()
+            .id("git-diff-lines")
+            .max_h(px(380.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .p_2()
+            .bg(rgb(theme::bg()));
+        for line in state.diff.lines() {
+            let color = if line.starts_with('+') {
+                theme::git_added_fg()
+            } else if line.starts_with('-') {
+                theme::agent_err_fg()
+            } else if line.starts_with("@@") {
+                theme::cue_fg()
+            } else {
+                theme::status_fg()
+            };
+            lines = lines.child(
+                div()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(rgb(color))
+                    .child(line.to_string()),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(820.0))
+                    .max_h(px(560.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("git.diff_title")),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(state.path.clone()),
+                    )
+                    .when(state.loading, |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("git.diff_loading")),
+                        )
+                    })
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .when(!state.loading && state.error.is_empty(), |card| {
+                        card.child(if state.diff.is_empty() {
+                            div()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("git.diff_empty"))
+                                .into_any_element()
+                        } else {
+                            lines.into_any_element()
+                        })
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("git-diff-close")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.close"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.git_diff = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(
+                                matches!(
+                                    self.git.file_status(&state.path),
+                                    Some(WorktreeStatus::Modified | WorktreeStatus::Deleted)
+                                ),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .id("git-diff-restore")
+                                            .px_3()
+                                            .py_1()
+                                            .bg(rgb(theme::status_bg()))
+                                            .text_color(rgb(theme::agent_err_fg()))
+                                            .cursor_pointer()
+                                            .child(self.t("git.restore"))
+                                            .on_click(cx.listener({
+                                                let path = state.path.clone();
+                                                move |this, _, _, cx| {
+                                                    this.open_git_restore(path.clone(), cx)
+                                                }
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(
+                                !matches!(
+                                    self.git.file_status(&state.path),
+                                    Some(WorktreeStatus::Modified | WorktreeStatus::Deleted)
+                                ),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::gutter_fg()))
+                                            .child(self.t("git.no_previous_version")),
+                                    )
+                                },
+                            ),
+                    ),
+            )
+    }
+
+    fn git_restore_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let prompt = self.git_restore.as_ref().expect("overlay only when open");
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(600.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::agent_err_fg()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("git.restore_title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.tf("git.restore_body", &[("path", &prompt.path)])),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("git.restore_hint")),
+                    )
+                    .when(!prompt.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(prompt.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("git-restore-confirm")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::agent_err_fg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.restore_confirm"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.confirm_git_restore(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("git-restore-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.close"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.git_restore = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn git_branch_prompt_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self
+            .git_branch_prompt
+            .as_ref()
+            .expect("overlay only when open");
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(560.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("git.branch_title")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("git.branch_hint")),
+                    )
+                    .child(
+                        div()
+                            .id("git-branch-name")
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(theme::bg()))
+                            .border_1()
+                            .border_color(rgb(theme::default_fg()))
+                            .text_color(rgb(if state.name.is_empty() {
+                                theme::gutter_fg()
+                            } else {
+                                theme::default_fg()
+                            }))
+                            .child(if state.name.is_empty() {
+                                self.t("git.branch_placeholder").to_string()
+                            } else {
+                                format!("{}▌", state.name)
+                            }),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("git-branch-save")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.branch_save"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.submit_branch_prompt(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("git-branch-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.close"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.git_branch_prompt = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn github_publish_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self
+            .github_publish
+            .as_ref()
+            .expect("overlay only when open");
+        let name_display = if state.name.is_empty() {
+            self.t("github.repo_placeholder").to_string()
+        } else {
+            format!("{}▌", state.name)
+        };
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("github.publish_title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("github.publish_hint")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("github.repo_name")),
+                    )
+                    .child(
+                        div()
+                            .id("github-publish-name")
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(theme::bg()))
+                            .border_1()
+                            .border_color(rgb(theme::default_fg()))
+                            .text_color(rgb(if state.name.is_empty() {
+                                theme::gutter_fg()
+                            } else {
+                                theme::default_fg()
+                            }))
+                            .child(name_display),
+                    )
+                    .child(
+                        div()
+                            .id("github-publish-private")
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(format!("[{}]", if state.private { "x" } else { " " }))
+                            .child(self.t("github.private"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.github_publish.as_mut() {
+                                    state.private = !state.private;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("github.publish_confirm_hint")),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("github-publish-confirm")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(if state.busy {
+                                        theme::gutter_fg()
+                                    } else {
+                                        theme::default_fg()
+                                    }))
+                                    .cursor_pointer()
+                                    .child(if state.busy {
+                                        self.t("github.publishing").to_string()
+                                    } else {
+                                        self.t("github.publish_confirm").to_string()
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.submit_github_publish(cx)
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("github-publish-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.close"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.git_busy {
+                                            this.github_publish = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn git_sync_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.git_sync.as_ref().expect("overlay only when open");
+        let remote = self
+            .github_remote_info()
+            .map(|(remote, owner, repo)| format!("{remote} · {owner}/{repo}"))
+            .unwrap_or_default();
+        let branch = if self.git.branch.is_empty() {
+            "main".to_string()
+        } else {
+            self.git.branch.clone()
+        };
+        let (title, body, hint, confirm_label) = match state.kind {
+            GitSyncKind::Push => (
+                self.t("github.push_title"),
+                self.tf(
+                    "github.push_body",
+                    &[("remote", &remote), ("branch", &branch)],
+                ),
+                self.t("github.push_hint"),
+                self.t("github.push_confirm"),
+            ),
+            GitSyncKind::Pull => (
+                self.t("github.pull_title"),
+                self.tf(
+                    "github.pull_body",
+                    &[("remote", &remote), ("branch", &branch)],
+                ),
+                self.t("github.pull_hint"),
+                self.t("github.pull_confirm"),
+            ),
+        };
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(div().text_color(rgb(theme::default_fg())).child(title))
+                    .child(div().text_color(rgb(theme::status_fg())).child(body))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(hint),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("git-sync-confirm")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(if state.busy {
+                                        theme::gutter_fg()
+                                    } else {
+                                        theme::default_fg()
+                                    }))
+                                    .cursor_pointer()
+                                    .child(if state.busy {
+                                        self.t("github.working").to_string()
+                                    } else {
+                                        confirm_label.to_string()
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.confirm_git_sync(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("git-sync-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.close"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.git_busy {
+                                            this.git_sync = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn github_pr_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = self.github_pr.as_ref().expect("overlay only when open");
+        let field = |index: u8, active: bool, text: String| {
+            let color = if active {
+                theme::default_fg()
+            } else {
+                theme::status_fg()
+            };
+            div()
+                .id(("github-pr-field", index as usize))
+                .px_2()
+                .py_1()
+                .flex_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .bg(rgb(theme::bg()))
+                .border_1()
+                .border_color(rgb(if active {
+                    theme::default_fg()
+                } else {
+                    theme::explorer_border()
+                }))
+                .text_color(rgb(color))
+                .child(if active { format!("{text}▌") } else { text })
+        };
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("github.pr_title")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("github.pr_hint")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_xs()
+                                    .text_color(rgb(theme::gutter_fg()))
+                                    .child(self.t("github.pr_title_label")),
+                            )
+                            .child(field(0, state.field == 0, state.title.clone()).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(state) = this.github_pr.as_mut() {
+                                        state.field = 0;
+                                    }
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_xs()
+                                    .text_color(rgb(theme::gutter_fg()))
+                                    .child(self.t("github.pr_body_label")),
+                            )
+                            .child(field(1, state.field == 1, state.body.clone()).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(state) = this.github_pr.as_mut() {
+                                        state.field = 1;
+                                    }
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(90.0))
+                                    .text_xs()
+                                    .text_color(rgb(theme::gutter_fg()))
+                                    .child(self.t("github.pr_base_label")),
+                            )
+                            .child(field(2, state.field == 2, state.base.clone()).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(state) = this.github_pr.as_mut() {
+                                        state.field = 2;
+                                    }
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .when(!state.error.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_color(rgb(theme::agent_err_fg()))
+                                .child(state.error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("github-pr-create")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(if state.busy {
+                                        theme::gutter_fg()
+                                    } else {
+                                        theme::default_fg()
+                                    }))
+                                    .cursor_pointer()
+                                    .child(if state.busy {
+                                        self.t("github.working").to_string()
+                                    } else {
+                                        self.t("github.pr_create").to_string()
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.submit_github_pr(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("github-pr-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("git.close"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.git_busy {
+                                            this.github_pr = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     fn git_commit_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.git_commit.as_ref().expect("overlay only when open");
-        let changed = self.git.changed_count();
+        let changed = state.selected.len();
         div()
             .absolute()
             .size_full()
@@ -6989,6 +8790,55 @@ impl Editor {
                             .text_color(rgb(theme::status_fg()))
                             .child(self.tf("git.commit_files", &[("n", &changed.to_string())])),
                     )
+                    .child({
+                        let mut files = div()
+                            .id("git-commit-files")
+                            .max_h(px(160.0))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .border_1()
+                            .border_color(rgb(theme::explorer_border()));
+                        let mut paths: Vec<&String> = self.git.files.keys().collect();
+                        paths.sort();
+                        for (index, path) in paths.into_iter().enumerate() {
+                            let checked = state.selected.contains(path);
+                            let status = self.git.file_status(path);
+                            let label = status
+                                .map(|status| self.t(Self::git_status_key(status)).to_string())
+                                .unwrap_or_default();
+                            let path_owned = path.clone();
+                            files = files.child(
+                                div()
+                                    .id(("git-commit-file", index))
+                                    .px_2()
+                                    .py_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgb(if checked {
+                                        theme::default_fg()
+                                    } else {
+                                        theme::gutter_fg()
+                                    }))
+                                    .child(format!("[{}]", if checked { "x" } else { " " }))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(path_owned.clone()),
+                                    )
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_git_commit_path(&path_owned, cx)
+                                    })),
+                            );
+                        }
+                        files
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -7283,6 +9133,42 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.git_branch_prompt.is_some() {
+            self.git_branch_prompt = None;
+            cx.notify();
+            return;
+        }
+        if self.github_publish.is_some() {
+            if !self.git_busy {
+                self.github_publish = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.git_sync.is_some() {
+            if !self.git_busy {
+                self.git_sync = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.github_pr.is_some() {
+            if !self.git_busy {
+                self.github_pr = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.git_restore.is_some() {
+            self.git_restore = None;
+            cx.notify();
+            return;
+        }
+        if self.git_diff.is_some() {
+            self.git_diff = None;
+            cx.notify();
+            return;
+        }
         if self.palette.is_some() {
             self.palette = None;
             cx.notify();
@@ -7538,8 +9424,23 @@ impl Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.git_branch_prompt.is_some() {
+            self.branch_prompt_backspace(cx);
+            return;
+        }
+        if self.github_publish.is_some() {
+            self.github_publish_backspace(cx);
+            return;
+        }
+        if self.github_pr.is_some() {
+            self.github_pr_backspace(cx);
+            return;
+        }
         if self.git_commit.is_some() {
             self.git_commit_backspace(cx);
+            return;
+        }
+        if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
         if self.chat.focused {
@@ -7673,6 +9574,25 @@ impl Editor {
         if self.delete_prompt.is_some() {
             self.delete_prompt = None;
             cx.notify();
+            return;
+        }
+        if self.git_branch_prompt.is_some() {
+            self.submit_branch_prompt(cx);
+            return;
+        }
+        if self.github_publish.is_some() {
+            self.submit_github_publish(cx);
+            return;
+        }
+        if self.git_sync.is_some() {
+            self.confirm_git_sync(cx);
+            return;
+        }
+        if self.github_pr.is_some() {
+            self.submit_github_pr(cx);
+            return;
+        }
+        if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
         if self.git_commit.is_some() {
@@ -8190,6 +10110,42 @@ impl Editor {
             if !self.git_busy {
                 self.git_commit = None;
             }
+            cx.notify();
+            return;
+        }
+        if self.git_branch_prompt.is_some() {
+            self.git_branch_prompt = None;
+            cx.notify();
+            return;
+        }
+        if self.github_publish.is_some() {
+            if !self.git_busy {
+                self.github_publish = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.git_sync.is_some() {
+            if !self.git_busy {
+                self.git_sync = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.github_pr.is_some() {
+            if !self.git_busy {
+                self.github_pr = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.git_restore.is_some() {
+            self.git_restore = None;
+            cx.notify();
+            return;
+        }
+        if self.git_diff.is_some() {
+            self.git_diff = None;
             cx.notify();
             return;
         }
@@ -11312,6 +13268,204 @@ impl Editor {
     /// Human Git panel (M13): plain-language changes, one-step version save,
     /// recent history and command tooltips. No Git jargon is required to use
     /// the primary actions, but every tooltip names the underlying command.
+    /// GitHub connection block inside the “Cambios” panel (M13): publish,
+    /// upload, bring and pull-request actions in plain language. Every
+    /// remote action opens a confirmation overlay first.
+    fn github_panel_section(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(rgb(theme::explorer_border()));
+        section = section.child(
+            div()
+                .px_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .text_color(rgb(theme::gutter_fg()))
+                .child(icon("github", theme::gutter_fg(), 13.0))
+                .child(self.t("github.section")),
+        );
+        if self.git_remotes_loading {
+            return section.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("github.loading")),
+            );
+        }
+        if !self.git_remotes_error.is_empty() {
+            return section.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::agent_err_fg()))
+                    .child(self.git_remotes_error.clone()),
+            );
+        }
+        if let Some((remote, owner, repo)) = self.github_remote_info() {
+            let label = format!("{owner}/{repo}");
+            let remote_tip = self.git_tooltip(
+                cx,
+                "git remote -v",
+                self.tf(
+                    "github.tip.remote",
+                    &[("remote", &remote), ("repo", &label)],
+                ),
+            );
+            section = section.child(
+                div()
+                    .id("github-remote")
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::git_added_fg()))
+                    .tooltip(move |_, _| remote_tip.clone())
+                    .child(label),
+            );
+            let branch = if self.git.branch.is_empty() {
+                "main".to_string()
+            } else {
+                self.git.branch.clone()
+            };
+            let push_tip = self.git_tooltip(
+                cx,
+                "git push",
+                self.tf(
+                    "github.tip.push",
+                    &[("remote", &remote), ("branch", &branch)],
+                ),
+            );
+            let pull_tip = self.git_tooltip(
+                cx,
+                "git pull --ff-only",
+                self.tf(
+                    "github.tip.pull",
+                    &[("remote", &remote), ("branch", &branch)],
+                ),
+            );
+            let pr_tip = self.git_tooltip(cx, "gh pr create", self.t("github.tip.pr").to_string());
+            section = section.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("github-push")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::default_fg()))
+                            .cursor_pointer()
+                            .tooltip(move |_, _| push_tip.clone())
+                            .child(self.t("github.push"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_git_sync(GitSyncKind::Push, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("github-pull")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::status_fg()))
+                            .cursor_pointer()
+                            .tooltip(move |_, _| pull_tip.clone())
+                            .child(self.t("github.pull"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_git_sync(GitSyncKind::Pull, cx)
+                            })),
+                    )
+                    .when(branch != "main", |row| {
+                        row.child(
+                            div()
+                                .id("github-pr")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .bg(rgb(theme::status_bg()))
+                                .text_color(rgb(theme::status_fg()))
+                                .cursor_pointer()
+                                .tooltip(move |_, _| pr_tip.clone())
+                                .child(self.t("github.pr"))
+                                .on_click(cx.listener(|this, _, _, cx| this.open_github_pr(cx))),
+                        )
+                    }),
+            );
+            if self.git.ahead > 0 || self.git.behind > 0 {
+                section = section.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(theme::git_modified_fg()))
+                        .child(self.tf(
+                            "github.pending",
+                            &[
+                                ("ahead", &self.git.ahead.to_string()),
+                                ("behind", &self.git.behind.to_string()),
+                            ],
+                        )),
+                );
+            }
+            return section;
+        }
+        if !self.git_remotes.is_empty() {
+            return section.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("github.remote_not_github")),
+            );
+        }
+        let publish_tip = self.git_tooltip(
+            cx,
+            "POST /user/repos",
+            self.t("github.tip.publish").to_string(),
+        );
+        section.child(
+            div()
+                .px_2()
+                .py_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::status_fg()))
+                        .child(self.t("github.not_connected")),
+                )
+                .child(
+                    div()
+                        .id("github-publish")
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .bg(rgb(theme::status_bg()))
+                        .text_color(rgb(theme::default_fg()))
+                        .cursor_pointer()
+                        .tooltip(move |_, _| publish_tip.clone())
+                        .child(self.t("github.publish"))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_github_publish(cx))),
+                ),
+        )
+    }
+
     fn git_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut panel = div()
             .id("git-panel")
@@ -11485,7 +13639,11 @@ impl Editor {
                 };
                 let label = self.t(Self::git_status_key(status));
                 let path_owned = path.clone();
-                let tip = self.git_tooltip(cx, "git status", format!("{label}: {path}"));
+                let tip = self.git_tooltip(
+                    cx,
+                    "git diff",
+                    format!("{label}: {path} — {}", self.t("git.tip.diff")),
+                );
                 panel = panel.child(
                     div()
                         .id(("git-file", index))
@@ -11511,12 +13669,96 @@ impl Editor {
                                 .text_color(rgb(git_color(status)))
                                 .child(label),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_path(&path_owned, window, cx)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_git_diff(path_owned.clone(), cx)
                         })),
                 );
             }
         }
+        panel = panel.child(
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(rgb(theme::gutter_fg()))
+                .child(self.t("git.drafts")),
+        );
+        if self.git_branches_loading {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("git.loading_drafts")),
+            );
+        } else if !self.git_branches_error.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::agent_err_fg()))
+                    .child(self.git_branches_error.clone()),
+            );
+        } else {
+            for (index, branch) in self.git_branches.iter().take(8).enumerate() {
+                let is_current = branch.current;
+                let name = branch.name.clone();
+                let tip = self.git_tooltip(
+                    cx,
+                    "git branch",
+                    if is_current {
+                        self.t("git.tip.branch_current").to_string()
+                    } else {
+                        format!("{}: {name}", self.t("git.tip.branch_switch"))
+                    },
+                );
+                panel = panel.child(
+                    div()
+                        .id(("git-branch", index))
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(rgb(if is_current {
+                            theme::default_fg()
+                        } else {
+                            theme::status_fg()
+                        }))
+                        .tooltip(move |_, _| tip.clone())
+                        .child(if is_current { "•" } else { "○" })
+                        .child(name.clone())
+                        .when(is_current, |row| {
+                            row.child(
+                                div()
+                                    .text_color(rgb(theme::git_added_fg()))
+                                    .child(self.t("git.current")),
+                            )
+                        })
+                        .when(!is_current, |row| {
+                            row.on_click(cx.listener(move |this, _, _, cx| {
+                                this.switch_git_branch(name.clone(), cx)
+                            }))
+                        }),
+                );
+            }
+            panel = panel.child(
+                div()
+                    .id("git-new-branch")
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(self.t("git.new_draft"))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_branch_prompt(cx))),
+            );
+        }
+        panel = panel.child(self.github_panel_section(cx));
         panel = panel.child(
             div()
                 .px_2()
@@ -12571,7 +14813,8 @@ impl Editor {
                  \"models\":{},\"fetching\":{},\"error\":\"{}\",\
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
-                 \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\"}}",
+                 \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\",\
+                 \"github_key_present\":{},\"github_key_source\":\"{}\"}}",
                 state.provider.key(),
                 escape_json(&state.model),
                 escape_json(&state.base_url),
@@ -12595,6 +14838,8 @@ impl Editor {
                         .map(|project| project.manifest().title.clone())
                         .unwrap_or_default()
                 ),
+                state.github_token_present,
+                escape_json(&state.github_token_source),
             )
         } else {
             format!(
@@ -12603,7 +14848,8 @@ impl Editor {
                  \"models\":0,\"fetching\":false,\"error\":\"\",\
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
-                 \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\"}}",
+                 \"show_config_files\":{},\"project_open\":{},\"project_title\":\"{}\",\
+                 \"github_key_present\":{},\"github_key_source\":\"{}\"}}",
                 self.agent_settings.provider.key(),
                 escape_json(&self.agent_settings.model),
                 escape_json(&self.agent_settings.base_url),
@@ -12622,6 +14868,8 @@ impl Editor {
                         .map(|project| project.manifest().title.clone())
                         .unwrap_or_default()
                 ),
+                github_token_status().0,
+                escape_json(&github_token_status().1),
             )
         };
         let palette_dump = if let Some(state) = self.palette.as_ref() {
@@ -13476,8 +15724,25 @@ impl EntityInputHandler for Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.git_branch_prompt.is_some() {
+            self.branch_prompt_input(new_text, cx);
+            return;
+        }
+        if self.github_publish.is_some() {
+            self.github_publish_input(new_text, cx);
+            return;
+        }
+        if self.github_pr.is_some() {
+            self.github_pr_input(new_text, cx);
+            return;
+        }
         if self.git_commit.is_some() {
             self.git_commit_input(new_text, cx);
+            return;
+        }
+        // Diff and restore are read-only modals: typing must never reach the
+        // buffer behind them.
+        if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
         if self.chat.focused {
@@ -13609,8 +15874,25 @@ impl EntityInputHandler for Editor {
         if self.delete_prompt.is_some() {
             return;
         }
+        if self.git_branch_prompt.is_some() {
+            self.branch_prompt_input(new_text, cx);
+            return;
+        }
+        if self.github_publish.is_some() {
+            self.github_publish_input(new_text, cx);
+            return;
+        }
+        if self.github_pr.is_some() {
+            self.github_pr_input(new_text, cx);
+            return;
+        }
         if self.git_commit.is_some() {
             self.git_commit_input(new_text, cx);
+            return;
+        }
+        // Diff and restore are read-only modals: typing must never reach the
+        // buffer behind them.
+        if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
         if self.chat.focused {
@@ -13723,6 +16005,12 @@ impl Render for Editor {
         self.maybe_refresh_git(cx);
         if self.git_history_stale && !self.git_history_loading && self.git.available {
             self.request_git_history(cx);
+        }
+        if self.git_branches_stale && !self.git_branches_loading && self.git.available {
+            self.request_git_branches(cx);
+        }
+        if self.git_remotes_stale && !self.git_remotes_loading && self.git.available {
+            self.request_git_remotes(cx);
         }
         theme::set_system_dark(matches!(
             window.appearance(),
@@ -13984,6 +16272,24 @@ impl Render for Editor {
             .when(self.git_commit.is_some(), |root| {
                 root.child(self.git_commit_overlay(cx))
             })
+            .when(self.git_diff.is_some(), |root| {
+                root.child(self.git_diff_overlay(cx))
+            })
+            .when(self.git_restore.is_some(), |root| {
+                root.child(self.git_restore_overlay(cx))
+            })
+            .when(self.git_branch_prompt.is_some(), |root| {
+                root.child(self.git_branch_prompt_overlay(cx))
+            })
+            .when(self.github_publish.is_some(), |root| {
+                root.child(self.github_publish_overlay(cx))
+            })
+            .when(self.git_sync.is_some(), |root| {
+                root.child(self.git_sync_overlay(cx))
+            })
+            .when(self.github_pr.is_some(), |root| {
+                root.child(self.github_pr_overlay(cx))
+            })
             .when(self.new_file.is_some(), |root| {
                 root.child(self.new_file_overlay(cx))
             })
@@ -14038,6 +16344,91 @@ fn resolve_provider_key(provider: AiProvider) -> Result<Option<String>, String> 
         ));
     }
     Ok(key)
+}
+
+/// Parse `https://github.com/owner/repo(.git)` or `git@github.com:owner/repo(.git)`
+/// into `(owner, repo)`. Returns `None` for anything that is not GitHub.
+fn parse_github_remote(url: &str) -> Option<(String, String)> {
+    let rest = if let Some(rest) = url.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else {
+        url.strip_prefix("ssh://git@github.com/")?
+    };
+    let rest = rest.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = rest.splitn(2, '/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// Turn a project title into a conservative GitHub repository name.
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for character in value.chars() {
+        let ascii = match character {
+            'á' | 'à' | 'ä' | 'â' | 'ã' | 'Á' | 'À' | 'Ä' | 'Â' | 'Ã' => 'a',
+            'é' | 'è' | 'ë' | 'ê' | 'É' | 'È' | 'Ë' | 'Ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' | 'Í' | 'Ì' | 'Ï' | 'Î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' | 'õ' | 'Ó' | 'Ò' | 'Ö' | 'Ô' | 'Õ' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' | 'Ú' | 'Ù' | 'Ü' | 'Û' => 'u',
+            'ñ' | 'Ñ' => 'n',
+            'ç' | 'Ç' => 'c',
+            other => other,
+        };
+        if ascii.is_ascii_alphanumeric() {
+            slug.push(ascii.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "narra-project".to_string()
+    } else {
+        slug
+    }
+}
+
+fn github_token_status() -> (bool, String) {
+    let store = narra_core::provider::OsKeychain::new();
+    match store.get(GITHUB_TOKEN_ACCOUNT) {
+        Ok(Some(secret)) if !secret.trim().is_empty() => (true, "keychain".to_string()),
+        Ok(_) => match env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(_) => (true, "env".to_string()),
+            None => (false, String::new()),
+        },
+        Err(error) => match env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(_) => (true, "env".to_string()),
+            None => (false, error.to_string()),
+        },
+    }
+}
+
+fn resolve_github_token() -> Result<Option<String>, String> {
+    let store = narra_core::provider::OsKeychain::new();
+    let env_value = env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    narra_core::provider::resolve_secret(&store, GITHUB_TOKEN_ACCOUNT, env_value.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 fn provider_key_status(provider: AiProvider) -> (bool, String) {
@@ -14607,6 +16998,20 @@ fn run() -> Result<(), String> {
                 git_history_error: String::new(),
                 git_history_stale: false,
                 git_commit: None,
+                git_diff: None,
+                git_restore: None,
+                git_branches: Vec::new(),
+                git_branches_loading: false,
+                git_branches_error: String::new(),
+                git_branches_stale: false,
+                git_branch_prompt: None,
+                git_remotes: Vec::new(),
+                git_remotes_loading: false,
+                git_remotes_error: String::new(),
+                git_remotes_stale: false,
+                github_publish: None,
+                git_sync: None,
+                github_pr: None,
                 git_busy: false,
                 right_tab: RightTab::Chat,
                 chat: ChatUiState::new(ChatMode::Plan),
@@ -14930,6 +17335,39 @@ mod tests {
         );
         assert_eq!(split_path_name("README"), ("", "README", ""));
         assert_eq!(split_path_name("notes/.hidden"), ("notes", ".hidden", ""));
+    }
+
+    #[test]
+    fn added_file_diff_marks_every_line_as_new() {
+        let diff = added_file_diff("notes/new.md", "uno\ndos\n");
+        assert!(diff.starts_with("--- /dev/null\n+++ b/notes/new.md\n"));
+        assert!(diff.contains("@@ -0,0 +1,2 @@"));
+        assert!(diff.contains("+uno\n+dos\n"));
+        assert!(added_file_diff("empty.md", "").contains("@@ -0,0 +0,0 @@"));
+    }
+
+    #[test]
+    fn github_remote_parsing_and_slugify_are_conservative() {
+        assert_eq!(
+            parse_github_remote("https://github.com/example/narra-fixture.git"),
+            Some(("example".to_string(), "narra-fixture".to_string()))
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:example/narra-fixture.git"),
+            Some(("example".to_string(), "narra-fixture".to_string()))
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/example/narra-fixture"),
+            Some(("example".to_string(), "narra-fixture".to_string()))
+        );
+        assert_eq!(parse_github_remote("https://gitlab.com/a/b.git"), None);
+        assert_eq!(parse_github_remote("https://github.com/only-owner"), None);
+        assert_eq!(parse_github_remote("https://github.com/a/b/c"), None);
+        assert_eq!(slugify("Serie Nueva"), "serie-nueva");
+        assert_eq!(slugify("  ¿Quién?  "), "quien");
+        assert_eq!(slugify("Guión de prueba"), "guion-de-prueba");
+        assert_eq!(slugify(""), "narra-project");
+        assert_eq!(slugify("---"), "narra-project");
     }
 
     #[test]

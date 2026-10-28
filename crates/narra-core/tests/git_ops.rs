@@ -567,3 +567,57 @@ fn remote_arguments_cannot_inject_flags() {
         .expect_err("flag-like remote");
     assert!(matches!(error, GitError::InvalidInput(_)), "{error:?}");
 }
+
+#[test]
+fn diff_path_show_file_and_unstage_are_scoped_and_non_destructive() {
+    let repo = new_repo();
+    write(
+        &repo,
+        "screenplay/main.fountain",
+        "INT. CASA - DÍA\nMarta entra.\n",
+    );
+    let first = commit_all(&repo, "primera");
+    write(
+        &repo,
+        "screenplay/main.fountain",
+        "INT. CASA - DÍA\nMarta sale.\n",
+    );
+    let diff = repo
+        .diff_path(
+            DiffScope::WorktreeVsHead,
+            "screenplay/main.fountain",
+            options(),
+        )
+        .expect("diff");
+    assert!(diff.contains("Marta entra"), "{diff}");
+    assert!(diff.contains("Marta sale"), "{diff}");
+    let old = repo
+        .show_file(&first, "screenplay/main.fountain", options())
+        .expect("show");
+    assert_eq!(old, "INT. CASA - DÍA\nMarta entra.\n");
+    repo.unstage_all(options()).expect("unstage");
+    let status = repo.status(options()).expect("status").1;
+    assert!(
+        status
+            .iter()
+            .any(|entry| entry.path == "screenplay/main.fountain")
+    );
+}
+
+#[test]
+fn remotes_reject_embedded_credentials_and_accept_public_urls() {
+    let repo = new_repo();
+    let error = repo
+        .add_remote(
+            "origin",
+            "https://token@github.com/example/repo.git",
+            options(),
+        )
+        .expect_err("credential URL must be rejected");
+    assert!(error.to_string().contains("credentials"), "{error}");
+    repo.add_remote("origin", "https://github.com/example/repo.git", options())
+        .expect("public remote");
+    let remotes = repo.remotes(options()).expect("remotes");
+    assert_eq!(remotes.len(), 1);
+    assert_eq!(remotes[0].0, "origin");
+}

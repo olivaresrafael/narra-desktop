@@ -19,7 +19,7 @@ pub use runner::{CancellationToken, GitError, OpOptions, redact_secrets};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use runner::run_git;
+use runner::{run_git, run_git_env};
 
 /// Minimum Git version supported by the app; older versions are rejected
 /// with an actionable message instead of failing later in surprising ways.
@@ -313,6 +313,50 @@ impl Repository {
     }
 
     /// Per-file insertion/deletion counts for the given scope.
+    /// Unified diff for one path. `path` is a project-relative pathspec; it
+    /// never contains credentials.
+    pub fn diff_path(
+        &self,
+        scope: DiffScope,
+        path: &str,
+        options: OpOptions,
+    ) -> Result<String, GitError> {
+        validate_relative_path(path)?;
+        let scope_arg = match scope {
+            DiffScope::Worktree => &[][..],
+            DiffScope::Staged => &["--cached"][..],
+            DiffScope::WorktreeVsHead => &["HEAD"][..],
+        };
+        let mut args = vec!["diff", "--no-color", "--find-renames"];
+        args.extend_from_slice(scope_arg);
+        args.push("--");
+        args.push(path);
+        let output = run_git(Some(&self.root), "diff", &args, options)?;
+        if !output.status.success() {
+            return Err(command_failed("diff", &output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Read a file's content at a commit without touching the working tree.
+    /// Used by the human “restore this version” flow; the caller decides
+    /// whether to write the returned bytes.
+    pub fn show_file(
+        &self,
+        commit: &str,
+        path: &str,
+        options: OpOptions,
+    ) -> Result<String, GitError> {
+        validate_commitish(commit)?;
+        validate_relative_path(path)?;
+        let object = format!("{commit}:{path}");
+        let output = run_git(Some(&self.root), "show", &["show", &object], options)?;
+        if !output.status.success() {
+            return Err(command_failed("show", &output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     pub fn diff_stats(
         &self,
         scope: DiffScope,
@@ -353,6 +397,17 @@ impl Repository {
         let output = run_git(Some(&self.root), "add", &["add", "--all"], options)?;
         if !output.status.success() {
             return Err(command_failed("add", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Clear the index without touching the working tree. The human commit
+    /// dialog uses this before staging its explicit file selection, so a
+    /// previously staged path can never sneak into a new version.
+    pub fn unstage_all(&self, options: OpOptions) -> Result<(), GitError> {
+        let output = run_git(Some(&self.root), "reset", &["reset"], options)?;
+        if !output.status.success() {
+            return Err(command_failed("reset", &output.stderr));
         }
         Ok(())
     }
@@ -577,6 +632,102 @@ impl Repository {
     }
 
     /// Fetch from `remote` (no merge, no working-tree changes).
+    /// Add a credential-free remote URL. Tokens must never be embedded in a
+    /// remote URL; authenticated pushes use `push_with_token` instead.
+    pub fn add_remote(&self, name: &str, url: &str, options: OpOptions) -> Result<(), GitError> {
+        validate_remote_name(name)?;
+        if url.contains('@')
+            || url.contains("://")
+                && url
+                    .split("://")
+                    .nth(1)
+                    .is_some_and(|rest| rest.contains('@'))
+        {
+            return Err(GitError::InvalidInput(
+                "remote URLs must not contain credentials",
+            ));
+        }
+        let output = run_git(
+            Some(&self.root),
+            "remote add",
+            &["remote", "add", name, url],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("remote add", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Push with a GitHub token supplied through the environment. The token is
+    /// never an argv item: Git invokes a temporary credential helper that
+    /// reads it from the child environment instead.
+    pub fn push_with_token(
+        &self,
+        remote: &str,
+        branch: &str,
+        token: &str,
+        options: OpOptions,
+    ) -> Result<(), GitError> {
+        validate_remote_name(remote)?;
+        validate_branch_name(branch)?;
+        if token.trim().is_empty() {
+            return Err(GitError::InvalidInput("GitHub token must not be empty"));
+        }
+        let helper = "!f() { echo username=x-access-token; echo password=$NARRA_GITHUB_TOKEN; }; f";
+        let output = run_git_env(
+            Some(&self.root),
+            "push",
+            &[
+                "-c",
+                &format!("credential.helper={helper}"),
+                "push",
+                remote,
+                branch,
+            ],
+            &[("NARRA_GITHUB_TOKEN", token)],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("push", &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Fast-forward pull with the same environment-only credential helper.
+    pub fn pull_with_token(
+        &self,
+        remote: &str,
+        branch: &str,
+        token: &str,
+        options: OpOptions,
+    ) -> Result<(), GitError> {
+        validate_remote_name(remote)?;
+        validate_branch_name(branch)?;
+        if token.trim().is_empty() {
+            return Err(GitError::InvalidInput("GitHub token must not be empty"));
+        }
+        let helper = "!f() { echo username=x-access-token; echo password=$NARRA_GITHUB_TOKEN; }; f";
+        let output = run_git_env(
+            Some(&self.root),
+            "pull",
+            &[
+                "-c",
+                &format!("credential.helper={helper}"),
+                "pull",
+                "--ff-only",
+                remote,
+                branch,
+            ],
+            &[("NARRA_GITHUB_TOKEN", token)],
+            options,
+        )?;
+        if !output.status.success() {
+            return Err(command_failed("pull --ff-only", &output.stderr));
+        }
+        Ok(())
+    }
+
     pub fn fetch(&self, remote: &str, options: OpOptions) -> Result<(), GitError> {
         validate_remote_name(remote)?;
         let output = run_git(Some(&self.root), "fetch", &["fetch", remote], options)?;
@@ -668,6 +819,27 @@ pub fn clone(url: &str, destination: &Path, options: OpOptions) -> Result<Reposi
 /// Validate a branch name against a conservative subset of
 /// `git check-ref-format`: enough to guarantee the name is safe as an argv
 /// element and unambiguous as a ref, without a full refspec implementation.
+fn validate_relative_path(path: &str) -> Result<(), GitError> {
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        return Err(GitError::InvalidInput(
+            "path must be project-relative without traversal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_commitish(commit: &str) -> Result<(), GitError> {
+    if commit.is_empty()
+        || commit.starts_with('-')
+        || commit
+            .chars()
+            .any(|c| c.is_whitespace() || c == ':' || c == '\0')
+    {
+        return Err(GitError::InvalidInput("invalid Git commit id"));
+    }
+    Ok(())
+}
+
 pub fn validate_branch_name(name: &str) -> Result<(), GitError> {
     let invalid = |reason: &'static str| Err(GitError::InvalidInput(reason));
     if name.is_empty() {
