@@ -131,9 +131,10 @@ mod recent;
 mod screenplay;
 mod scrollbar;
 mod settings;
+mod text_field;
 mod theme;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -186,6 +187,7 @@ use new_file::Kind as NewFileKind;
 use project_settings::{ProjectField, ProjectSettingsState};
 use recent::RecentProjects;
 use settings::{AiProvider, AppSettings, LanguageSetting};
+use text_field::TextField;
 use theme::ThemeMode;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -481,11 +483,11 @@ enum NewProjectField {
 /// The AI mode adds a prompt, a busy phase and a reviewable file plan.
 #[derive(Debug)]
 struct NewProjectState {
-    title: String,
+    title: TextField,
     kind: ProjectType,
     lang: Lang,
     mode: NewProjectMode,
-    prompt: String,
+    prompt: TextField,
     field: NewProjectField,
     error: String,
     picking: bool,
@@ -496,6 +498,26 @@ struct NewProjectState {
     path: Option<PathBuf>,
     /// Reviewable AI plan; nothing is written until the user confirms.
     plan: Option<ScaffoldPlan>,
+}
+
+impl NewProjectState {
+    fn text_field(&self, field: NewProjectField) -> &TextField {
+        match field {
+            NewProjectField::Title => &self.title,
+            NewProjectField::Prompt => &self.prompt,
+        }
+    }
+
+    fn text_field_mut(&mut self, field: NewProjectField) -> &mut TextField {
+        match field {
+            NewProjectField::Title => &mut self.title,
+            NewProjectField::Prompt => &mut self.prompt,
+        }
+    }
+
+    fn active_text_field_mut(&mut self) -> &mut TextField {
+        self.text_field_mut(self.field)
+    }
 }
 
 /// Snapshot of the dialog inputs handed to the AI scaffold worker: what the
@@ -1155,7 +1177,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// Shape one line with the row's font so caret/selection positions can be
 /// computed in pixel space. Runs only for rows that carry caret/selection/IME
 /// state, plus hit-testing (mouse/IME), not for every visible row.
-fn shape_line(window: &Window, text: &str) -> ShapedLine {
+pub(crate) fn shape_line(window: &Window, text: &str) -> ShapedLine {
     let run = TextRun {
         len: text.len(),
         font: gpui::font(FONT_FAMILY),
@@ -5394,6 +5416,21 @@ impl Editor {
             || self.git_sync.is_some()
     }
 
+    /// Apply an edit to the active New Project field without touching the
+    /// document. Returns true while the dialog exists, even when the field is
+    /// temporarily read-only (picking, busy or reviewing a plan).
+    fn with_new_project_text(&mut self, edit: impl FnOnce(&mut TextField)) -> bool {
+        let Some(state) = self.new_project.as_mut() else {
+            return false;
+        };
+        if state.picking || state.busy || state.plan.is_some() {
+            return true;
+        }
+        edit(state.active_text_field_mut());
+        state.error.clear();
+        true
+    }
+
     fn set_caret(&mut self, target: usize, extend: bool) {
         if self.modal_owns_keyboard() {
             return;
@@ -6155,12 +6192,20 @@ impl Editor {
     }
 
     fn on_left(&mut self, _: &MoveLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_left(false)) {
+            cx.notify();
+            return;
+        }
         self.move_horiz(-1, false);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_right(&mut self, _: &MoveRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_right(false)) {
+            cx.notify();
+            return;
+        }
         self.move_horiz(1, false);
         cx.notify();
         self.ensure_caret_visible();
@@ -6173,6 +6218,10 @@ impl Editor {
         }
         if self.palette.is_some() {
             self.palette_move(-1, cx);
+            return;
+        }
+        if self.with_new_project_text(|field| field.move_up(false)) {
+            cx.notify();
             return;
         }
         self.move_vert(-1, false, window);
@@ -6189,60 +6238,100 @@ impl Editor {
             self.palette_move(1, cx);
             return;
         }
+        if self.with_new_project_text(|field| field.move_down(false)) {
+            cx.notify();
+            return;
+        }
         self.move_vert(1, false, window);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_home(&mut self, _: &MoveHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_home(false)) {
+            cx.notify();
+            return;
+        }
         self.move_line_edge(true, false);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_end(&mut self, _: &MoveEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_end(false)) {
+            cx.notify();
+            return;
+        }
         self.move_line_edge(false, false);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_left(true)) {
+            cx.notify();
+            return;
+        }
         self.move_horiz(-1, true);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_right(true)) {
+            cx.notify();
+            return;
+        }
         self.move_horiz(1, true);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_up(true)) {
+            cx.notify();
+            return;
+        }
         self.move_vert(-1, true, window);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_down(true)) {
+            cx.notify();
+            return;
+        }
         self.move_vert(1, true, window);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_home(&mut self, _: &SelectHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_home(true)) {
+            cx.notify();
+            return;
+        }
         self.move_line_edge(true, true);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_end(&mut self, _: &SelectEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.move_end(true)) {
+            cx.notify();
+            return;
+        }
         self.move_line_edge(false, true);
         cx.notify();
         self.ensure_caret_visible();
     }
 
     fn on_select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.select_all()) {
+            cx.notify();
+            return;
+        }
         self.select_all();
         cx.notify();
     }
@@ -7188,11 +7277,11 @@ impl Editor {
         }
         self.new_project_generation = self.new_project_generation.saturating_add(1);
         self.new_project = Some(NewProjectState {
-            title: String::new(),
+            title: TextField::single_line(),
             kind: ProjectType::Feature,
             lang: self.lang,
             mode: NewProjectMode::Template,
-            prompt: String::new(),
+            prompt: TextField::multiline(),
             field: NewProjectField::Title,
             error: String::new(),
             picking: false,
@@ -7232,7 +7321,7 @@ impl Editor {
         if state.picking || state.busy {
             return;
         }
-        let folder = new_project::clean_title(&state.title)
+        let folder = new_project::clean_title(state.title.text())
             .and_then(|title| new_project::suggested_folder(&title))
             .unwrap_or_else(|| "Narra Project".to_string());
         let start = self.default_project_dir();
@@ -7301,7 +7390,7 @@ impl Editor {
         if state.picking || state.busy {
             return;
         }
-        let Some(title) = new_project::clean_title(&state.title) else {
+        let Some(title) = new_project::clean_title(state.title.text()) else {
             self.set_new_project_error(self.t("newproject.invalid_title").to_string());
             cx.notify();
             return;
@@ -7327,7 +7416,7 @@ impl Editor {
         let kind = state.kind;
         let lang = state.lang;
         let mode = state.mode;
-        let prompt = state.prompt.trim().to_string();
+        let prompt = state.prompt.text().trim().to_string();
         let plan_ready = state.plan.is_some();
         if mode == NewProjectMode::Ai {
             if !self.ai_scaffold_available() {
@@ -7491,7 +7580,8 @@ impl Editor {
         let Some(plan) = state.plan.clone() else {
             return;
         };
-        let title = new_project::clean_title(&state.title).unwrap_or_else(|| state.title.clone());
+        let title = new_project::clean_title(state.title.text())
+            .unwrap_or_else(|| state.title.text().to_string());
         let kind = state.kind;
         let lang = state.lang;
         match create_project(&path, &title, kind, lang.key()) {
@@ -7529,11 +7619,227 @@ impl Editor {
         cx.notify();
     }
 
+    /// Render the New Project title or prompt with selection, caret and
+    /// mouse drag. The model lives in `TextField`; this view only lays it out.
+    fn new_project_text_input(
+        state: &NewProjectState,
+        field: NewProjectField,
+        window: &Window,
+        width: Pixels,
+        min_height: Pixels,
+        placeholder: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let text_field = state.text_field(field);
+        let focused = state.field == field && !state.picking && !state.busy && state.plan.is_none();
+        let text = text_field.text().to_string();
+        let selection = text_field.selection();
+        let caret = text_field.caret();
+        let line_height = px(theme::line_height());
+        let rows = text_field.rows(window, f32::from(width));
+        let mut column = div().flex().flex_col().w_full();
+        if text.is_empty() {
+            let mut row = div()
+                .h(line_height)
+                .flex()
+                .items_center()
+                .whitespace_nowrap();
+            if focused {
+                row = row.child(cursor_element());
+            }
+            if !placeholder.is_empty() {
+                row = row.child(
+                    div()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(placeholder.to_string()),
+                );
+            }
+            column = column.child(row);
+        } else {
+            // Draw the caret in exactly one row. At a soft-wrap boundary the
+            // same byte offset is the end of one row and the start of the
+            // next; prefer the row where the caret has room, otherwise the
+            // last row for the document end.
+            let caret_row = rows
+                .iter()
+                .position(|row| caret >= row.start && (caret < row.end || row.end == text.len()))
+                .unwrap_or(rows.len().saturating_sub(1));
+            for (row_index, row) in rows.iter().enumerate() {
+                let row = *row;
+                let mut cuts = vec![row.start, row.end];
+                if selection.end > row.start && selection.start < row.end {
+                    cuts.push(selection.start.max(row.start).min(row.end));
+                    cuts.push(selection.end.max(row.start).min(row.end));
+                }
+                if focused && row_index == caret_row && caret >= row.start && caret <= row.end {
+                    cuts.push(caret);
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                let mut visual = div()
+                    .h(line_height)
+                    .flex()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .overflow_hidden();
+                for pair in cuts.windows(2) {
+                    let (start, end) = (pair[0], pair[1]);
+                    if focused && row_index == caret_row && start == caret {
+                        visual = visual.child(cursor_element());
+                    }
+                    if start == end {
+                        continue;
+                    }
+                    let selected = start >= selection.start && end <= selection.end;
+                    let mut segment = div().whitespace_nowrap();
+                    if selected {
+                        segment = segment.bg(rgba(theme::selection_bg()));
+                    }
+                    visual = visual.child(segment.child(text[start..end].to_string()));
+                }
+                if focused && row_index == caret_row && caret == row.end && caret != row.start {
+                    visual = visual.child(cursor_element());
+                }
+                column = column.child(visual);
+            }
+        }
+
+        let bounds_cell: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let bounds_for_canvas = bounds_cell.clone();
+        let bounds_for_click = bounds_cell.clone();
+        let bounds_for_drag = bounds_cell.clone();
+        let field_for_click = field;
+        let field_for_drag = field;
+        let width_for_click = width;
+        let width_for_drag = width;
+        let id = match field {
+            NewProjectField::Title => "new-project-title-input",
+            NewProjectField::Prompt => "new-project-prompt-input",
+        };
+        div()
+            .id(id)
+            .relative()
+            .w_full()
+            .p_2()
+            .bg(rgb(theme::bg()))
+            .border_1()
+            .border_color(rgb(if focused {
+                theme::default_fg()
+            } else {
+                theme::explorer_border()
+            }))
+            .font_family(FONT_FAMILY)
+            .text_size(px(theme::text_size()))
+            .line_height(line_height)
+            .text_color(rgb(theme::default_fg()))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .min_h(min_height)
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            let Some(state) = this.new_project.as_mut() else {
+                                return;
+                            };
+                            if state.picking || state.busy || state.plan.is_some() {
+                                return;
+                            }
+                            state.field = field_for_click;
+                            state.error.clear();
+                            let Some(bounds) = bounds_for_click.get() else {
+                                return;
+                            };
+                            let index = state.text_field(field_for_click).index_for_point(
+                                window,
+                                event.position,
+                                bounds,
+                                f32::from(width_for_click),
+                            );
+                            state
+                                .text_field_mut(field_for_click)
+                                .begin_drag(index, event.modifiers.shift);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                return;
+                            }
+                            let Some(state) = this.new_project.as_mut() else {
+                                return;
+                            };
+                            if !state.text_field(field_for_drag).is_dragging() {
+                                return;
+                            }
+                            let Some(bounds) = bounds_for_drag.get() else {
+                                return;
+                            };
+                            let index = state.text_field(field_for_drag).index_for_point(
+                                window,
+                                event.position,
+                                bounds,
+                                f32::from(width_for_drag),
+                            );
+                            state.text_field_mut(field_for_drag).drag_to(index);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(state) = this.new_project.as_mut() {
+                                let field = state.field;
+                                state.text_field_mut(field).end_drag();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(state) = this.new_project.as_mut() {
+                                let field = state.field;
+                                state.text_field_mut(field).end_drag();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(column),
+            )
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, _cx| {
+                        let content = Bounds::new(
+                            point(
+                                bounds.left() + px(ROW_PADDING_X),
+                                bounds.top() + px(ROW_PADDING_X),
+                            ),
+                            size(
+                                (bounds.size.width - px(ROW_PADDING_X * 2.0)).max(px(0.0)),
+                                (bounds.size.height - px(ROW_PADDING_X * 2.0)).max(px(0.0)),
+                            ),
+                        );
+                        bounds_for_canvas.set(Some(content));
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
     /// New Project dialog: title, kind, primary language, destination folder,
     /// project base and review. The folder button opens the native panel;
     /// Enter accepts (creating the template or starting the AI plan). Esc
     /// closes the dialog.
-    fn new_project_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn new_project_overlay(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_project.as_ref().expect("overlay only when open");
         let editable = !state.picking && !state.busy && state.plan.is_none();
         let mut modes = div().flex().flex_wrap().gap_2();
@@ -7696,40 +8002,15 @@ impl Editor {
                                     .text_color(rgb(theme::status_fg()))
                                     .child(self.t("newproject.name")),
                             )
-                            .child(
-                                div()
-                                    .id("new-project-title")
-                                    .flex_1()
-                                    .bg(rgb(theme::bg()))
-                                    .px_2()
-                                    .py_1()
-                                    .border_1()
-                                    .border_color(rgb(if state.field == NewProjectField::Title {
-                                        theme::default_fg()
-                                    } else {
-                                        theme::explorer_border()
-                                    }))
-                                    .text_color(rgb(theme::default_fg()))
-                                    .child(
-                                        if state.field == NewProjectField::Title
-                                            && !state.busy
-                                            && state.plan.is_none()
-                                        {
-                                            format!("{}▌", state.title)
-                                        } else {
-                                            state.title.clone()
-                                        },
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(state) = this.new_project.as_mut()
-                                            && !state.busy
-                                            && state.plan.is_none()
-                                        {
-                                            state.field = NewProjectField::Title;
-                                        }
-                                        cx.notify();
-                                    })),
-                            ),
+                            .child(div().flex_1().child(Self::new_project_text_input(
+                                state,
+                                NewProjectField::Title,
+                                window,
+                                px(480.0),
+                                px(theme::line_height()),
+                                "",
+                                cx,
+                            ))),
                     )
                     .child(
                         div()
@@ -7842,47 +8123,15 @@ impl Editor {
                                             .text_color(rgb(theme::status_fg()))
                                             .child(self.t("newproject.prompt")),
                                     )
-                                    .child(
-                                        div()
-                                            .id("new-project-prompt")
-                                            .min_h(px(60.0))
-                                            .bg(rgb(theme::bg()))
-                                            .p_2()
-                                            .border_1()
-                                            .border_color(rgb(
-                                                if state.field == NewProjectField::Prompt {
-                                                    theme::default_fg()
-                                                } else {
-                                                    theme::explorer_border()
-                                                },
-                                            ))
-                                            .text_color(rgb(if state.prompt.is_empty() {
-                                                theme::gutter_fg()
-                                            } else {
-                                                theme::default_fg()
-                                            }))
-                                            .whitespace_normal()
-                                            .cursor_text()
-                                            .child(if state.prompt.is_empty() {
-                                                format!("{}▌", self.t("newproject.prompt_hint"))
-                                            } else if state.field == NewProjectField::Prompt
-                                                && !state.busy
-                                                && state.plan.is_none()
-                                            {
-                                                format!("{}▌", state.prompt)
-                                            } else {
-                                                state.prompt.clone()
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(state) = this.new_project.as_mut()
-                                                    && !state.busy
-                                                    && state.plan.is_none()
-                                                {
-                                                    state.field = NewProjectField::Prompt;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    ),
+                                    .child(Self::new_project_text_input(
+                                        state,
+                                        NewProjectField::Prompt,
+                                        window,
+                                        px(552.0),
+                                        px(60.0),
+                                        self.t("newproject.prompt_hint"),
+                                        cx,
+                                    )),
                             )
                         },
                     )
@@ -10690,16 +10939,7 @@ impl Editor {
                 && !state.busy
                 && state.plan.is_none()
             {
-                let target =
-                    if state.mode == NewProjectMode::Ai && state.field == NewProjectField::Prompt {
-                        &mut state.prompt
-                    } else {
-                        &mut state.title
-                    };
-                if let Some(last) = target.chars().last() {
-                    let len = target.len();
-                    target.truncate(len - last.len_utf8());
-                }
+                state.active_text_field_mut().backspace();
                 state.error.clear();
             }
             cx.notify();
@@ -10753,6 +10993,10 @@ impl Editor {
     }
 
     fn on_delete(&mut self, _: &DeleteText, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.with_new_project_text(|field| field.delete()) {
+            cx.notify();
+            return;
+        }
         if self.settings.is_some()
             || self.project_settings.is_some()
             || self.palette.is_some()
@@ -10934,6 +11178,13 @@ impl Editor {
     }
 
     fn on_copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.new_project.as_ref() {
+            let text = state.text_field(state.field).selected_text().to_string();
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         if self.modal_owns_keyboard() {
             return;
         }
@@ -10944,6 +11195,19 @@ impl Editor {
     }
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.new_project.as_mut() {
+            if state.picking || state.busy || state.plan.is_some() {
+                return;
+            }
+            let text = state.text_field(state.field).selected_text().to_string();
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                state.active_text_field_mut().delete();
+                state.error.clear();
+                cx.notify();
+            }
+            return;
+        }
         if self.modal_owns_keyboard() || self.doc.preview {
             return;
         }
@@ -16436,15 +16700,23 @@ impl Editor {
         let new_project_dump = match &self.new_project {
             Some(state) => format!(
                 "{{\"open\":true,\"title\":\"{}\",\"type\":\"{}\",\"lang\":\"{}\",\
-                 \"mode\":\"{}\",\"error\":\"{}\",\"picking\":{},\"busy\":{},\
+                 \"mode\":\"{}\",\"field\":\"{}\",\"caret\":{},\"selection\":[{},{}],\
+                 \"error\":\"{}\",\"picking\":{},\"busy\":{},\
                  \"path\":\"{}\",\"plan_files\":{}}}",
-                escape_json(&state.title),
+                escape_json(state.title.text()),
                 state.kind.as_str(),
                 state.lang.key(),
                 match state.mode {
                     NewProjectMode::Template => "template",
                     NewProjectMode::Ai => "ai",
                 },
+                match state.field {
+                    NewProjectField::Title => "title",
+                    NewProjectField::Prompt => "prompt",
+                },
+                state.text_field(state.field).caret(),
+                state.text_field(state.field).selection().start,
+                state.text_field(state.field).selection().end,
                 escape_json(&state.error),
                 state.picking,
                 state.busy,
@@ -16462,7 +16734,8 @@ impl Editor {
                     .unwrap_or(0),
             ),
             None => "{\"open\":false,\"title\":\"\",\"type\":\"\",\"lang\":\"\",\
-                     \"mode\":\"\",\"error\":\"\",\"picking\":false,\"busy\":false,\
+                     \"mode\":\"\",\"field\":\"\",\"caret\":0,\"selection\":[0,0],\
+                     \"error\":\"\",\"picking\":false,\"busy\":false,\
                      \"path\":\"\",\"plan_files\":0}"
                 .to_string(),
         };
@@ -17331,7 +17604,7 @@ fn line_local_range(range: &Range<usize>, line: &Range<usize>) -> Option<Range<u
 /// width marks the start of the next visual row. Word-wrap edges can differ
 /// by a word between GPUI's div layout and this approximation; the spike
 /// accepts and documents that (mouse caret lands within the same row).
-fn wrap_row_starts(glyphs: &[(usize, f32)], wrap_width: f32) -> Vec<usize> {
+pub(crate) fn wrap_row_starts(glyphs: &[(usize, f32)], wrap_width: f32) -> Vec<usize> {
     let mut starts = vec![0usize];
     let mut current_row_start_x = 0.0;
     for &(index, x) in glyphs {
@@ -17532,24 +17805,14 @@ impl EntityInputHandler for Editor {
             return;
         }
         // The New Project dialog owns its title/prompt field (M10 slice 2b,
-        // M16 slice 9).
+        // M16 slice 9, TextField in M17 slice 1).
         if self.new_project.is_some() {
-            let cleaned: String = new_text
-                .chars()
-                .filter(|c| !c.is_control() || *c == ' ')
-                .collect();
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
                 && !state.busy
                 && state.plan.is_none()
             {
-                let target =
-                    if state.mode == NewProjectMode::Ai && state.field == NewProjectField::Prompt {
-                        &mut state.prompt
-                    } else {
-                        &mut state.title
-                    };
-                target.push_str(&cleaned);
+                state.active_text_field_mut().insert(new_text);
                 state.error.clear();
             }
             cx.notify();
@@ -17678,6 +17941,18 @@ impl EntityInputHandler for Editor {
         }
         if self.project_settings.is_some() {
             self.project_settings_input(new_text, cx);
+            return;
+        }
+        if self.new_project.is_some() {
+            if let Some(state) = self.new_project.as_mut()
+                && !state.picking
+                && !state.busy
+                && state.plan.is_none()
+            {
+                state.active_text_field_mut().insert(new_text);
+                state.error.clear();
+            }
+            cx.notify();
             return;
         }
         // IME while the find bar is open: commit into the active field with
@@ -18116,7 +18391,7 @@ impl Render for Editor {
                 root.child(self.new_file_overlay(cx))
             })
             .when(self.new_project.is_some(), |root| {
-                root.child(self.new_project_overlay(cx))
+                root.child(self.new_project_overlay(window, cx))
             })
     }
 }
