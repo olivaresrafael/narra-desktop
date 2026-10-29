@@ -36,6 +36,7 @@ pub mod language;
 pub mod manifest;
 pub mod markdown;
 pub mod project;
+pub mod project_type;
 pub mod provider;
 pub mod search;
 
@@ -52,7 +53,10 @@ pub use manifest::{
 pub use markdown::{Block as MarkdownBlock, InlineSpan, MarkdownDocument};
 pub use project::{
     DEFAULT_SCREENPLAY, MANIFEST_FILE, Project, ProjectError, ProjectIndex, SceneRef,
-    TEMPLATE_DIRS, create_project, open_project,
+    TEMPLATE_DIRS, create_project, create_project_from_type, open_project,
+};
+pub use project_type::{
+    ProjectTypePackage, TemplateFile, TypeOrigin, TypePackageError, builtin, builtins, registry,
 };
 
 /// Marker for the core boundary, so the crate is exercised by CI from day one.

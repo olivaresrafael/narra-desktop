@@ -182,7 +182,10 @@ use narra_core::provider::{
     CachedSecretStore, GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest,
     NewRepository, OsKeychain, SecretError, SecretStore,
 };
-use narra_core::{DocumentError, Project, ProjectError, ProjectType, create_project, open_project};
+use narra_core::{
+    DocumentError, Project, ProjectError, ProjectType, create_project, create_project_from_type,
+    open_project,
+};
 use new_file::Kind as NewFileKind;
 use project_settings::{ProjectField, ProjectSettingsState};
 use recent::RecentProjects;
@@ -7454,23 +7457,16 @@ impl Editor {
         lang: Lang,
         cx: &mut Context<Self>,
     ) {
-        match create_project(&path, &title, kind, lang.key()) {
-            Ok(project) => {
-                if let Err(error) = narra_core::project::seed_basic_template(&path, lang.key()) {
-                    let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
-                    self.set_new_project_error(message);
-                } else {
-                    match self.install_project(project, cx) {
-                        Ok(()) => {
-                            self.new_project = None;
-                        }
-                        Err(error) => {
-                            let message = self.tf("newproject.open_failed", &[("error", &error)]);
-                            self.set_new_project_error(message);
-                        }
-                    }
+        match create_project_from_type(&path, &title, kind, lang.key()) {
+            Ok(project) => match self.install_project(project, cx) {
+                Ok(()) => {
+                    self.new_project = None;
                 }
-            }
+                Err(error) => {
+                    let message = self.tf("newproject.open_failed", &[("error", &error)]);
+                    self.set_new_project_error(message);
+                }
+            },
             Err(error) => {
                 let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
                 self.set_new_project_error(message);

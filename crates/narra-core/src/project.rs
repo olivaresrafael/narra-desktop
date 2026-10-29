@@ -61,6 +61,9 @@ pub enum ProjectError {
     #[error(transparent)]
     Document(#[from] DocumentError),
 
+    #[error("project type package: {0}")]
+    TypePackage(#[from] crate::project_type::TypePackageError),
+
     #[error("failed to access `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -324,6 +327,47 @@ pub fn create_project(
     })
 }
 
+/// Create a project from a built-in type package (M17 slice 1, D-045). The
+/// package owns the directories and starter files, so the resulting tree is
+/// byte-identical to the previous `create_project` + `seed_basic_template`
+/// path. Creation never overwrites an existing manifest.
+pub fn create_project_from_type(
+    root: &Path,
+    title: &str,
+    project_type: ProjectType,
+    primary_language: &str,
+) -> Result<Project, ProjectError> {
+    if root.exists() {
+        if !root.is_dir() {
+            return Err(ProjectError::NotADirectory(root.to_path_buf()));
+        }
+        if root.join(MANIFEST_FILE).exists() {
+            return Err(ProjectError::AlreadyExists(root.to_path_buf()));
+        }
+    }
+    fs::create_dir_all(root).map_err(|source| ProjectError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let package =
+        crate::project_type::builtin(project_type.as_str()).expect("built-in type package");
+    for directory in &package.directories {
+        let path = root.join(directory);
+        fs::create_dir_all(&path).map_err(|source| ProjectError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    let manifest = Manifest::new_v1(title, project_type, primary_language, DEFAULT_SCREENPLAY);
+    let text = manifest::serialize_manifest(&manifest)?;
+    document::write_document(root, MANIFEST_FILE, &text)?;
+    crate::project_type::write_template(root, &package, primary_language)?;
+    Ok(Project {
+        root: root.to_path_buf(),
+        manifest,
+    })
+}
+
 /// Starter documents for the New Project **basic template** (M16 slice 8,
 /// D-044). Every file is create-only: an existing file is an explicit error
 /// and is never overwritten. The entity folders match the bible layout.
@@ -342,18 +386,10 @@ pub fn seed_basic_template(root: &Path, primary_language: &str) -> Result<(), Pr
 
 /// Localized starter files for [`seed_basic_template`]. Unknown languages
 /// fall back to English, matching the manifest's English on-disk convention.
+/// The text lives in the project-type package module so package templates and
+/// the legacy seeder cannot drift.
 pub fn basic_template_documents(primary_language: &str) -> (&'static str, &'static str) {
-    if primary_language == "es" {
-        (
-            "# Premisa\n\nEscribe aquí la premisa de la historia: quién, qué quiere y qué se lo impide.\n",
-            "# Escaleta\n\n## Acto I\n\n- Presentación del mundo y del protagonista.\n\n## Acto II\n\n- Conflicto y punto medio.\n\n## Acto III\n\n- Resolución.\n",
-        )
-    } else {
-        (
-            "# Premise\n\nWrite the story premise here: who wants what, and what stands in the way.\n",
-            "# Outline\n\n## Act I\n\n- Introduce the world and the protagonist.\n\n## Act II\n\n- Conflict and midpoint.\n\n## Act III\n\n- Resolution.\n",
-        )
-    }
+    crate::project_type::basic_template_documents(primary_language)
 }
 
 /// Open an existing project: `project.yaml` must exist and validate.
@@ -436,6 +472,64 @@ mod tests {
         assert!(outline.contains("Outline"), "{outline}");
         let (fallback, _) = basic_template_documents("fr");
         assert!(fallback.contains("Premise"), "{fallback}");
+    }
+
+    #[test]
+    fn type_packages_match_the_legacy_starter_tree() {
+        use std::collections::BTreeMap;
+        fn snapshot(root: &Path) -> BTreeMap<String, String> {
+            fn walk(base: &Path, current: &Path, out: &mut BTreeMap<String, String>) {
+                for entry in fs::read_dir(current).expect("read dir") {
+                    let entry = entry.expect("entry");
+                    let path = entry.path();
+                    let relative = path
+                        .strip_prefix(base)
+                        .expect("relative")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if relative == MANIFEST_FILE {
+                        continue;
+                    }
+                    if entry.file_type().expect("type").is_dir() {
+                        out.insert(format!("{relative}/"), String::new());
+                        walk(base, &path, out);
+                    } else {
+                        out.insert(
+                            relative,
+                            fs::read_to_string(&path).expect("read starter file"),
+                        );
+                    }
+                }
+            }
+            let mut out = BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        let kinds = [
+            ProjectType::Feature,
+            ProjectType::Series,
+            ProjectType::WebSeries,
+            ProjectType::Short,
+            ProjectType::Microdrama,
+            ProjectType::Other,
+        ];
+        for kind in kinds {
+            for language in ["en", "es"] {
+                let legacy = temp_root();
+                create_project(&legacy, "Muestra", kind, language).expect("legacy create");
+                seed_basic_template(&legacy, language).expect("legacy seed");
+                let packaged = temp_root();
+                create_project_from_type(&packaged, "Muestra", kind, language)
+                    .expect("package create");
+                assert_eq!(
+                    snapshot(&legacy),
+                    snapshot(&packaged),
+                    "starter tree mismatch for {} ({language})",
+                    kind.as_str()
+                );
+            }
+        }
     }
 
     #[test]
