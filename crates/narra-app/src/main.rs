@@ -1131,21 +1131,46 @@ fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
     (active, pending)
 }
 
-fn project_profile(project: &Project) -> ProjectProfile {
+fn project_type_package(project: &Project) -> Option<ProjectTypePackage> {
     let type_id = project.manifest().project_type_id.as_str();
-    if let Some(package) = narra_core::project_type::builtin(type_id) {
-        return package.profile();
-    }
-    let registry =
-        narra_core::project_type::registry(Some(project.root()), Some(&recent::config_dir()));
-    if let Ok(packages) = registry
-        && let Some(package) = packages.into_iter().find(|package| package.id == type_id)
-    {
-        return package.profile();
-    }
+    narra_core::project_type::builtin(type_id).or_else(|| {
+        narra_core::project_type::registry(Some(project.root()), Some(&recent::config_dir()))
+            .ok()?
+            .into_iter()
+            .find(|package| package.id == type_id)
+    })
+}
+
+fn generic_profile(type_id: &str) -> ProjectProfile {
     ProjectProfile {
         type_id: type_id.to_string(),
         ..ProjectProfile::default()
+    }
+}
+
+fn project_profile(project: &Project) -> ProjectProfile {
+    let type_id = project.manifest().project_type_id.as_str();
+    let Some(package) = project_type_package(project) else {
+        return generic_profile(type_id);
+    };
+    if package.origin == narra_core::project_type::TypeOrigin::Project
+        && narra_core::project_type::untrusted_project_type(project.root(), &package)
+            .unwrap_or(true)
+    {
+        return generic_profile(type_id);
+    }
+    package.profile()
+}
+
+fn project_type_trust(project: &Project) -> Option<ProjectTypePackage> {
+    let package = project_type_package(project)?;
+    if package.origin == narra_core::project_type::TypeOrigin::Project
+        && narra_core::project_type::untrusted_project_type(project.root(), &package)
+            .unwrap_or(true)
+    {
+        Some(package)
+    } else {
+        None
     }
 }
 
@@ -1851,6 +1876,8 @@ struct Editor {
     skills: Vec<Skill>,
     /// Project skills awaiting an explicit trust confirmation.
     skill_trust: Option<Vec<Skill>>,
+    /// Project-level type package awaiting confirmation.
+    type_trust: Option<ProjectTypePackage>,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
     /// Derived bible entities and mention matcher (M11).
@@ -5501,6 +5528,7 @@ impl Editor {
             || self.git_restore.is_some()
             || self.git_sync.is_some()
             || self.skill_trust.is_some()
+            || self.type_trust.is_some()
     }
 
     /// Apply an edit to the active New Project field without touching the
@@ -7292,6 +7320,7 @@ impl Editor {
         self.git_request = self.git_request.saturating_add(1);
         self.git_refreshed_at = None;
         self.profile = project_profile(&project);
+        self.type_trust = project_type_trust(&project);
         (self.skills, self.skill_trust) = project_skills(&project);
         self.project = Some(project);
         self.explorer = explorer;
@@ -7584,15 +7613,24 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         match create_project_from_package(&path, &title, &package, lang.key()) {
-            Ok(project) => match self.install_project(project, cx) {
-                Ok(()) => {
-                    self.new_project = None;
+            Ok(project) => {
+                if package.origin != narra_core::project_type::TypeOrigin::Builtin {
+                    let _ = narra_core::project_type::trust_type(
+                        &path,
+                        &package.id,
+                        &package.content_hash,
+                    );
                 }
-                Err(error) => {
-                    let message = self.tf("newproject.open_failed", &[("error", &error)]);
-                    self.set_new_project_error(message);
+                match self.install_project(project, cx) {
+                    Ok(()) => {
+                        self.new_project = None;
+                    }
+                    Err(error) => {
+                        let message = self.tf("newproject.open_failed", &[("error", &error)]);
+                        self.set_new_project_error(message);
+                    }
                 }
-            },
+            }
             Err(error) => {
                 let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
                 self.set_new_project_error(message);
@@ -7766,6 +7804,95 @@ impl Editor {
             self.skills = active_skills(project.root(), &all).unwrap_or_else(|_| all.clone());
         }
         cx.notify();
+    }
+
+    fn trust_project_type(&mut self, cx: &mut Context<Self>) {
+        let Some(package) = self.type_trust.take() else {
+            return;
+        };
+        if let Some(project) = self.project.as_ref() {
+            if let Err(error) = narra_core::project_type::trust_type(
+                project.root(),
+                &package.id,
+                &package.content_hash,
+            ) {
+                self.notice = Some(self.tf("type.trust_failed", &[("error", &error)]));
+            }
+            self.profile = project_profile(project);
+        }
+        cx.notify();
+    }
+
+    fn type_trust_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let package = self.type_trust.as_ref().expect("overlay only when open");
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .child(
+                div()
+                    .w(px(520.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("type.trust.title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("type.trust.body")),
+                    )
+                    .child(
+                        div()
+                            .p_2()
+                            .bg(rgb(theme::bg()))
+                            .border_1()
+                            .border_color(rgb(theme::explorer_border()))
+                            .child(format!("{} · {}", package.name, package.id)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("type-trust-accept")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("type.trust.accept"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.trust_project_type(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("type-trust-later")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("type.trust.later"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.type_trust = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn skill_trust_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -11841,6 +11968,11 @@ impl Editor {
     }
 
     fn on_close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.type_trust.is_some() {
+            self.type_trust = None;
+            cx.notify();
+            return;
+        }
         if self.skill_trust.is_some() {
             self.skill_trust = None;
             cx.notify();
@@ -18714,6 +18846,9 @@ impl Render for Editor {
             .when(self.unsaved_prompt.is_some(), |root| {
                 root.child(self.quit_overlay(cx))
             })
+            .when(self.type_trust.is_some(), |root| {
+                root.child(self.type_trust_overlay(cx))
+            })
             .when(self.skill_trust.is_some(), |root| {
                 root.child(self.skill_trust_overlay(cx))
             })
@@ -19452,6 +19587,7 @@ fn run() -> Result<(), String> {
                 .unwrap_or_else(|| ProjectProfile::screenplay("feature"));
             let (startup_skills, startup_skill_trust) =
                 project.as_ref().map(project_skills).unwrap_or_default();
+            let startup_type_trust = project.as_ref().and_then(project_type_trust);
             install_menus(lang, recents.paths(), Some(&startup_profile), cx);
 
             let entity = cx.new(|cx| Editor {
@@ -19493,6 +19629,7 @@ fn run() -> Result<(), String> {
                 profile: startup_profile,
                 skills: startup_skills,
                 skill_trust: startup_skill_trust,
+                type_trust: startup_type_trust,
                 project,
                 explorer,
                 entities,

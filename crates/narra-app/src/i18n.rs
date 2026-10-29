@@ -907,6 +907,23 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Could not save skill trust: {error}",
         "No se pudo guardar la confianza de la skill: {error}",
     ),
+    (
+        "type.trust.title",
+        "Project type needs confirmation",
+        "El tipo de proyecto necesita confirmación",
+    ),
+    (
+        "type.trust.body",
+        "This project contains its own project type. Its template and capabilities are untrusted until you confirm. If the package changes, you will be asked again.",
+        "Este proyecto contiene su propio tipo de proyecto. Su plantilla y capacidades no son de confianza hasta que lo confirmes. Si el paquete cambia, se volverá a preguntar.",
+    ),
+    ("type.trust.accept", "Trust and use", "Confiar y usar"),
+    ("type.trust.later", "Use generic", "Usar genérico"),
+    (
+        "type.trust_failed",
+        "Could not save type trust: {error}",
+        "No se pudo guardar la confianza del tipo: {error}",
+    ),
     ("chat.rejected", "proposal rejected", "propuesta rechazada"),
     (
         "chat.rejected_note",

@@ -9,11 +9,13 @@
 //! The package id is the directory name and matches `project_type` in
 //! `project.yaml`. Built-in ids are reserved and cannot be replaced.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use saphyr::{LoadableYamlNode, Yaml};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// File inside each package directory.
@@ -22,6 +24,8 @@ pub const TYPE_FILE: &str = "type.yaml";
 pub const PROJECT_TYPES_DIR: &str = ".narra/types";
 /// User-scope type packages, relative to the user config directory.
 pub const USER_TYPES_DIR: &str = "project-types";
+/// Trust record for project-level type packages.
+pub const TYPE_TRUST_FILE: &str = ".narra/trusted-types.json";
 /// Package format this build reads.
 pub const SCHEMA_VERSION: u32 = 1;
 /// Capability API this build implements.
@@ -165,6 +169,8 @@ pub struct ProjectTypePackage {
     /// Source directory for user/project packages, used when copying the
     /// package into a created project. Built-ins have no source directory.
     pub source_dir: Option<PathBuf>,
+    /// SHA-256 of the package files; project packages are trusted by hash.
+    pub content_hash: String,
 }
 
 impl ProjectTypePackage {
@@ -326,6 +332,118 @@ pub const BUILTIN_IDS: [&str; 6] = [
     "other",
 ];
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn builtin_hash(id: &str) -> String {
+    sha256_hex(format!("builtin-project-type:{id}:v{SCHEMA_VERSION}").as_bytes())
+}
+
+fn directory_hash(directory: &Path) -> Result<String, TypePackageError> {
+    fn collect(
+        base: &Path,
+        current: &Path,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<(), TypePackageError> {
+        let entries = fs::read_dir(current).map_err(|error| TypePackageError::Io {
+            path: current.to_path_buf(),
+            error: error.to_string(),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| TypePackageError::Io {
+                path: current.to_path_buf(),
+                error: error.to_string(),
+            })?;
+            let path = entry.path();
+            if entry
+                .file_type()
+                .map_err(|error| TypePackageError::Io {
+                    path: path.clone(),
+                    error: error.to_string(),
+                })?
+                .is_dir()
+            {
+                collect(base, &path, files)?;
+            } else {
+                files.push(path.strip_prefix(base).unwrap_or(&path).to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut relative = Vec::new();
+    collect(directory, directory, &mut relative)?;
+    relative.sort();
+    let mut hasher = Sha256::new();
+    for path in relative {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        let bytes = fs::read(directory.join(&path)).map_err(|error| TypePackageError::Io {
+            path: directory.join(&path),
+            error: error.to_string(),
+        })?;
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hashes explicitly trusted for project-level type packages.
+pub fn trusted_type_hashes(project_root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let path = project_root.join(TYPE_TRUST_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let value: TypeTrustFile =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    if value.schema_version != 1 {
+        return Err(format!(
+            "unsupported type trust schema_version {}",
+            value.schema_version
+        ));
+    }
+    Ok(value.types)
+}
+
+/// Trust one project-level type package at its current content hash.
+pub fn trust_type(project_root: &Path, id: &str, hash: &str) -> Result<(), String> {
+    let mut types = trusted_type_hashes(project_root)?;
+    types.insert(id.to_string(), hash.to_string());
+    let file = TypeTrustFile {
+        schema_version: 1,
+        types,
+    };
+    let text = serde_json::to_string_pretty(&file)
+        .map_err(|error| format!("could not encode type trust: {error}"))?;
+    let root = project_root.join(".narra");
+    fs::create_dir_all(&root).map_err(|error| format!("{}: {error}", root.display()))?;
+    crate::document::write_document(project_root, TYPE_TRUST_FILE, &text)
+        .map_err(|error| error.to_string())
+}
+
+/// Whether a project-level package needs confirmation.
+pub fn untrusted_project_type(
+    project_root: &Path,
+    package: &ProjectTypePackage,
+) -> Result<bool, String> {
+    if package.origin != TypeOrigin::Project {
+        return Ok(false);
+    }
+    let trusted = trusted_type_hashes(project_root)?;
+    Ok(trusted.get(&package.id) != Some(&package.content_hash))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TypeTrustFile {
+    schema_version: u32,
+    #[serde(default)]
+    types: BTreeMap<String, String>,
+}
+
 /// Look up a built-in package by id.
 pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
     let (name, description) = match id {
@@ -356,6 +474,7 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         capabilities: TypeCapabilities::screenplay(),
         origin: TypeOrigin::Builtin,
         source_dir: None,
+        content_hash: builtin_hash(id),
     })
 }
 
@@ -382,6 +501,7 @@ pub fn load_package(
         error: error.to_string(),
     })?;
     package.source_dir = Some(directory.to_path_buf());
+    package.content_hash = directory_hash(directory)?;
     let directory_name = directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -589,6 +709,7 @@ pub fn parse_package(
         capabilities,
         origin,
         source_dir: None,
+        content_hash: String::new(),
     };
     package.validate()?;
     Ok(package)
@@ -991,6 +1112,29 @@ mod tests {
         let mut package = builtin("feature").expect("feature");
         package.files[0].path = ".narra/agents/x/agent.yaml".to_string();
         assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn project_type_trust_is_hash_bound() {
+        let root = temp_root();
+        let dir = root.join(PROJECT_TYPES_DIR).join("campaign");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join(TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\n",
+        )
+        .expect("type");
+        let mut package = load_package(&dir, TypeOrigin::Project).expect("package");
+        assert!(untrusted_project_type(&root, &package).expect("untrusted"));
+        trust_type(&root, &package.id, &package.content_hash).expect("trust");
+        assert!(!untrusted_project_type(&root, &package).expect("trusted"));
+        fs::write(
+            dir.join(TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign v2\n",
+        )
+        .expect("change");
+        package = load_package(&dir, TypeOrigin::Project).expect("reload");
+        assert!(untrusted_project_type(&root, &package).expect("changed"));
     }
 
     #[test]
