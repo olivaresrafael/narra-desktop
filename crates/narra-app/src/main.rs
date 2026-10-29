@@ -183,8 +183,8 @@ use narra_core::provider::{
     NewRepository, OsKeychain, SecretError, SecretStore,
 };
 use narra_core::{
-    DocumentError, Project, ProjectError, ProjectType, create_project, create_project_from_type,
-    open_project,
+    DocumentError, Project, ProjectError, ProjectProfile, ProjectType, create_project,
+    create_project_from_type, open_project,
 };
 use new_file::Kind as NewFileKind;
 use project_settings::{ProjectField, ProjectSettingsState};
@@ -1103,6 +1103,15 @@ fn project_window_title(title: Option<&str>) -> String {
     }
 }
 
+/// Resolve the UI-neutral capabilities for an open project. Built-ins are
+/// available today; custom packages fall back to the generic profile until
+/// their manifest ids are loaded.
+fn project_profile(project: &Project) -> ProjectProfile {
+    narra_core::project_type::builtin(project.manifest().project_type.as_str())
+        .map(|package| package.profile())
+        .unwrap_or_default()
+}
+
 fn role_source_label(lang: Lang, source: &str) -> &'static str {
     match source {
         "project" => i18n::tr(lang, "role.project"),
@@ -1798,6 +1807,9 @@ struct Editor {
     /// Open Narra project (M6 slice 1). `None` in `--fixture` spike mode,
     /// which keeps the verified spike surface unchanged.
     project: Option<Project>,
+    /// UI-neutral capabilities resolved from the project's type package.
+    /// The presentation layer reads this instead of matching a type id.
+    profile: ProjectProfile,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
     /// Derived bible entities and mention matcher (M11).
@@ -3724,8 +3736,12 @@ impl Editor {
         };
         match state.save(project) {
             Ok(()) => {
+                if let Some(project) = self.project.as_ref() {
+                    self.profile = project_profile(project);
+                }
                 self.project_settings = None;
                 self.notice = Some(i18n::tr(lang, "notice.project_settings_saved").to_string());
+                self.refresh_menus(cx);
             }
             Err(error) => {
                 if let Some(state) = self.project_settings.as_mut() {
@@ -4466,34 +4482,42 @@ impl Editor {
             ),
             ContextMenuItem::separator(),
             ContextMenuItem::action(ContextAction::Propose, t("context.propose"), "⌘K", true),
-            ContextMenuItem::separator(),
-            ContextMenuItem::action(
-                ContextAction::Convert(NewFileKind::Character),
-                t("context.convert.character"),
-                "",
-                entity_ok,
-            ),
-            ContextMenuItem::action(
-                ContextAction::Convert(NewFileKind::Location),
-                t("context.convert.location"),
-                "",
-                entity_ok,
-            ),
-            ContextMenuItem::action(
-                ContextAction::Convert(NewFileKind::Object),
-                t("context.convert.object"),
-                "",
-                entity_ok,
-            ),
-            ContextMenuItem::separator(),
         ];
-        for kind in screenplay::ElementType::ALL {
-            items.push(ContextMenuItem::action(
-                ContextAction::SetElement(kind),
-                t(kind.i18n_key()),
-                "",
-                true,
-            ));
+        let mut entity_items = Vec::new();
+        for (kind, capability) in [
+            (NewFileKind::Character, "character"),
+            (NewFileKind::Location, "location"),
+            (NewFileKind::Object, "object"),
+        ] {
+            if self.profile.allows_entity(capability) {
+                let key = match kind {
+                    NewFileKind::Character => "context.convert.character",
+                    NewFileKind::Location => "context.convert.location",
+                    NewFileKind::Object => "context.convert.object",
+                    _ => continue,
+                };
+                entity_items.push(ContextMenuItem::action(
+                    ContextAction::Convert(kind),
+                    t(key),
+                    "",
+                    entity_ok,
+                ));
+            }
+        }
+        if !entity_items.is_empty() {
+            items.push(ContextMenuItem::separator());
+            items.extend(entity_items);
+        }
+        if self.profile.screenplay {
+            items.push(ContextMenuItem::separator());
+            for kind in screenplay::ElementType::ALL {
+                items.push(ContextMenuItem::action(
+                    ContextAction::SetElement(kind),
+                    t(kind.i18n_key()),
+                    "",
+                    true,
+                ));
+            }
         }
         self.show_context_menu(position, items, ContextTarget::Editor, window, cx);
     }
@@ -5069,6 +5093,10 @@ impl Editor {
     /// selection (or to the caret line). Uses the same forced markers as the
     /// Tab cycle, so the text is preserved.
     fn context_set_element(&mut self, kind: screenplay::ElementType, cx: &mut Context<Self>) {
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
+            return;
+        }
         let caret = self.caret();
         let start_line = self.doc.buffer.position_at(self.doc.selected.start).line;
         let end_line = if self.doc.selected.is_empty() {
@@ -6723,6 +6751,10 @@ impl Editor {
             self.project_settings_cycle_field(true, cx);
             return;
         }
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
+            return;
+        }
         if self.doc.preview {
             return;
         }
@@ -6746,6 +6778,10 @@ impl Editor {
         }
         if self.project_settings.is_some() {
             self.project_settings_cycle_field(false, cx);
+            return;
+        }
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
             return;
         }
         if self.doc.preview {
@@ -6792,12 +6828,27 @@ impl Editor {
             cx.notify();
             return;
         }
+        let kind = NewFileKind::ALL
+            .into_iter()
+            .find(|kind| self.new_file_kind_allowed(*kind))
+            .unwrap_or(NewFileKind::Notes);
         self.new_file = Some(NewFileState {
-            kind: NewFileKind::Screenplay,
+            kind,
             name: String::new(),
             error: String::new(),
         });
         cx.notify();
+    }
+
+    /// Whether the active type profile exposes a document kind.
+    fn new_file_kind_allowed(&self, kind: NewFileKind) -> bool {
+        match kind {
+            NewFileKind::Character => self.profile.allows_entity("character"),
+            NewFileKind::Location => self.profile.allows_entity("location"),
+            NewFileKind::Object => self.profile.allows_entity("object"),
+            NewFileKind::Screenplay => self.profile.screenplay,
+            NewFileKind::Notes | NewFileKind::Research => true,
+        }
     }
 
     /// Create the document described by the dialog: an explicit canonical
@@ -6868,7 +6919,10 @@ impl Editor {
     fn new_file_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_file.as_ref().expect("overlay only when open");
         let mut kinds = div().flex().gap_2();
-        for kind in NewFileKind::ALL {
+        for kind in NewFileKind::ALL
+            .into_iter()
+            .filter(|kind| self.new_file_kind_allowed(*kind))
+        {
             let selected = kind == state.kind;
             kinds = kinds.child(
                 div()
@@ -7181,6 +7235,7 @@ impl Editor {
         self.git_pending = false;
         self.git_request = self.git_request.saturating_add(1);
         self.git_refreshed_at = None;
+        self.profile = project_profile(&project);
         self.project = Some(project);
         self.explorer = explorer;
         self.refresh_entities();
@@ -8243,7 +8298,7 @@ impl Editor {
 
     /// Rebuild the native menus with the current language and recents.
     fn refresh_menus(&self, cx: &gpui::App) {
-        install_menus(self.lang, self.recents.paths(), cx);
+        install_menus(self.lang, self.recents.paths(), Some(&self.profile), cx);
     }
 
     // ---- live page count (M9 slice 7) ------------------------------------
@@ -12137,6 +12192,11 @@ impl Editor {
         i18n::tf(self.lang, key, params)
     }
 
+    fn capability_unavailable(&mut self, cx: &mut Context<Self>) {
+        self.notice = Some(self.t("notice.capability_unavailable").to_string());
+        cx.notify();
+    }
+
     /// Localized word for a terminal proposal state in notices (the dump
     /// keeps machine-oriented English `status_key` values).
     fn propose_status_word(&self, status: ProposeStatus) -> &'static str {
@@ -12259,6 +12319,10 @@ impl Editor {
     /// buffer is refused with an explicit notice instead of being reviewed
     /// at the wrong version.
     fn on_review_scene(&mut self, _: &ReviewScene, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
+            return;
+        }
         self.run_review(cx);
     }
 
@@ -12502,6 +12566,10 @@ impl Editor {
     /// flow whose panel is visible (the proposal panel wins when open —
     /// the same rule as the render); nothing to retry says so explicitly.
     fn on_retry_agent(&mut self, _: &RetryAgent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
+            return;
+        }
         match retry_target(
             self.propose.is_open(),
             self.propose.status,
@@ -12540,6 +12608,10 @@ impl Editor {
     /// the user sees) is exported, never a silent disk re-read; the PDF is
     /// an artifact and no canonical file changes.
     fn on_export_pdf(&mut self, _: &ExportPdf, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.profile.export_pdf {
+            self.capability_unavailable(cx);
+            return;
+        }
         let Some(project) = self.project.as_ref() else {
             self.notice = Some(self.t("notice.fixture_no_project").to_string());
             cx.notify();
@@ -12862,6 +12934,10 @@ impl Editor {
     /// bar borrows the single focus (spike compromise): the find bar closes
     /// when it opens and vice versa.
     fn on_open_propose(&mut self, _: &OpenPropose, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
+            return;
+        }
         if self.doc.find.open {
             self.close_find(cx);
         }
@@ -12885,6 +12961,10 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.profile.screenplay {
+            self.capability_unavailable(cx);
+            return;
+        }
         if self.doc.find.open {
             self.close_find(cx);
         }
@@ -16788,6 +16868,20 @@ impl Editor {
                 escape_json(&self.git.error),
             )
         };
+        let profile_entities = self
+            .profile
+            .entity_kinds
+            .iter()
+            .map(|kind| format!("\"{}\"", escape_json(kind)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let profile_dump = format!(
+            "{{\"type\":\"{}\",\"screenplay\":{},\"entity_kinds\":[{}],\"export_pdf\":{}}}",
+            escape_json(&self.profile.type_id),
+            self.profile.screenplay,
+            profile_entities,
+            self.profile.export_pdf,
+        );
         let panels_dump = format!(
             "{{\"explorer\":{},\"agent\":{},\"git\":{},\"explorer_w\":{},\"right_w\":{},\"wrap_w\":{},\
              \"chat_scroll_offset\":{},\"chat_scroll_max\":{},\"chat_at_bottom\":{},\
@@ -17145,7 +17239,7 @@ impl Editor {
                 "\"document\":\"{}\",\"language\":\"{}\",\"preview\":{{\"active\":{},\"blocks\":{}}},\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"language\":{},\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"unsaved\":{},\"git\":{},\"panels\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
+                 \"unsaved\":{},\"git\":{},\"panels\":{},\"profile\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
                  \"rename\":{},\"delete_prompt\":{},\"chat\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
@@ -17210,6 +17304,7 @@ impl Editor {
             unsaved_dump,
             git_dump,
             panels_dump,
+            profile_dump,
             settings_dump,
             palette_dump,
             context_dump,
@@ -17251,7 +17346,12 @@ fn cursor_element() -> gpui::Div {
 /// table and are rebuilt when the language toggles; items dispatch the same
 /// actions as the keybindings, and the shortcut column is resolved by the
 /// platform from the keymap.
-fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
+fn install_menus(
+    lang: Lang,
+    recents: &[PathBuf],
+    profile: Option<&ProjectProfile>,
+    cx: &gpui::App,
+) {
     let label = |key: &str| i18n::tr(lang, key);
     let menu = |key: &str, items: Vec<gpui::MenuItem>| gpui::Menu {
         name: label(key).into(),
@@ -17285,9 +17385,12 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
     file_items.push(gpui::MenuItem::separator());
     file_items.push(gpui::MenuItem::action(label("menu.close_tab"), CloseTab));
     file_items.push(gpui::MenuItem::action(label("menu.save"), Save));
-    file_items.push(gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf));
+    if profile.is_none_or(|profile| profile.export_pdf) {
+        file_items.push(gpui::MenuItem::action(label("menu.export_pdf"), ExportPdf));
+    }
 
-    cx.set_menus(vec![
+    let screenplay = profile.is_none_or(|profile| profile.screenplay);
+    let mut menus = vec![
         menu(
             "menu.app",
             vec![
@@ -17341,7 +17444,9 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.language"), ToggleLang),
             ],
         ),
-        menu(
+    ];
+    if screenplay {
+        menus.push(menu(
             "menu.script",
             vec![
                 gpui::MenuItem::action(label("menu.review"), ReviewScene),
@@ -17355,8 +17460,9 @@ fn install_menus(lang: Lang, recents: &[PathBuf], cx: &gpui::App) {
                 gpui::MenuItem::action(label("menu.restore_backup"), RestoreBackup),
                 gpui::MenuItem::action(label("menu.discard_backup"), DiscardBackup),
             ],
-        ),
-    ]);
+        ));
+    }
+    cx.set_menus(menus);
 }
 
 /// Line-number gutter cell (M9 slice 3): fixed width, right-aligned digits.
@@ -19075,7 +19181,11 @@ fn run() -> Result<(), String> {
             // Native macOS menus (M10 slice 1), localized with the startup
             // language and rebuilt by the ⌘⌥L toggle. The recents submenu is
             // part of the same rebuild (M10 slice 2b).
-            install_menus(lang, recents.paths(), cx);
+            let startup_profile = project
+                .as_ref()
+                .map(project_profile)
+                .unwrap_or_else(|| ProjectProfile::screenplay("feature"));
+            install_menus(lang, recents.paths(), Some(&startup_profile), cx);
 
             let entity = cx.new(|cx| Editor {
                 doc: DocumentState::new(doc_path, &content),
@@ -19113,6 +19223,7 @@ fn run() -> Result<(), String> {
                 find_probe_cursor: 0,
                 diff_probe_left: diff_steps,
                 diff_probe_total: diff_steps,
+                profile: startup_profile,
                 project,
                 explorer,
                 entities,

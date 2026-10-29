@@ -56,7 +56,8 @@ pub use project::{
     TEMPLATE_DIRS, create_project, create_project_from_type, open_project,
 };
 pub use project_type::{
-    ProjectTypePackage, TemplateFile, TypeOrigin, TypePackageError, builtin, builtins, registry,
+    ProjectProfile, ProjectTypePackage, TemplateFile, TypeCapabilities, TypeOrigin,
+    TypePackageError, builtin, builtins, registry,
 };
 
 /// Marker for the core boundary, so the crate is exercised by CI from day one.

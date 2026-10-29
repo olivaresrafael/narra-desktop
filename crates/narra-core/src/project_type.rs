@@ -37,7 +37,7 @@ const MAX_DESCRIPTION_CHARS: usize = 500;
 const MAX_PATH_CHARS: usize = 160;
 const MAX_SKILLS: usize = 32;
 
-const PACKAGE_KEYS: [&str; 8] = [
+const PACKAGE_KEYS: [&str; 9] = [
     "schema_version",
     "api_version",
     "id",
@@ -46,6 +46,7 @@ const PACKAGE_KEYS: [&str; 8] = [
     "directories",
     "files",
     "skills",
+    "capabilities",
 ];
 
 /// Where a package was loaded from.
@@ -86,6 +87,68 @@ pub struct TemplateFile {
     pub content: LocalizedText,
 }
 
+/// What the editor exposes for a type. The UI consumes this profile instead
+/// of matching on a type id. Unknown entity ids are ignored by this build.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TypeCapabilities {
+    /// Fountain document support: element cycling, scene review and PDF.
+    pub screenplay: bool,
+    /// Entity kinds that can be created from a selection.
+    pub entity_kinds: Vec<String>,
+    /// PDF export is available for this type.
+    pub export_pdf: bool,
+}
+
+impl TypeCapabilities {
+    pub fn screenplay() -> Self {
+        Self {
+            screenplay: true,
+            entity_kinds: vec![
+                "character".to_string(),
+                "location".to_string(),
+                "object".to_string(),
+            ],
+            export_pdf: true,
+        }
+    }
+}
+
+/// UI-neutral view of one type's capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProfile {
+    pub type_id: String,
+    pub screenplay: bool,
+    pub entity_kinds: Vec<String>,
+    pub export_pdf: bool,
+}
+
+impl ProjectProfile {
+    pub fn screenplay(type_id: impl Into<String>) -> Self {
+        let capabilities = TypeCapabilities::screenplay();
+        Self {
+            type_id: type_id.into(),
+            screenplay: capabilities.screenplay,
+            entity_kinds: capabilities.entity_kinds,
+            export_pdf: capabilities.export_pdf,
+        }
+    }
+
+    pub fn allows_entity(&self, kind: &str) -> bool {
+        self.entity_kinds.iter().any(|candidate| candidate == kind)
+    }
+}
+
+impl Default for ProjectProfile {
+    fn default() -> Self {
+        Self {
+            type_id: "other".to_string(),
+            screenplay: false,
+            entity_kinds: Vec::new(),
+            export_pdf: false,
+        }
+    }
+}
+
 /// A validated project-type package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectTypePackage {
@@ -97,12 +160,22 @@ pub struct ProjectTypePackage {
     pub directories: Vec<String>,
     pub files: Vec<TemplateFile>,
     pub skills: Vec<String>,
+    pub capabilities: TypeCapabilities,
     pub origin: TypeOrigin,
 }
 
 impl ProjectTypePackage {
     pub fn file(&self, path: &str) -> Option<&TemplateFile> {
         self.files.iter().find(|file| file.path == path)
+    }
+
+    pub fn profile(&self) -> ProjectProfile {
+        ProjectProfile {
+            type_id: self.id.clone(),
+            screenplay: self.capabilities.screenplay,
+            entity_kinds: self.capabilities.entity_kinds.clone(),
+            export_pdf: self.capabilities.export_pdf,
+        }
     }
 
     /// Validate the package without touching the filesystem. The id must be
@@ -201,6 +274,22 @@ impl ProjectTypePackage {
                 });
             }
         }
+        if self.capabilities.entity_kinds.len() > 16 {
+            return Err(TypePackageError::Invalid {
+                field: "capabilities.entity_kinds",
+                detail: "at most 16 entity kinds are allowed".to_string(),
+            });
+        }
+        let mut entities = BTreeSet::new();
+        for entity in &self.capabilities.entity_kinds {
+            validate_id(entity)?;
+            if !entities.insert(entity.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "capabilities.entity_kinds",
+                    detail: format!("duplicate entity kind `{entity}`"),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -261,6 +350,7 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         directories,
         files,
         skills: Vec::new(),
+        capabilities: TypeCapabilities::screenplay(),
         origin: TypeOrigin::Builtin,
     })
 }
@@ -415,6 +505,10 @@ pub fn parse_package(
     let id = required_string(&root, "id")?.to_string();
     let name = required_string(&root, "name")?.to_string();
     let description = optional_string(&root, "description").unwrap_or_default();
+    let capabilities = match root.as_mapping_get("capabilities") {
+        Some(value) => parse_capabilities(value)?,
+        None => TypeCapabilities::default(),
+    };
 
     let directories = match root.as_mapping_get("directories") {
         Some(value) => string_sequence(value, "directories")?,
@@ -487,10 +581,55 @@ pub fn parse_package(
         directories,
         files,
         skills,
+        capabilities,
         origin,
     };
     package.validate()?;
     Ok(package)
+}
+
+fn parse_capabilities(value: &Yaml) -> Result<TypeCapabilities, TypePackageError> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "capabilities",
+            detail: "must be a mapping".to_string(),
+        })?;
+    for key in mapping.keys() {
+        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+            field: "capabilities",
+            detail: "keys must be strings".to_string(),
+        })?;
+        if !matches!(key, "screenplay" | "entity_kinds" | "export_pdf") {
+            return Err(TypePackageError::Invalid {
+                field: "capabilities",
+                detail: format!("unknown key `{key}`"),
+            });
+        }
+    }
+    let screenplay = match value.as_mapping_get("screenplay") {
+        Some(node) => node.as_bool().ok_or_else(|| TypePackageError::Invalid {
+            field: "capabilities.screenplay",
+            detail: "must be a boolean".to_string(),
+        })?,
+        None => false,
+    };
+    let export_pdf = match value.as_mapping_get("export_pdf") {
+        Some(node) => node.as_bool().ok_or_else(|| TypePackageError::Invalid {
+            field: "capabilities.export_pdf",
+            detail: "must be a boolean".to_string(),
+        })?,
+        None => false,
+    };
+    let entity_kinds = match value.as_mapping_get("entity_kinds") {
+        Some(node) => string_sequence(node, "capabilities.entity_kinds")?,
+        None => Vec::new(),
+    };
+    Ok(TypeCapabilities {
+        screenplay,
+        entity_kinds,
+        export_pdf,
+    })
 }
 
 fn mapping_get<'a>(mapping: &'a saphyr::Mapping<'a>, key: &str) -> Option<&'a Yaml<'a>> {
@@ -785,8 +924,33 @@ mod tests {
             let package = builtin(id).expect("builtin");
             assert_eq!(package.id, id);
             package.validate().expect("valid");
+            let profile = package.profile();
+            assert!(profile.screenplay);
+            assert!(profile.allows_entity("character"));
+            assert!(profile.export_pdf);
         }
         assert!(builtin("unknown").is_none());
+    }
+
+    #[test]
+    fn capabilities_parse_and_default_to_generic() {
+        let generic = parse_package(
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            TypeOrigin::User,
+        )
+        .expect("generic package");
+        assert!(!generic.profile().screenplay);
+        assert!(generic.profile().entity_kinds.is_empty());
+        assert!(!generic.profile().export_pdf);
+
+        let typed = parse_package(
+            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncapabilities:\n  screenplay: true\n  entity_kinds: [audience, channel]\n  export_pdf: true\n",
+            TypeOrigin::User,
+        )
+        .expect("typed package");
+        assert!(typed.profile().screenplay);
+        assert_eq!(typed.profile().entity_kinds, ["audience", "channel"]);
+        assert!(typed.profile().export_pdf);
     }
 
     #[test]

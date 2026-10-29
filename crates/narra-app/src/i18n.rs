@@ -327,6 +327,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "abre la pestaña del guion para exportar el PDF",
     ),
     (
+        "notice.capability_unavailable",
+        "this project type does not support that action",
+        "este tipo de proyecto no admite esa acción",
+    ),
+    (
         "notice.apply_target_dirty",
         "the proposal target has unsaved changes: save it before applying",
         "el destino de la propuesta tiene cambios sin guardar: guárdalo antes de aplicar",
