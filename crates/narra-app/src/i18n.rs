@@ -836,6 +836,15 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "selecciona texto primero",
     ),
     ("chat.selection_chip", "Selection", "Selección"),
+    ("chat.attach_scene", "Scene", "Escena"),
+    ("chat.attach_selection", "Selection", "Selección"),
+    ("chat.attach_document", "Document", "Documento"),
+    ("chat.attach_file", "File…", "Archivo…"),
+    (
+        "chat.attach_failed",
+        "Could not attach {path}: {error}",
+        "No se pudo adjuntar {path}: {error}",
+    ),
     (
         "chat.rewrite_prompt",
         "Rewrite the attached scene to…",
@@ -1215,6 +1224,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // --- quick open / command palette (M10 slice 5) -----------------------
     ("palette.files_title", "Go to file", "Ir a archivo"),
     ("palette.commands_title", "Commands", "Comandos"),
+    (
+        "palette.attach_title",
+        "Attach a document to the chat",
+        "Adjuntar un documento al chat",
+    ),
+    (
+        "palette.placeholder_attach",
+        "Type a document name…",
+        "Escribe el nombre de un documento…",
+    ),
     (
         "palette.placeholder_files",
         "Type a file name…",

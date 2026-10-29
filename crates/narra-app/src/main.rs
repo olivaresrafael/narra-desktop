@@ -706,6 +706,8 @@ enum SettingsMessage {
 enum PaletteMode {
     Files,
     Commands,
+    /// Pick a project document to attach to the next chat message.
+    AttachFile,
 }
 
 impl PaletteMode {
@@ -713,6 +715,7 @@ impl PaletteMode {
         match self {
             PaletteMode::Files => "files",
             PaletteMode::Commands => "commands",
+            PaletteMode::AttachFile => "attach",
         }
     }
 }
@@ -4228,7 +4231,7 @@ impl Editor {
 
     fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = match self.palette.as_ref().map(|state| state.mode) {
-            Some(PaletteMode::Files) => self.palette_files().len(),
+            Some(PaletteMode::Files | PaletteMode::AttachFile) => self.palette_files().len(),
             Some(PaletteMode::Commands) => self.palette_commands().len(),
             None => 0,
         };
@@ -4246,10 +4249,13 @@ impl Editor {
             return Vec::new();
         };
         let query = state.query.trim().to_lowercase();
-        filter_palette_paths(
-            explorer::visible_paths(&self.explorer, self.show_config_files),
-            &query,
-        )
+        let paths = match state.mode {
+            PaletteMode::AttachFile => explorer::attachable_paths(&self.explorer),
+            PaletteMode::Files | PaletteMode::Commands => {
+                explorer::visible_paths(&self.explorer, self.show_config_files)
+            }
+        };
+        filter_palette_paths(paths, &query)
     }
 
     fn palette_commands(&self) -> Vec<PaletteCommand> {
@@ -4278,6 +4284,13 @@ impl Editor {
                 };
                 self.palette = None;
                 self.select_path(&path, true, window, cx);
+            }
+            PaletteMode::AttachFile => {
+                let Some(path) = self.palette_files().get(selected).cloned() else {
+                    return;
+                };
+                self.palette = None;
+                self.chat_attach_path(&path, cx);
             }
             PaletteMode::Commands => {
                 let Some(command) = self.palette_commands().get(selected).copied() else {
@@ -4341,11 +4354,14 @@ impl Editor {
         let title = match state.mode {
             PaletteMode::Files => self.t("palette.files_title"),
             PaletteMode::Commands => self.t("palette.commands_title"),
+            PaletteMode::AttachFile => self.t("palette.attach_title"),
         };
         let placeholder = match state.mode {
             PaletteMode::Files => self.t("palette.placeholder_files"),
             PaletteMode::Commands => self.t("palette.placeholder_commands"),
+            PaletteMode::AttachFile => self.t("palette.placeholder_attach"),
         };
+        let attach_mode = state.mode == PaletteMode::AttachFile;
         let mut list = div()
             .id("palette-list")
             .max_h(px(320.0))
@@ -4353,7 +4369,7 @@ impl Editor {
             .flex()
             .flex_col();
         match state.mode {
-            PaletteMode::Files => {
+            PaletteMode::Files | PaletteMode::AttachFile => {
                 for (index, path) in self.palette_files().iter().enumerate() {
                     let selected = index == state.selected;
                     let kind = FileKind::from_path(path);
@@ -4391,7 +4407,11 @@ impl Editor {
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.palette = None;
-                                this.select_path(&path_owned, true, window, cx);
+                                if attach_mode {
+                                    this.chat_attach_path(&path_owned, cx);
+                                } else {
+                                    this.select_path(&path_owned, true, window, cx);
+                                }
                                 cx.notify();
                             })),
                     );
@@ -4436,7 +4456,7 @@ impl Editor {
             }
         }
         let empty = match state.mode {
-            PaletteMode::Files => self.palette_files().is_empty(),
+            PaletteMode::Files | PaletteMode::AttachFile => self.palette_files().is_empty(),
             PaletteMode::Commands => self.palette_commands().is_empty(),
         };
         if empty {
@@ -11307,13 +11327,13 @@ impl Editor {
         if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
+        if self.palette.is_some() {
+            self.palette_backspace(cx);
+            return;
+        }
         if self.chat.focused {
             self.chat.backspace();
             cx.notify();
-            return;
-        }
-        if self.palette.is_some() {
-            self.palette_backspace(cx);
             return;
         }
         if self.settings.is_some() {
@@ -11471,12 +11491,12 @@ impl Editor {
             self.submit_git_commit(cx);
             return;
         }
-        if self.chat.focused {
-            self.chat_send(window, cx);
-            return;
-        }
         if self.palette.is_some() {
             self.palette_activate(window, cx);
+            return;
+        }
+        if self.chat.focused {
+            self.chat_send(window, cx);
             return;
         }
         if self.settings.is_some() {
@@ -13745,6 +13765,45 @@ impl Editor {
         cx.notify();
     }
 
+    /// Open the file palette in attach mode. Only text documents are listed;
+    /// configuration and hidden state never enter the chat through this path.
+    fn chat_open_attach_file(&mut self, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::AttachFile, cx);
+    }
+
+    /// Attach one project document. The open buffer wins over disk so unsaved
+    /// edits are what the user sees and sends; other files are read through
+    /// the boundary-checked project API.
+    fn chat_attach_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let text = if path == self.doc.path {
+            self.doc.buffer.slice(0..self.doc.buffer.doc_len())
+        } else {
+            let Some(project) = self.project.as_ref() else {
+                return;
+            };
+            match project.read_document(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.notice = Some(self.tf(
+                        "chat.attach_failed",
+                        &[("path", path), ("error", &error.to_string())],
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let label = path.rsplit('/').next().unwrap_or(path).to_string();
+        self.chat.add_attachment(ChatAttachment::new(
+            "document",
+            label,
+            path.to_string(),
+            text,
+        ));
+        self.chat.focused = true;
+        cx.notify();
+    }
+
     fn chat_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat.status == ChatStatus::Running || !self.chat.can_send() {
             return;
@@ -14788,7 +14847,7 @@ impl Editor {
                             .text_xs()
                             .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
-                            .child("@ Escena")
+                            .child(format!("@ {}", t("chat.attach_scene")))
                             .on_click(cx.listener(|this, _, _, cx| this.chat_attach_scene(cx))),
                     )
                     .child(
@@ -14799,7 +14858,7 @@ impl Editor {
                             .text_xs()
                             .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
-                            .child("@ Selección")
+                            .child(format!("@ {}", t("chat.attach_selection")))
                             .on_click(cx.listener(|this, _, _, cx| this.chat_attach_selection(cx))),
                     )
                     .child(
@@ -14810,8 +14869,19 @@ impl Editor {
                             .text_xs()
                             .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
-                            .child("@ Documento")
+                            .child(format!("@ {}", t("chat.attach_document")))
                             .on_click(cx.listener(|this, _, _, cx| this.chat_attach_document(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("chat-attach-file")
+                            .px_1()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(format!("@ {}", t("chat.attach_file")))
+                            .on_click(cx.listener(|this, _, _, cx| this.chat_open_attach_file(cx))),
                     ),
             )
             .child(
@@ -17372,7 +17442,7 @@ impl Editor {
         };
         let palette_dump = if let Some(state) = self.palette.as_ref() {
             let count = match state.mode {
-                PaletteMode::Files => self.palette_files().len(),
+                PaletteMode::Files | PaletteMode::AttachFile => self.palette_files().len(),
                 PaletteMode::Commands => self.palette_commands().len(),
             };
             format!(
@@ -18285,13 +18355,13 @@ impl EntityInputHandler for Editor {
         if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
+        if self.palette.is_some() {
+            self.palette_input(new_text, cx);
+            return;
+        }
         if self.chat.focused {
             self.chat.push_input(new_text);
             cx.notify();
-            return;
-        }
-        if self.palette.is_some() {
-            self.palette_input(new_text, cx);
             return;
         }
         if self.settings.is_some() {
@@ -18437,13 +18507,13 @@ impl EntityInputHandler for Editor {
         if self.git_diff.is_some() || self.git_restore.is_some() {
             return;
         }
+        if self.palette.is_some() {
+            self.palette_input(new_text, cx);
+            return;
+        }
         if self.chat.focused {
             self.chat.push_input(new_text);
             cx.notify();
-            return;
-        }
-        if self.palette.is_some() {
-            self.palette_input(new_text, cx);
             return;
         }
         if self.settings.is_some() {

@@ -144,6 +144,23 @@ pub fn visible_paths(paths: &[String], show_config_files: bool) -> Vec<String> {
         .collect()
 }
 
+/// Files the chat may attach as text. Configuration and hidden state stay out
+/// even when the explorer is showing them; binary/unknown extensions are
+/// excluded because they cannot be read as UTF-8 context.
+pub fn attachable_paths(paths: &[String]) -> Vec<String> {
+    visible_paths(paths, false)
+        .into_iter()
+        .filter(|path| is_attachable_path(path))
+        .collect()
+}
+
+pub fn is_attachable_path(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next(),
+        Some("md" | "markdown" | "fountain" | "txt" | "yaml" | "yml")
+    )
+}
+
 /// Parent directory of a project-relative path (`""` at the root).
 fn parent_of(path: &str) -> &str {
     path.rsplit_once('/')
@@ -317,6 +334,28 @@ mod tests {
         assert_eq!(visible_paths(&paths, true), paths);
         assert!(is_config_path("project.yaml"));
         assert!(!is_config_path("notes/decisions.md"));
+    }
+
+    #[test]
+    fn attachable_paths_skip_config_and_binary_files() {
+        let paths = vec![
+            "AGENTS.md".to_string(),
+            "bible/world.md".to_string(),
+            "exports/main.pdf".to_string(),
+            "notes/ideas.txt".to_string(),
+            "project.yaml".to_string(),
+            "screenplay/main.fountain".to_string(),
+        ];
+        assert_eq!(
+            attachable_paths(&paths),
+            vec![
+                "bible/world.md".to_string(),
+                "notes/ideas.txt".to_string(),
+                "screenplay/main.fountain".to_string()
+            ]
+        );
+        assert!(!is_attachable_path("README"));
+        assert!(is_attachable_path("notes/beats.yml"));
     }
 
     #[test]
