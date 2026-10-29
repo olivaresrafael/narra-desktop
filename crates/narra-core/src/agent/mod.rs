@@ -24,6 +24,7 @@ pub mod scaffold;
 mod scene;
 pub mod scene_edit;
 pub mod scene_review;
+pub mod skill;
 pub mod tool_loop;
 pub mod tools;
 
@@ -44,6 +45,10 @@ pub use roles::{Role, RoleOrigin, RolesError};
 pub use scaffold::{ProjectScaffoldTask, ScaffoldError, ScaffoldFile, ScaffoldPlan, write_plan};
 pub use scene_edit::SceneEditTask;
 pub use scene_review::SceneReviewTask;
+pub use skill::{
+    Skill, SkillError, SkillOrigin, active_skills, load_skills, trust_skill, trusted_hashes,
+    untrusted_project_skills,
+};
 pub use tool_loop::ToolLoopTask;
 pub use tools::{
     ChatMessage, ChatRole, GrantPolicy, PermissionDecision, PermissionPolicy, ToolCall,

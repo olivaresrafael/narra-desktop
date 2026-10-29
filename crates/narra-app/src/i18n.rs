@@ -881,6 +881,32 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "could not apply the proposal: {error}",
         "no se pudo aplicar la propuesta: {error}",
     ),
+    (
+        "skill.trust.title",
+        "Project skills need confirmation",
+        "Las skills del proyecto necesitan confirmación",
+    ),
+    (
+        "skill.trust.body",
+        "This project contains skills whose instructions will be available to the assistant. Review them before trusting. If their content changes, you will be asked again.",
+        "Este proyecto contiene skills cuyas instrucciones estarán disponibles para el asistente. Revísalas antes de confiar. Si su contenido cambia, se volverá a preguntar.",
+    ),
+    (
+        "skill.trust.accept",
+        "Trust and activate",
+        "Confiar y activar",
+    ),
+    ("skill.trust.later", "Not now", "Ahora no"),
+    (
+        "chat.skill_prompt_required",
+        "Write a message after the skill command.",
+        "Escribe un mensaje después del comando de skill.",
+    ),
+    (
+        "skill.trust_failed",
+        "Could not save skill trust: {error}",
+        "No se pudo guardar la confianza de la skill: {error}",
+    ),
     ("chat.rejected", "proposal rejected", "propuesta rechazada"),
     (
         "chat.rejected_note",

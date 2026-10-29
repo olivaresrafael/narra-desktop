@@ -401,6 +401,9 @@ pub struct ProjectScaffoldTask {
     pub project_type: ProjectType,
     pub language: String,
     pub prompt: String,
+    /// Human-readable type label for custom packages; built-ins fall back to
+    /// the enum label.
+    pub type_label: Option<String>,
     pub role: Option<Role>,
 }
 
@@ -420,8 +423,14 @@ impl ProjectScaffoldTask {
             project_type,
             language: language.into(),
             prompt: prompt.into(),
+            type_label: None,
             role: None,
         }
+    }
+
+    pub fn with_type_label(mut self, label: impl Into<String>) -> Self {
+        self.type_label = Some(label.into());
+        self
     }
 
     pub fn with_role(mut self, role: Role) -> Self {
@@ -489,7 +498,9 @@ impl ProjectScaffoldTask {
         let prompt = format!(
             "{RULES}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n",
             self.title.trim(),
-            project_type_label(self.project_type),
+            self.type_label
+                .as_deref()
+                .unwrap_or_else(|| project_type_label(self.project_type)),
             self.language.trim(),
             self.prompt.trim()
         );

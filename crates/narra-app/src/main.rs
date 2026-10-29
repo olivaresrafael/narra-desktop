@@ -166,7 +166,8 @@ use i18n::Lang;
 use narra_core::agent::{
     AgentError, ChatAttachment, ChatMode, ChatTask, ChatThread, LOCAL_DEFAULT_BASE_URL,
     MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig, ProjectScaffoldTask,
-    ScaffoldPlan, SceneEditTask, SceneReviewTask, TaskOptions, fetch_model_ids, proposal, roles,
+    ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill, TaskOptions, active_skills,
+    fetch_model_ids, load_skills, proposal, roles, trust_skill, untrusted_project_skills,
     write_plan,
 };
 use narra_core::cancel::CancellationToken;
@@ -535,6 +536,7 @@ impl NewProjectState {
 struct NewProjectDraft {
     title: String,
     kind: ProjectType,
+    type_label: String,
     lang: Lang,
     prompt: String,
 }
@@ -1116,6 +1118,17 @@ fn project_window_title(title: Option<&str>) -> String {
 fn new_project_types() -> Vec<ProjectTypePackage> {
     narra_core::project_type::registry(None, Some(&recent::config_dir()))
         .unwrap_or_else(|_| narra_core::project_type::builtins())
+}
+
+/// Load active and untrusted project skills for a project. Errors are
+/// non-fatal: a malformed skill must not prevent the project from opening.
+fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
+    let all = load_skills(project.root(), Some(&recent::config_dir())).unwrap_or_default();
+    let active = active_skills(project.root(), &all).unwrap_or_else(|_| all.clone());
+    let pending = untrusted_project_skills(project.root(), &all)
+        .ok()
+        .filter(|skills| !skills.is_empty());
+    (active, pending)
 }
 
 fn project_profile(project: &Project) -> ProjectProfile {
@@ -1834,6 +1847,10 @@ struct Editor {
     /// UI-neutral capabilities resolved from the project's type package.
     /// The presentation layer reads this instead of matching a type id.
     profile: ProjectProfile,
+    /// Trusted/user skills active for chat commands.
+    skills: Vec<Skill>,
+    /// Project skills awaiting an explicit trust confirmation.
+    skill_trust: Option<Vec<Skill>>,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
     /// Derived bible entities and mention matcher (M11).
@@ -5483,6 +5500,7 @@ impl Editor {
             || self.git_diff.is_some()
             || self.git_restore.is_some()
             || self.git_sync.is_some()
+            || self.skill_trust.is_some()
     }
 
     /// Apply an edit to the active New Project field without touching the
@@ -7274,6 +7292,7 @@ impl Editor {
         self.git_request = self.git_request.saturating_add(1);
         self.git_refreshed_at = None;
         self.profile = project_profile(&project);
+        (self.skills, self.skill_trust) = project_skills(&project);
         self.project = Some(project);
         self.explorer = explorer;
         self.refresh_entities();
@@ -7545,6 +7564,7 @@ impl Editor {
             let draft = NewProjectDraft {
                 title,
                 kind,
+                type_label: package.name.clone(),
                 lang,
                 prompt,
             };
@@ -7626,6 +7646,7 @@ impl Editor {
                     draft.lang.key(),
                     draft.prompt.clone(),
                 )
+                .with_type_label(draft.type_label.clone())
                 .with_role(role);
                 let options = TaskOptions {
                     timeout: AGENT_TIMEOUT,
@@ -7727,6 +7748,110 @@ impl Editor {
             }
         }
         cx.notify();
+    }
+
+    /// Trust every project skill currently awaiting confirmation, persist the
+    /// hashes and reload the active set.
+    fn trust_project_skills(&mut self, cx: &mut Context<Self>) {
+        let Some(skills) = self.skill_trust.take() else {
+            return;
+        };
+        if let Some(project) = self.project.as_ref() {
+            for skill in &skills {
+                if let Err(error) = trust_skill(project.root(), &skill.id, &skill.hash) {
+                    self.notice = Some(self.tf("skill.trust_failed", &[("error", &error)]));
+                }
+            }
+            let all = load_skills(project.root(), Some(&recent::config_dir())).unwrap_or_default();
+            self.skills = active_skills(project.root(), &all).unwrap_or_else(|_| all.clone());
+        }
+        cx.notify();
+    }
+
+    fn skill_trust_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let skills = self.skill_trust.as_ref().expect("overlay only when open");
+        let mut list = div().flex().flex_col().gap_1();
+        for skill in skills {
+            list = list.child(
+                div()
+                    .p_2()
+                    .bg(rgb(theme::bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(format!("{}  ·  {}", skill.name, skill.id)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(skill.description.clone()),
+                    ),
+            );
+        }
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .child(
+                div()
+                    .w(px(520.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("skill.trust.title")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("skill.trust.body")),
+                    )
+                    .child(list)
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("skill-trust-accept")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("skill.trust.accept"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.trust_project_skills(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("skill-trust-dismiss")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("skill.trust.later"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skill_trust = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     /// Render the New Project title or prompt with selection, caret and
@@ -11716,6 +11841,11 @@ impl Editor {
     }
 
     fn on_close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.skill_trust.is_some() {
+            self.skill_trust = None;
+            cx.notify();
+            return;
+        }
         // Escape closes whichever bar owns the keystrokes (single bar model:
         // find, the instruction bar and the focus bar are never open at the
         // same time). The unsaved-changes prompt wins over all of them.
@@ -13478,55 +13608,71 @@ impl Editor {
         if raw.is_empty() {
             return;
         }
-        let (mode, instruction) = match split_chat_command(&raw) {
-            Some(("/plan", rest)) => {
-                self.chat.set_mode(ChatMode::Plan);
-                if rest.is_empty() {
-                    self.chat.set_input(String::new());
-                    cx.notify();
-                    return;
-                }
-                (ChatMode::Plan, rest.to_string())
+        // A slash command that matches a trusted skill attaches its body as
+        // explicit context; known built-in commands keep precedence.
+        let skill = if split_chat_command(&raw).is_none() {
+            split_skill_command(&self.skills, &raw)
+        } else {
+            None
+        };
+        let (mode, instruction) = if let Some((_, rest)) = &skill {
+            if rest.is_empty() {
+                self.notice = Some(self.t("chat.skill_prompt_required").to_string());
+                cx.notify();
+                return;
             }
-            Some(("/build", rest)) => {
-                self.chat.set_mode(ChatMode::Build);
-                if rest.is_empty() {
-                    self.chat.set_input(String::new());
-                    cx.notify();
-                    return;
+            (self.chat.mode(), rest.clone())
+        } else {
+            match split_chat_command(&raw) {
+                Some(("/plan", rest)) => {
+                    self.chat.set_mode(ChatMode::Plan);
+                    if rest.is_empty() {
+                        self.chat.set_input(String::new());
+                        cx.notify();
+                        return;
+                    }
+                    (ChatMode::Plan, rest.to_string())
                 }
-                (ChatMode::Build, rest.to_string())
-            }
-            Some(("/review", rest)) => {
-                self.chat.set_mode(ChatMode::Review);
-                if rest.is_empty() {
-                    self.chat.set_input(String::new());
-                    cx.notify();
-                    return;
+                Some(("/build", rest)) => {
+                    self.chat.set_mode(ChatMode::Build);
+                    if rest.is_empty() {
+                        self.chat.set_input(String::new());
+                        cx.notify();
+                        return;
+                    }
+                    (ChatMode::Build, rest.to_string())
                 }
-                (ChatMode::Review, rest.to_string())
-            }
-            Some(("/rewrite", rest)) => {
-                self.chat.set_mode(ChatMode::Build);
-                if rest.is_empty() {
-                    self.chat
-                        .set_input(self.t("chat.rewrite_prompt").to_string());
-                    cx.notify();
-                    return;
+                Some(("/review", rest)) => {
+                    self.chat.set_mode(ChatMode::Review);
+                    if rest.is_empty() {
+                        self.chat.set_input(String::new());
+                        cx.notify();
+                        return;
+                    }
+                    (ChatMode::Review, rest.to_string())
                 }
-                (ChatMode::Build, rest.to_string())
-            }
-            Some(("/continuity", rest)) => {
-                self.chat.set_mode(ChatMode::Review);
-                if rest.is_empty() {
-                    self.chat
-                        .set_input(self.t("chat.continuity_prompt").to_string());
-                    cx.notify();
-                    return;
+                Some(("/rewrite", rest)) => {
+                    self.chat.set_mode(ChatMode::Build);
+                    if rest.is_empty() {
+                        self.chat
+                            .set_input(self.t("chat.rewrite_prompt").to_string());
+                        cx.notify();
+                        return;
+                    }
+                    (ChatMode::Build, rest.to_string())
                 }
-                (ChatMode::Review, rest.to_string())
+                Some(("/continuity", rest)) => {
+                    self.chat.set_mode(ChatMode::Review);
+                    if rest.is_empty() {
+                        self.chat
+                            .set_input(self.t("chat.continuity_prompt").to_string());
+                        cx.notify();
+                        return;
+                    }
+                    (ChatMode::Review, rest.to_string())
+                }
+                _ => (self.chat.mode(), raw),
             }
-            _ => (self.chat.mode(), raw),
         };
         let Some(project) = self.project.as_ref() else {
             self.notice = Some(self.t("notice.fixture_no_project").to_string());
@@ -13535,7 +13681,15 @@ impl Editor {
         };
         let root = project.root().to_string_lossy().into_owned();
         let history = self.chat.thread.messages.clone();
-        let attachments = self.chat.attachments.clone();
+        let mut attachments = self.chat.attachments.clone();
+        if let Some((skill, _)) = &skill {
+            attachments.push(ChatAttachment::new(
+                "skill",
+                skill.name.clone(),
+                format!("skill:{}", skill.id),
+                skill.body.clone(),
+            ));
+        }
         self.chat.set_input(String::new());
         self.chat
             .begin_run(instruction.clone(), attachments.clone());
@@ -16970,6 +17124,11 @@ impl Editor {
             profile_entities,
             self.profile.export_pdf,
         );
+        let skills_dump = format!(
+            "{{\"active\":{},\"trust_pending\":{}}}",
+            self.skills.len(),
+            self.skill_trust.as_ref().map_or(0, Vec::len),
+        );
         let panels_dump = format!(
             "{{\"explorer\":{},\"agent\":{},\"git\":{},\"explorer_w\":{},\"right_w\":{},\"wrap_w\":{},\
              \"chat_scroll_offset\":{},\"chat_scroll_max\":{},\"chat_at_bottom\":{},\
@@ -17327,7 +17486,7 @@ impl Editor {
                 "\"document\":\"{}\",\"language\":\"{}\",\"preview\":{{\"active\":{},\"blocks\":{}}},\"dirty\":{},\"notice\":{},\"explorer\":[{}],\
                  \"agent\":{},\"focus_bar\":{},\"proposal\":{},\"export\":{},\"search\":{},\
                  \"outline\":[{}],\"language\":{},\"tree\":[{}],\"entities\":[{}],\"pages\":{},\"quit_prompt\":{},\
-                 \"unsaved\":{},\"git\":{},\"panels\":{},\"profile\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
+                 \"unsaved\":{},\"git\":{},\"panels\":{},\"profile\":{},\"skills\":{},\"settings\":{},\"palette\":{},\"context_menu\":{},\
                  \"rename\":{},\"delete_prompt\":{},\"chat\":{},\
                  \"new_file\":{},\"new_project\":{},\"tabs\":[{}],\"active_tab\":{},\
                  \"project\":\"{}\",\"recents\":[{}],\"recents_error\":\"{}\",\
@@ -17393,6 +17552,7 @@ impl Editor {
             git_dump,
             panels_dump,
             profile_dump,
+            skills_dump,
             settings_dump,
             palette_dump,
             context_dump,
@@ -17597,6 +17757,20 @@ fn filter_palette_paths(paths: Vec<String>, query: &str) -> Vec<String> {
     starts.extend(contains);
     starts.truncate(80);
     starts
+}
+
+/// Resolve `/skill-id rest` against the trusted skills. Built-in chat
+/// commands are checked first by the caller.
+fn split_skill_command(skills: &[Skill], input: &str) -> Option<(Skill, String)> {
+    let trimmed = input.trim_start().strip_prefix('/')?;
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let id = parts.next()?;
+    let rest = parts.next().unwrap_or("").trim_start();
+    skills
+        .iter()
+        .find(|skill| skill.id == id)
+        .cloned()
+        .map(|skill| (skill, rest.to_string()))
 }
 
 /// Parse `/command rest` at the start of a chat message. Returns the command
@@ -18540,6 +18714,9 @@ impl Render for Editor {
             .when(self.unsaved_prompt.is_some(), |root| {
                 root.child(self.quit_overlay(cx))
             })
+            .when(self.skill_trust.is_some(), |root| {
+                root.child(self.skill_trust_overlay(cx))
+            })
             .when(self.settings.is_some(), |root| {
                 root.child(self.settings_overlay(cx))
             })
@@ -19273,6 +19450,8 @@ fn run() -> Result<(), String> {
                 .as_ref()
                 .map(project_profile)
                 .unwrap_or_else(|| ProjectProfile::screenplay("feature"));
+            let (startup_skills, startup_skill_trust) =
+                project.as_ref().map(project_skills).unwrap_or_default();
             install_menus(lang, recents.paths(), Some(&startup_profile), cx);
 
             let entity = cx.new(|cx| Editor {
@@ -19312,6 +19491,8 @@ fn run() -> Result<(), String> {
                 diff_probe_left: diff_steps,
                 diff_probe_total: diff_steps,
                 profile: startup_profile,
+                skills: startup_skills,
+                skill_trust: startup_skill_trust,
                 project,
                 explorer,
                 entities,
