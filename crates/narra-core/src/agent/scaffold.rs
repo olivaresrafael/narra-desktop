@@ -35,6 +35,10 @@ pub const KIND: &str = "project_scaffold";
 pub const MAX_FILES: usize = 12;
 pub const MAX_FILE_BYTES: usize = 16 * 1024;
 pub const MAX_PATH_CHARS: usize = 120;
+/// Output budget for the plan. 2k truncated multi-file plans mid-JSON; the
+/// plan is capped at 12 files, so give the model enough room to finish the
+/// object instead of returning a parse error.
+const SCAFFOLD_MAX_TOKENS: u32 = 8_000;
 
 /// The only top-level folders a generated file may live in.
 pub const ALLOWED_ROOTS: [&str; 5] = ["bible", "structure", "research", "notes", "screenplay"];
@@ -63,7 +67,10 @@ const RULES: &str = "Devuelve SOLO un objeto JSON con esta forma:\n\
 extensión .md o .fountain.\n\
 - Nunca .narra/, project.yaml, agents.yaml, AGENTS.md, .gitignore, \
 screenplay/main.fountain, notes/decisions.md ni notes/open-questions.md.\n\
-- Contenido en el idioma del proyecto; no inventes datos personales.";
+- Contenido en el idioma del proyecto; no inventes datos personales.\n\
+- Sé conciso: prioriza entre 3 y 6 archivos y no repitas contenido.\n\
+- El contenido debe ser una cadena JSON válida: escapa los saltos de línea \
+como \\n y las comillas como \\\".";
 
 /// One proposed file. Paths are validated before this type is exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,18 +108,12 @@ pub enum ScaffoldError {
     Write { path: String, error: String },
 }
 
-/// Parse the model's strict JSON, tolerating an optional Markdown fence or
-/// surrounding prose by slicing from the first `{` to the last `}`.
+/// Parse the model's strict JSON, tolerating a Markdown fence, surrounding
+/// prose, raw newlines inside strings and trailing commas. Models routinely
+/// return a valid-looking plan with unescaped control characters in long
+/// Markdown bodies; a plain `serde_json` parse would reject the whole plan.
 pub fn parse_plan(text: &str) -> Result<ScaffoldPlan, ScaffoldError> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| ScaffoldError::Parse("no JSON object found".to_string()))?;
-    let end = text
-        .rfind('}')
-        .filter(|end| *end >= start)
-        .ok_or_else(|| ScaffoldError::Parse("no complete JSON object found".to_string()))?;
-    let value: Value = serde_json::from_str(&text[start..=end])
-        .map_err(|error| ScaffoldError::Parse(error.to_string()))?;
+    let value = parse_json_object(text)?;
     let object = value
         .as_object()
         .ok_or_else(|| ScaffoldError::Parse("top level must be an object".to_string()))?;
@@ -155,6 +156,123 @@ pub fn parse_plan(text: &str) -> Result<ScaffoldPlan, ScaffoldError> {
     }
     validate_plan(&plan)?;
     Ok(plan)
+}
+
+/// Find and decode the first usable JSON object in the model's answer.
+/// Balanced braces inside strings are ignored; prose before/after the object
+/// is skipped. Each candidate is tried as-is and then with a conservative
+/// repair (unescaped control characters and trailing commas).
+fn parse_json_object(text: &str) -> Result<Value, ScaffoldError> {
+    let mut last_error: Option<String> = None;
+    for candidate in balanced_json_objects(text) {
+        let repaired = repair_json_text(&candidate);
+        for attempt in [candidate.as_str(), repaired.as_str()] {
+            match serde_json::from_str::<Value>(attempt) {
+                Ok(value) if value.get("files").is_some_and(Value::is_array) => {
+                    return Ok(value);
+                }
+                Ok(value) if value.is_object() => {
+                    last_error = Some("missing `files` array".to_string());
+                }
+                Ok(_) => {
+                    last_error = Some("top level must be an object".to_string());
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+    }
+    Err(ScaffoldError::Parse(
+        last_error.unwrap_or_else(|| "no JSON object found".to_string()),
+    ))
+}
+
+/// Extract balanced `{...}` candidates. The scanner tracks JSON strings so a
+/// brace in a Markdown body or a quoted prompt does not end the object.
+fn balanced_json_objects(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for (start, _) in text.match_indices('{') {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, ch) in text[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let end = start + offset + ch.len_utf8();
+                        candidates.push(text[start..end].to_string());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    candidates
+}
+
+/// Repair the two common model-JSON defects without touching the strings'
+/// meaning: escape raw control characters inside strings and drop trailing
+/// commas before `}` or `]`.
+fn repair_json_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                out.push(ch);
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+                out.push(ch);
+            } else {
+                match ch {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    control if control < ' ' => {
+                        out.push_str(&format!("\\u{:04x}", control as u32));
+                    }
+                    _ => out.push(ch),
+                }
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if ch == ',' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_whitespace() {
+                next += 1;
+            }
+            if next >= chars.len() || !matches!(chars[next], '}' | ']') {
+                out.push(ch);
+            }
+            // A comma directly before a closing delimiter is dropped.
+        } else {
+            out.push(ch);
+        }
+        index += 1;
+    }
+    out
 }
 
 /// Validate a plan without touching the filesystem.
@@ -378,7 +496,7 @@ impl ProjectScaffoldTask {
         let request = ModelRequest {
             system,
             prompt,
-            max_output_tokens: 2_000,
+            max_output_tokens: SCAFFOLD_MAX_TOKENS,
             tools: Vec::new(),
             history: Vec::new(),
         };
@@ -501,6 +619,27 @@ mod tests {
         let plan = parse_plan(&fenced).expect("valid plan");
         assert_eq!(plan.files.len(), 1);
         assert_eq!(plan.files[0].path, "bible/premise.md");
+    }
+
+    #[test]
+    fn parses_raw_newlines_braces_in_prose_and_trailing_commas() {
+        // Models often emit literal newlines inside Markdown content instead
+        // of JSON `\n` escapes; the repair must preserve the text.
+        let raw =
+            "{\"files\":[{\"path\":\"bible/a.md\",\"content\":\"# A\nline with } and { braces\"}]}";
+        let plan = parse_plan(raw).expect("raw newlines");
+        assert_eq!(plan.files[0].content, "# A\nline with } and { braces");
+
+        // Prose before the real object may contain its own braces or even a
+        // different JSON object without `files`.
+        let prose = "{\"note\":\"ejemplo\"}. Aquí está el plan {no es JSON}. {\"files\":[{\"path\":\"notes/a.md\",\"content\":\"x\"}]} Gracias.";
+        let plan = parse_plan(prose).expect("prose");
+        assert_eq!(plan.files[0].path, "notes/a.md");
+
+        // A trailing comma before a closing delimiter is tolerated.
+        let trailing = "{\"files\":[{\"path\":\"bible/a.md\",\"content\":\"x\",},],}";
+        let plan = parse_plan(trailing).expect("trailing commas");
+        assert_eq!(plan.files[0].content, "x");
     }
 
     #[test]

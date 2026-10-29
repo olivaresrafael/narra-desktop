@@ -387,8 +387,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("newproject.language", "Language:", "Idioma:"),
     (
         "newproject.hint",
-        "The system panel will ask for the project folder.",
-        "El panel del sistema pedirá la carpeta del proyecto.",
+        "Review the details and accept.",
+        "Revisa los datos y acepta.",
     ),
     (
         "newproject.waiting",
@@ -396,6 +396,23 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Esperando la carpeta en el panel del sistema…",
     ),
     ("newproject.create", "Create project", "Crear proyecto"),
+    ("newproject.generate", "Generate base", "Generar base"),
+    ("newproject.folder", "Folder:", "Carpeta:"),
+    (
+        "newproject.no_folder",
+        "No folder selected",
+        "Ninguna carpeta seleccionada",
+    ),
+    (
+        "newproject.folder_hint",
+        "Choose a folder, then accept.",
+        "Elige una carpeta y luego acepta.",
+    ),
+    (
+        "newproject.folder_required",
+        "Choose a project folder first.",
+        "Elige primero una carpeta para el proyecto.",
+    ),
     (
         "newproject.choose_folder",
         "Choose folder…",

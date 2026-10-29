@@ -473,10 +473,12 @@ enum NewProjectField {
     Prompt,
 }
 
-/// The New Project modal (M10 slice 2b): title, kind, primary language and
-/// the native save-panel phase. `picking` is true while the OS dialog owns
-/// the app; duplicate Creates cannot open two panels. The AI mode adds a
-/// prompt, a busy phase and a reviewable file plan (M16 slice 9).
+/// The New Project modal (M10 slice 2b): title, kind, primary language, the
+/// destination folder and the native save-panel phase. Choosing a folder and
+/// accepting are separate actions: the folder is only stored here, and
+/// `accept_new_project` creates the template or starts the AI plan. `picking`
+/// is true while the OS dialog owns the app, so duplicate panels cannot open.
+/// The AI mode adds a prompt, a busy phase and a reviewable file plan.
 #[derive(Debug)]
 struct NewProjectState {
     title: String,
@@ -489,21 +491,21 @@ struct NewProjectState {
     picking: bool,
     /// AI generation in progress (the save panel has already returned).
     busy: bool,
-    /// Target folder selected before the project exists (AI mode).
+    /// Destination folder chosen with the folder button. Nothing exists
+    /// there until the user accepts.
     path: Option<PathBuf>,
     /// Reviewable AI plan; nothing is written until the user confirms.
     plan: Option<ScaffoldPlan>,
 }
 
-/// Snapshot of the dialog inputs handed to the async save-panel task: what
-/// the user saw when pressing Create decides the manifest, even if the modal
-/// is still on screen while the OS dialog runs.
+/// Snapshot of the dialog inputs handed to the AI scaffold worker: what the
+/// user saw when pressing Accept decides the plan, even if the modal is still
+/// on screen while the model runs.
 #[derive(Debug, Clone)]
 struct NewProjectDraft {
     title: String,
     kind: ProjectType,
     lang: Lang,
-    mode: NewProjectMode,
     prompt: String,
 }
 
@@ -7221,44 +7223,18 @@ impl Editor {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// Create in the modal: validate the title, then ask the OS for the
-    /// exact project folder with a save panel (suggested name included).
-    fn begin_new_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Ask the OS for the destination folder without creating anything.
+    /// Choosing a folder and accepting the dialog are separate actions.
+    fn choose_new_project_folder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.new_project.as_ref() else {
             return;
         };
-        if state.picking {
+        if state.picking || state.busy {
             return;
         }
-        let Some(title) = new_project::clean_title(&state.title) else {
-            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
-            cx.notify();
-            return;
-        };
-        let Some(folder) = new_project::suggested_folder(&title) else {
-            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
-            cx.notify();
-            return;
-        };
-        if state.mode == NewProjectMode::Ai {
-            if !self.ai_scaffold_available() {
-                self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
-                cx.notify();
-                return;
-            }
-            if state.prompt.trim().is_empty() {
-                self.set_new_project_error(self.t("newproject.prompt_required").to_string());
-                cx.notify();
-                return;
-            }
-        }
-        let draft = NewProjectDraft {
-            title,
-            kind: state.kind,
-            lang: state.lang,
-            mode: state.mode,
-            prompt: state.prompt.trim().to_string(),
-        };
+        let folder = new_project::clean_title(&state.title)
+            .and_then(|title| new_project::suggested_folder(&title))
+            .unwrap_or_else(|| "Narra Project".to_string());
         let start = self.default_project_dir();
         let rx = cx.prompt_for_new_path(&start, Some(&folder));
         if let Some(state) = self.new_project.as_mut() {
@@ -7272,19 +7248,19 @@ impl Editor {
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
-            let _ = view.update(cx, |view, cx| {
-                view.finish_new_project_path(draft, picked, cx)
-            });
+            let _ = view.update(cx, |view, cx| view.finish_new_project_path(picked, cx));
         })
         .detach();
     }
 
     fn finish_new_project_path(
         &mut self,
-        draft: NewProjectDraft,
         picked: Result<Option<PathBuf>, String>,
         cx: &mut Context<Self>,
     ) {
+        if self.new_project.is_none() {
+            return;
+        }
         if let Some(state) = self.new_project.as_mut() {
             state.picking = false;
         }
@@ -7295,6 +7271,10 @@ impl Editor {
                 self.set_new_project_error(message);
             }
             Ok(Some(path)) => {
+                if let Some(state) = self.new_project.as_mut() {
+                    state.path = Some(path.clone());
+                    state.error.clear();
+                }
                 if let Err(error) = new_project::check_destination(&path) {
                     let message = match error {
                         new_project::DestinationError::NotADirectory => {
@@ -7305,44 +7285,106 @@ impl Editor {
                         }
                     };
                     self.set_new_project_error(message);
-                    cx.notify();
-                    return;
                 }
-                if draft.mode == NewProjectMode::Ai {
-                    // Nothing is created yet: the model proposes, the user
-                    // reviews and only then the project is written (D-044).
-                    self.start_new_project_scaffold(path, draft, cx);
-                    cx.notify();
-                    return;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The explicit accept action. Template projects are created here; AI
+    /// projects generate the reviewable plan first, then create on the next
+    /// accept. It never opens the folder panel.
+    fn accept_new_project(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.new_project.as_ref() else {
+            return;
+        };
+        if state.picking || state.busy {
+            return;
+        }
+        let Some(title) = new_project::clean_title(&state.title) else {
+            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
+            cx.notify();
+            return;
+        };
+        let Some(path) = state.path.clone() else {
+            self.set_new_project_error(self.t("newproject.folder_required").to_string());
+            cx.notify();
+            return;
+        };
+        if let Err(error) = new_project::check_destination(&path) {
+            let message = match error {
+                new_project::DestinationError::NotADirectory => {
+                    self.t("newproject.not_directory").to_string()
                 }
-                match create_project(&path, &draft.title, draft.kind, draft.lang.key()) {
-                    Ok(project) => {
-                        if let Err(error) =
-                            narra_core::project::seed_basic_template(&path, draft.lang.key())
-                        {
-                            let message =
-                                self.tf("newproject.failed", &[("error", &error.to_string())]);
+                new_project::DestinationError::NotEmpty => {
+                    self.t("newproject.not_empty").to_string()
+                }
+            };
+            self.set_new_project_error(message);
+            cx.notify();
+            return;
+        }
+        let kind = state.kind;
+        let lang = state.lang;
+        let mode = state.mode;
+        let prompt = state.prompt.trim().to_string();
+        let plan_ready = state.plan.is_some();
+        if mode == NewProjectMode::Ai {
+            if !self.ai_scaffold_available() {
+                self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
+                cx.notify();
+                return;
+            }
+            if prompt.is_empty() {
+                self.set_new_project_error(self.t("newproject.prompt_required").to_string());
+                cx.notify();
+                return;
+            }
+            if plan_ready {
+                self.create_new_project_from_plan(cx);
+                return;
+            }
+            let draft = NewProjectDraft {
+                title,
+                kind,
+                lang,
+                prompt,
+            };
+            self.start_new_project_scaffold(path, draft, cx);
+            cx.notify();
+            return;
+        }
+        self.create_new_project_from_template(path, title, kind, lang, cx);
+    }
+
+    fn create_new_project_from_template(
+        &mut self,
+        path: PathBuf,
+        title: String,
+        kind: ProjectType,
+        lang: Lang,
+        cx: &mut Context<Self>,
+    ) {
+        match create_project(&path, &title, kind, lang.key()) {
+            Ok(project) => {
+                if let Err(error) = narra_core::project::seed_basic_template(&path, lang.key()) {
+                    let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
+                    self.set_new_project_error(message);
+                } else {
+                    match self.install_project(project, cx) {
+                        Ok(()) => {
+                            self.new_project = None;
+                        }
+                        Err(error) => {
+                            let message = self.tf("newproject.open_failed", &[("error", &error)]);
                             self.set_new_project_error(message);
-                            cx.notify();
-                            return;
                         }
-                        match self.install_project(project, cx) {
-                            Ok(()) => {
-                                self.new_project = None;
-                            }
-                            Err(error) => {
-                                let message =
-                                    self.tf("newproject.open_failed", &[("error", &error)]);
-                                self.set_new_project_error(message);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let message =
-                            self.tf("newproject.failed", &[("error", &error.to_string())]);
-                        self.set_new_project_error(message);
                     }
                 }
+            }
+            Err(error) => {
+                let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
+                self.set_new_project_error(message);
             }
         }
         cx.notify();
@@ -7487,8 +7529,10 @@ impl Editor {
         cx.notify();
     }
 
-    /// New Project dialog: title, kind, primary language, then the native
-    /// destination panel. Enter opens the panel; Esc closes the dialog.
+    /// New Project dialog: title, kind, primary language, destination folder,
+    /// project base and review. The folder button opens the native panel;
+    /// Enter accepts (creating the template or starting the AI plan). Esc
+    /// closes the dialog.
     fn new_project_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_project.as_ref().expect("overlay only when open");
         let editable = !state.picking && !state.busy && state.plan.is_none();
@@ -7712,6 +7756,58 @@ impl Editor {
                             )
                             .child(languages),
                     )
+                    .child({
+                        let folder = state
+                            .path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| self.t("newproject.no_folder").to_string());
+                        let folder_enabled = !state.picking && !state.busy && state.plan.is_none();
+                        let mut button = div()
+                            .id("new-project-folder")
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(if folder_enabled {
+                                theme::status_bg()
+                            } else {
+                                theme::explorer_bg()
+                            }))
+                            .text_color(rgb(if folder_enabled {
+                                theme::default_fg()
+                            } else {
+                                theme::gutter_fg()
+                            }))
+                            .child(self.t("newproject.choose_folder"));
+                        if folder_enabled {
+                            button = button.cursor_pointer().on_click(cx.listener(
+                                |this, _, window, cx| this.choose_new_project_folder(window, cx),
+                            ));
+                        }
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("newproject.folder")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(rgb(if state.path.is_some() {
+                                        theme::default_fg()
+                                    } else {
+                                        theme::gutter_fg()
+                                    }))
+                                    .child(folder),
+                            )
+                            .child(button)
+                    })
                     .child(
                         div()
                             .flex()
@@ -7833,6 +7929,8 @@ impl Editor {
                                 self.t("newproject.generating")
                             } else if state.plan.is_some() {
                                 self.t("newproject.plan")
+                            } else if state.path.is_none() {
+                                self.t("newproject.folder_hint")
                             } else {
                                 self.t("newproject.hint")
                             }),
@@ -7846,11 +7944,11 @@ impl Editor {
                     })
                     .child({
                         let plan_ready = state.plan.is_some();
-                        let can_click = !state.picking && !state.busy;
-                        let label = if plan_ready {
+                        let can_click = !state.picking && !state.busy && state.path.is_some();
+                        let label = if plan_ready || state.mode == NewProjectMode::Template {
                             self.t("newproject.create")
                         } else {
-                            self.t("newproject.choose_folder")
+                            self.t("newproject.generate")
                         };
                         let mut primary = div()
                             .id("new-project-create")
@@ -7868,19 +7966,12 @@ impl Editor {
                             }))
                             .child(label);
                         if can_click {
-                            primary = primary.cursor_pointer().on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    if this
-                                        .new_project
-                                        .as_ref()
-                                        .is_some_and(|state| state.plan.is_some())
-                                    {
-                                        this.create_new_project_from_plan(cx);
-                                    } else {
-                                        this.begin_new_project(window, cx);
-                                    }
-                                },
-                            ));
+                            primary =
+                                primary
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_new_project(cx);
+                                    }));
                         }
                         div().flex().gap_2().child(primary).child(
                             div()
@@ -10753,10 +10844,10 @@ impl Editor {
             self.create_new_file(window, cx);
             return;
         }
-        // The New Project dialog asks the OS for the location on enter
-        // (M10 slice 2b).
+        // The New Project dialog accepts on enter. Choosing the folder is a
+        // separate button; enter never opens the OS panel.
         if self.new_project.is_some() {
-            self.begin_new_project(window, cx);
+            self.accept_new_project(cx);
             return;
         }
         // While the find bar owns keystrokes, enter means "next match" in the
@@ -16345,15 +16436,34 @@ impl Editor {
         let new_project_dump = match &self.new_project {
             Some(state) => format!(
                 "{{\"open\":true,\"title\":\"{}\",\"type\":\"{}\",\"lang\":\"{}\",\
-                 \"error\":\"{}\",\"picking\":{}}}",
+                 \"mode\":\"{}\",\"error\":\"{}\",\"picking\":{},\"busy\":{},\
+                 \"path\":\"{}\",\"plan_files\":{}}}",
                 escape_json(&state.title),
                 state.kind.as_str(),
                 state.lang.key(),
+                match state.mode {
+                    NewProjectMode::Template => "template",
+                    NewProjectMode::Ai => "ai",
+                },
                 escape_json(&state.error),
                 state.picking,
+                state.busy,
+                escape_json(
+                    &state
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                ),
+                state
+                    .plan
+                    .as_ref()
+                    .map(|plan| plan.files.len())
+                    .unwrap_or(0),
             ),
             None => "{\"open\":false,\"title\":\"\",\"type\":\"\",\"lang\":\"\",\
-                     \"error\":\"\",\"picking\":false}"
+                     \"mode\":\"\",\"error\":\"\",\"picking\":false,\"busy\":false,\
+                     \"path\":\"\",\"plan_files\":0}"
                 .to_string(),
         };
         let project_dump = self
