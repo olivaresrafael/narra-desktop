@@ -13848,7 +13848,9 @@ impl Editor {
         let generation = self.chat_generation;
         let cancel = CancellationToken::new();
         self.chat_cancel = Some(cancel.clone());
-        let task = ChatTask::new(root, mode, history, instruction).with_attachments(attachments);
+        let task = ChatTask::new(root, mode, history, instruction)
+            .with_attachments(attachments)
+            .with_project_context(true);
         let settings = self.agent_settings.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {

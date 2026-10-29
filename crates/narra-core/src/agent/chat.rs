@@ -31,7 +31,7 @@ use super::tools::{
 };
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::document;
-use crate::project::open_project;
+use crate::project::{Project, open_project};
 
 /// Chat modes exposed by the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -295,6 +295,9 @@ pub struct ChatTask {
     pub history: Vec<ChatTurn>,
     pub instruction: String,
     pub attachments: Vec<ChatAttachment>,
+    /// Add a bounded project inventory and the generated base documents
+    /// (premise, outline, decisions, open questions) to the context.
+    pub include_project_context: bool,
 }
 
 impl ChatTask {
@@ -312,11 +315,17 @@ impl ChatTask {
             history,
             instruction: instruction.into(),
             attachments: Vec::new(),
+            include_project_context: false,
         }
     }
 
     pub fn with_attachments(mut self, attachments: Vec<ChatAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    pub fn with_project_context(mut self, include: bool) -> Self {
+        self.include_project_context = include;
         self
     }
 
@@ -359,6 +368,11 @@ impl ChatTask {
             detail: format!("Título «{}» e idioma primario", manifest.title),
         }];
         let mut context = String::new();
+        if self.include_project_context {
+            let (project_context, project_sources) = project_context(&project);
+            context.push_str(&project_context);
+            sources.extend(project_sources);
+        }
         for attachment in &self.attachments {
             let chars = attachment.content.chars().count();
             let (text, truncated) = if chars > 8_000 {
@@ -649,6 +663,62 @@ fn transcript(history: &[ChatTurn]) -> String {
         .join("\n")
 }
 
+/// Generated/base documents included automatically. Other files appear in
+/// the inventory; their content still requires an explicit attachment.
+const BASE_CONTEXT_DOCS: [&str; 4] = [
+    "bible/premise.md",
+    "structure/outline.md",
+    "notes/decisions.md",
+    "notes/open-questions.md",
+];
+const MAX_INVENTORY_FILES: usize = 200;
+const MAX_BASE_DOC_CHARS: usize = 8_000;
+
+fn project_context(project: &Project) -> (String, Vec<ContextSource>) {
+    let mut context = String::new();
+    let mut sources = Vec::new();
+    let documents = project.list_documents().unwrap_or_default();
+    if !documents.is_empty() {
+        let shown = documents.len().min(MAX_INVENTORY_FILES);
+        context.push_str("\n[inventario del proyecto]\n");
+        for path in documents.iter().take(shown) {
+            let size = std::fs::metadata(project.root().join(path))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            context.push_str(&format!("- {path} ({size} B)\n"));
+        }
+        if documents.len() > shown {
+            context.push_str(&format!(
+                "- … {} archivos más no listados\n",
+                documents.len() - shown
+            ));
+        }
+        sources.push(ContextSource {
+            kind: "inventory".to_string(),
+            location: "project".to_string(),
+            detail: format!("{shown} archivos del proyecto"),
+        });
+    }
+    for path in BASE_CONTEXT_DOCS {
+        let Ok(content) = project.read_document(path) else {
+            continue;
+        };
+        let chars = content.chars().count();
+        let text = truncate(&content, MAX_BASE_DOC_CHARS);
+        context.push_str(&format!("\n[documento: {path}]\n{text}\n"));
+        sources.push(ContextSource {
+            kind: "document".to_string(),
+            location: path.to_string(),
+            detail: if chars > MAX_BASE_DOC_CHARS {
+                format!("{chars} caracteres (truncados a {MAX_BASE_DOC_CHARS})")
+            } else {
+                format!("{chars} caracteres")
+            },
+        });
+    }
+    (context, sources)
+}
+
 fn truncate(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).collect();
     if text.chars().count() > max_chars {
@@ -778,6 +848,35 @@ mod tests {
         assert_eq!(output.sources.len(), 2);
         assert_eq!(output.data["mode"], "plan");
         assert!(output.data["tools"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn project_context_includes_inventory_and_generated_base() {
+        let root = project();
+        crate::project::seed_basic_template(&root, "es").expect("base template");
+        let task = ChatTask::new(root.to_string_lossy(), ChatMode::Plan, Vec::new(), "Resume")
+            .with_project_context(true);
+        let output = task
+            .run(
+                &crate::agent::MockAdapter::new(),
+                &TaskOptions::default(),
+                |_| {},
+            )
+            .expect("chat");
+        let kinds: Vec<&str> = output
+            .sources
+            .iter()
+            .map(|source| source.kind.as_str())
+            .collect();
+        assert!(kinds.contains(&"manifest"), "{kinds:?}");
+        assert!(kinds.contains(&"inventory"), "{kinds:?}");
+        assert!(kinds.contains(&"document"), "{kinds:?}");
+        assert!(
+            output.sources.iter().any(|source| {
+                source.location == "bible/premise.md" && source.kind == "document"
+            }),
+            "{kinds:?}"
+        );
     }
 
     #[test]
