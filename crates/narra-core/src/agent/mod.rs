@@ -46,8 +46,8 @@ pub use scaffold::{ProjectScaffoldTask, ScaffoldError, ScaffoldFile, ScaffoldPla
 pub use scene_edit::SceneEditTask;
 pub use scene_review::SceneReviewTask;
 pub use skill::{
-    Skill, SkillError, SkillOrigin, active_skills, load_skills, trust_skill, trusted_hashes,
-    untrusted_project_skills,
+    Skill, SkillError, SkillOrigin, active_skills, load_scope, load_skills, trust_skill,
+    trusted_hashes, untrusted_project_skills,
 };
 pub use tool_loop::ToolLoopTask;
 pub use tools::{

@@ -166,9 +166,9 @@ use i18n::Lang;
 use narra_core::agent::{
     AgentError, ChatAttachment, ChatMode, ChatTask, ChatThread, LOCAL_DEFAULT_BASE_URL,
     MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig, ProjectScaffoldTask,
-    ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill, TaskOptions, active_skills,
-    fetch_model_ids, load_skills, proposal, roles, trust_skill, untrusted_project_skills,
-    write_plan,
+    ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill, SkillOrigin, TaskOptions, active_skills,
+    fetch_model_ids, load_scope, load_skills, proposal, roles, trust_skill,
+    untrusted_project_skills, write_plan,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
@@ -1123,7 +1123,20 @@ fn new_project_types() -> Vec<ProjectTypePackage> {
 /// Load active and untrusted project skills for a project. Errors are
 /// non-fatal: a malformed skill must not prevent the project from opening.
 fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
-    let all = load_skills(project.root(), Some(&recent::config_dir())).unwrap_or_default();
+    let mut by_id: std::collections::BTreeMap<String, Skill> = std::collections::BTreeMap::new();
+    // Skills shipped inside the active type package.
+    if let Some(package) = project_type_package(project)
+        && let Some(source) = &package.source_dir
+    {
+        for skill in load_scope(&source.join("skills"), SkillOrigin::Project).unwrap_or_default() {
+            by_id.insert(skill.id.clone(), skill);
+        }
+    }
+    // User and project-level skills override package skills by id.
+    for skill in load_skills(project.root(), Some(&recent::config_dir())).unwrap_or_default() {
+        by_id.insert(skill.id.clone(), skill);
+    }
+    let all: Vec<Skill> = by_id.into_values().collect();
     let active = active_skills(project.root(), &all).unwrap_or_else(|_| all.clone());
     let pending = untrusted_project_skills(project.root(), &all)
         .ok()
