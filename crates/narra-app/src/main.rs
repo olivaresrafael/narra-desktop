@@ -5371,7 +5371,31 @@ impl Editor {
         }
     }
 
+    /// True when a modal dialog owns the keyboard. Caret movement and edits
+    /// must not run behind it (M17 slice 0); text fields route their own
+    /// input before reaching the buffer.
+    fn modal_owns_keyboard(&self) -> bool {
+        self.settings.is_some()
+            || self.project_settings.is_some()
+            || self.unsaved_prompt.is_some()
+            || self.new_file.is_some()
+            || self.new_project.is_some()
+            || self.rename.is_some()
+            || self.delete_prompt.is_some()
+            || self.palette.is_some()
+            || self.git_branch_prompt.is_some()
+            || self.github_publish.is_some()
+            || self.github_pr.is_some()
+            || self.git_commit.is_some()
+            || self.git_diff.is_some()
+            || self.git_restore.is_some()
+            || self.git_sync.is_some()
+    }
+
     fn set_caret(&mut self, target: usize, extend: bool) {
+        if self.modal_owns_keyboard() {
+            return;
+        }
         if extend {
             if self.doc.reversed {
                 self.doc.selected.start = target;
@@ -5653,6 +5677,9 @@ impl Editor {
     /// Apply an edit, record undo state, move the caret after the inserted
     /// text and invalidate the derived scene index.
     fn apply_edit(&mut self, range: Range<usize>, text: &str) -> Range<usize> {
+        if self.modal_owns_keyboard() {
+            return range;
+        }
         let start = range.start;
         let (inserted, deleted) = self.doc.buffer.replace(range.clone(), text);
         self.splice_for_edit(start, &deleted, text);
@@ -5705,6 +5732,9 @@ impl Editor {
     }
 
     fn undo(&mut self) {
+        if self.modal_owns_keyboard() {
+            return;
+        }
         let Some(edit) = self.doc.undo_stack.pop() else {
             return;
         };
@@ -5722,6 +5752,9 @@ impl Editor {
     }
 
     fn redo(&mut self) {
+        if self.modal_owns_keyboard() {
+            return;
+        }
         let Some(edit) = self.doc.redo_stack.pop() else {
             return;
         };
@@ -6081,6 +6114,9 @@ impl Editor {
     }
 
     fn select_all(&mut self) {
+        if self.modal_owns_keyboard() {
+            return;
+        }
         self.doc.selected = 0..self.doc.buffer.doc_len();
         self.doc.reversed = false;
     }
@@ -10807,11 +10843,7 @@ impl Editor {
     }
 
     fn on_copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some()
-            || self.project_settings.is_some()
-            || self.palette.is_some()
-            || self.unsaved_prompt.is_some()
-        {
+        if self.modal_owns_keyboard() {
             return;
         }
         if !self.doc.selected.is_empty() {
@@ -10821,12 +10853,7 @@ impl Editor {
     }
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some()
-            || self.project_settings.is_some()
-            || self.palette.is_some()
-            || self.unsaved_prompt.is_some()
-            || self.doc.preview
-        {
+        if self.modal_owns_keyboard() || self.doc.preview {
             return;
         }
         if !self.doc.selected.is_empty() {
@@ -16001,25 +16028,44 @@ impl Editor {
             .whitespace_nowrap()
             .child(gutter_element(ix, ix == caret_line));
 
+        // Clamp every document range to this line before turning it into
+        // line-local columns. A selection that starts on an earlier line (or
+        // a match that spans lines) must never underflow the unsigned
+        // subtraction while the row renders.
+        let selection_local = selection_here.and_then(|range| line_local_range(range, &doc));
+        let marked_local = marked_here.and_then(|range| line_local_range(range, &doc));
+        let matches_local: Vec<(Range<usize>, bool)> = matches_here
+            .iter()
+            .filter_map(|(range, current)| {
+                line_local_range(range, &doc).map(|local| (local, *current))
+            })
+            .collect();
+
         let len = text.len();
         let mut cuts: Vec<usize> = vec![0, len];
-        if let Some(selection) = selection_here {
-            cuts.push((selection.start - doc.start).min(len));
-            cuts.push((selection.end - doc.start).min(len));
+        if let Some(range) = &selection_local {
+            cuts.push(range.start);
+            cuts.push(range.end);
         }
-        if let Some(marked) = marked_here {
-            cuts.push((marked.start - doc.start).min(len));
-            cuts.push((marked.end - doc.start).min(len));
+        if let Some(range) = &marked_local {
+            cuts.push(range.start);
+            cuts.push(range.end);
         }
-        for (range, _) in &matches_here {
-            cuts.push((range.start - doc.start).min(len));
-            cuts.push((range.end - doc.start).min(len));
+        for (range, _) in &matches_local {
+            cuts.push(range.start);
+            cuts.push(range.end);
         }
         for mention in &mentions_here {
             cuts.push(mention.start.min(len));
             cuts.push(mention.end.min(len));
         }
-        let caret_col = (caret - doc.start).min(len);
+        // Only read the caret when it is on this line; a selection that
+        // extends upward puts the caret before `doc.start`.
+        let caret_col = if caret_here {
+            (caret - doc.start).min(len)
+        } else {
+            0
+        };
         if caret_here {
             cuts.push(caret_col);
         }
@@ -16034,15 +16080,15 @@ impl Editor {
             if start == end {
                 continue;
             }
-            let selected = selection_here.is_some_and(|selection| {
-                start >= selection.start - doc.start && end <= selection.end - doc.start
-            });
-            let composing = marked_here.is_some_and(|marked| {
-                start >= marked.start - doc.start && end <= marked.end - doc.start
-            });
-            let match_state = matches_here.iter().find(|(range, _)| {
-                start >= range.start - doc.start && end <= range.end - doc.start
-            });
+            let selected = selection_local
+                .as_ref()
+                .is_some_and(|range| start >= range.start && end <= range.end);
+            let composing = marked_local
+                .as_ref()
+                .is_some_and(|range| start >= range.start && end <= range.end);
+            let match_state = matches_local
+                .iter()
+                .find(|(range, _)| start >= range.start && end <= range.end);
             let mention_state = mentions_here
                 .iter()
                 .find(|mention| start >= mention.start && end <= mention.end);
@@ -17158,6 +17204,15 @@ fn utf16_to_byte_in(text: &str, utf16: Range<usize>) -> Range<usize> {
         units += ch.len_utf16();
     }
     start.unwrap_or(text.len())..end.unwrap_or(text.len())
+}
+
+/// Intersect a document range with one line and return it in line-local byte
+/// columns. Clamping both ends makes selections that start or end on another
+/// line safe: no unsigned subtraction can underflow while a row renders.
+fn line_local_range(range: &Range<usize>, line: &Range<usize>) -> Option<Range<usize>> {
+    let start = range.start.max(line.start);
+    let end = range.end.min(line.end);
+    (start < end).then(|| (start - line.start)..(end - line.start))
 }
 
 /// Byte columns where each visual (soft-wrapped) row of a line starts,
@@ -18954,6 +19009,23 @@ mod tests {
         record_edit(&mut stack, false, 1..1, 1..2, "y", String::new());
         assert_eq!(stack.len(), 2);
         assert_eq!(stack[1].new_text, "y");
+    }
+
+    #[test]
+    fn line_local_range_clamps_ranges_from_other_lines() {
+        let line = 10..20;
+        assert_eq!(line_local_range(&(10..20), &line), Some(0..10));
+        // A selection that starts on an earlier line clamps to column 0.
+        assert_eq!(line_local_range(&(0..15), &line), Some(0..5));
+        // A selection that continues past the line clamps to its end.
+        assert_eq!(line_local_range(&(15..30), &line), Some(5..10));
+        // A selection that begins after the line (or ends before it) does
+        // not touch this row at all.
+        assert_eq!(line_local_range(&(20..30), &line), None);
+        assert_eq!(line_local_range(&(0..10), &line), None);
+        assert_eq!(line_local_range(&(10..10), &line), None);
+        // The old `range.start - line.start` underflowed here.
+        assert_eq!(line_local_range(&(0..30), &line), Some(0..10));
     }
 
     #[test]
