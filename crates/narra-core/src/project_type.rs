@@ -162,6 +162,9 @@ pub struct ProjectTypePackage {
     pub skills: Vec<String>,
     pub capabilities: TypeCapabilities,
     pub origin: TypeOrigin,
+    /// Source directory for user/project packages, used when copying the
+    /// package into a created project. Built-ins have no source directory.
+    pub source_dir: Option<PathBuf>,
 }
 
 impl ProjectTypePackage {
@@ -352,6 +355,7 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         skills: Vec::new(),
         capabilities: TypeCapabilities::screenplay(),
         origin: TypeOrigin::Builtin,
+        source_dir: None,
     })
 }
 
@@ -373,10 +377,11 @@ pub fn load_package(
     if text.len() > MAX_PACKAGE_BYTES {
         return Err(TypePackageError::TooLarge { path });
     }
-    let package = parse_package(&text, origin).map_err(|error| TypePackageError::Parse {
+    let mut package = parse_package(&text, origin).map_err(|error| TypePackageError::Parse {
         path: path.clone(),
         error: error.to_string(),
     })?;
+    package.source_dir = Some(directory.to_path_buf());
     let directory_name = directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -583,6 +588,7 @@ pub fn parse_package(
         skills,
         capabilities,
         origin,
+        source_dir: None,
     };
     package.validate()?;
     Ok(package)

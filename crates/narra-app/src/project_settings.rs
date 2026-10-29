@@ -47,6 +47,9 @@ impl ProjectField {
 pub struct ProjectSettingsState {
     pub title: String,
     pub project_type: ProjectType,
+    /// Actual package id; custom ids survive a title/language edit even
+    /// though the legacy enum shows `Other`.
+    pub project_type_id: String,
     pub primary_language: String,
     /// Editable comma-separated list; normalized on save.
     pub additional_languages: String,
@@ -62,6 +65,7 @@ impl ProjectSettingsState {
         Self {
             title: manifest.title.clone(),
             project_type: manifest.project_type,
+            project_type_id: manifest.project_type_id.clone(),
             primary_language: manifest.primary_language.clone(),
             additional_languages: manifest.additional_languages.join(", "),
             default_screenplay: manifest.default_screenplay_path.clone(),
@@ -111,6 +115,15 @@ impl ProjectSettingsState {
         let mut manifest = project.manifest().clone();
         manifest.title = self.title.trim().to_string();
         manifest.project_type = self.project_type;
+        let keep_existing_id = ProjectType::parse(&self.project_type_id)
+            .map_or(self.project_type == ProjectType::Other, |known| {
+                known == self.project_type
+            });
+        manifest.project_type_id = if keep_existing_id {
+            self.project_type_id.clone()
+        } else {
+            self.project_type.as_str().to_string()
+        };
         manifest.primary_language = self.primary_language.trim().to_string();
         manifest.additional_languages = self
             .additional_languages
@@ -154,6 +167,29 @@ mod tests {
             narra_core::project::DEFAULT_SCREENPLAY
         );
         assert_eq!(state.field, ProjectField::Title);
+    }
+
+    #[test]
+    fn custom_project_type_id_survives_a_form_save() {
+        let root = std::env::temp_dir().join(format!(
+            "narra-project-settings-custom-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let package = narra_core::project_type::parse_package(
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            narra_core::project_type::TypeOrigin::User,
+        )
+        .expect("package");
+        let mut project =
+            narra_core::project::create_project_from_package(&root, "Documental", &package, "es")
+                .expect("create");
+        let mut state = ProjectSettingsState::new(&project);
+        state.title = "Documental nuevo".to_string();
+        state.save(&mut project).expect("save");
+        assert_eq!(project.manifest().title, "Documental nuevo");
+        assert_eq!(project.manifest().project_type_id, "documentary");
     }
 
     #[test]

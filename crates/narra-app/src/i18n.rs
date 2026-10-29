@@ -473,6 +473,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Ponle un nombre al proyecto.",
     ),
     (
+        "newproject.type_missing",
+        "The selected project type is no longer available.",
+        "El tipo de proyecto seleccionado ya no está disponible.",
+    ),
+    (
         "newproject.dialog_failed",
         "Could not open the folder panel: {error}",
         "No se pudo abrir el panel de carpetas: {error}",

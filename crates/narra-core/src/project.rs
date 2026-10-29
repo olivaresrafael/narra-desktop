@@ -337,6 +337,35 @@ pub fn create_project_from_type(
     project_type: ProjectType,
     primary_language: &str,
 ) -> Result<Project, ProjectError> {
+    let package =
+        crate::project_type::builtin(project_type.as_str()).expect("built-in type package");
+    create_project_from_package(root, title, &package, primary_language)
+}
+
+/// Create a project from any loaded package, including a user or project
+/// package with a custom id. The package is validated before the manifest is
+/// written; a failure after creation leaves no partial manifest.
+pub fn create_project_from_package(
+    root: &Path,
+    title: &str,
+    package: &crate::project_type::ProjectTypePackage,
+    primary_language: &str,
+) -> Result<Project, ProjectError> {
+    let project = create_project_base_from_package(root, title, package, primary_language)?;
+    crate::project_type::write_template(root, package, primary_language)?;
+    Ok(project)
+}
+
+/// Create only the manifest and package directories, leaving the starter
+/// files for a reviewed AI plan. Used by the AI project base so the plan can
+/// create its own `bible/` or `structure/` files create-only.
+pub fn create_project_base_from_package(
+    root: &Path,
+    title: &str,
+    package: &crate::project_type::ProjectTypePackage,
+    primary_language: &str,
+) -> Result<Project, ProjectError> {
+    package.validate()?;
     if root.exists() {
         if !root.is_dir() {
             return Err(ProjectError::NotADirectory(root.to_path_buf()));
@@ -349,8 +378,6 @@ pub fn create_project_from_type(
         path: root.to_path_buf(),
         source,
     })?;
-    let package =
-        crate::project_type::builtin(project_type.as_str()).expect("built-in type package");
     for directory in &package.directories {
         let path = root.join(directory);
         fs::create_dir_all(&path).map_err(|source| ProjectError::Io {
@@ -358,14 +385,57 @@ pub fn create_project_from_type(
             source,
         })?;
     }
-    let manifest = Manifest::new_v1(title, project_type, primary_language, DEFAULT_SCREENPLAY);
+    // A user/project package travels with the project so it still opens on
+    // another machine. Built-ins are embedded and referenced by id.
+    if package.origin != crate::project_type::TypeOrigin::Builtin
+        && let Some(source) = &package.source_dir
+    {
+        let destination = root
+            .join(crate::project_type::PROJECT_TYPES_DIR)
+            .join(&package.id);
+        copy_directory(source, &destination)?;
+    }
+    let manifest =
+        Manifest::new_v1_with_type_id(title, &package.id, primary_language, DEFAULT_SCREENPLAY)?;
     let text = manifest::serialize_manifest(&manifest)?;
     document::write_document(root, MANIFEST_FILE, &text)?;
-    crate::project_type::write_template(root, &package, primary_language)?;
     Ok(Project {
         root: root.to_path_buf(),
         manifest,
     })
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), ProjectError> {
+    fs::create_dir_all(destination).map_err(|error| ProjectError::Io {
+        path: destination.to_path_buf(),
+        source: error,
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| ProjectError::Io {
+        path: source.to_path_buf(),
+        source: error,
+    })? {
+        let entry = entry.map_err(|error| ProjectError::Io {
+            path: source.to_path_buf(),
+            source: error,
+        })?;
+        let target = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| ProjectError::Io {
+                path: entry.path(),
+                source: error,
+            })?
+            .is_dir()
+        {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target).map_err(|error| ProjectError::Io {
+                path: target,
+                source: error,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Starter documents for the New Project **basic template** (M16 slice 8,
@@ -533,6 +603,47 @@ mod tests {
     }
 
     #[test]
+    fn custom_package_creates_and_reopens_a_custom_type_id() {
+        let root = temp_root();
+        let package = crate::project_type::parse_package(
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content:\n      en: Brief\n      es: Guion\ncapabilities:\n  screenplay: false\n  export_pdf: false\n",
+            crate::project_type::TypeOrigin::User,
+        )
+        .expect("package");
+        let project = create_project_from_package(&root, "Documental", &package, "es")
+            .expect("create custom package");
+        assert_eq!(project.manifest().project_type_id, "documentary");
+        assert_eq!(project.manifest().project_type, ProjectType::Other);
+        assert_eq!(
+            fs::read_to_string(root.join("docs/brief.md")).expect("brief"),
+            "Guion"
+        );
+        let reopened = open_project(&root).expect("reopen");
+        assert_eq!(reopened.manifest().project_type_id, "documentary");
+    }
+
+    #[test]
+    fn user_type_package_is_copied_into_the_project() {
+        let source = temp_root();
+        let package_dir = source.join("documentary");
+        fs::create_dir_all(&package_dir).expect("package dir");
+        fs::write(
+            package_dir.join(crate::project_type::TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content: Brief\n",
+        )
+        .expect("type.yaml");
+        let package =
+            crate::project_type::load_package(&package_dir, crate::project_type::TypeOrigin::User)
+                .expect("package");
+        let root = temp_root();
+        create_project_from_package(&root, "Documental", &package, "es").expect("create");
+        assert!(
+            root.join(".narra/types/documentary/type.yaml").is_file(),
+            "package should travel with the project"
+        );
+    }
+
+    #[test]
     fn create_refuses_to_overwrite_existing_project() {
         let root = temp_root();
         create_project(&root, "Uno", ProjectType::Feature, "es").expect("first");
@@ -559,6 +670,7 @@ mod tests {
         let mut manifest = project.manifest().clone();
         manifest.title = "Después".to_string();
         manifest.project_type = ProjectType::Series;
+        manifest.project_type_id = "series".to_string();
         project.update_manifest(manifest).expect("update");
         let reopened = open_project(&root).expect("reopen");
         assert_eq!(reopened.manifest().title, "Después");

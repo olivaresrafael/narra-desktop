@@ -74,7 +74,11 @@ pub struct Manifest {
     pub schema_version: u32,
     pub project_id: Uuid,
     pub title: String,
+    /// Built-in enum kept for labels and legacy callers.
     pub project_type: ProjectType,
+    /// Actual project-type package id. For built-ins it equals
+    /// `project_type.as_str()`; custom ids map to `ProjectType::Other`.
+    pub project_type_id: String,
     pub primary_language: String,
     pub additional_languages: Vec<String>,
     /// RFC 3339, UTC. Set once at creation and never rewritten afterwards.
@@ -99,11 +103,32 @@ impl Manifest {
             project_id: Uuid::new_v4(),
             title: title.to_string(),
             project_type,
+            project_type_id: project_type.as_str().to_string(),
             primary_language: primary_language.to_string(),
             additional_languages: Vec::new(),
             created_at,
             default_screenplay_path: default_screenplay_path.to_string(),
         }
+    }
+
+    /// Build a v1 manifest for a custom project-type package id. Known ids
+    /// still map to their enum; unknown ids use `Other` for labels only.
+    pub fn new_v1_with_type_id(
+        title: &str,
+        project_type_id: &str,
+        primary_language: &str,
+        default_screenplay_path: &str,
+    ) -> Result<Self, ManifestError> {
+        validate_project_type_id(project_type_id)?;
+        let project_type = ProjectType::parse(project_type_id).unwrap_or(ProjectType::Other);
+        let mut manifest = Self::new_v1(
+            title,
+            project_type,
+            primary_language,
+            default_screenplay_path,
+        );
+        manifest.project_type_id = project_type_id.to_string();
+        Ok(manifest)
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
@@ -114,6 +139,29 @@ impl Manifest {
             });
         }
         require_non_empty("title", &self.title)?;
+        validate_project_type_id(&self.project_type_id)?;
+        match ProjectType::parse(&self.project_type_id) {
+            Some(known) if known != self.project_type => {
+                return Err(ManifestError::InvalidValue {
+                    field: "project_type",
+                    detail: format!(
+                        "`{}` does not match project_type_id `{}`",
+                        self.project_type.as_str(),
+                        self.project_type_id
+                    ),
+                });
+            }
+            None if self.project_type != ProjectType::Other => {
+                return Err(ManifestError::InvalidValue {
+                    field: "project_type",
+                    detail: format!(
+                        "custom project type `{}` must use `other` in the legacy field",
+                        self.project_type_id
+                    ),
+                });
+            }
+            _ => {}
+        }
         require_language("primary_language", &self.primary_language)?;
         for language in &self.additional_languages {
             require_language("additional_languages", language)?;
@@ -216,14 +264,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
 
     let title = required_string(&root, "title", "string")?.to_string();
     let project_type_raw = required_string(&root, "project_type", "string")?;
-    let project_type =
-        ProjectType::parse(project_type_raw).ok_or_else(|| ManifestError::InvalidValue {
-            field: "project_type",
-            detail: format!(
-                "unknown project type `{project_type_raw}` (expected one of: feature, series, \
-                 web_series, short, microdrama, other)"
-            ),
-        })?;
+    validate_project_type_id(project_type_raw)?;
+    let project_type = ProjectType::parse(project_type_raw).unwrap_or(ProjectType::Other);
 
     let primary_language = required_string(&root, "primary_language", "string")?.to_string();
     let additional_languages = match root.as_mapping_get("additional_languages") {
@@ -259,6 +301,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
         project_id,
         title,
         project_type,
+        project_type_id: project_type_raw.to_string(),
         primary_language,
         additional_languages,
         created_at,
@@ -283,7 +326,7 @@ pub fn serialize_manifest(manifest: &Manifest) -> Result<String, ManifestError> 
     out.push_str(&format!("title: {}\n", yaml_string(&manifest.title)));
     out.push_str(&format!(
         "project_type: {}\n",
-        yaml_string(manifest.project_type.as_str())
+        yaml_string(&manifest.project_type_id)
     ));
     out.push_str(&format!(
         "primary_language: {}\n",
@@ -325,6 +368,33 @@ fn required_string<'a>(
             .ok_or(ManifestError::MissingField { field, expected }),
         None => Err(ManifestError::MissingField { field, expected }),
     }
+}
+
+/// Project-type ids use the package charset: lowercase letters, digits, `-`
+/// and `_`; separators cannot lead, trail or repeat.
+fn validate_project_type_id(value: &str) -> Result<(), ManifestError> {
+    let invalid = || ManifestError::InvalidValue {
+        field: "project_type",
+        detail: format!("`{value}` is not a safe project-type id"),
+    };
+    if value.is_empty() || value.chars().count() > 64 {
+        return Err(invalid());
+    }
+    let mut last_separator = true;
+    for ch in value.chars() {
+        let separator = matches!(ch, '-' | '_');
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || separator) {
+            return Err(invalid());
+        }
+        if separator && last_separator {
+            return Err(invalid());
+        }
+        last_separator = separator;
+    }
+    if last_separator {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), ManifestError> {
@@ -471,11 +541,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_project_type() {
+    fn accepts_custom_type_ids_and_rejects_unsafe_ones() {
         let text = serialize_manifest(&sample())
             .expect("serialize")
-            .replace("\"series\"", "\"telenovela\"");
-        let error = parse_manifest(&text).expect_err("bad project type");
+            .replace("\"series\"", "\"documentary\"");
+        let manifest = parse_manifest(&text).expect("custom type id");
+        assert_eq!(manifest.project_type, ProjectType::Other);
+        assert_eq!(manifest.project_type_id, "documentary");
+        let again = serialize_manifest(&manifest).expect("serialize");
+        assert!(again.contains("project_type: \"documentary\""));
+
+        let unsafe_id = serialize_manifest(&sample())
+            .expect("serialize")
+            .replace("\"series\"", "\"Telenovela\"");
+        let error = parse_manifest(&unsafe_id).expect_err("unsafe project type");
         assert!(matches!(
             error,
             ManifestError::InvalidValue {

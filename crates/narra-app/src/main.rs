@@ -183,8 +183,8 @@ use narra_core::provider::{
     NewRepository, OsKeychain, SecretError, SecretStore,
 };
 use narra_core::{
-    DocumentError, Project, ProjectError, ProjectProfile, ProjectType, create_project,
-    create_project_from_type, open_project,
+    DocumentError, Project, ProjectError, ProjectProfile, ProjectType, ProjectTypePackage,
+    create_project_base_from_package, create_project_from_package, open_project,
 };
 use new_file::Kind as NewFileKind;
 use project_settings::{ProjectField, ProjectSettingsState};
@@ -487,7 +487,12 @@ enum NewProjectField {
 #[derive(Debug)]
 struct NewProjectState {
     title: TextField,
+    /// Legacy enum used by the AI task/labels; custom ids map to `Other`.
     kind: ProjectType,
+    /// Selected package id; may be a user-defined type.
+    type_id: String,
+    /// Installed types shown in the dialog (built-ins + user packages).
+    types: Vec<ProjectTypePackage>,
     lang: Lang,
     mode: NewProjectMode,
     prompt: TextField,
@@ -1106,10 +1111,29 @@ fn project_window_title(title: Option<&str>) -> String {
 /// Resolve the UI-neutral capabilities for an open project. Built-ins are
 /// available today; custom packages fall back to the generic profile until
 /// their manifest ids are loaded.
+/// Installed types for the New Project dialog: built-ins plus user packages.
+/// An invalid user package does not hide the built-ins.
+fn new_project_types() -> Vec<ProjectTypePackage> {
+    narra_core::project_type::registry(None, Some(&recent::config_dir()))
+        .unwrap_or_else(|_| narra_core::project_type::builtins())
+}
+
 fn project_profile(project: &Project) -> ProjectProfile {
-    narra_core::project_type::builtin(project.manifest().project_type.as_str())
-        .map(|package| package.profile())
-        .unwrap_or_default()
+    let type_id = project.manifest().project_type_id.as_str();
+    if let Some(package) = narra_core::project_type::builtin(type_id) {
+        return package.profile();
+    }
+    let registry =
+        narra_core::project_type::registry(Some(project.root()), Some(&recent::config_dir()));
+    if let Ok(packages) = registry
+        && let Some(package) = packages.into_iter().find(|package| package.id == type_id)
+    {
+        return package.profile();
+    }
+    ProjectProfile {
+        type_id: type_id.to_string(),
+        ..ProjectProfile::default()
+    }
 }
 
 fn role_source_label(lang: Lang, source: &str) -> &'static str {
@@ -3794,7 +3818,7 @@ impl Editor {
         .into_iter()
         .enumerate()
         {
-            let selected = kind == state.project_type;
+            let selected = state.project_type_id == kind.as_str();
             kinds = kinds.child(
                 div()
                     .id(("project-kind", index))
@@ -3821,11 +3845,25 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.project_settings.as_mut() {
                             state.project_type = kind;
+                            state.project_type_id = kind.as_str().to_string();
                             state.field = ProjectField::Type;
                             state.error.clear();
                         }
                         cx.notify();
                     })),
+            );
+        }
+        if ProjectType::parse(&state.project_type_id).is_none() {
+            kinds = kinds.child(
+                div()
+                    .id("project-kind-custom")
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(theme::doc_selected_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::default_fg()))
+                    .text_color(rgb(theme::default_fg()))
+                    .child(state.project_type_id.clone()),
             );
         }
         let mut screenplay_choices = div().flex().flex_col().gap_1();
@@ -7334,9 +7372,12 @@ impl Editor {
             return;
         }
         self.new_project_generation = self.new_project_generation.saturating_add(1);
+        let types = new_project_types();
         self.new_project = Some(NewProjectState {
             title: TextField::single_line(),
             kind: ProjectType::Feature,
+            type_id: "feature".to_string(),
+            types,
             lang: self.lang,
             mode: NewProjectMode::Template,
             prompt: TextField::multiline(),
@@ -7472,6 +7513,16 @@ impl Editor {
             return;
         }
         let kind = state.kind;
+        let Some(package) = state
+            .types
+            .iter()
+            .find(|package| package.id == state.type_id)
+            .cloned()
+        else {
+            self.set_new_project_error(self.t("newproject.type_missing").to_string());
+            cx.notify();
+            return;
+        };
         let lang = state.lang;
         let mode = state.mode;
         let prompt = state.prompt.text().trim().to_string();
@@ -7501,18 +7552,18 @@ impl Editor {
             cx.notify();
             return;
         }
-        self.create_new_project_from_template(path, title, kind, lang, cx);
+        self.create_new_project_from_template(path, title, package, lang, cx);
     }
 
     fn create_new_project_from_template(
         &mut self,
         path: PathBuf,
         title: String,
-        kind: ProjectType,
+        package: ProjectTypePackage,
         lang: Lang,
         cx: &mut Context<Self>,
     ) {
-        match create_project_from_type(&path, &title, kind, lang.key()) {
+        match create_project_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => match self.install_project(project, cx) {
                 Ok(()) => {
                     self.new_project = None;
@@ -7633,9 +7684,17 @@ impl Editor {
         };
         let title = new_project::clean_title(state.title.text())
             .unwrap_or_else(|| state.title.text().to_string());
-        let kind = state.kind;
         let lang = state.lang;
-        match create_project(&path, &title, kind, lang.key()) {
+        let Some(package) = state
+            .types
+            .iter()
+            .find(|package| package.id == state.type_id)
+            .cloned()
+        else {
+            self.set_new_project_error(self.t("newproject.type_missing").to_string());
+            return;
+        };
+        match create_project_base_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => match write_plan(&path, &plan) {
                 Ok(()) => match self.install_project(project, cx) {
                     Ok(()) => {
@@ -7942,11 +8001,18 @@ impl Editor {
             modes = modes.child(chip);
         }
         let mut kinds = div().flex().flex_wrap().gap_2();
-        for kind in new_project::TYPES {
-            let selected = kind == state.kind;
+        for (index, package) in state.types.iter().enumerate() {
+            let selected = package.id == state.type_id;
+            let kind = ProjectType::parse(&package.id);
+            let label = kind.map_or_else(
+                || package.name.clone(),
+                |kind| self.t(new_project::type_i18n_key(kind)).to_string(),
+            );
+            let package_id = package.id.clone();
+            let package_kind = kind.unwrap_or(ProjectType::Other);
             kinds = kinds.child(
                 div()
-                    .id(kind.as_str())
+                    .id(("project-type-chip", index as u64))
                     .px_3()
                     .py_1()
                     .bg(rgb(if selected {
@@ -7966,14 +8032,15 @@ impl Editor {
                         theme::status_fg()
                     }))
                     .cursor_pointer()
-                    .child(self.t(new_project::type_i18n_key(kind)))
+                    .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
                             && !state.busy
                             && state.plan.is_none()
                         {
-                            state.kind = kind;
+                            state.type_id = package_id.clone();
+                            state.kind = package_kind;
                             state.error.clear();
                         }
                         cx.notify();
@@ -8019,6 +8086,19 @@ impl Editor {
                     })),
             );
         }
+        let type_summary = state
+            .types
+            .iter()
+            .find(|package| package.id == state.type_id)
+            .map(|package| {
+                format!(
+                    "{} · {} carpetas · {} archivos",
+                    package.description,
+                    package.directories.len(),
+                    package.files.len()
+                )
+            })
+            .unwrap_or_default();
         div()
             .absolute()
             .size_full()
@@ -8076,6 +8156,14 @@ impl Editor {
                             )
                             .child(kinds),
                     )
+                    .when(!type_summary.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::gutter_fg()))
+                                .child(type_summary),
+                        )
+                    })
                     .child(
                         div()
                             .flex()

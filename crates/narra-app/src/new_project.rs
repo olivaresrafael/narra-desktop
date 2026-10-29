@@ -10,17 +10,7 @@ use std::path::Path;
 
 use narra_core::ProjectType;
 
-/// Project kinds offered by the dialog, in menu order.
-pub const TYPES: [ProjectType; 6] = [
-    ProjectType::Feature,
-    ProjectType::Series,
-    ProjectType::WebSeries,
-    ProjectType::Short,
-    ProjectType::Microdrama,
-    ProjectType::Other,
-];
-
-/// i18n key for a kind label.
+/// i18n key for a built-in kind label.
 pub fn type_i18n_key(kind: ProjectType) -> &'static str {
     match kind {
         ProjectType::Feature => "newproject.type.feature",
@@ -158,8 +148,15 @@ mod tests {
     }
 
     #[test]
-    fn every_kind_has_a_label_key() {
-        for kind in TYPES {
+    fn every_builtin_kind_has_a_label_key() {
+        for kind in [
+            ProjectType::Feature,
+            ProjectType::Series,
+            ProjectType::WebSeries,
+            ProjectType::Short,
+            ProjectType::Microdrama,
+            ProjectType::Other,
+        ] {
             assert!(type_i18n_key(kind).starts_with("newproject.type."));
         }
     }
