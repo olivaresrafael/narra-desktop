@@ -33,11 +33,12 @@ pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
 pub use chat::{
     ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatProposalRef, ChatTask,
-    ChatThread, ChatTurn, ChatTurnRole, ChatUsage,
+    ChatThread, ChatTurn, ChatTurnRole, ChatUsage, ContextBudget,
 };
 pub use mock::MockAdapter;
 pub use openai_compat::{
-    LOCAL_DEFAULT_BASE_URL, OpenAiCompatAdapter, OpenAiCompatConfig, fetch_model_ids,
+    LOCAL_DEFAULT_BASE_URL, ModelInfo, OpenAiCompatAdapter, OpenAiCompatConfig, fetch_model_ids,
+    fetch_models,
 };
 pub use package::{
     AgentPackage, PACKAGE_FILE, PROJECT_PACKAGES_DIR, PackageError, PackageOrigin, PackageTrust,
@@ -116,6 +117,11 @@ pub enum TaskEvent {
         id: String,
         target: String,
         hunks: usize,
+    },
+    /// Estimated context used by the next model request. The UI renders this
+    /// as a live meter; provider-reported usage replaces it after the turn.
+    ContextBudget {
+        budget: crate::agent::chat::ContextBudget,
     },
     /// One tool call was processed: the policy ruled and the outcome is
     /// recorded (`allowed: false` means the call never executed).

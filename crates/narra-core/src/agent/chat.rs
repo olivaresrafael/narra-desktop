@@ -395,6 +395,64 @@ struct BuildPrompt {
     sources: Vec<ContextSource>,
 }
 
+/// Coarse token estimate for the current request. Tokenization is provider
+/// specific; the value is a documented `chars / 4` approximation until the
+/// provider reports exact usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBudget {
+    pub estimated_input_tokens: u32,
+    pub context_window: Option<u32>,
+    pub system_tokens: u32,
+    pub prompt_tokens: u32,
+    pub history_tokens: u32,
+    pub tools_tokens: u32,
+}
+
+fn estimate_tokens(chars: usize) -> u32 {
+    let tokens = chars.div_ceil(4);
+    tokens.min(u32::MAX as usize) as u32
+}
+
+fn context_budget(
+    system: &str,
+    prompt: &str,
+    history: &[ChatMessage],
+    specs: &[tools::ToolSpec],
+    context_window: Option<u32>,
+) -> ContextBudget {
+    let system_tokens = estimate_tokens(system.chars().count());
+    let prompt_tokens = estimate_tokens(prompt.chars().count());
+    let history_chars: usize = history
+        .iter()
+        .map(|message| {
+            message.content.chars().count()
+                + message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        call.name.chars().count() + call.arguments.to_string().chars().count()
+                    })
+                    .sum::<usize>()
+        })
+        .sum();
+    let history_tokens = estimate_tokens(history_chars);
+    let tools_chars = serde_json::to_string(specs)
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    let tools_tokens = estimate_tokens(tools_chars);
+    ContextBudget {
+        estimated_input_tokens: system_tokens
+            .saturating_add(prompt_tokens)
+            .saturating_add(history_tokens)
+            .saturating_add(tools_tokens),
+        context_window,
+        system_tokens,
+        prompt_tokens,
+        history_tokens,
+        tools_tokens,
+    }
+}
+
 /// Explicit chat input. A fresh task is built for each user turn; prior
 /// conversation and attachments are inputs, never hidden global state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +468,8 @@ pub struct ChatTask {
     /// Trusted skills available to `load_skill`; only metadata goes in the
     /// prompt until the model asks for a body.
     pub skills: Vec<Skill>,
+    /// Provider catalog context window for this model, when known.
+    pub context_window: Option<u32>,
 }
 
 impl ChatTask {
@@ -429,11 +489,17 @@ impl ChatTask {
             attachments: Vec::new(),
             include_project_context: false,
             skills: Vec::new(),
+            context_window: None,
         }
     }
 
     pub fn with_attachments(mut self, attachments: Vec<ChatAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
+        self.context_window = context_window;
         self
     }
 
@@ -617,6 +683,15 @@ impl ChatTask {
                 tools: specs.clone(),
                 history: history.clone(),
             };
+            emit(TaskEvent::ContextBudget {
+                budget: context_budget(
+                    &request.system,
+                    &request.prompt,
+                    &request.history,
+                    &request.tools,
+                    self.context_window,
+                ),
+            });
             let response = if options.stream {
                 adapter.complete_streaming(&request, &options.cancel, &mut |delta| {
                     emit(TaskEvent::ModelDelta {
@@ -1194,6 +1269,17 @@ mod tests {
         let proposals = output.data["proposals"].as_array().expect("proposals");
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0]["target"], "bible/characters/marta.md");
+    }
+
+    #[test]
+    fn context_budget_estimates_prompt_history_and_tools() {
+        let budget = context_budget("12345678", "1234", &[], &[], Some(1_000_000));
+        assert_eq!(budget.system_tokens, 2);
+        assert_eq!(budget.prompt_tokens, 1);
+        assert_eq!(budget.history_tokens, 0);
+        assert_eq!(budget.tools_tokens, 1);
+        assert_eq!(budget.estimated_input_tokens, 4);
+        assert_eq!(budget.context_window, Some(1_000_000));
     }
 
     #[test]

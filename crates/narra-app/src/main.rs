@@ -166,10 +166,10 @@ use gpui::{
 use i18n::Lang;
 use narra_core::agent::{
     AgentError, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask, ChatThread,
-    LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
-    ProjectScaffoldTask, ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill, SkillOrigin,
-    TaskOptions, active_skills, fetch_model_ids, load_scope, load_skills, proposal, roles,
-    trust_skill, untrusted_project_skills, write_plan,
+    LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
+    OpenAiCompatConfig, ProjectScaffoldTask, ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill,
+    SkillOrigin, TaskOptions, active_skills, fetch_model_ids, fetch_models, load_scope,
+    load_skills, proposal, roles, trust_skill, untrusted_project_skills, write_plan,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
@@ -860,7 +860,7 @@ struct ChatMentionItem {
 enum ChatModelsMessage {
     Done {
         request: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<ModelInfo>, String>,
     },
 }
 
@@ -1015,6 +1015,99 @@ impl gpui::Render for GitTooltip {
                     .text_color(rgb(theme::status_fg()))
                     .child(self.description.clone()),
             )
+    }
+}
+
+struct ChatContextTooltip {
+    lang: Lang,
+    used: u32,
+    limit: Option<u32>,
+    percent: Option<f32>,
+    cost: Option<f64>,
+    system: u32,
+    prompt: u32,
+    history: u32,
+    tools: u32,
+}
+
+impl gpui::Render for ChatContextTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let t = |key: &str| i18n::tr(self.lang, key).to_string();
+        let summary = match self.limit {
+            Some(limit) if limit > 0 => format!(
+                "{}% · {} / {}",
+                self.percent.unwrap_or(0.0).round() as u32,
+                compact_tokens(self.used),
+                compact_tokens(limit)
+            ),
+            _ => format!(
+                "~{} tokens · {}",
+                compact_tokens(self.used),
+                t("chat.context.unknown_limit")
+            ),
+        };
+        let cost = self
+            .cost
+            .map(|cost| format!("≈ ${cost:.4} USD"))
+            .unwrap_or_else(|| t("chat.context.no_cost"));
+        let rows = [
+            ("chat.context.system", self.system),
+            ("chat.context.prompt", self.prompt),
+            ("chat.context.history", self.history),
+            ("chat.context.tools", self.tools),
+        ];
+        let mut card = div()
+            .w(px(250.0))
+            .p_2()
+            .bg(rgb(theme::explorer_bg()))
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_sm()
+            .child(
+                div()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(t("chat.context.title")),
+            )
+            .child(div().text_color(rgb(theme::default_fg())).child(summary))
+            .child(div().h(px(1.0)).w_full().bg(rgb(theme::explorer_border())))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(t("chat.context.cost"))
+                    .child(cost),
+            );
+        for (key, tokens) in rows {
+            card = card.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(t(key))
+                    .child(compact_tokens(tokens)),
+            );
+        }
+        card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::gutter_fg()))
+                .child(t("chat.context.approx")),
+        )
+    }
+}
+
+fn compact_tokens(tokens: u32) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -1978,7 +2071,7 @@ struct Editor {
     chat_context_selected: usize,
     /// Models shown in the inline picker; refreshed from the provider when
     /// the picker opens.
-    chat_models: Vec<String>,
+    chat_models: Vec<ModelInfo>,
     chat_models_request: u64,
     chat_models_loading: bool,
     /// Scroll state of the chat transcript (M16 slice 4); the app draws the
@@ -13856,6 +13949,9 @@ impl Editor {
         self.right_tab = RightTab::Chat;
         self.chat.focused = true;
         self.chat_history_open = false;
+        if self.chat_models.is_empty() && !self.chat_models_loading {
+            self.chat_prepare_models(cx);
+        }
         window.focus(&self.focus_handle(cx));
         cx.notify();
     }
@@ -14086,10 +14182,12 @@ impl Editor {
         let generation = self.chat_generation;
         let cancel = CancellationToken::new();
         self.chat_cancel = Some(cancel.clone());
+        let context_window = self.chat_model_info().and_then(|model| model.context_limit);
         let task = ChatTask::new(root, mode, history, instruction)
             .with_attachments(attachments)
             .with_project_context(true)
-            .with_skills(self.skills.clone());
+            .with_skills(self.skills.clone())
+            .with_context_window(context_window);
         let mut settings = self.agent_settings.clone();
         settings.session = Some(format!("narra-chat-{}", self.chat.thread.id));
         let (tx, rx) = mpsc::channel();
@@ -14537,19 +14635,25 @@ impl Editor {
         cx.notify();
     }
 
+    fn chat_model_info(&self) -> Option<&ModelInfo> {
+        self.chat_models
+            .iter()
+            .find(|model| model.id == self.agent_settings.model)
+    }
+
     fn chat_prepare_models(&mut self, cx: &mut Context<Self>) {
         let provider = self.agent_settings.provider;
         let mut models = provider
             .known_models()
             .iter()
-            .map(|model| (*model).to_string())
+            .map(|model| ModelInfo::from_id(*model))
             .collect::<Vec<_>>();
         if !self.agent_settings.model.trim().is_empty()
             && !models
                 .iter()
-                .any(|model| model == &self.agent_settings.model)
+                .any(|model| model.id == self.agent_settings.model)
         {
-            models.insert(0, self.agent_settings.model.clone());
+            models.insert(0, ModelInfo::from_id(self.agent_settings.model.clone()));
         }
         self.chat_models = models;
         self.chat_models_loading = false;
@@ -14565,7 +14669,7 @@ impl Editor {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let key = resolve_provider_key(provider).ok().flatten();
-            let result = fetch_model_ids(&models_url, key.as_deref(), Duration::from_secs(20))
+            let result = fetch_models(&models_url, key.as_deref(), Duration::from_secs(20))
                 .map_err(|error| error.to_string());
             let _ = tx.send(ChatModelsMessage::Done { request, result });
         });
@@ -14577,8 +14681,8 @@ impl Editor {
             view.chat_models_loading = false;
             match result {
                 Ok(mut models) => {
-                    models.sort();
-                    models.dedup();
+                    models.sort_by(|a, b| a.id.cmp(&b.id));
+                    models.dedup_by(|a, b| a.id == b.id);
                     if !models.is_empty() {
                         view.chat_models = models;
                     }
@@ -15839,8 +15943,8 @@ impl Editor {
             );
         }
         for (index, model) in self.chat_models.iter().enumerate() {
-            let selected = model == &self.agent_settings.model;
-            let choice = model.clone();
+            let selected = model.id == self.agent_settings.model;
+            let choice = model.id.clone();
             model_menu = model_menu.child(
                 div()
                     .id(("chat-model-choice", index))
@@ -15913,6 +16017,69 @@ impl Editor {
             theme::gutter_fg()
         };
         let follow_tip = self.git_tooltip(cx, "", self.t("chat.follow").to_string());
+        let model_info = self.chat_model_info();
+        let budget = self.chat.context_budget.as_ref();
+        let context_limit = budget
+            .and_then(|budget| budget.context_window)
+            .or(model_info.and_then(|model| model.context_limit));
+        let context_used = self
+            .chat
+            .last_run_input_tokens
+            .or(budget.map(|budget| budget.estimated_input_tokens))
+            .unwrap_or(0);
+        let context_percent = context_limit
+            .filter(|limit| *limit > 0)
+            .map(|limit| (context_used as f32 / limit as f32 * 100.0).clamp(0.0, 999.0));
+        let input_price = model_info
+            .and_then(|model| model.input_price_per_million)
+            .or((self.app_settings.input_price_per_million > 0.0)
+                .then_some(self.app_settings.input_price_per_million));
+        let output_price = model_info
+            .and_then(|model| model.output_price_per_million)
+            .or((self.app_settings.output_price_per_million > 0.0)
+                .then_some(self.app_settings.output_price_per_million));
+        let output_tokens = self.chat.last_run_output_tokens.unwrap_or(0);
+        let context_cost = if input_price.is_some() || output_price.is_some() {
+            Some(
+                context_used as f64 / 1_000_000.0 * input_price.unwrap_or(0.0)
+                    + output_tokens as f64 / 1_000_000.0 * output_price.unwrap_or(0.0),
+            )
+        } else {
+            None
+        };
+        let context_tip: gpui::AnyView = cx
+            .new(|_| ChatContextTooltip {
+                lang: self.lang,
+                used: context_used,
+                limit: context_limit,
+                percent: context_percent,
+                cost: context_cost,
+                system: budget.map(|budget| budget.system_tokens).unwrap_or(0),
+                prompt: budget.map(|budget| budget.prompt_tokens).unwrap_or(0),
+                history: budget.map(|budget| budget.history_tokens).unwrap_or(0),
+                tools: budget.map(|budget| budget.tools_tokens).unwrap_or(0),
+            })
+            .into();
+        let context_color = match context_percent {
+            Some(percent) if percent >= 95.0 => theme::agent_err_fg(),
+            Some(percent) if percent >= 80.0 => theme::git_modified_fg(),
+            _ => theme::status_fg(),
+        };
+        let context_label = context_percent
+            .map(|percent| format!("{percent:.0}%"))
+            .unwrap_or_else(|| "–".to_string());
+        let context_button = div()
+            .id("chat-context")
+            .px_1()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .text_color(rgb(context_color))
+            .child(icon("gauge", context_color, 14.0))
+            .child(context_label)
+            .tooltip(move |_, _| context_tip.clone());
         div()
             .border_t_1()
             .border_color(rgb(theme::explorer_border()))
@@ -15992,6 +16159,9 @@ impl Editor {
                             .tooltip(move |_, _| follow_tip.clone())
                             .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_follow(cx))),
                     )
+                    .when(self.agent_settings.provider != AiProvider::Mock, |row| {
+                        row.child(context_button)
+                    })
                     .child(
                         div()
                             .id("chat-mode")

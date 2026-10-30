@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::AgentError;
@@ -77,15 +78,47 @@ impl OpenAiCompatConfig {
     }
 }
 
-/// Fetch model ids from an OpenAI-style `/models` endpoint. `models_url` is
-/// explicit because gateways such as OpenCode Zen/Go expose the catalog at a
-/// different path from their chat-completions base URL. The key, when
-/// present, only travels in the Authorization header; errors are redacted.
-pub fn fetch_model_ids(
+/// Catalog metadata for one model. Optional fields stay `None` when the
+/// provider does not advertise them; the UI never invents a limit or price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_per_million: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price_per_million: Option<f64>,
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default)]
+    pub tools: bool,
+    #[serde(default)]
+    pub image_input: bool,
+}
+
+impl ModelInfo {
+    /// Metadata-less fallback for curated model ids.
+    pub fn from_id(id: impl Into<String>) -> Self {
+        let id = id.into();
+        Self {
+            name: id.clone(),
+            id,
+            ..Self::default()
+        }
+    }
+}
+
+/// Fetch the full catalog with limits and prices. The OpenAI-compatible
+/// `/models` route is the same one used by `fetch_model_ids`.
+pub fn fetch_models(
     models_url: &str,
     api_key: Option<&str>,
     timeout: Duration,
-) -> Result<Vec<String>, AgentError> {
+) -> Result<Vec<ModelInfo>, AgentError> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
@@ -116,21 +149,88 @@ pub fn fetch_model_ids(
             crate::git::redact_secrets(&detail)
         )));
     }
-    Ok(parse_model_ids(&payload))
+    Ok(parse_model_infos(&payload))
 }
 
-fn parse_model_ids(payload: &Value) -> Vec<String> {
+/// Fetch model ids from an OpenAI-style `/models` endpoint. Kept as a thin
+/// wrapper for callers that only need the picker labels.
+pub fn fetch_model_ids(
+    models_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<String>, AgentError> {
+    Ok(fetch_models(models_url, api_key, timeout)?
+        .into_iter()
+        .map(|model| model.id)
+        .collect())
+}
+
+fn parse_model_infos(payload: &Value) -> Vec<ModelInfo> {
     payload
         .get("data")
         .and_then(Value::as_array)
         .map(|entries| {
             entries
                 .iter()
-                .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-                .map(str::to_string)
+                .filter_map(|entry| {
+                    let id = entry.get("id").and_then(Value::as_str)?;
+                    let context = entry
+                        .pointer("/limit/context")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.min(u32::MAX as u64) as u32);
+                    let output = entry
+                        .pointer("/limit/output")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.min(u32::MAX as u64) as u32);
+                    let input_price = entry
+                        .pointer("/cost/text/input/price")
+                        .and_then(Value::as_f64);
+                    let output_price = entry
+                        .pointer("/cost/text/output/price")
+                        .and_then(Value::as_f64);
+                    let modalities = entry
+                        .pointer("/modalities/input")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .any(|mime| mime.starts_with("image"))
+                        })
+                        .unwrap_or(false);
+                    Some(ModelInfo {
+                        id: id.to_string(),
+                        name: entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(id)
+                            .to_string(),
+                        context_limit: context,
+                        output_limit: output,
+                        input_price_per_million: input_price,
+                        output_price_per_million: output_price,
+                        reasoning: entry
+                            .pointer("/capabilities/reasoning/supported")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        tools: entry
+                            .pointer("/capabilities/tools/supported")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        image_input: modalities,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn parse_model_ids(payload: &Value) -> Vec<String> {
+    parse_model_infos(payload)
+        .into_iter()
+        .map(|model| model.id)
+        .collect()
 }
 
 /// The single provider adapter: OpenAI wire format, any compatible server.
@@ -698,6 +798,34 @@ mod tests {
     fn missing_choices_is_an_actionable_error() {
         let error = parse_response(json!({"model": "x"})).expect_err("fail");
         assert!(error.to_string().contains("choices[0]"), "{error}");
+    }
+
+    #[test]
+    fn model_catalog_metadata_is_parsed() {
+        let payload: Value = serde_json::from_str(
+            r#"{"data":[{
+                "id":"deepseek-v4.1-flash",
+                "name":"DeepSeek V4.1 Flash",
+                "limit":{"context":1000000,"output":384000},
+                "cost":{"text":{"input":{"price":0.15},"output":{"price":0.6}}},
+                "capabilities":{"reasoning":{"supported":true},"tools":{"supported":true}},
+                "modalities":{"input":["text","image/png"]}
+            },{"id":"plain-model"}]}"#,
+        )
+        .expect("json");
+        let models = parse_model_infos(&payload);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "deepseek-v4.1-flash");
+        assert_eq!(models[0].name, "DeepSeek V4.1 Flash");
+        assert_eq!(models[0].context_limit, Some(1_000_000));
+        assert_eq!(models[0].output_limit, Some(384_000));
+        assert_eq!(models[0].input_price_per_million, Some(0.15));
+        assert_eq!(models[0].output_price_per_million, Some(0.6));
+        assert!(models[0].reasoning);
+        assert!(models[0].tools);
+        assert!(models[0].image_input);
+        assert_eq!(models[1].name, "plain-model");
+        assert_eq!(models[1].context_limit, None);
     }
 
     #[test]

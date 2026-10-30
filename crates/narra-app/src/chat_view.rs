@@ -10,7 +10,7 @@
 
 use narra_core::agent::{
     AgentError, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatProposalRef,
-    ChatThread, ContextSource, TaskEvent, TaskOutput,
+    ChatThread, ContextBudget, ContextSource, TaskEvent, TaskOutput,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +138,11 @@ pub struct ChatUiState {
     pub usage_reported: bool,
     /// Estimated cost for the persisted thread, in micro-USD.
     pub cost_micros: Option<u64>,
+    /// Latest context estimate emitted by the core for the running turn.
+    pub context_budget: Option<ContextBudget>,
+    /// Provider-reported tokens for the most recent turn, when available.
+    pub last_run_input_tokens: Option<u32>,
+    pub last_run_output_tokens: Option<u32>,
 }
 
 impl ChatUiState {
@@ -157,6 +162,9 @@ impl ChatUiState {
             output_tokens: 0,
             usage_reported: false,
             cost_micros: None,
+            context_budget: None,
+            last_run_input_tokens: None,
+            last_run_output_tokens: None,
         }
     }
 
@@ -184,6 +192,9 @@ impl ChatUiState {
             output_tokens,
             usage_reported: input_tokens > 0 || output_tokens > 0,
             cost_micros,
+            context_budget: None,
+            last_run_input_tokens: None,
+            last_run_output_tokens: None,
         }
     }
 
@@ -233,6 +244,9 @@ impl ChatUiState {
         self.error.clear();
         self.sources.clear();
         self.streaming.clear();
+        self.context_budget = None;
+        self.last_run_input_tokens = None;
+        self.last_run_output_tokens = None;
     }
 
     pub fn apply_event(&mut self, event: &TaskEvent) {
@@ -242,6 +256,9 @@ impl ChatUiState {
             }
             TaskEvent::Progress { stage, .. } => {
                 self.stage = stage.clone();
+            }
+            TaskEvent::ContextBudget { budget } => {
+                self.context_budget = Some(budget.clone());
             }
             TaskEvent::ContextCollected { sources } => {
                 let run = self.thread.current_run();
@@ -370,6 +387,8 @@ impl ChatUiState {
                     let run_output = output.data["output_tokens"].as_u64().unwrap_or(0) as u32;
                     self.input_tokens = self.input_tokens.saturating_add(run_input);
                     self.output_tokens = self.output_tokens.saturating_add(run_output);
+                    self.last_run_input_tokens = Some(run_input);
+                    self.last_run_output_tokens = Some(run_output);
                     self.thread.usage.input_tokens =
                         self.thread.usage.input_tokens.saturating_add(run_input);
                     self.thread.usage.output_tokens =
@@ -493,6 +512,7 @@ impl ChatUiState {
             "{{\"thread\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"status\":\"{}\",\
              \"input\":\"{}\",\"focused\":{},\"streaming\":\"{}\",\"error\":\"{}\",\
              \"sources\":{},\"attachments\":{},\"usage\":{{\"input\":{},\"output\":{},\"reported\":{},\"cost_micros\":{}}},\
+             \"context\":{{\"estimated\":{},\"limit\":{},\"last_input\":{}}},\
              \"activities\":[{}],\"messages\":[{}],\"proposals\":[{}]}}",
             json_escape(&self.thread.id),
             json_escape(&self.thread.title),
@@ -508,6 +528,18 @@ impl ChatUiState {
             self.output_tokens,
             self.usage_reported,
             self.cost_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.context_budget
+                .as_ref()
+                .map(|budget| budget.estimated_input_tokens.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.context_budget
+                .as_ref()
+                .and_then(|budget| budget.context_window)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.last_run_input_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             activities,
@@ -733,6 +765,35 @@ mod tests {
         assert_eq!(chat.thread.activities[0].run, 0);
         assert_eq!(chat.thread.activities[2].proposal_id.as_deref(), Some("p1"));
         assert_eq!(chat.thread.activities[1].target, "faro");
+    }
+
+    #[test]
+    fn context_budget_updates_during_the_run_and_exact_usage_replaces_it() {
+        let mut chat = ChatUiState::new(ChatMode::Plan);
+        chat.begin_run("hola".to_string(), Vec::new());
+        chat.apply_event(&TaskEvent::ContextBudget {
+            budget: ContextBudget {
+                estimated_input_tokens: 900,
+                context_window: Some(10_000),
+                system_tokens: 100,
+                prompt_tokens: 700,
+                history_tokens: 50,
+                tools_tokens: 50,
+            },
+        });
+        assert_eq!(
+            chat.context_budget
+                .as_ref()
+                .map(|b| b.estimated_input_tokens),
+            Some(900)
+        );
+        let mut task = output("ok", serde_json::json!([]));
+        task.data["input_tokens"] = serde_json::json!(12);
+        task.data["output_tokens"] = serde_json::json!(7);
+        task.data["usage_reported"] = serde_json::json!(true);
+        chat.finish_with_prices(Ok(task), 0.0, 0.0);
+        assert_eq!(chat.last_run_input_tokens, Some(12));
+        assert_eq!(chat.last_run_output_tokens, Some(7));
     }
 
     #[test]
