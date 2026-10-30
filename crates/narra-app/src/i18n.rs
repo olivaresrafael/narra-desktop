@@ -889,6 +889,22 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("chat.change_summary", "{n} change(s)", "{n} cambio(s)"),
     ("chat.open_file", "Open file", "Abrir archivo"),
     (
+        "chat.review_in_file",
+        "Review in file",
+        "Revisar en archivo",
+    ),
+    (
+        "chat.review_title",
+        "Reviewing {target}",
+        "Revisando {target}",
+    ),
+    ("chat.review_close", "Close review", "Cerrar revisión"),
+    (
+        "chat.review_hint",
+        "Review the proposal; apply it only when it is ready.",
+        "Revisa la propuesta; aplícala solo cuando esté lista.",
+    ),
+    (
         "chat.following_file",
         "Editing {target}",
         "Editando {target}",
@@ -994,6 +1010,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("chat.follow_on", "Following", "Siguiendo"),
     ("chat.follow_off", "Paused", "Pausado"),
     ("chat.new_thread", "New thread", "Nuevo hilo"),
+    ("chat.expand", "Expand chat", "Expandir chat"),
+    (
+        "chat.collapse",
+        "Restore chat width",
+        "Restaurar ancho del chat",
+    ),
     ("chat.settings", "Settings…", "Ajustes…"),
     ("chat.skills", "Skills…", "Skills…"),
     (

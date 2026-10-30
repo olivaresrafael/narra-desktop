@@ -2062,6 +2062,9 @@ struct Editor {
     chat_menu: Option<ChatMenu>,
     /// Whether the transcript follows new agent text (Zed's follow mode).
     chat_follow: bool,
+    /// Whether the chat panel is expanded; the previous width is restored
+    /// when it collapses.
+    chat_restore_width: Option<f32>,
     /// `@` autocomplete query and selected row.
     chat_mention: Option<ChatMentionState>,
     /// Submenu opened from `+` (files, entities, …). `None` means the
@@ -2081,6 +2084,9 @@ struct Editor {
     preview_scroll: ScrollHandle,
     /// Scroll state for the explorer tree, separate from the fixed header.
     explorer_scroll: ScrollHandle,
+    /// Proposal shown in the editor as a review diff, if any.
+    proposal_review_id: Option<String>,
+    proposal_review_scroll: ScrollHandle,
     /// Active chat-scrollbar drag.
     chat_scroll_drag: Option<ChatScrollDrag>,
     /// Parsed Markdown for assistant turns, keyed by a content hash (M16
@@ -2183,6 +2189,7 @@ impl Editor {
         }
         self.check_backup_notice();
         self.chat.focused = false;
+        self.proposal_review_id = None;
         // The preview scroll handle is per active surface, not per tab; a new
         // tab starts at the top rather than inheriting the previous offset.
         self.preview_scroll = ScrollHandle::new();
@@ -12205,6 +12212,11 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.proposal_review_id.is_some() {
+            self.proposal_review_id = None;
+            cx.notify();
+            return;
+        }
         if self.chat_menu.is_some() || self.chat_mention.is_some() {
             self.chat_menu = None;
             self.chat_mention = None;
@@ -14344,6 +14356,16 @@ impl Editor {
         cx.notify();
     }
 
+    fn chat_toggle_expand(&mut self, cx: &mut Context<Self>) {
+        if let Some(width) = self.chat_restore_width.take() {
+            self.right_panel_w = width;
+        } else {
+            self.chat_restore_width = Some(self.right_panel_w);
+            self.right_panel_w = 720.0;
+        }
+        cx.notify();
+    }
+
     fn current_scene_number(&self) -> Option<usize> {
         let caret_line = self.doc.buffer.position_at(self.caret()).line;
         scene_number_at(&self.doc.scene_lines, caret_line)
@@ -15228,6 +15250,16 @@ impl Editor {
             .text_sm()
             .font_family(FONT_FAMILY)
             .child(self.right_tab_bar(cx));
+        let expand_tip = self.git_tooltip(
+            cx,
+            "",
+            self.t(if self.chat_restore_width.is_some() {
+                "chat.collapse"
+            } else {
+                "chat.expand"
+            })
+            .to_string(),
+        );
         let header = div()
             .flex()
             .items_center()
@@ -15267,6 +15299,29 @@ impl Editor {
                     .text_color(rgb(theme::status_fg()))
                     .child(icon("plus", theme::status_fg(), 14.0))
                     .on_click(cx.listener(|this, _, _, cx| this.chat_new_thread(cx))),
+            )
+            .child(
+                div()
+                    .id("chat-expand")
+                    .px_1()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_color(rgb(if self.chat_restore_width.is_some() {
+                        theme::cue_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
+                    .child(icon(
+                        "expand",
+                        if self.chat_restore_width.is_some() {
+                            theme::cue_fg()
+                        } else {
+                            theme::status_fg()
+                        },
+                        14.0,
+                    ))
+                    .tooltip(move |_, _| expand_tip.clone())
+                    .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_expand(cx))),
             )
             .child(
                 div()
@@ -15669,6 +15724,7 @@ impl Editor {
             card = card.child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_1()
                     .child(
                         div()
@@ -15703,6 +15759,21 @@ impl Editor {
                                     this.chat_apply_proposal(id.clone(), window, cx)
                                 }
                             })),
+                    )
+                    .child(
+                        div()
+                            .id(chat_element_id("chat-review", &view.id))
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::cue_fg()))
+                            .child(self.t("chat.review_in_file"))
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, window, cx| {
+                                    this.open_proposal_review(id.clone(), window, cx)
+                                }
+                            })),
                     ),
             );
         }
@@ -15727,6 +15798,199 @@ impl Editor {
             );
         }
         card
+    }
+
+    fn open_proposal_review(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_chat_proposal_diffs();
+        let Some(view) = self.chat.proposal(&id) else {
+            return;
+        };
+        let target = view.target.clone();
+        let is_new = view.is_new;
+        if !is_new {
+            let _ = self.open_document_path(&target, true);
+        }
+        self.doc.diff.open = false;
+        self.doc.preview = false;
+        self.proposal_review_id = Some(id);
+        self.proposal_review_scroll = ScrollHandle::new();
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_proposal_review(&mut self, cx: &mut Context<Self>) {
+        self.proposal_review_id = None;
+        cx.notify();
+    }
+
+    fn proposal_review_view(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(id) = self.proposal_review_id.as_deref() else {
+            return div().into_any_element();
+        };
+        let Some(view) = self.chat.proposal(id) else {
+            return div().into_any_element();
+        };
+        let status_key = chat_proposal_status_key(view.status);
+        let status_color = match view.status {
+            ProposalCardStatus::Ready => theme::git_modified_fg(),
+            ProposalCardStatus::Applied => theme::git_added_fg(),
+            ProposalCardStatus::Rejected | ProposalCardStatus::Failed => theme::agent_err_fg(),
+        };
+        let file_name = view.target.rsplit('/').next().unwrap_or(&view.target);
+        let mut actions = div().flex().items_center().gap_1();
+        if view.status == ProposalCardStatus::Ready {
+            actions =
+                actions
+                    .child(
+                        div()
+                            .id(chat_element_id("review-reject", &view.id))
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("chat.reject"))
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, _, cx| {
+                                    this.chat_reject_proposal(id.clone(), cx);
+                                    this.proposal_review_id = None;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(chat_element_id("review-apply", &view.id))
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .bg(rgb(theme::status_bg()))
+                            .text_color(rgb(theme::default_fg()))
+                            .child(if view.armed {
+                                self.t("chat.apply_confirm")
+                            } else {
+                                self.t("chat.apply")
+                            })
+                            .on_click(cx.listener({
+                                let id = view.id.clone();
+                                move |this, _, window, cx| {
+                                    this.chat_apply_proposal(id.clone(), window, cx);
+                                    if this.chat.proposal(&id).is_some_and(|view| {
+                                        view.status == ProposalCardStatus::Applied
+                                    }) {
+                                        this.proposal_review_id = None;
+                                    }
+                                    cx.notify();
+                                }
+                            })),
+                    );
+        }
+        actions = actions.child(
+            div()
+                .id("review-close")
+                .px_2()
+                .py_1()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(rgb(theme::cue_fg()))
+                .child(self.t("chat.review_close"))
+                .on_click(cx.listener(|this, _, _, cx| this.close_proposal_review(cx))),
+        );
+        let toolbar = div()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::explorer_bg()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon("file-text", status_color, 14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.tf("chat.review_title", &[("target", file_name)])),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(status_color))
+                            .child(self.t(status_key)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1())
+                    .child(actions),
+            );
+        let mut rows = div()
+            .id("proposal-review")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .track_scroll(&self.proposal_review_scroll)
+            .overflow_y_scroll()
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+            .flex()
+            .flex_col()
+            .p_2()
+            .font_family("Menlo")
+            .text_xs();
+        for row in &view.diff_rows {
+            let (color, background) = match row.0 {
+                '+' => (
+                    theme::git_added_fg(),
+                    Some(rgba((theme::git_added_fg() << 8) | 0x22)),
+                ),
+                '-' => (
+                    theme::agent_err_fg(),
+                    Some(rgba((theme::agent_err_fg() << 8) | 0x22)),
+                ),
+                '#' => (theme::gutter_fg(), Some(rgb(theme::status_bg()))),
+                _ => (theme::status_fg(), None),
+            };
+            let mut line = div()
+                .w_full()
+                .px_2()
+                .py(px(1.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(rgb(color))
+                .child(format!("{}{}", row.0, row.1));
+            if let Some(background) = background {
+                line = line.bg(background);
+            }
+            rows = rows.child(line);
+        }
+        div()
+            .id("proposal-review-host")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::bg()))
+            .child(toolbar)
+            .child(rows)
+            .into_any_element()
     }
 
     fn chat_composer(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -18792,7 +19056,7 @@ impl Editor {
              \"chat_scroll_offset\":{},\"chat_scroll_max\":{},\"chat_at_bottom\":{},\
              \"preview_scroll_offset\":{},\"preview_scroll_max\":{},\"preview_scroll_viewport\":{},\
              \"explorer_scroll_offset\":{},\"explorer_scroll_max\":{},\"explorer_scroll_viewport\":{},\
-             \"window_title\":\"{}\"}}",
+             \"proposal_review\":\"{}\",\"window_title\":\"{}\"}}",
             self.explorer_open,
             self.agent_panel_open,
             self.git_panel_open,
@@ -18808,6 +19072,7 @@ impl Editor {
             f32::from(self.explorer_scroll.offset().y),
             f32::from(self.explorer_scroll.max_offset().height),
             f32::from(self.explorer_scroll.bounds().size.height),
+            escape_json(self.proposal_review_id.as_deref().unwrap_or("")),
             escape_json(&self.window_title)
         );
         let settings_dump = if let Some(state) = self.settings.as_ref() {
@@ -20401,7 +20666,9 @@ impl Render for Editor {
                                 column.child(self.tab_bar(cx))
                             })
                             .when(
-                                self.project.is_some() && self.active_is_markdown(),
+                                self.project.is_some()
+                                    && self.active_is_markdown()
+                                    && self.proposal_review_id.is_none(),
                                 |column| column.child(self.document_toolbar(cx)),
                             )
                             .child(
@@ -20417,7 +20684,10 @@ impl Render for Editor {
                             // The diff view replaces the buffer rows while open; the
                             // buffer list keeps its own (idle) scroll state so
                             // closing the diff restores the caret position.
-                            .when(self.doc.diff.open, |host| {
+                            .when(self.proposal_review_id.is_some(), |host| {
+                                host.child(self.proposal_review_view(window, cx))
+                            })
+                            .when(self.doc.diff.open && self.proposal_review_id.is_none(), |host| {
                                 host.child(
                                     list(self.doc.diff_list_state.clone(), {
                                         let entity = entity.clone();
@@ -20428,34 +20698,44 @@ impl Render for Editor {
                                     .size_full(),
                                 )
                             })
-                            .when(!self.doc.diff.open && self.doc.preview, |host| {
-                                host.child(
-                                    div()
-                                        .absolute()
-                                        .size_full()
-                                        .flex()
-                                        .on_scroll_wheel(cx.listener(
-                                            |_, _, _, cx| cx.notify(),
-                                        ))
-                                        .child(markdown_view::render(
-                                            &self.doc.preview_document,
-                                            self.lang,
-                                            &self.preview_scroll,
-                                        ))
-                                        .child(self.preview_scrollbar()),
-                                )
-                            })
-                            .when(!self.doc.diff.open && !self.doc.preview, |host| {
-                                host.child(
-                                    list(self.doc.list_state.clone(), {
-                                        let entity = entity.clone();
-                                        move |ix: usize, window: &mut Window, cx: &mut App| {
-                                            entity.read(cx).row(ix, window).into_any_element()
-                                        }
-                                    })
-                                    .size_full(),
-                                )
-                            })
+                            .when(
+                                !self.doc.diff.open
+                                    && self.doc.preview
+                                    && self.proposal_review_id.is_none(),
+                                |host| {
+                                    host.child(
+                                        div()
+                                            .absolute()
+                                            .size_full()
+                                            .flex()
+                                            .on_scroll_wheel(cx.listener(
+                                                |_, _, _, cx| cx.notify(),
+                                            ))
+                                            .child(markdown_view::render(
+                                                &self.doc.preview_document,
+                                                self.lang,
+                                                &self.preview_scroll,
+                                            ))
+                                            .child(self.preview_scrollbar()),
+                                    )
+                                },
+                            )
+                            .when(
+                                !self.doc.diff.open
+                                    && !self.doc.preview
+                                    && self.proposal_review_id.is_none(),
+                                |host| {
+                                    host.child(
+                                        list(self.doc.list_state.clone(), {
+                                            let entity = entity.clone();
+                                            move |ix: usize, window: &mut Window, cx: &mut App| {
+                                                entity.read(cx).row(ix, window).into_any_element()
+                                            }
+                                        })
+                                        .size_full(),
+                                    )
+                                },
+                            )
                             // Invisible overlay that registers the platform input
                             // handler for this frame: typing and IME flow into
                             // `EntityInputHandler` while the root has focus.
@@ -21350,12 +21630,15 @@ fn run() -> Result<(), String> {
                 chat_mention: None,
                 chat_context_filter: None,
                 chat_context_selected: 0,
+                chat_restore_width: None,
                 chat_models: Vec::new(),
                 chat_models_request: 0,
                 chat_models_loading: false,
                 chat_scroll: ScrollHandle::new(),
                 preview_scroll: ScrollHandle::new(),
                 explorer_scroll: ScrollHandle::new(),
+                proposal_review_id: None,
+                proposal_review_scroll: ScrollHandle::new(),
                 chat_scroll_drag: None,
                 chat_markdown: RefCell::new(HashMap::new()),
                 rename: None,
