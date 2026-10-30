@@ -971,6 +971,61 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("chat.mention_empty", "No matches", "Sin coincidencias"),
     (
+        "chat.menu.files",
+        "Files & Directories",
+        "Archivos y carpetas",
+    ),
+    (
+        "chat.menu.files_detail",
+        "Documents and folders in the project",
+        "Documentos y carpetas del proyecto",
+    ),
+    (
+        "chat.menu.entities",
+        "Characters & Entities",
+        "Personajes y entidades",
+    ),
+    (
+        "chat.menu.entities_detail",
+        "Dossiers allowed by this project type",
+        "Fichas permitidas por este tipo de proyecto",
+    ),
+    ("chat.menu.scenes", "Scenes", "Escenas"),
+    ("chat.menu.selection", "Selection", "Selección"),
+    ("chat.menu.threads", "Threads", "Hilos"),
+    (
+        "chat.menu.threads_detail",
+        "Open recent conversations",
+        "Abrir conversaciones recientes",
+    ),
+    ("chat.menu.git", "Git changes", "Cambios de Git"),
+    (
+        "chat.menu.git_detail",
+        "Open the Changes panel",
+        "Abrir el panel de Cambios",
+    ),
+    (
+        "chat.menu.git_unavailable",
+        "No Git repository in this project",
+        "Este proyecto no tiene repositorio Git",
+    ),
+    ("chat.menu.images", "Image…", "Imagen…"),
+    (
+        "chat.menu.file_picker_detail",
+        "Open the file picker",
+        "Abrir el selector de archivos",
+    ),
+    (
+        "chat.menu.images_detail",
+        "Image attachments are not supported yet",
+        "Las imágenes aún no se pueden adjuntar",
+    ),
+    (
+        "chat.menu.commands_hint",
+        "Type / for commands",
+        "Escribe / para comandos",
+    ),
+    (
         "chat.models_empty",
         "No models listed",
         "No hay modelos listados",

@@ -815,6 +815,7 @@ enum ChatRunMessage {
 enum ChatMenu {
     Compose,
     Model,
+    Mode,
     Top,
 }
 
@@ -824,15 +825,33 @@ struct ChatMentionState {
     selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatMentionCategory {
+    Files,
+    Entities,
+    Scenes,
+    Selection,
+    Threads,
+    Git,
+    Images,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatMentionAction {
     File(String),
     Scene,
     Selection,
+    CurrentDocument,
+    FilePicker,
+    OpenHistory,
+    OpenGit,
+    Disabled(String),
 }
 
 #[derive(Debug, Clone)]
 struct ChatMentionItem {
+    category: ChatMentionCategory,
+    icon: &'static str,
     label: String,
     detail: String,
     action: ChatMentionAction,
@@ -1952,6 +1971,11 @@ struct Editor {
     chat_follow: bool,
     /// `@` autocomplete query and selected row.
     chat_mention: Option<ChatMentionState>,
+    /// Submenu opened from `+` (files, entities, …). `None` means the
+    /// top-level category menu or an `@` search.
+    chat_context_filter: Option<ChatMentionCategory>,
+    /// Selected row in the top-level `+` category menu.
+    chat_context_selected: usize,
     /// Models shown in the inline picker; refreshed from the provider when
     /// the picker opens.
     chat_models: Vec<String>,
@@ -6935,8 +6959,13 @@ impl Editor {
             self.palette_move(-1, cx);
             return;
         }
-        if self.chat.focused && self.chat_mention.is_some() {
+        if self.chat_mention.is_some() {
             self.chat_mention_move(-1, cx);
+            return;
+        }
+        if self.chat_menu == Some(ChatMenu::Compose) && self.chat_mention.is_none() {
+            self.chat_context_selected = self.chat_context_selected.saturating_sub(1);
+            cx.notify();
             return;
         }
         if self.with_new_project_text(|field| field.move_up(false)) {
@@ -6957,8 +6986,14 @@ impl Editor {
             self.palette_move(1, cx);
             return;
         }
-        if self.chat.focused && self.chat_mention.is_some() {
+        if self.chat_mention.is_some() {
             self.chat_mention_move(1, cx);
+            return;
+        }
+        if self.chat_menu == Some(ChatMenu::Compose) && self.chat_mention.is_none() {
+            self.chat_context_selected =
+                (self.chat_context_selected + 1).min(CHAT_CONTEXT_CATEGORIES.len() - 1);
+            cx.notify();
             return;
         }
         if self.with_new_project_text(|field| field.move_down(false)) {
@@ -11545,7 +11580,14 @@ impl Editor {
             self.palette_activate(window, cx);
             return;
         }
-        if self.chat.focused && self.chat_mention.is_some() {
+        if self.chat_menu == Some(ChatMenu::Compose) && self.chat_mention.is_none() {
+            let index = self
+                .chat_context_selected
+                .min(CHAT_CONTEXT_CATEGORIES.len() - 1);
+            self.chat_accept_category(CHAT_CONTEXT_CATEGORIES[index], cx);
+            return;
+        }
+        if self.chat_mention.is_some() {
             let index = self
                 .chat_mention
                 .as_ref()
@@ -12073,6 +12115,7 @@ impl Editor {
         if self.chat_menu.is_some() || self.chat_mention.is_some() {
             self.chat_menu = None;
             self.chat_mention = None;
+            self.chat_context_filter = None;
             cx.notify();
             return;
         }
@@ -14034,6 +14077,7 @@ impl Editor {
             self.chat_scroll.scroll_to_bottom();
         }
         self.chat_mention = None;
+        self.chat_context_filter = None;
         self.chat_menu = None;
         self.chat.focused = true;
         self.agent_panel_open = true;
@@ -14165,7 +14209,23 @@ impl Editor {
     }
 
     fn chat_toggle_menu(&mut self, menu: ChatMenu, cx: &mut Context<Self>) {
+        if menu == ChatMenu::Compose {
+            if self.chat_menu == Some(ChatMenu::Compose) {
+                self.chat_menu = None;
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+            } else {
+                self.chat_menu = Some(ChatMenu::Compose);
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+                self.chat_context_selected = 0;
+            }
+            self.chat.focused = false;
+            cx.notify();
+            return;
+        }
         self.chat_mention = None;
+        self.chat_context_filter = None;
         if self.chat_menu == Some(menu) {
             self.chat_menu = None;
         } else {
@@ -14207,6 +14267,7 @@ impl Editor {
     fn chat_refresh_mention(&mut self) {
         match self.chat_mention_query() {
             Some(query) => {
+                self.chat_context_filter = None;
                 let selected = self
                     .chat_mention
                     .as_ref()
@@ -14227,6 +14288,54 @@ impl Editor {
         let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(query);
         let mut items = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
+
+        // Files and directories first: the most common context in the panel.
+        for path in explorer::visible_paths(&self.explorer, self.show_config_files)
+            .into_iter()
+            .filter(|path| explorer::is_attachable_path(path))
+            .filter(|path| {
+                !["bible/characters/", "bible/locations/", "bible/objects/"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            })
+            .take(4)
+        {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            if (matches(&name) || matches(&path)) && seen.insert(path.clone()) {
+                items.push(ChatMentionItem {
+                    category: ChatMentionCategory::Files,
+                    icon: "file-text",
+                    label: name,
+                    detail: path.clone(),
+                    action: ChatMentionAction::File(path),
+                });
+            }
+        }
+
+        // Explicit current-document and file-picker actions keep the old
+        // attach paths available without mixing modes into this menu.
+        let current_label = self.t("chat.attach_document").to_string();
+        if matches(&current_label) {
+            items.push(ChatMentionItem {
+                category: ChatMentionCategory::Files,
+                icon: "file-text",
+                label: current_label,
+                detail: self.doc.path.clone(),
+                action: ChatMentionAction::CurrentDocument,
+            });
+        }
+        let file_label = self.t("chat.attach_file").to_string();
+        if matches(&file_label) {
+            items.push(ChatMentionItem {
+                category: ChatMentionCategory::Files,
+                icon: "folder",
+                label: file_label,
+                detail: self.t("chat.menu.file_picker_detail").to_string(),
+                action: ChatMentionAction::FilePicker,
+            });
+        }
+
+        // Dossiers allowed by the active project type.
         for (kind, prefix) in [
             ("character", "bible/characters/"),
             ("location", "bible/locations/"),
@@ -14235,58 +14344,88 @@ impl Editor {
             if !self.profile.allows_entity(kind) {
                 continue;
             }
+            let mut entity_count = 0usize;
             for path in &self.explorer {
-                if !path.starts_with(prefix) {
+                if !path.starts_with(prefix) || entity_count >= 4 {
                     continue;
                 }
                 let name = path
                     .trim_start_matches(prefix)
                     .trim_end_matches(".md")
                     .to_string();
-                if matches(&name) {
-                    let label = format!("{}: {}", self.t(entity_kind_key(kind)), name);
-                    if seen.insert(path.clone()) {
-                        items.push(ChatMentionItem {
-                            label,
-                            detail: path.clone(),
-                            action: ChatMentionAction::File(path.clone()),
-                        });
-                    }
+                if matches(&name) && seen.insert(path.clone()) {
+                    items.push(ChatMentionItem {
+                        category: ChatMentionCategory::Entities,
+                        icon: "users",
+                        label: format!("{}: {}", self.t(entity_kind_key(kind)), name),
+                        detail: path.clone(),
+                        action: ChatMentionAction::File(path.clone()),
+                    });
+                    entity_count += 1;
                 }
             }
         }
-        for path in explorer::visible_paths(&self.explorer, self.show_config_files)
-            .into_iter()
-            .filter(|path| explorer::is_attachable_path(path))
-            .take(6)
-        {
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            if (matches(&name) || matches(&path)) && seen.insert(path.clone()) {
-                items.push(ChatMentionItem {
-                    label: name,
-                    detail: path.clone(),
-                    action: ChatMentionAction::File(path),
-                });
-            }
-        }
+
         if self.profile.screenplay
             && matches(self.t("chat.attach_scene"))
             && let Some(scene) = self.current_scene_number()
         {
             items.push(ChatMentionItem {
+                category: ChatMentionCategory::Scenes,
+                icon: "clapperboard",
                 label: format!("{} {}", self.t("chat.attach_scene"), scene),
                 detail: self.t("chat.mention_scene_detail").to_string(),
                 action: ChatMentionAction::Scene,
             });
         }
+
         if !self.doc.selected.is_empty() && matches(self.t("chat.attachment_selection")) {
             items.push(ChatMentionItem {
+                category: ChatMentionCategory::Selection,
+                icon: "copy",
                 label: self.t("chat.attachment_selection").to_string(),
                 detail: self.t("chat.mention_selection_detail").to_string(),
                 action: ChatMentionAction::Selection,
             });
         }
-        items.truncate(10);
+
+        if matches(self.t("chat.menu.threads")) {
+            items.push(ChatMentionItem {
+                category: ChatMentionCategory::Threads,
+                icon: "message-square",
+                label: self.t("chat.menu.threads").to_string(),
+                detail: self.t("chat.menu.threads_detail").to_string(),
+                action: ChatMentionAction::OpenHistory,
+            });
+        }
+
+        if self.project.is_some() {
+            let label = self.t("chat.menu.git").to_string();
+            if matches(&label) {
+                items.push(ChatMentionItem {
+                    category: ChatMentionCategory::Git,
+                    icon: "git-branch",
+                    label,
+                    detail: self.t("chat.menu.git_detail").to_string(),
+                    action: ChatMentionAction::OpenGit,
+                });
+            }
+        }
+
+        let image_label = self.t("chat.menu.images").to_string();
+        if matches(&image_label) {
+            items.push(ChatMentionItem {
+                category: ChatMentionCategory::Images,
+                icon: "image",
+                label: image_label,
+                detail: self.t("chat.menu.images_detail").to_string(),
+                action: ChatMentionAction::Disabled(self.t("chat.menu.images_detail").to_string()),
+            });
+        }
+
+        if let Some(filter) = self.chat_context_filter {
+            items.retain(|item| item.category == filter);
+        }
         items
     }
 
@@ -14305,18 +14444,96 @@ impl Editor {
         let Some(item) = self.chat_mention_items().get(index).cloned() else {
             return;
         };
-        if let Some(at) = self.chat.input.rfind('@') {
+        let from_button = self.chat_menu == Some(ChatMenu::Compose);
+        if !from_button && let Some(at) = self.chat.input.rfind('@') {
             self.chat.input.truncate(at);
             self.chat.input = self.chat.input.trim_end().to_string();
         }
         self.chat_mention = None;
+        self.chat_context_filter = None;
         self.chat_menu = None;
         match item.action {
             ChatMentionAction::File(path) => self.chat_attach_path(&path, cx),
             ChatMentionAction::Scene => self.chat_attach_scene(cx),
             ChatMentionAction::Selection => self.chat_attach_selection(cx),
+            ChatMentionAction::CurrentDocument => self.chat_attach_document(cx),
+            ChatMentionAction::FilePicker => self.chat_open_attach_file(cx),
+            ChatMentionAction::OpenHistory => {
+                self.chat_history_open = false;
+                self.chat_toggle_history(cx);
+            }
+            ChatMentionAction::OpenGit => {
+                self.git_panel_open = true;
+                self.explorer_open = true;
+                self.refresh_git_now(cx);
+                self.request_git_history(cx);
+                self.request_git_branches(cx);
+                self.git_remotes_stale = true;
+            }
+            ChatMentionAction::Disabled(reason) => {
+                self.notice = Some(reason);
+            }
         }
         self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn chat_accept_category(&mut self, category: ChatMentionCategory, cx: &mut Context<Self>) {
+        match category {
+            ChatMentionCategory::Files | ChatMentionCategory::Entities => {
+                self.chat_menu = Some(ChatMenu::Compose);
+                self.chat_context_filter = Some(category);
+                self.chat_mention = Some(ChatMentionState {
+                    query: String::new(),
+                    selected: 0,
+                });
+                self.chat.focused = false;
+            }
+            ChatMentionCategory::Scenes => {
+                self.chat_menu = None;
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+                self.chat_attach_scene(cx);
+            }
+            ChatMentionCategory::Selection => {
+                self.chat_menu = None;
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+                self.chat_attach_selection(cx);
+            }
+            ChatMentionCategory::Threads => {
+                self.chat_menu = None;
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+                self.chat_history_open = false;
+                self.chat_toggle_history(cx);
+            }
+            ChatMentionCategory::Git => {
+                self.chat_menu = None;
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+                self.git_panel_open = true;
+                self.explorer_open = true;
+                self.refresh_git_now(cx);
+                self.request_git_history(cx);
+                self.request_git_branches(cx);
+                self.git_remotes_stale = true;
+            }
+            ChatMentionCategory::Images => {
+                self.chat_menu = None;
+                self.chat_mention = None;
+                self.chat_context_filter = None;
+                self.notice = Some(self.t("chat.menu.images_detail").to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn chat_context_back(&mut self, cx: &mut Context<Self>) {
+        self.chat_menu = Some(ChatMenu::Compose);
+        self.chat_mention = None;
+        self.chat_context_filter = None;
+        self.chat_context_selected = 0;
         cx.notify();
     }
 
@@ -14419,6 +14636,7 @@ impl Editor {
         self.chat_markdown.borrow_mut().clear();
         self.chat_menu = None;
         self.chat_mention = None;
+        self.chat_context_filter = None;
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
         self.chat.focused = true;
@@ -14449,6 +14667,7 @@ impl Editor {
         self.chat_markdown.borrow_mut().clear();
         self.chat_menu = None;
         self.chat_mention = None;
+        self.chat_context_filter = None;
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
         self.chat_scroll.scroll_to_bottom();
@@ -15436,17 +15655,89 @@ impl Editor {
             );
         }
 
-        let mention_items = self.chat_mention_items();
-        let mut mention_list = div()
-            .id("chat-mention-list")
+        let mut context_menu = div()
+            .id("chat-context-menu")
             .mb_1()
-            .max_h(px(220.0))
+            .max_h(px(360.0))
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .border_1()
             .border_color(rgb(theme::explorer_border()))
             .bg(rgb(theme::bg()));
+        let categories = CHAT_CONTEXT_CATEGORIES;
+        for (index, category) in categories.into_iter().enumerate() {
+            let icon_name = chat_mention_category_icon(category);
+            let label_key = chat_mention_category_key(category);
+            let detail_key = chat_mention_category_detail_key(category);
+            let selected = index == self.chat_context_selected;
+            let disabled = category == ChatMentionCategory::Images;
+            let color = if disabled {
+                theme::gutter_fg()
+            } else {
+                theme::default_fg()
+            };
+            context_menu = context_menu.child(
+                div()
+                    .id(("chat-context-category", index))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .hover(|row| row.bg(rgb(theme::status_bg())))
+                    .child(icon(icon_name, color, 14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(color))
+                                    .child(self.t(label_key)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::gutter_fg()))
+                                    .child(self.t(detail_key)),
+                            ),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.chat_accept_category(category, cx)),
+                    ),
+            );
+        }
+
+        let mention_items = self.chat_mention_items();
+        let mut mention_list = div()
+            .id("chat-mention-list")
+            .mb_1()
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::bg()));
+        if let Some(filter) = self.chat_context_filter {
+            mention_list = mention_list.child(
+                div()
+                    .id("chat-context-back")
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::cue_fg()))
+                    .child(format!("← {}", self.t(chat_mention_category_key(filter))))
+                    .on_click(cx.listener(|this, _, _, cx| this.chat_context_back(cx))),
+            );
+        }
         if mention_items.is_empty() {
             mention_list = mention_list.child(
                 div()
@@ -15462,8 +15753,27 @@ impl Editor {
             .as_ref()
             .map(|state| state.selected)
             .unwrap_or(0);
+        let mut last_category: Option<ChatMentionCategory> = None;
         for (index, item) in mention_items.iter().enumerate() {
+            if last_category != Some(item.category) {
+                mention_list = mention_list.child(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t(chat_mention_category_key(item.category))),
+                );
+                last_category = Some(item.category);
+            }
             let selected = index == selected_mention;
+            let disabled = matches!(item.action, ChatMentionAction::Disabled(_));
+            let label_color = if disabled {
+                theme::gutter_fg()
+            } else {
+                theme::default_fg()
+            };
             mention_list = mention_list.child(
                 div()
                     .id(("chat-mention", index))
@@ -15474,15 +15784,22 @@ impl Editor {
                     .gap_2()
                     .cursor_pointer()
                     .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .child(icon(item.icon, label_color, 13.0))
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .text_sm()
-                            .text_color(rgb(theme::default_fg()))
+                            .text_color(rgb(label_color))
                             .child(item.label.clone()),
                     )
                     .child(
                         div()
+                            .max_w(px(150.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .text_xs()
                             .text_color(rgb(theme::gutter_fg()))
                             .child(item.detail.clone()),
@@ -15492,83 +15809,14 @@ impl Editor {
                     ),
             );
         }
-
-        let mut compose_menu = div()
-            .id("chat-compose-menu")
-            .mb_1()
-            .flex()
-            .flex_col()
-            .border_1()
-            .border_color(rgb(theme::explorer_border()))
-            .bg(rgb(theme::bg()));
-        for (index, mode) in ChatMode::ALL.into_iter().enumerate() {
-            let selected = self.chat.mode() == mode;
-            compose_menu = compose_menu.child(
-                div()
-                    .id(("chat-mode", index))
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
-                    .text_color(rgb(theme::default_fg()))
-                    .child(self.t(chat_mode_key(mode)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.chat_set_mode(mode, cx);
-                        this.chat_menu = None;
-                    })),
-            );
-        }
-        for (index, (label, action)) in [
-            ("chat.attach_scene", 0u8),
-            ("chat.attach_selection", 1),
-            ("chat.attach_document", 2),
-            ("chat.attach_file", 3),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            compose_menu = compose_menu.child(
-                div()
-                    .id(("chat-attach-action", index))
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .cursor_pointer()
-                    .text_color(rgb(theme::status_fg()))
-                    .hover(|row| row.bg(rgb(theme::status_bg())))
-                    .child(format!("@ {}", self.t(label)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.chat_menu = None;
-                        match action {
-                            0 => this.chat_attach_scene(cx),
-                            1 => this.chat_attach_selection(cx),
-                            2 => this.chat_attach_document(cx),
-                            _ => this.chat_open_attach_file(cx),
-                        }
-                    })),
-            );
-        }
-        for command in ["/rewrite", "/continuity", "/character"] {
-            compose_menu = compose_menu.child(
-                div()
-                    .id(command)
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .cursor_pointer()
-                    .text_color(rgb(theme::gutter_fg()))
-                    .hover(|row| row.bg(rgb(theme::status_bg())))
-                    .child(command)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.chat_menu = None;
-                        this.chat.focused = true;
-                        this.chat.set_input(format!("{command} "));
-                        window.focus(&this.focus_handle(cx));
-                        cx.notify();
-                    })),
-            );
-        }
+        mention_list = mention_list.child(
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(rgb(theme::gutter_fg()))
+                .child(t("chat.menu.commands_hint")),
+        );
 
         let mut model_menu = div()
             .id("chat-model-menu")
@@ -15623,6 +15871,37 @@ impl Editor {
             );
         }
 
+        let mut mode_menu = div()
+            .id("chat-mode-menu")
+            .mb_1()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::bg()));
+        for (index, mode) in ChatMode::ALL.into_iter().enumerate() {
+            let selected = self.chat.mode() == mode;
+            mode_menu = mode_menu.child(
+                div()
+                    .id(("chat-mode-choice", index))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
+                    .child(self.t(chat_mode_key(mode)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chat_set_mode(mode, cx);
+                        this.chat_menu = None;
+                    })),
+            );
+        }
+
         let input = if self.chat.input.is_empty() {
             format!("{}▌", t("chat.placeholder"))
         } else {
@@ -15643,14 +15922,18 @@ impl Editor {
             .flex_shrink_0()
             .gap_1()
             .child(attachments)
+            .when(
+                self.chat_menu == Some(ChatMenu::Compose) && self.chat_mention.is_none(),
+                |composer| composer.child(context_menu),
+            )
             .when(self.chat_mention.is_some(), |composer| {
                 composer.child(mention_list)
             })
-            .when(self.chat_menu == Some(ChatMenu::Compose), |composer| {
-                composer.child(compose_menu)
-            })
             .when(self.chat_menu == Some(ChatMenu::Model), |composer| {
                 composer.child(model_menu)
+            })
+            .when(self.chat_menu == Some(ChatMenu::Mode), |composer| {
+                composer.child(mode_menu)
             })
             .child(
                 div()
@@ -15708,6 +15991,23 @@ impl Editor {
                             .child(icon("crosshair", follow_color, 14.0))
                             .tooltip(move |_, _| follow_tip.clone())
                             .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_follow(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("chat-mode")
+                            .px_1()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t(chat_mode_key(self.chat.mode())))
+                            .child(icon("chevron-down", theme::status_fg(), 10.0))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chat_toggle_menu(ChatMenu::Mode, cx)
+                            })),
                     )
                     .child(
                         div()
@@ -19009,6 +19309,52 @@ fn entity_kind_key(kind: &str) -> &'static str {
     }
 }
 
+fn chat_mention_category_key(category: ChatMentionCategory) -> &'static str {
+    match category {
+        ChatMentionCategory::Files => "chat.menu.files",
+        ChatMentionCategory::Entities => "chat.menu.entities",
+        ChatMentionCategory::Scenes => "chat.menu.scenes",
+        ChatMentionCategory::Selection => "chat.menu.selection",
+        ChatMentionCategory::Threads => "chat.menu.threads",
+        ChatMentionCategory::Git => "chat.menu.git",
+        ChatMentionCategory::Images => "chat.menu.images",
+    }
+}
+
+const CHAT_CONTEXT_CATEGORIES: [ChatMentionCategory; 7] = [
+    ChatMentionCategory::Files,
+    ChatMentionCategory::Entities,
+    ChatMentionCategory::Scenes,
+    ChatMentionCategory::Selection,
+    ChatMentionCategory::Threads,
+    ChatMentionCategory::Git,
+    ChatMentionCategory::Images,
+];
+
+fn chat_mention_category_icon(category: ChatMentionCategory) -> &'static str {
+    match category {
+        ChatMentionCategory::Files => "folder",
+        ChatMentionCategory::Entities => "users",
+        ChatMentionCategory::Scenes => "clapperboard",
+        ChatMentionCategory::Selection => "copy",
+        ChatMentionCategory::Threads => "message-square",
+        ChatMentionCategory::Git => "git-branch",
+        ChatMentionCategory::Images => "image",
+    }
+}
+
+fn chat_mention_category_detail_key(category: ChatMentionCategory) -> &'static str {
+    match category {
+        ChatMentionCategory::Files => "chat.menu.files_detail",
+        ChatMentionCategory::Entities => "chat.menu.entities_detail",
+        ChatMentionCategory::Scenes => "chat.mention_scene_detail",
+        ChatMentionCategory::Selection => "chat.mention_selection_detail",
+        ChatMentionCategory::Threads => "chat.menu.threads_detail",
+        ChatMentionCategory::Git => "chat.menu.git_detail",
+        ChatMentionCategory::Images => "chat.menu.images_detail",
+    }
+}
+
 fn chat_mode_key(mode: ChatMode) -> &'static str {
     match mode {
         ChatMode::Plan => "chat.mode.plan",
@@ -20832,6 +21178,8 @@ fn run() -> Result<(), String> {
                 chat_menu: None,
                 chat_follow: true,
                 chat_mention: None,
+                chat_context_filter: None,
+                chat_context_selected: 0,
                 chat_models: Vec::new(),
                 chat_models_request: 0,
                 chat_models_loading: false,
