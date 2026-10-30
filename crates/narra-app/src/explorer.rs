@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use narra_core::ExplorerGroup;
+
 /// File kind, used for the explorer's icon (M10 S3c).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -122,6 +124,46 @@ pub fn build_rows(paths: &[String], collapsed: &HashSet<String>) -> Vec<Row> {
     let mut rows = Vec::new();
     emit("", 0, &dirs, &files, collapsed, &mut rows);
     rows
+}
+
+/// One tree row with the optional profile group that owns it. The UI inserts
+/// a section header when `group` changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedRow {
+    pub group: Option<String>,
+    pub row: Row,
+}
+
+/// Reorder top-level folder blocks into the profile's group order. Rows that
+/// are not owned by a group keep their original order after the grouped
+/// blocks. Nested rows always travel with their top-level folder.
+pub fn group_rows(rows: Vec<Row>, groups: &[ExplorerGroup]) -> Vec<GroupedRow> {
+    let mut used = vec![false; rows.len()];
+    let mut out = Vec::with_capacity(rows.len());
+    for group in groups {
+        for (index, row) in rows.iter().enumerate() {
+            if row.depth != 0 || !group.folders.iter().any(|folder| folder == &row.path) {
+                continue;
+            }
+            let mut cursor = index;
+            while cursor < rows.len() && (cursor == index || rows[cursor].depth > 0) {
+                if !used[cursor] {
+                    used[cursor] = true;
+                    out.push(GroupedRow {
+                        group: Some(group.id.clone()),
+                        row: rows[cursor].clone(),
+                    });
+                }
+                cursor += 1;
+            }
+        }
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if !used[index] {
+            out.push(GroupedRow { group: None, row });
+        }
+    }
+    out
 }
 
 /// Project-internal files hidden from the explorer by default (M10 S4c).
@@ -271,6 +313,45 @@ mod tests {
             !rows
                 .iter()
                 .any(|row| row.path == "screenplay/main.fountain")
+        );
+    }
+
+    #[test]
+    fn groups_reorder_top_level_blocks_and_keep_nested_rows() {
+        let rows = build_rows(&paths(), &HashSet::new());
+        let groups = vec![
+            ExplorerGroup {
+                id: "script".to_string(),
+                folders: vec!["screenplay".to_string()],
+            },
+            ExplorerGroup {
+                id: "story".to_string(),
+                folders: vec!["bible".to_string()],
+            },
+        ];
+        let grouped = group_rows(rows, &groups);
+        let sequence: Vec<(Option<&str>, usize, &str)> = grouped
+            .iter()
+            .map(|item| {
+                (
+                    item.group.as_deref(),
+                    item.row.depth,
+                    item.row.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![
+                (Some("script"), 0, "screenplay"),
+                (Some("script"), 1, "main.fountain"),
+                (Some("story"), 0, "bible"),
+                (Some("story"), 1, "characters"),
+                (Some("story"), 2, "marta.md"),
+                (Some("story"), 1, "world.md"),
+                (None, 0, "agents.yaml"),
+                (None, 0, "project.yaml"),
+            ]
         );
     }
 

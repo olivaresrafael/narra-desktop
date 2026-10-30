@@ -1251,6 +1251,10 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "↑↓ mover · Enter abrir · Esc cerrar",
     ),
     ("bar.language_native", "native", "nativo"),
+    ("explorer.group.story", "Story", "Historia"),
+    ("explorer.group.script", "Script", "Guion"),
+    ("explorer.group.research", "Research", "Investigación"),
+    ("explorer.group.notes", "Notes", "Notas"),
     ("panel.git_none", "no repository", "sin repositorio"),
     // --- human Git surface (M13) -----------------------------------------
     ("git.changes", "Changes", "Cambios"),

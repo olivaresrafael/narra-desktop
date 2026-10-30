@@ -57,7 +57,7 @@ pub use project::{
     create_project_from_type, open_project,
 };
 pub use project_type::{
-    ProjectProfile, ProjectTypePackage, TemplateFile, TypeCapabilities, TypeOrigin,
+    ExplorerGroup, ProjectProfile, ProjectTypePackage, TemplateFile, TypeCapabilities, TypeOrigin,
     TypePackageError, builtin, builtins, registry,
 };
 

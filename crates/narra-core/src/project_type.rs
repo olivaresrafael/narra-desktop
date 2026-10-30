@@ -125,6 +125,8 @@ pub struct TypeCapabilities {
     pub entity_kinds: Vec<String>,
     /// PDF export is available for this type.
     pub export_pdf: bool,
+    /// Explorer sections declared by the type, in display order.
+    pub explorer_groups: Vec<ExplorerGroup>,
 }
 
 impl TypeCapabilities {
@@ -137,8 +139,35 @@ impl TypeCapabilities {
                 "object".to_string(),
             ],
             export_pdf: true,
+            explorer_groups: vec![
+                ExplorerGroup {
+                    id: "story".to_string(),
+                    folders: vec!["bible".to_string(), "structure".to_string()],
+                },
+                ExplorerGroup {
+                    id: "script".to_string(),
+                    folders: vec!["screenplay".to_string()],
+                },
+                ExplorerGroup {
+                    id: "research".to_string(),
+                    folders: vec!["research".to_string()],
+                },
+                ExplorerGroup {
+                    id: "notes".to_string(),
+                    folders: vec!["notes".to_string(), "reviews".to_string()],
+                },
+            ],
         }
     }
+}
+
+/// One explorer section declared by a type. The app localizes `id` and shows
+/// the named top-level folders under that section. `folders` are
+/// project-relative, exactly as they appear in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplorerGroup {
+    pub id: String,
+    pub folders: Vec<String>,
 }
 
 /// UI-neutral view of one type's capabilities.
@@ -148,6 +177,7 @@ pub struct ProjectProfile {
     pub screenplay: bool,
     pub entity_kinds: Vec<String>,
     pub export_pdf: bool,
+    pub explorer_groups: Vec<ExplorerGroup>,
 }
 
 impl ProjectProfile {
@@ -158,6 +188,7 @@ impl ProjectProfile {
             screenplay: capabilities.screenplay,
             entity_kinds: capabilities.entity_kinds,
             export_pdf: capabilities.export_pdf,
+            explorer_groups: capabilities.explorer_groups,
         }
     }
 
@@ -173,6 +204,7 @@ impl Default for ProjectProfile {
             screenplay: false,
             entity_kinds: Vec::new(),
             export_pdf: false,
+            explorer_groups: Vec::new(),
         }
     }
 }
@@ -211,6 +243,7 @@ impl ProjectTypePackage {
             screenplay: self.capabilities.screenplay,
             entity_kinds: self.capabilities.entity_kinds.clone(),
             export_pdf: self.capabilities.export_pdf,
+            explorer_groups: self.capabilities.explorer_groups.clone(),
         }
     }
 
@@ -830,7 +863,10 @@ fn parse_capabilities(value: &Yaml) -> Result<TypeCapabilities, TypePackageError
             field: "capabilities",
             detail: "keys must be strings".to_string(),
         })?;
-        if !matches!(key, "screenplay" | "entity_kinds" | "export_pdf") {
+        if !matches!(
+            key,
+            "screenplay" | "entity_kinds" | "export_pdf" | "explorer_groups"
+        ) {
             return Err(TypePackageError::Invalid {
                 field: "capabilities",
                 detail: format!("unknown key `{key}`"),
@@ -855,11 +891,80 @@ fn parse_capabilities(value: &Yaml) -> Result<TypeCapabilities, TypePackageError
         Some(node) => string_sequence(node, "capabilities.entity_kinds")?,
         None => Vec::new(),
     };
+    let explorer_groups = match value.as_mapping_get("explorer_groups") {
+        Some(node) => parse_explorer_groups(node)?,
+        None => Vec::new(),
+    };
     Ok(TypeCapabilities {
         screenplay,
         entity_kinds,
         export_pdf,
+        explorer_groups,
     })
+}
+
+fn parse_explorer_groups(value: &Yaml) -> Result<Vec<ExplorerGroup>, TypePackageError> {
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "capabilities.explorer_groups",
+            detail: "must be a list".to_string(),
+        })?;
+    if sequence.len() > 8 {
+        return Err(TypePackageError::Invalid {
+            field: "capabilities.explorer_groups",
+            detail: "at most 8 groups are allowed".to_string(),
+        });
+    }
+    let mut groups = Vec::with_capacity(sequence.len());
+    let mut ids = BTreeSet::new();
+    for item in sequence {
+        let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field: "capabilities.explorer_groups",
+            detail: "each group must be a mapping".to_string(),
+        })?;
+        for key in mapping.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field: "capabilities.explorer_groups",
+                detail: "keys must be strings".to_string(),
+            })?;
+            if key != "id" && key != "folders" {
+                return Err(TypePackageError::Invalid {
+                    field: "capabilities.explorer_groups",
+                    detail: format!("unknown group key `{key}`"),
+                });
+            }
+        }
+        let id = mapping_get(mapping, "id")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "capabilities.explorer_groups",
+                detail: "each group needs a string `id`".to_string(),
+            })?
+            .to_string();
+        validate_id(&id)?;
+        if !ids.insert(id.clone()) {
+            return Err(TypePackageError::Invalid {
+                field: "capabilities.explorer_groups",
+                detail: format!("duplicate group `{id}`"),
+            });
+        }
+        let folders = match mapping_get(mapping, "folders") {
+            Some(node) => string_sequence(node, "capabilities.explorer_groups.folders")?,
+            None => Vec::new(),
+        };
+        if folders.len() > 16 {
+            return Err(TypePackageError::Invalid {
+                field: "capabilities.explorer_groups.folders",
+                detail: "at most 16 folders are allowed".to_string(),
+            });
+        }
+        for folder in &folders {
+            validate_relative_path("capabilities.explorer_groups.folders", folder)?;
+        }
+        groups.push(ExplorerGroup { id, folders });
+    }
+    Ok(groups)
 }
 
 fn mapping_get<'a>(mapping: &'a saphyr::Mapping<'a>, key: &str) -> Option<&'a Yaml<'a>> {
@@ -1172,15 +1277,31 @@ mod tests {
         assert!(!generic.profile().screenplay);
         assert!(generic.profile().entity_kinds.is_empty());
         assert!(!generic.profile().export_pdf);
+        assert!(generic.profile().explorer_groups.is_empty());
 
         let typed = parse_package(
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncapabilities:\n  screenplay: true\n  entity_kinds: [audience, channel]\n  export_pdf: true\n",
+            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncapabilities:\n  screenplay: true\n  entity_kinds: [audience, channel]\n  export_pdf: true\n  explorer_groups:\n    - id: campaign\n      folders: [brief, audiences]\n",
             TypeOrigin::User,
         )
         .expect("typed package");
         assert!(typed.profile().screenplay);
         assert_eq!(typed.profile().entity_kinds, ["audience", "channel"]);
         assert!(typed.profile().export_pdf);
+        assert_eq!(typed.profile().explorer_groups.len(), 1);
+        assert_eq!(typed.profile().explorer_groups[0].id, "campaign");
+        assert_eq!(
+            typed.profile().explorer_groups[0].folders,
+            ["brief", "audiences"]
+        );
+
+        let builtin = builtin("feature").expect("feature");
+        assert!(
+            builtin
+                .profile()
+                .explorer_groups
+                .iter()
+                .any(|group| group.id == "story" && group.folders.contains(&"bible".to_string()))
+        );
     }
 
     #[test]
