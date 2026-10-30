@@ -201,12 +201,16 @@ impl AiProvider {
 
 /// Persisted, non-secret preferences. `error` is load-time diagnostics only
 /// and is never written back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppSettings {
     // AI (v1)
     pub provider: AiProvider,
     pub base_url: String,
     pub model: String,
+    /// Optional manual prices per million tokens for the usage report. Zero
+    /// means "not configured"; the app never guesses provider pricing.
+    pub input_price_per_million: f64,
+    pub output_price_per_million: f64,
     // General (v2)
     pub language: LanguageSetting,
     pub theme: ThemeMode,
@@ -228,6 +232,8 @@ impl Default for AppSettings {
             provider: AiProvider::Mock,
             base_url: LOCAL_DEFAULT_BASE_URL.to_string(),
             model: String::new(),
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             language: LanguageSetting::System,
             theme: ThemeMode::System,
             font_size: 14,
@@ -312,6 +318,8 @@ impl AppSettings {
             model,
             ..Self::default()
         };
+        settings.input_price_per_million = optional_f64(object, "input_price_per_million", 0.0)?;
+        settings.output_price_per_million = optional_f64(object, "output_price_per_million", 0.0)?;
         if version >= 2 {
             settings.language = optional_enum(
                 object,
@@ -351,6 +359,8 @@ impl AppSettings {
             "provider": self.provider.key(),
             "base_url": self.base_url,
             "model": self.model,
+            "input_price_per_million": self.input_price_per_million,
+            "output_price_per_million": self.output_price_per_million,
             "language": self.language.key(),
             "theme": self.theme.key(),
             "font_size": self.font_size.clamp(12, 24),
@@ -374,6 +384,20 @@ impl AppSettings {
             .fixed_base_url()
             .map(str::to_string)
             .unwrap_or_else(|| self.base_url.clone())
+    }
+}
+
+fn optional_f64(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    default: f64,
+) -> Result<f64, String> {
+    match object.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| format!("`{key}` must be a non-negative number")),
     }
 }
 
@@ -471,6 +495,8 @@ mod tests {
             provider: AiProvider::OpenCode,
             base_url: "https://ignored".to_string(),
             model: "deepseek-v4.1-flash".to_string(),
+            input_price_per_million: 0.15,
+            output_price_per_million: 0.60,
             language: LanguageSetting::Es,
             theme: ThemeMode::Light,
             font_size: 17,

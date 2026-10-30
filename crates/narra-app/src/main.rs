@@ -474,6 +474,8 @@ enum SettingsField {
     BaseUrl,
     Model,
     ApiKey,
+    InputPrice,
+    OutputPrice,
     GitName,
     GitEmail,
     GitHubToken,
@@ -487,15 +489,17 @@ enum SettingsSection {
     Ai,
     Git,
     Agents,
+    Packages,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 5] = [
+    const ALL: [SettingsSection; 6] = [
         SettingsSection::General,
         SettingsSection::Editor,
         SettingsSection::Ai,
         SettingsSection::Git,
         SettingsSection::Agents,
+        SettingsSection::Packages,
     ];
 
     fn i18n_key(self) -> &'static str {
@@ -505,6 +509,7 @@ impl SettingsSection {
             SettingsSection::Ai => "settings.section.ai",
             SettingsSection::Git => "settings.section.git",
             SettingsSection::Agents => "settings.section.agents",
+            SettingsSection::Packages => "settings.section.packages",
         }
     }
 }
@@ -516,6 +521,8 @@ struct SettingsState {
     provider: AiProvider,
     base_url: String,
     model: String,
+    input_price: String,
+    output_price: String,
     key_input: String,
     key_present: bool,
     key_source: String,
@@ -548,6 +555,10 @@ struct SettingsState {
     /// project config). Read-only here; installation is file-based.
     agents: Vec<roles::Role>,
     agents_error: String,
+    /// Installed user/project type packages and skills, for Packages.
+    packages_types: Vec<ProjectTypePackage>,
+    packages_skills: Vec<Skill>,
+    packages_error: String,
 }
 
 impl std::fmt::Debug for SettingsState {
@@ -2293,6 +2304,8 @@ impl Editor {
             provider,
             base_url,
             model,
+            input_price: price_text(self.app_settings.input_price_per_million),
+            output_price: price_text(self.app_settings.output_price_per_million),
             key_input: String::new(),
             key_present,
             key_source,
@@ -2323,7 +2336,11 @@ impl Editor {
             github_request: 0,
             agents,
             agents_error,
+            packages_types: Vec::new(),
+            packages_skills: Vec::new(),
+            packages_error: String::new(),
         });
+        self.reload_settings_packages(cx);
         cx.notify();
     }
 
@@ -2338,6 +2355,253 @@ impl Editor {
             Ok(agents) => (agents, String::new()),
             Err(error) => (Vec::new(), error.to_string()),
         }
+    }
+
+    /// Installed user/project types and skills for Ajustes → Paquetes.
+    fn reload_settings_packages(&mut self, cx: &mut Context<Self>) {
+        let config = recent::config_dir();
+        let project_root = self
+            .project
+            .as_ref()
+            .map(|project| project.root().to_path_buf());
+        let types = narra_core::project_type::registry(project_root.as_deref(), Some(&config))
+            .map(|packages| {
+                packages
+                    .into_iter()
+                    .filter(|package| {
+                        package.origin != narra_core::project_type::TypeOrigin::Builtin
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let skills = match project_root.as_deref() {
+            Some(root) => load_skills(root, Some(&config)).unwrap_or_default(),
+            None => load_scope(&config.join("skills"), SkillOrigin::User).unwrap_or_default(),
+        };
+        if let Some(state) = self.settings.as_mut() {
+            state.packages_types = types;
+            state.packages_skills = skills;
+            state.packages_error.clear();
+        }
+        cx.notify();
+    }
+
+    fn settings_import_type(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.t("settings.packages_import_type").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.finish_import_type(picked, replace, cx);
+            });
+        })
+        .detach();
+        let _ = window;
+    }
+
+    fn finish_import_type(
+        &mut self,
+        picked: Option<PathBuf>,
+        replace: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = picked else {
+            return;
+        };
+        let config = recent::config_dir();
+        let result = narra_core::project_type::import_package(
+            &source,
+            narra_core::project_type::TypeOrigin::User,
+            None,
+            Some(&config),
+            replace,
+        );
+        let success = result.as_ref().ok().map(|package| {
+            self.tf(
+                "settings.packages_imported",
+                &[("name", &package.name), ("id", &package.id)],
+            )
+        });
+        if let Some(state) = self.settings.as_mut() {
+            match result {
+                Ok(_) => state.status = success.unwrap_or_default(),
+                Err(error) => state.packages_error = error.to_string(),
+            }
+        }
+        self.reload_settings_packages(cx);
+        self.refresh_menus(cx);
+    }
+
+    fn settings_export_type(
+        &mut self,
+        package: ProjectTypePackage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.t("settings.packages_export_type").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.finish_export_type(package.clone(), picked, cx);
+            });
+        })
+        .detach();
+        let _ = window;
+    }
+
+    fn finish_export_type(
+        &mut self,
+        package: ProjectTypePackage,
+        picked: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(destination) = picked else {
+            return;
+        };
+        let result = narra_core::project_type::export_package(&package, &destination);
+        let success = result.as_ref().ok().map(|path| {
+            self.tf(
+                "settings.packages_exported",
+                &[("path", &path.display().to_string())],
+            )
+        });
+        if let Some(state) = self.settings.as_mut() {
+            match result {
+                Ok(_) => state.status = success.unwrap_or_default(),
+                Err(error) => state.packages_error = error.to_string(),
+            }
+        }
+        cx.notify();
+    }
+
+    fn settings_import_skill(
+        &mut self,
+        replace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.t("settings.packages_import_skill").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.finish_import_skill(picked, replace, cx);
+            });
+        })
+        .detach();
+        let _ = window;
+    }
+
+    fn finish_import_skill(
+        &mut self,
+        picked: Option<PathBuf>,
+        replace: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = picked else {
+            return;
+        };
+        let config = recent::config_dir();
+        let result = narra_core::agent::skill::import_skill(
+            &source,
+            SkillOrigin::User,
+            None,
+            Some(&config),
+            replace,
+        );
+        let success = result.as_ref().ok().map(|skill| {
+            self.tf(
+                "settings.packages_imported_skill",
+                &[("name", &skill.name), ("id", &skill.id)],
+            )
+        });
+        if let Some(state) = self.settings.as_mut() {
+            match result {
+                Ok(_) => state.status = success.unwrap_or_default(),
+                Err(error) => state.packages_error = error.to_string(),
+            }
+        }
+        self.reload_settings_packages(cx);
+        (self.skills, self.skill_trust) = self
+            .project
+            .as_ref()
+            .map(project_skills)
+            .unwrap_or_default();
+    }
+
+    fn settings_export_skill(&mut self, skill: Skill, window: &mut Window, cx: &mut Context<Self>) {
+        let source = match skill.origin {
+            SkillOrigin::User => recent::config_dir().join("skills").join(&skill.id),
+            SkillOrigin::Project => self
+                .project
+                .as_ref()
+                .map(|project| project.root().join(".narra/skills").join(&skill.id))
+                .unwrap_or_default(),
+        };
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.t("settings.packages_export_skill").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.finish_export_skill(source.clone(), picked, cx);
+            });
+        })
+        .detach();
+        let _ = window;
+    }
+
+    fn finish_export_skill(
+        &mut self,
+        source: PathBuf,
+        picked: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(destination) = picked else {
+            return;
+        };
+        let result = narra_core::agent::skill::export_skill(&source, &destination);
+        let success = result.as_ref().ok().map(|path| {
+            self.tf(
+                "settings.packages_exported",
+                &[("path", &path.display().to_string())],
+            )
+        });
+        if let Some(state) = self.settings.as_mut() {
+            match result {
+                Ok(_) => state.status = success.unwrap_or_default(),
+                Err(error) => state.packages_error = error.to_string(),
+            }
+        }
+        cx.notify();
     }
 
     fn reload_settings_agents(&mut self, cx: &mut Context<Self>) {
@@ -2395,6 +2659,8 @@ impl Editor {
             match state.field {
                 SettingsField::BaseUrl => state.base_url.push_str(&cleaned),
                 SettingsField::Model => state.model.push_str(&cleaned),
+                SettingsField::InputPrice => state.input_price.push_str(&cleaned),
+                SettingsField::OutputPrice => state.output_price.push_str(&cleaned),
                 SettingsField::ApiKey => state.key_input.push_str(&cleaned),
                 SettingsField::GitName => state.git_name.push_str(&cleaned),
                 SettingsField::GitEmail => state.git_email.push_str(&cleaned),
@@ -2411,6 +2677,8 @@ impl Editor {
             let target = match state.field {
                 SettingsField::BaseUrl => &mut state.base_url,
                 SettingsField::Model => &mut state.model,
+                SettingsField::InputPrice => &mut state.input_price,
+                SettingsField::OutputPrice => &mut state.output_price,
                 SettingsField::ApiKey => &mut state.key_input,
                 SettingsField::GitName => &mut state.git_name,
                 SettingsField::GitEmail => &mut state.git_email,
@@ -2431,11 +2699,18 @@ impl Editor {
             let fields: &[SettingsField] = match state.section {
                 SettingsSection::Ai => {
                     if state.provider.fixed_base_url().is_some() {
-                        &[SettingsField::Model, SettingsField::ApiKey]
+                        &[
+                            SettingsField::Model,
+                            SettingsField::InputPrice,
+                            SettingsField::OutputPrice,
+                            SettingsField::ApiKey,
+                        ]
                     } else {
                         &[
                             SettingsField::BaseUrl,
                             SettingsField::Model,
+                            SettingsField::InputPrice,
+                            SettingsField::OutputPrice,
                             SettingsField::ApiKey,
                         ]
                     }
@@ -2445,7 +2720,10 @@ impl Editor {
                     SettingsField::GitEmail,
                     SettingsField::GitHubToken,
                 ],
-                SettingsSection::General | SettingsSection::Editor | SettingsSection::Agents => &[],
+                SettingsSection::General
+                | SettingsSection::Editor
+                | SettingsSection::Agents
+                | SettingsSection::Packages => &[],
             };
             if fields.is_empty() {
                 cx.notify();
@@ -2482,6 +2760,26 @@ impl Editor {
             .map(str::to_string)
             .unwrap_or_else(|| state.base_url.trim().to_string());
         let key_input = state.key_input.trim().to_string();
+        let input_price = match parse_price(&state.input_price) {
+            Ok(value) => value,
+            Err(()) => {
+                if let Some(state) = self.settings.as_mut() {
+                    state.error = i18n::tr(lang, "settings.price_invalid").to_string();
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let output_price = match parse_price(&state.output_price) {
+            Ok(value) => value,
+            Err(()) => {
+                if let Some(state) = self.settings.as_mut() {
+                    state.error = i18n::tr(lang, "settings.price_invalid").to_string();
+                }
+                cx.notify();
+                return;
+            }
+        };
         if provider != AiProvider::Mock && model.is_empty() {
             if let Some(state) = self.settings.as_mut() {
                 state.error = i18n::tr(lang, "settings.model_required").to_string();
@@ -2547,6 +2845,8 @@ impl Editor {
             provider,
             base_url: base_url.clone(),
             model: model.clone(),
+            input_price_per_million: input_price,
+            output_price_per_million: output_price,
             language: state.language,
             theme: state.theme,
             font_size: state.font_size,
@@ -3290,6 +3590,65 @@ impl Editor {
                                 div()
                                     .w(px(110.0))
                                     .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("settings.input_price")),
+                            )
+                            .child(
+                                field(
+                                    "settings-input-price",
+                                    format!("{}▌", state.input_price),
+                                    state.field == SettingsField::InputPrice,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(state) = this.settings.as_mut() {
+                                            state.field = SettingsField::InputPrice;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(110.0))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("settings.output_price")),
+                            )
+                            .child(
+                                field(
+                                    "settings-output-price",
+                                    format!("{}▌", state.output_price),
+                                    state.field == SettingsField::OutputPrice,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(state) = this.settings.as_mut() {
+                                            state.field = SettingsField::OutputPrice;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("settings.price_hint")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(110.0))
+                                    .text_color(rgb(theme::status_fg()))
                                     .child(self.t("settings.api_key")),
                             )
                             .child(
@@ -3561,6 +3920,209 @@ impl Editor {
                         .cursor_pointer()
                         .child(self.t("settings.agents_reload"))
                         .on_click(cx.listener(|this, _, _, cx| this.reload_settings_agents(cx))),
+                )
+            }
+            SettingsSection::Packages => {
+                let mut body = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("settings.packages_hint")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("settings-import-type")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("settings.packages_import_type"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings_import_type(false, window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-update-type")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("settings.packages_update_type"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings_import_type(true, window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-import-skill")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("settings.packages_import_skill"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings_import_skill(false, window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-update-skill")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::status_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("settings.packages_update_skill"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings_import_skill(true, window, cx)
+                                    })),
+                            ),
+                    );
+                if !state.packages_error.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_color(rgb(theme::agent_err_fg()))
+                            .child(state.packages_error.clone()),
+                    );
+                }
+                if !state.status.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(state.status.clone()),
+                    );
+                }
+                let mut type_list = div()
+                    .id("settings-packages-types")
+                    .max_h(px(220.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1();
+                if state.packages_types.is_empty() {
+                    type_list = type_list.child(
+                        div()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("settings.packages_empty")),
+                    );
+                }
+                for (index, package) in state.packages_types.iter().enumerate() {
+                    let package_for_export = package.clone();
+                    type_list = type_list.child(
+                        div()
+                            .id(("settings-package-type", index))
+                            .p_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_1()
+                            .border_color(rgb(theme::explorer_border()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(format!("{} · {}", package.name, package.id))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::gutter_fg()))
+                                            .child(package.origin.key()),
+                                    ),
+                            )
+                            .when(package.source_dir.is_some(), |row| {
+                                row.child(
+                                    div()
+                                        .id(("settings-export-type", index))
+                                        .px_2()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .text_color(rgb(theme::status_fg()))
+                                        .child(self.t("settings.packages_export"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.settings_export_type(
+                                                package_for_export.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            }),
+                    );
+                }
+                body = body.child(type_list);
+                let mut skill_list = div()
+                    .id("settings-packages-skills")
+                    .max_h(px(180.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1();
+                for (index, skill) in state.packages_skills.iter().enumerate() {
+                    let skill_for_export = skill.clone();
+                    skill_list = skill_list.child(
+                        div()
+                            .id(("settings-package-skill", index))
+                            .p_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_1()
+                            .border_color(rgb(theme::explorer_border()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(format!("{} · {}", skill.name, skill.id))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::gutter_fg()))
+                                            .child(skill.origin.key()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("settings-export-skill", index))
+                                    .px_2()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("settings.packages_export"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.settings_export_skill(
+                                            skill_for_export.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            ),
+                    );
+                }
+                body = body.child(skill_list);
+                body.child(
+                    div()
+                        .id("settings-packages-reload")
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(theme::status_bg()))
+                        .text_color(rgb(theme::status_fg()))
+                        .cursor_pointer()
+                        .child(self.t("settings.agents_reload"))
+                        .on_click(cx.listener(|this, _, _, cx| this.reload_settings_packages(cx))),
                 )
             }
         };
@@ -9074,6 +9636,8 @@ impl Editor {
                     .map(str::to_string)
                     .unwrap_or_else(|| self.app_settings.base_url.clone()),
                 model: self.app_settings.model.clone(),
+                input_price: price_text(self.app_settings.input_price_per_million),
+                output_price: price_text(self.app_settings.output_price_per_million),
                 key_input: String::new(),
                 key_present,
                 key_source,
@@ -9104,7 +9668,11 @@ impl Editor {
                 github_request: 0,
                 agents,
                 agents_error,
+                packages_types: Vec::new(),
+                packages_skills: Vec::new(),
+                packages_error: String::new(),
             });
+            self.reload_settings_packages(cx);
         } else if let Some(settings) = self.settings.as_mut() {
             settings.section = SettingsSection::Git;
         }
@@ -13501,6 +14069,8 @@ impl Editor {
                 continue;
             };
             view.hunks = record.hunks.len();
+            view.is_new = record.base_missing;
+            view.selected = vec![true; view.hunks];
             view.selected = vec![true; view.hunks];
             view.diff_rows = diff_rows_from_hunks(&record.hunks);
             view.status = match record.state {
@@ -13972,6 +14542,31 @@ impl Editor {
             }
             messages = messages.child(sources);
         }
+        if self.chat.usage_reported {
+            let mut label = self.tf(
+                "chat.usage",
+                &[
+                    ("input", &self.chat.input_tokens.to_string()),
+                    ("output", &self.chat.output_tokens.to_string()),
+                ],
+            );
+            let input_price = self.app_settings.input_price_per_million;
+            let output_price = self.app_settings.output_price_per_million;
+            if input_price > 0.0 || output_price > 0.0 {
+                let cost = (f64::from(self.chat.input_tokens) / 1_000_000.0) * input_price
+                    + (f64::from(self.chat.output_tokens) / 1_000_000.0) * output_price;
+                label.push_str(" · ");
+                label.push_str(&self.tf("chat.cost", &[("cost", &format!("{cost:.4}"))]));
+            }
+            messages = messages.child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(label),
+            );
+        }
         for (index, view) in self.chat.proposals.iter().enumerate() {
             messages = messages.child(self.chat_proposal_card(view, index, cx));
         }
@@ -14021,8 +14616,25 @@ impl Editor {
             .child(
                 div()
                     .text_color(rgb(theme::default_fg()))
-                    .child(format!("{} · {}", view.target, status)),
+                    .child(if view.is_new {
+                        format!(
+                            "{} · {} · {}",
+                            view.target,
+                            status,
+                            self.t("chat.new_document")
+                        )
+                    } else {
+                        format!("{} · {}", view.target, status)
+                    }),
             )
+            .when(view.is_new, |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .child(self.t("chat.new_document_hint")),
+                )
+            })
             .child(
                 div()
                     .text_xs()
@@ -16949,7 +17561,8 @@ impl Editor {
         let settings_dump = if let Some(state) = self.settings.as_ref() {
             format!(
                 "{{\"open\":true,\"provider\":\"{}\",\"model\":\"{}\",\
-                 \"base_url\":\"{}\",\"key_present\":{},\"key_source\":\"{}\",\"key_checked\":{},\
+                 \"base_url\":\"{}\",\"input_price\":{},\"output_price\":{},\
+                 \"key_present\":{},\"key_source\":\"{}\",\"key_checked\":{},\
                  \"models\":{},\"fetching\":{},\"error\":\"{}\",\
                  \"language\":\"{}\",\"theme\":\"{}\",\"resolved_theme\":\"{}\",\
                  \"font_size\":{},\"word_wrap\":{},\"line_numbers\":{},\
@@ -16959,6 +17572,8 @@ impl Editor {
                 state.provider.key(),
                 escape_json(&state.model),
                 escape_json(&state.base_url),
+                state.input_price,
+                state.output_price,
                 state.key_present || !state.key_input.is_empty(),
                 escape_json(&state.key_source),
                 state.key_checked,
@@ -17633,6 +18248,26 @@ fn project_type_i18n(kind: ProjectType) -> &'static str {
         ProjectType::Microdrama => "project.type.microdrama",
         ProjectType::Other => "project.type.other",
     }
+}
+
+fn price_text(value: f64) -> String {
+    if value > 0.0 {
+        let text = format!("{value:.6}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn parse_price(text: &str) -> Result<f64, ()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(0.0);
+    }
+    text.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or(())
 }
 
 fn language_name(path: &str) -> &'static str {

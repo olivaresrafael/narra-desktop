@@ -48,6 +48,8 @@ pub struct ChatProposalView {
     pub id: String,
     pub target: String,
     pub hunks: usize,
+    /// True when the proposal creates a new file instead of editing one.
+    pub is_new: bool,
     pub diff_rows: Vec<(char, String)>,
     pub selected: Vec<bool>,
     pub cursor: usize,
@@ -62,6 +64,7 @@ impl ChatProposalView {
             id,
             target,
             hunks,
+            is_new: false,
             diff_rows: Vec::new(),
             selected: vec![true; hunks],
             cursor: 0,
@@ -127,6 +130,11 @@ pub struct ChatUiState {
     pub streaming: String,
     pub proposals: Vec<ChatProposalView>,
     pub attachments: Vec<ChatAttachment>,
+    /// Token usage accumulated across this chat session, when the provider
+    /// reports it. Cost is calculated by the app from optional settings.
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub usage_reported: bool,
 }
 
 impl ChatUiState {
@@ -142,6 +150,9 @@ impl ChatUiState {
             streaming: String::new(),
             proposals: Vec::new(),
             attachments: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usage_reported: false,
         }
     }
 
@@ -162,6 +173,9 @@ impl ChatUiState {
             streaming: String::new(),
             proposals,
             attachments: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usage_reported: false,
         }
     }
 
@@ -292,6 +306,15 @@ impl ChatUiState {
                         }
                     }
                 }
+                if output.data["usage_reported"].as_bool().unwrap_or(false) {
+                    self.input_tokens = self
+                        .input_tokens
+                        .saturating_add(output.data["input_tokens"].as_u64().unwrap_or(0) as u32);
+                    self.output_tokens = self
+                        .output_tokens
+                        .saturating_add(output.data["output_tokens"].as_u64().unwrap_or(0) as u32);
+                    self.usage_reported = true;
+                }
                 self.status = ChatStatus::Completed;
                 self.streaming.clear();
                 self.stage.clear();
@@ -365,10 +388,11 @@ impl ChatUiState {
             .iter()
             .map(|proposal| {
                 format!(
-                    "{{\"id\":\"{}\",\"target\":\"{}\",\"hunks\":{},\"status\":\"{}\",\"armed\":{},\"selected\":{}}}",
+                    "{{\"id\":\"{}\",\"target\":\"{}\",\"hunks\":{},\"new\":{},\"status\":\"{}\",\"armed\":{},\"selected\":{}}}",
                     json_escape(&proposal.id),
                     json_escape(&proposal.target),
                     proposal.hunks,
+                    proposal.is_new,
                     proposal.status_key(),
                     proposal.armed,
                     proposal.selected_hunks().len()
@@ -379,7 +403,8 @@ impl ChatUiState {
         format!(
             "{{\"thread\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"status\":\"{}\",\
              \"input\":\"{}\",\"focused\":{},\"streaming\":\"{}\",\"error\":\"{}\",\
-             \"sources\":{},\"attachments\":{},\"messages\":[{}],\"proposals\":[{}]}}",
+             \"sources\":{},\"attachments\":{},\"usage\":{{\"input\":{},\"output\":{},\"reported\":{}}},\
+             \"messages\":[{}],\"proposals\":[{}]}}",
             json_escape(&self.thread.id),
             json_escape(&self.thread.title),
             self.thread.mode.key(),
@@ -390,6 +415,9 @@ impl ChatUiState {
             json_escape(&self.error),
             self.sources.len(),
             self.attachments.len(),
+            self.input_tokens,
+            self.output_tokens,
+            self.usage_reported,
             messages,
             proposals
         )
@@ -417,6 +445,20 @@ mod tests {
             }),
             sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn finish_accumulates_provider_usage_when_reported() {
+        let mut chat = ChatUiState::new(ChatMode::Plan);
+        chat.begin_run("hola".to_string(), Vec::new());
+        let mut task = output("ok", serde_json::json!([]));
+        task.data["input_tokens"] = serde_json::json!(12);
+        task.data["output_tokens"] = serde_json::json!(7);
+        task.data["usage_reported"] = serde_json::json!(true);
+        chat.finish(Ok(task));
+        assert_eq!(chat.input_tokens, 12);
+        assert_eq!(chat.output_tokens, 7);
+        assert!(chat.usage_reported);
     }
 
     #[test]

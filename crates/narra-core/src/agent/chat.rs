@@ -500,6 +500,9 @@ impl ChatTask {
         let mut proposals = Vec::new();
         let mut model_name = "desconocido".to_string();
         let mut final_text: Option<String> = None;
+        let mut input_tokens = 0u32;
+        let mut output_tokens = 0u32;
+        let mut usage_reported = false;
         let mut policy = match self.mode {
             ChatMode::Build => GrantPolicy::new()
                 .allow("propose_scene_edit")
@@ -544,6 +547,14 @@ impl ChatTask {
                 return Err(AgentError::Timeout(options.timeout));
             }
             model_name = response.model.clone();
+            if let Some(tokens) = response.input_tokens {
+                input_tokens = input_tokens.saturating_add(tokens);
+                usage_reported = true;
+            }
+            if let Some(tokens) = response.output_tokens {
+                output_tokens = output_tokens.saturating_add(tokens);
+                usage_reported = true;
+            }
             emit(TaskEvent::ModelResponded {
                 model: response.model.clone(),
                 output_chars: response.text.chars().count(),
@@ -643,6 +654,9 @@ impl ChatTask {
                 "final_text": final_text,
                 "adapter": adapter.name(),
                 "model": model_name,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "usage_reported": usage_reported,
                 "tools": audit,
                 "proposals": proposals,
                 "sources": sources.clone(),
@@ -1089,8 +1103,8 @@ mod tests {
                 text: "Marta es la protagonista.".to_string(),
                 model: "mock".to_string(),
                 tool_calls: Vec::new(),
-                input_tokens: None,
-                output_tokens: None,
+                input_tokens: Some(4),
+                output_tokens: Some(5),
             },
         ]);
         let mut events = Vec::new();
@@ -1109,6 +1123,9 @@ mod tests {
             .run(&adapter, &options, |event| events.push(event))
             .expect("streaming chat");
         assert_eq!(output.summary, "Marta es la protagonista.");
+        assert_eq!(output.data["input_tokens"], 4);
+        assert_eq!(output.data["output_tokens"], 5);
+        assert_eq!(output.data["usage_reported"], true);
         let streamed: String = events
             .iter()
             .filter_map(|event| match event {

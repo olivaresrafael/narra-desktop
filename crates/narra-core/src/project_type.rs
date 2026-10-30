@@ -512,6 +512,23 @@ pub fn trust_type(project_root: &Path, id: &str, hash: &str) -> Result<(), Strin
         .map_err(|error| error.to_string())
 }
 
+/// Remove a package from the trust record, forcing confirmation after an
+/// import or update.
+pub fn untrust_type(project_root: &Path, id: &str) -> Result<(), String> {
+    let mut types = trusted_type_hashes(project_root)?;
+    if types.remove(id).is_some() {
+        let file = TypeTrustFile {
+            schema_version: 1,
+            types,
+        };
+        let text = serde_json::to_string_pretty(&file)
+            .map_err(|error| format!("could not encode type trust: {error}"))?;
+        crate::document::write_document(project_root, TYPE_TRUST_FILE, &text)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Whether a project-level package needs confirmation.
 pub fn untrusted_project_type(
     project_root: &Path,
@@ -683,6 +700,152 @@ pub fn resolve(project_root: &Path, id: &str) -> Option<ProjectTypePackage> {
         return None;
     }
     Some(package)
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), TypePackageError> {
+    fs::create_dir_all(destination).map_err(|error| TypePackageError::Io {
+        path: destination.to_path_buf(),
+        error: error.to_string(),
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| TypePackageError::Io {
+        path: source.to_path_buf(),
+        error: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| TypePackageError::Io {
+            path: source.to_path_buf(),
+            error: error.to_string(),
+        })?;
+        let target = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| TypePackageError::Io {
+                path: entry.path(),
+                error: error.to_string(),
+            })?
+            .is_dir()
+        {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target).map_err(|error| TypePackageError::Io {
+                path: target,
+                error: error.to_string(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Export a user/project package into `destination/<id>`. Built-ins are
+/// embedded and cannot be exported as directories.
+pub fn export_package(
+    package: &ProjectTypePackage,
+    destination: &Path,
+) -> Result<PathBuf, TypePackageError> {
+    let source = package
+        .source_dir
+        .as_ref()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "package",
+            detail: format!(
+                "built-in type `{}` has no source directory to export",
+                package.id
+            ),
+        })?;
+    let target = destination.join(&package.id);
+    if target.exists() {
+        return Err(TypePackageError::Invalid {
+            field: "destination",
+            detail: format!("`{}` already exists", target.display()),
+        });
+    }
+    fs::create_dir_all(destination).map_err(|error| TypePackageError::Io {
+        path: destination.to_path_buf(),
+        error: error.to_string(),
+    })?;
+    copy_directory(source, &target)?;
+    Ok(target)
+}
+
+/// Import or update a package into the user or project scope. The package is
+/// validated and copied through a temporary sibling; a failed copy leaves the
+/// previous installation intact. Project imports lose their trust record.
+pub fn import_package(
+    source: &Path,
+    origin: TypeOrigin,
+    project_root: Option<&Path>,
+    config_dir: Option<&Path>,
+    replace: bool,
+) -> Result<ProjectTypePackage, TypePackageError> {
+    if origin == TypeOrigin::Builtin {
+        return Err(TypePackageError::Invalid {
+            field: "origin",
+            detail: "built-in packages cannot be imported".to_string(),
+        });
+    }
+    let package = load_package(source, origin)?;
+    if builtin(&package.id).is_some() {
+        return Err(TypePackageError::ReservedId(package.id));
+    }
+    let base = match origin {
+        TypeOrigin::User => config_dir
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "config_dir",
+                detail: "user scope needs a config directory".to_string(),
+            })?
+            .join(USER_TYPES_DIR),
+        TypeOrigin::Project => project_root
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "project_root",
+                detail: "project scope needs a project root".to_string(),
+            })?
+            .join(PROJECT_TYPES_DIR),
+        TypeOrigin::Builtin => unreachable!("checked above"),
+    };
+    let target = base.join(&package.id);
+    if target.exists() && !replace {
+        return Err(TypePackageError::Invalid {
+            field: "package",
+            detail: format!(
+                "`{}` is already installed at {}; update it explicitly",
+                package.id,
+                target.display()
+            ),
+        });
+    }
+    fs::create_dir_all(&base).map_err(|error| TypePackageError::Io {
+        path: base.clone(),
+        error: error.to_string(),
+    })?;
+    let temp = base.join(format!(".{}.import-{}", package.id, uuid::Uuid::new_v4()));
+    copy_directory(source, &temp)?;
+    let backup = base.join(format!(".{}.backup-{}", package.id, uuid::Uuid::new_v4()));
+    if target.exists() {
+        fs::rename(&target, &backup).map_err(|error| TypePackageError::Io {
+            path: target.clone(),
+            error: error.to_string(),
+        })?;
+    }
+    if let Err(error) = fs::rename(&temp, &target) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &target);
+        }
+        let _ = fs::remove_dir_all(&temp);
+        return Err(TypePackageError::Io {
+            path: target,
+            error: error.to_string(),
+        });
+    }
+    let _ = fs::remove_dir_all(&backup);
+    if origin == TypeOrigin::Project
+        && let Some(root) = project_root
+        && let Err(error) = untrust_type(root, &package.id)
+    {
+        return Err(TypePackageError::Invalid {
+            field: "trust",
+            detail: error,
+        });
+    }
+    load_package(&target, origin)
 }
 
 /// Parse a `type.yaml` document without a directory (used by tests and the
@@ -1374,6 +1537,95 @@ mod tests {
         let mut package = builtin("feature").expect("feature");
         package.files[0].path = ".narra/agents/x/agent.yaml".to_string();
         assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn imports_updates_and_exports_user_packages() {
+        let config = temp_root();
+        let source = temp_root().join("documentary");
+        fs::create_dir_all(source.join("docs")).expect("docs");
+        fs::write(
+            source.join(TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles: []\n",
+        )
+        .expect("type");
+        fs::write(source.join("docs/brief.md"), "# Brief\n").expect("brief");
+
+        let imported =
+            import_package(&source, TypeOrigin::User, None, Some(&config), false).expect("import");
+        assert_eq!(imported.name, "Documentary");
+        assert!(
+            config
+                .join(USER_TYPES_DIR)
+                .join("documentary/type.yaml")
+                .is_file()
+        );
+        let registry = registry(None, Some(&config)).expect("registry");
+        assert!(registry.iter().any(|package| package.id == "documentary"));
+
+        // Update requires an explicit replace.
+        fs::write(
+            source.join(TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary v2\ndirectories: [docs]\nfiles: []\n",
+        )
+        .expect("type v2");
+        assert!(
+            import_package(&source, TypeOrigin::User, None, Some(&config), false).is_err(),
+            "an existing package needs an explicit update"
+        );
+        let updated =
+            import_package(&source, TypeOrigin::User, None, Some(&config), true).expect("update");
+        assert_eq!(updated.name, "Documentary v2");
+
+        let export = temp_root().join("exported");
+        let target = export_package(&updated, &export).expect("export");
+        assert!(target.join(TYPE_FILE).is_file());
+        assert!(target.join("docs/brief.md").is_file());
+        assert!(export_package(&updated, &export).is_err(), "no overwrite");
+    }
+
+    #[test]
+    fn imports_reject_builtin_ids_and_project_updates_reset_trust() {
+        let source = temp_root().join("feature");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(
+            source.join(TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: feature\nname: Fake\n",
+        )
+        .expect("type");
+        let config = temp_root();
+        assert!(matches!(
+            import_package(&source, TypeOrigin::User, None, Some(&config), false),
+            Err(TypePackageError::ReservedId(id)) if id == "feature"
+        ));
+
+        let project = temp_root();
+        let source = temp_root().join("campaign");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(
+            source.join(TYPE_FILE),
+            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\n",
+        )
+        .expect("type");
+        let imported = import_package(&source, TypeOrigin::Project, Some(&project), None, false)
+            .expect("import project");
+        trust_type(&project, &imported.id, &imported.content_hash).expect("trust");
+        assert!(
+            load_package(
+                &project.join(PROJECT_TYPES_DIR).join("campaign"),
+                TypeOrigin::Project
+            )
+            .is_ok()
+        );
+        trust_type(&project, "campaign", "old").expect("trust old");
+        let _ = import_package(&source, TypeOrigin::Project, Some(&project), None, true)
+            .expect("update project");
+        assert!(
+            !trusted_type_hashes(&project)
+                .expect("trust")
+                .contains_key("campaign"),
+            "an updated project package must be trusted again"
+        );
     }
 
     #[test]

@@ -820,6 +820,38 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Context: {n} source(s)",
         "Contexto: {n} fuente(s)",
     ),
+    (
+        "settings.input_price",
+        "Input price / 1M",
+        "Precio entrada / 1M",
+    ),
+    (
+        "settings.output_price",
+        "Output price / 1M",
+        "Precio salida / 1M",
+    ),
+    (
+        "settings.price_hint",
+        "Optional, in USD per million tokens. Leave empty if you do not want a cost estimate.",
+        "Opcional, en USD por millón de tokens. Déjalo vacío si no quieres una estimación de costo.",
+    ),
+    (
+        "settings.price_invalid",
+        "Prices must be empty or non-negative numbers.",
+        "Los precios deben estar vacíos o ser números no negativos.",
+    ),
+    (
+        "chat.usage",
+        "Usage: {input} input · {output} output tokens",
+        "Uso: {input} entrada · {output} salida tokens",
+    ),
+    ("chat.cost", "≈ ${cost} USD", "≈ ${cost} USD"),
+    ("chat.new_document", "new document", "documento nuevo"),
+    (
+        "chat.new_document_hint",
+        "This file does not exist yet; it will be created only after you apply the proposal.",
+        "Este archivo todavía no existe; se creará solo al aplicar la propuesta.",
+    ),
     ("chat.reject", "Reject", "Rechazar"),
     ("chat.apply", "Apply…", "Aplicar…"),
     (
@@ -976,6 +1008,63 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("settings.section.ai", "AI", "IA"),
     ("settings.section.git", "Versions", "Versiones"),
     ("settings.section.agents", "Agents", "Agentes"),
+    ("settings.section.packages", "Packages", "Paquetes"),
+    (
+        "settings.packages_hint",
+        "Install, update or export project types and skills. Packages are instructions and configuration only.",
+        "Instala, actualiza o exporta tipos de proyecto y skills. Los paquetes son solo instrucciones y configuración.",
+    ),
+    (
+        "settings.packages_import_type",
+        "Import type…",
+        "Importar tipo…",
+    ),
+    (
+        "settings.packages_update_type",
+        "Update type…",
+        "Actualizar tipo…",
+    ),
+    (
+        "settings.packages_import_skill",
+        "Import skill…",
+        "Importar skill…",
+    ),
+    (
+        "settings.packages_update_skill",
+        "Update skill…",
+        "Actualizar skill…",
+    ),
+    ("settings.packages_export", "Export…", "Exportar…"),
+    (
+        "settings.packages_export_type",
+        "Choose a folder to export the type package",
+        "Elige una carpeta para exportar el tipo",
+    ),
+    (
+        "settings.packages_export_skill",
+        "Choose a folder to export the skill",
+        "Elige una carpeta para exportar la skill",
+    ),
+    (
+        "settings.packages_empty",
+        "No user or project types installed yet.",
+        "Todavía no hay tipos de usuario o de proyecto instalados.",
+    ),
+    (
+        "settings.packages_imported",
+        "Imported {name} ({id}).",
+        "Se importó {name} ({id}).",
+    ),
+    (
+        "settings.packages_imported_skill",
+        "Imported skill {name} ({id}).",
+        "Se importó la skill {name} ({id}).",
+    ),
+    (
+        "settings.packages_exported",
+        "Exported to {path}.",
+        "Exportado a {path}.",
+    ),
     (
         "settings.agents_hint",
         "Instruction-only packages from .narra/agents (project) and the user config agents/ folder. Executable tools are not supported yet.",

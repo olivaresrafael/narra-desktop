@@ -194,6 +194,142 @@ pub fn trust_skill(project_root: &Path, id: &str, hash: &str) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
+/// Remove a project skill from the trust record, forcing confirmation after
+/// an import or update.
+pub fn untrust_skill(project_root: &Path, id: &str) -> Result<(), String> {
+    let mut skills = trusted_hashes(project_root)?;
+    if skills.remove(id).is_some() {
+        let file = TrustFile {
+            schema_version: TRUST_SCHEMA_VERSION,
+            skills,
+        };
+        let text = serde_json::to_string_pretty(&file)
+            .map_err(|error| format!("could not encode skill trust: {error}"))?;
+        crate::document::write_document(project_root, TRUST_FILE, &text)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Copy one skill directory into `destination/<id>` without overwriting.
+pub fn export_skill(source: &Path, destination: &Path) -> Result<PathBuf, SkillError> {
+    let skill = load_skill(source, SkillOrigin::User)?;
+    let target = destination.join(&skill.id);
+    if target.exists() {
+        return Err(SkillError::Invalid {
+            path: target.clone(),
+            error: "destination already exists".to_string(),
+        });
+    }
+    fs::create_dir_all(destination).map_err(|error| SkillError::Io {
+        path: destination.to_path_buf(),
+        error: error.to_string(),
+    })?;
+    copy_directory(source, &target)?;
+    Ok(target)
+}
+
+/// Import or update a skill into the user or project scope. The copy is
+/// validated first and staged through a temporary sibling; project imports
+/// lose their trust record.
+pub fn import_skill(
+    source: &Path,
+    origin: SkillOrigin,
+    project_root: Option<&Path>,
+    config_dir: Option<&Path>,
+    replace: bool,
+) -> Result<Skill, SkillError> {
+    let skill = load_skill(source, origin)?;
+    let base = match origin {
+        SkillOrigin::User => config_dir
+            .ok_or_else(|| SkillError::Invalid {
+                path: source.to_path_buf(),
+                error: "user scope needs a config directory".to_string(),
+            })?
+            .join(USER_SKILLS_DIR),
+        SkillOrigin::Project => project_root
+            .ok_or_else(|| SkillError::Invalid {
+                path: source.to_path_buf(),
+                error: "project scope needs a project root".to_string(),
+            })?
+            .join(PROJECT_SKILLS_DIR),
+    };
+    let target = base.join(&skill.id);
+    if target.exists() && !replace {
+        return Err(SkillError::Invalid {
+            path: target.clone(),
+            error: "skill already installed; update it explicitly".to_string(),
+        });
+    }
+    fs::create_dir_all(&base).map_err(|error| SkillError::Io {
+        path: base.clone(),
+        error: error.to_string(),
+    })?;
+    let temp = base.join(format!(".{}.import-{}", skill.id, uuid::Uuid::new_v4()));
+    copy_directory(source, &temp)?;
+    let backup = base.join(format!(".{}.backup-{}", skill.id, uuid::Uuid::new_v4()));
+    if target.exists() {
+        fs::rename(&target, &backup).map_err(|error| SkillError::Io {
+            path: target.clone(),
+            error: error.to_string(),
+        })?;
+    }
+    if let Err(error) = fs::rename(&temp, &target) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &target);
+        }
+        let _ = fs::remove_dir_all(&temp);
+        return Err(SkillError::Io {
+            path: target,
+            error: error.to_string(),
+        });
+    }
+    let _ = fs::remove_dir_all(&backup);
+    if origin == SkillOrigin::Project
+        && let Some(root) = project_root
+        && let Err(error) = untrust_skill(root, &skill.id)
+    {
+        return Err(SkillError::Invalid {
+            path: source.to_path_buf(),
+            error,
+        });
+    }
+    load_skill(&target, origin)
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), SkillError> {
+    fs::create_dir_all(destination).map_err(|error| SkillError::Io {
+        path: destination.to_path_buf(),
+        error: error.to_string(),
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| SkillError::Io {
+        path: source.to_path_buf(),
+        error: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| SkillError::Io {
+            path: source.to_path_buf(),
+            error: error.to_string(),
+        })?;
+        let target = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| SkillError::Io {
+                path: entry.path(),
+                error: error.to_string(),
+            })?
+            .is_dir()
+        {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target).map_err(|error| SkillError::Io {
+                path: target,
+                error: error.to_string(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Project skills whose current hash is not trusted.
 pub fn untrusted_project_skills(
     project_root: &Path,
@@ -396,6 +532,61 @@ mod tests {
         let bad = dir.join(SKILL_FILE);
         fs::write(&bad, "---\nname: Valid\n---\nBody").expect("bad frontmatter");
         assert!(load_skill(&dir, SkillOrigin::Project).is_err());
+    }
+
+    #[test]
+    fn imports_updates_exports_and_resets_project_skill_trust() {
+        let config = temp_root();
+        let source = temp_root();
+        let source_dir = write_skill(&source.join("skills"), "brief", "Brief", "User body");
+        let export_dir = temp_root().join("exported");
+        let exported = export_skill(&source_dir, &export_dir).expect("export");
+        assert!(exported.join(SKILL_FILE).is_file());
+
+        let imported = import_skill(&source_dir, SkillOrigin::User, None, Some(&config), false)
+            .expect("import user");
+        assert_eq!(imported.id, "brief");
+        assert!(
+            config
+                .join(USER_SKILLS_DIR)
+                .join("brief/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            import_skill(&source_dir, SkillOrigin::User, None, Some(&config), false).is_err(),
+            "existing skill needs explicit update"
+        );
+
+        let project = temp_root();
+        let project_skill = import_skill(
+            &source_dir,
+            SkillOrigin::Project,
+            Some(&project),
+            None,
+            false,
+        )
+        .expect("import project");
+        trust_skill(&project, &project_skill.id, &project_skill.hash).expect("trust");
+        fs::write(
+            source_dir.join(SKILL_FILE),
+            "---\nname: Brief v2\ndescription: Use when testing.\n---\nUpdated body\n",
+        )
+        .expect("updated skill");
+        let updated = import_skill(
+            &source_dir,
+            SkillOrigin::Project,
+            Some(&project),
+            None,
+            true,
+        )
+        .expect("update project");
+        assert_eq!(updated.name, "Brief v2");
+        assert!(
+            !trusted_hashes(&project)
+                .expect("trust")
+                .contains_key("brief"),
+            "an updated project skill must be trusted again"
+        );
     }
 
     #[test]
