@@ -33,6 +33,7 @@ pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
 pub use brief::ProjectBriefTask;
 pub use chat::{
     ChatAttachment, ChatMode, ChatProposalRef, ChatTask, ChatThread, ChatTurn, ChatTurnRole,
+    ChatUsage,
 };
 pub use mock::MockAdapter;
 pub use openai_compat::{

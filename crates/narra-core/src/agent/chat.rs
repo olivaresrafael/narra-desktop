@@ -192,6 +192,18 @@ pub struct ChatProposalRef {
     pub hunks: usize,
 }
 
+/// Token usage accumulated by one chat thread. Cost is stored in micro-USD so
+/// the record stays exact and `Eq` without floating-point persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ChatUsage {
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+}
+
 /// A persisted chat thread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatThread {
@@ -203,6 +215,8 @@ pub struct ChatThread {
     pub messages: Vec<ChatTurn>,
     #[serde(default)]
     pub proposals: Vec<ChatProposalRef>,
+    #[serde(default)]
+    pub usage: ChatUsage,
 }
 
 pub const CHAT_SCHEMA_VERSION: u32 = 1;
@@ -219,6 +233,7 @@ impl ChatThread {
             updated_at: now_rfc3339(),
             messages: Vec::new(),
             proposals: Vec::new(),
+            usage: ChatUsage::default(),
         }
     }
 
@@ -781,6 +796,11 @@ mod tests {
         thread.push_user("Resume la escena 1");
         thread.push_assistant("La escena plantea el conflicto.");
         thread.push_proposal("proposal-1", "screenplay/main.fountain", 2);
+        thread.usage = ChatUsage {
+            input_tokens: 120,
+            output_tokens: 80,
+            cost_micros: Some(34_000),
+        };
         thread.save(&root).expect("save");
         let path = root.join(CHATS_DIR).join(format!("{}.json", thread.id));
         assert!(path.is_file());
@@ -793,6 +813,9 @@ mod tests {
         assert_eq!(loaded.messages[0].role, ChatTurnRole::User);
         assert_eq!(loaded.proposals.len(), 1);
         assert_eq!(loaded.proposals[0].hunks, 2);
+        assert_eq!(loaded.usage.input_tokens, 120);
+        assert_eq!(loaded.usage.output_tokens, 80);
+        assert_eq!(loaded.usage.cost_micros, Some(34_000));
     }
 
     #[test]

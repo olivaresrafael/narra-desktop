@@ -135,6 +135,8 @@ pub struct ChatUiState {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub usage_reported: bool,
+    /// Estimated cost for the persisted thread, in micro-USD.
+    pub cost_micros: Option<u64>,
 }
 
 impl ChatUiState {
@@ -153,10 +155,14 @@ impl ChatUiState {
             input_tokens: 0,
             output_tokens: 0,
             usage_reported: false,
+            cost_micros: None,
         }
     }
 
     pub fn from_thread(thread: ChatThread) -> Self {
+        let input_tokens = thread.usage.input_tokens;
+        let output_tokens = thread.usage.output_tokens;
+        let cost_micros = thread.usage.cost_micros;
         let proposals = thread
             .proposals
             .iter()
@@ -173,9 +179,10 @@ impl ChatUiState {
             streaming: String::new(),
             proposals,
             attachments: Vec::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            usage_reported: false,
+            input_tokens,
+            output_tokens,
+            usage_reported: input_tokens > 0 || output_tokens > 0,
+            cost_micros,
         }
     }
 
@@ -274,7 +281,14 @@ impl ChatUiState {
     /// Fold the terminal result. On success the assistant text is appended
     /// once (streaming is transient) and proposal references are persisted in
     /// the thread.
-    pub fn finish(&mut self, result: Result<TaskOutput, AgentError>) {
+    /// Fold the terminal result and, when manual prices are configured,
+    /// accumulate an estimated cost in the persisted thread (micro-USD).
+    pub fn finish_with_prices(
+        &mut self,
+        result: Result<TaskOutput, AgentError>,
+        input_price_per_million: f64,
+        output_price_per_million: f64,
+    ) {
         match result {
             Ok(output) => {
                 let text = output.data["final_text"]
@@ -307,12 +321,27 @@ impl ChatUiState {
                     }
                 }
                 if output.data["usage_reported"].as_bool().unwrap_or(false) {
-                    self.input_tokens = self
-                        .input_tokens
-                        .saturating_add(output.data["input_tokens"].as_u64().unwrap_or(0) as u32);
-                    self.output_tokens = self
-                        .output_tokens
-                        .saturating_add(output.data["output_tokens"].as_u64().unwrap_or(0) as u32);
+                    let run_input = output.data["input_tokens"].as_u64().unwrap_or(0) as u32;
+                    let run_output = output.data["output_tokens"].as_u64().unwrap_or(0) as u32;
+                    self.input_tokens = self.input_tokens.saturating_add(run_input);
+                    self.output_tokens = self.output_tokens.saturating_add(run_output);
+                    self.thread.usage.input_tokens =
+                        self.thread.usage.input_tokens.saturating_add(run_input);
+                    self.thread.usage.output_tokens =
+                        self.thread.usage.output_tokens.saturating_add(run_output);
+                    if input_price_per_million > 0.0 || output_price_per_million > 0.0 {
+                        let cost = (f64::from(run_input) / 1_000_000.0) * input_price_per_million
+                            + (f64::from(run_output) / 1_000_000.0) * output_price_per_million;
+                        let micros = (cost * 1_000_000.0).round().max(0.0) as u64;
+                        self.thread.usage.cost_micros = Some(
+                            self.thread
+                                .usage
+                                .cost_micros
+                                .unwrap_or(0)
+                                .saturating_add(micros),
+                        );
+                        self.cost_micros = self.thread.usage.cost_micros;
+                    }
                     self.usage_reported = true;
                 }
                 self.status = ChatStatus::Completed;
@@ -403,7 +432,7 @@ impl ChatUiState {
         format!(
             "{{\"thread\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"status\":\"{}\",\
              \"input\":\"{}\",\"focused\":{},\"streaming\":\"{}\",\"error\":\"{}\",\
-             \"sources\":{},\"attachments\":{},\"usage\":{{\"input\":{},\"output\":{},\"reported\":{}}},\
+             \"sources\":{},\"attachments\":{},\"usage\":{{\"input\":{},\"output\":{},\"reported\":{},\"cost_micros\":{}}},\
              \"messages\":[{}],\"proposals\":[{}]}}",
             json_escape(&self.thread.id),
             json_escape(&self.thread.title),
@@ -418,6 +447,9 @@ impl ChatUiState {
             self.input_tokens,
             self.output_tokens,
             self.usage_reported,
+            self.cost_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
             messages,
             proposals
         )
@@ -455,10 +487,30 @@ mod tests {
         task.data["input_tokens"] = serde_json::json!(12);
         task.data["output_tokens"] = serde_json::json!(7);
         task.data["usage_reported"] = serde_json::json!(true);
-        chat.finish(Ok(task));
+        chat.finish_with_prices(Ok(task), 0.0, 0.0);
         assert_eq!(chat.input_tokens, 12);
         assert_eq!(chat.output_tokens, 7);
         assert!(chat.usage_reported);
+    }
+
+    #[test]
+    fn finish_persists_usage_and_estimated_cost_in_the_thread() {
+        let mut chat = ChatUiState::new(ChatMode::Plan);
+        chat.begin_run("hola".to_string(), Vec::new());
+        let mut task = output("ok", serde_json::json!([]));
+        task.data["input_tokens"] = serde_json::json!(12);
+        task.data["output_tokens"] = serde_json::json!(7);
+        task.data["usage_reported"] = serde_json::json!(true);
+        chat.finish_with_prices(Ok(task), 1000.0, 2000.0);
+        assert_eq!(chat.thread.usage.input_tokens, 12);
+        assert_eq!(chat.thread.usage.output_tokens, 7);
+        assert_eq!(chat.thread.usage.cost_micros, Some(26_000));
+        assert_eq!(chat.cost_micros, Some(26_000));
+
+        let restored = ChatUiState::from_thread(chat.thread.clone());
+        assert_eq!(restored.input_tokens, 12);
+        assert_eq!(restored.output_tokens, 7);
+        assert_eq!(restored.cost_micros, Some(26_000));
     }
 
     #[test]
@@ -474,7 +526,7 @@ mod tests {
             text: "cial".to_string(),
         });
         assert_eq!(chat.streaming, "parcial");
-        chat.finish(Ok(output("parcial", serde_json::json!([]))));
+        chat.finish_with_prices(Ok(output("parcial", serde_json::json!([]))), 0.0, 0.0);
         assert_eq!(chat.status, ChatStatus::Completed);
         assert!(chat.streaming.is_empty());
         assert_eq!(chat.thread.messages.len(), 2);
@@ -499,10 +551,14 @@ mod tests {
         assert_eq!(chat.proposals.len(), 1);
         assert_eq!(chat.proposals[0].selected, vec![true, true]);
         assert_eq!(chat.thread.proposals.len(), 1);
-        chat.finish(Ok(output(
-            "lista",
-            serde_json::json!([{"id":"p1","target":"screenplay/main.fountain","hunks":2}]),
-        )));
+        chat.finish_with_prices(
+            Ok(output(
+                "lista",
+                serde_json::json!([{"id":"p1","target":"screenplay/main.fountain","hunks":2}]),
+            )),
+            0.0,
+            0.0,
+        );
         assert_eq!(chat.thread.proposals.len(), 1, "deduplicated");
         assert_eq!(chat.thread.messages.len(), 2);
     }
@@ -514,12 +570,12 @@ mod tests {
         chat.apply_event(&TaskEvent::ModelDelta {
             text: "texto".to_string(),
         });
-        chat.finish(Err(AgentError::Cancelled));
+        chat.finish_with_prices(Err(AgentError::Cancelled), 0.0, 0.0);
         assert_eq!(chat.status, ChatStatus::Cancelled);
         assert!(chat.streaming.is_empty());
 
         chat.begin_run("otra".to_string(), Vec::new());
-        chat.finish(Err(AgentError::Adapter("sin red".to_string())));
+        chat.finish_with_prices(Err(AgentError::Adapter("sin red".to_string())), 0.0, 0.0);
         assert_eq!(chat.status, ChatStatus::Failed);
         assert!(chat.error.contains("sin red"));
     }
@@ -545,10 +601,14 @@ mod tests {
     fn thread_round_trip_preserves_mode_messages_and_proposals() {
         let mut chat = ChatUiState::new(ChatMode::Build);
         chat.begin_run("hola".to_string(), Vec::new());
-        chat.finish(Ok(output(
-            "respuesta",
-            serde_json::json!([{"id":"p1","target":"x","hunks":1}]),
-        )));
+        chat.finish_with_prices(
+            Ok(output(
+                "respuesta",
+                serde_json::json!([{"id":"p1","target":"x","hunks":1}]),
+            )),
+            0.0,
+            0.0,
+        );
         let restored = ChatUiState::from_thread(chat.thread.clone());
         assert_eq!(restored.mode(), ChatMode::Build);
         assert_eq!(restored.thread.messages.len(), 2);

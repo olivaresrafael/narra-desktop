@@ -13924,7 +13924,11 @@ impl Editor {
                 }
                 ChatRunMessage::Done(result) => {
                     view.chat_cancel = None;
-                    view.chat.finish(result);
+                    view.chat.finish_with_prices(
+                        result,
+                        view.app_settings.input_price_per_million,
+                        view.app_settings.output_price_per_million,
+                    );
                     view.chat_follow_stream();
                     view.load_chat_proposal_diffs();
                     view.save_chat_thread();
@@ -14550,11 +14554,8 @@ impl Editor {
                     ("output", &self.chat.output_tokens.to_string()),
                 ],
             );
-            let input_price = self.app_settings.input_price_per_million;
-            let output_price = self.app_settings.output_price_per_million;
-            if input_price > 0.0 || output_price > 0.0 {
-                let cost = (f64::from(self.chat.input_tokens) / 1_000_000.0) * input_price
-                    + (f64::from(self.chat.output_tokens) / 1_000_000.0) * output_price;
+            if let Some(micros) = self.chat.cost_micros {
+                let cost = micros as f64 / 1_000_000.0;
                 label.push_str(" · ");
                 label.push_str(&self.tf("chat.cost", &[("cost", &format!("{cost:.4}"))]));
             }
