@@ -12895,15 +12895,20 @@ impl Editor {
             cx.notify();
             return;
         }
-        if let Err(message) = self.open_document_path(&target, true) {
-            self.notice = Some(message);
-            cx.notify();
-            return;
-        }
-        if self.dirty() {
-            self.notice = Some(self.t("notice.apply_target_dirty").to_string());
-            cx.notify();
-            return;
+        let creating = proposal::load(Path::new(&root), &self.propose.id)
+            .ok()
+            .is_some_and(|record| record.base_missing);
+        if !creating {
+            if let Err(message) = self.open_document_path(&target, true) {
+                self.notice = Some(message);
+                cx.notify();
+                return;
+            }
+            if self.dirty() {
+                self.notice = Some(self.t("notice.apply_target_dirty").to_string());
+                cx.notify();
+                return;
+            }
         }
         // The selected subset (M6 slice 6): all selected → None (apply-all,
         // the core's canonical path); a subset → Some(indices); nothing
@@ -12928,8 +12933,13 @@ impl Editor {
                 let applied = outcome.applied_hunks.len();
                 let skipped = outcome.skipped_hunks.len();
                 let target = outcome.proposal.target.clone();
-                // Reload the buffer when the applied target is the open
-                // document, so the user sees the applied result immediately.
+                // A created document is opened for review; an existing target
+                // is reloaded only when it is already the active buffer.
+                if outcome.proposal.base_missing
+                    && let Err(message) = self.open_document_path(&target, true)
+                {
+                    self.notice = Some(message);
+                }
                 let reloaded = self
                     .project
                     .as_ref()
@@ -13323,7 +13333,7 @@ impl Editor {
             let options = TaskOptions {
                 timeout: AGENT_TIMEOUT,
                 cancel,
-                stream: mode != ChatMode::Build,
+                stream: true,
             };
             let result = match settings.build_adapter() {
                 Ok(adapter) => task.run(&*adapter, &options, |event| {
@@ -13544,7 +13554,11 @@ impl Editor {
                     view.armed = false;
                 }
                 let target = outcome.proposal.target.clone();
-                if self.doc.path == target
+                if outcome.proposal.base_missing
+                    && let Err(message) = self.open_document_path(&target, true)
+                {
+                    self.notice = Some(message);
+                } else if self.doc.path == target
                     && let Some(project) = self.project.as_ref()
                     && let Ok(text) = project.read_document(&target)
                 {

@@ -349,7 +349,7 @@ fn loop_honors_cancellation_between_rounds() {
 #[test]
 fn tool_specs_declare_permissions_and_schemas() {
     let specs: Vec<ToolSpec> = narra_core::agent::tools::tool_specs();
-    assert_eq!(specs.len(), 8);
+    assert_eq!(specs.len(), 9);
     for spec in &specs {
         assert_eq!(spec.parameters["type"], "object", "{}", spec.name);
         assert!(!spec.description.is_empty());
@@ -376,6 +376,14 @@ fn tool_specs_declare_permissions_and_schemas() {
         .expect("document proposal declared");
     assert_eq!(
         document.permission,
+        narra_core::agent::tools::ToolPermission::ProposeWrite
+    );
+    let create = specs
+        .iter()
+        .find(|spec| spec.name == "propose_document_create")
+        .expect("document creation declared");
+    assert_eq!(
+        create.permission,
         narra_core::agent::tools::ToolPermission::ProposeWrite
     );
     let apply = specs

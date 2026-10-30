@@ -84,9 +84,10 @@ impl ChatMode {
                 "Eres un colaborador de guion en modo BUILD. Puedes usar las \
                  herramientas de lectura para consultar el proyecto, read_scene \
                  para leer escenas, propose_scene_edit para proponer una \
-                 reescritura de escena y propose_document_edit para proponer \
+                 reescritura de escena, propose_document_edit para proponer \
                  una reescritura de la biblia, estructura, notas o \
-                 investigación. Una propuesta NO se aplica: queda para revisión \
+                 investigación, y propose_document_create para proponer un \
+                 documento nuevo. Una propuesta NO se aplica: queda para revisión \
                  humana. Nunca digas que aplicaste un cambio ni escribas \
                  archivos canónicos. Si falta información, búscala o pídela. \
                  Responde en el idioma del usuario."
@@ -112,8 +113,9 @@ impl ChatMode {
             ChatMode::Build => {
                 "Usa las herramientas de lectura si necesitas consultar el \
                  proyecto y cita la ruta consultada. Para escenas usa \
-                 propose_scene_edit; para bible, structure, notes o research \
-                 usa propose_document_edit. La propuesta queda para revisión \
+                 propose_scene_edit; para editar bible, structure, notes o \
+                 research usa propose_document_edit; para crear uno nuevo usa \
+                 propose_document_create. La propuesta queda para revisión \
                  humana."
             }
         }
@@ -501,7 +503,8 @@ impl ChatTask {
         let mut policy = match self.mode {
             ChatMode::Build => GrantPolicy::new()
                 .allow("propose_scene_edit")
-                .allow("propose_document_edit"),
+                .allow("propose_document_edit")
+                .allow("propose_document_create"),
             ChatMode::Plan | ChatMode::Review => GrantPolicy::new(),
         };
 
@@ -528,7 +531,15 @@ impl ChatTask {
                 tools: specs.clone(),
                 history: history.clone(),
             };
-            let response = adapter.complete(&request, &options.cancel)?;
+            let response = if options.stream {
+                adapter.complete_streaming(&request, &options.cancel, &mut |delta| {
+                    emit(TaskEvent::ModelDelta {
+                        text: delta.to_string(),
+                    });
+                })?
+            } else {
+                adapter.complete(&request, &options.cancel)?
+            };
             if started.elapsed() > options.timeout {
                 return Err(AgentError::Timeout(options.timeout));
             }
@@ -1051,6 +1062,112 @@ mod tests {
         let proposals = output.data["proposals"].as_array().expect("proposals");
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0]["target"], "bible/characters/marta.md");
+    }
+
+    #[test]
+    fn streaming_survives_a_tool_round_and_streams_the_final_text() {
+        let root = project();
+        fs::create_dir_all(root.join("bible/characters")).expect("bible");
+        fs::write(
+            root.join("bible/characters/marta.md"),
+            "# Marta\n\nProtagonista.\n",
+        )
+        .expect("character");
+        let adapter = crate::agent::MockAdapter::scripted(vec![
+            crate::agent::ModelResponse {
+                text: String::new(),
+                model: "mock".to_string(),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "read-1".to_string(),
+                    name: "read_document".to_string(),
+                    arguments: json!({"path": "bible/characters/marta.md"}),
+                }],
+                input_tokens: None,
+                output_tokens: None,
+            },
+            crate::agent::ModelResponse {
+                text: "Marta es la protagonista.".to_string(),
+                model: "mock".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]);
+        let mut events = Vec::new();
+        let options = TaskOptions {
+            timeout: std::time::Duration::from_secs(30),
+            cancel: crate::cancel::CancellationToken::new(),
+            stream: true,
+        };
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Plan,
+            Vec::new(),
+            "¿Quién es Marta?",
+        );
+        let output = task
+            .run(&adapter, &options, |event| events.push(event))
+            .expect("streaming chat");
+        assert_eq!(output.summary, "Marta es la protagonista.");
+        let streamed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::ModelDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            streamed, "Marta es la protagonista.",
+            "final text must be reassembled from deltas: {events:?}"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, TaskEvent::ToolExecuted { tool, .. } if tool == "read_document")
+        ));
+    }
+
+    #[test]
+    fn build_chat_can_propose_a_new_document_without_creating_it() {
+        let root = project();
+        let adapter = crate::agent::MockAdapter::scripted(vec![
+            crate::agent::ModelResponse {
+                text: String::new(),
+                model: "mock".to_string(),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "create-1".to_string(),
+                    name: "propose_document_create".to_string(),
+                    arguments: json!({
+                        "path": "bible/characters/elena.md",
+                        "instruction": "crea la ficha de Elena",
+                        "content": "# Elena\n\nHermana de Marta.\n"
+                    }),
+                }],
+                input_tokens: None,
+                output_tokens: None,
+            },
+            crate::agent::ModelResponse {
+                text: "Propuse la ficha de Elena.".to_string(),
+                model: "mock".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]);
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Build,
+            Vec::new(),
+            "Crea a Elena",
+        );
+        let output = task
+            .run(&adapter, &TaskOptions::default(), |_event| {})
+            .expect("chat build");
+        assert_eq!(output.data["final_text"], "Propuse la ficha de Elena.");
+        assert!(!root.join("bible/characters/elena.md").exists());
+        let proposals = output.data["proposals"].as_array().expect("proposals");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0]["target"], "bible/characters/elena.md");
+        let id = proposals[0]["id"].as_str().expect("id");
+        assert!(proposal::load(&root, id).expect("record").base_missing);
     }
 
     #[test]

@@ -362,6 +362,24 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             permission: ToolPermission::ProposeWrite,
         },
         ToolSpec {
+            name: "propose_document_create".to_string(),
+            description: "Propone crear un documento nuevo de la biblia, \
+                          estructura, notas o investigación. No escribe nada: \
+                          la creación queda como propuesta para revisión \
+                          humana y falla si el archivo ya existe."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "instruction", "content"]
+            }),
+            permission: ToolPermission::ProposeWrite,
+        },
+        ToolSpec {
             name: "apply_proposal".to_string(),
             description: "Aplica una propuesta revisada a su archivo \
                           canónico. Operación destructiva: solo con \
@@ -476,6 +494,7 @@ impl<'a> ToolExecutor<'a> {
             "read_scene" => self.read_scene(call),
             "propose_scene_edit" => self.propose_scene_edit(call, origin),
             "propose_document_edit" => self.propose_document_edit(call, origin),
+            "propose_document_create" => self.propose_document_create(call, origin),
             "apply_proposal" => self.apply_proposal(call),
             other => ToolOutcome::Failed {
                 // Unreachable while `permission_of` and `dispatch` agree;
@@ -767,6 +786,96 @@ impl<'a> ToolExecutor<'a> {
             screenplay_path.clone(),
             &base,
             &proposed,
+            instruction,
+            origin,
+            head_oid(self.root),
+        ) {
+            Ok(record) => {
+                let hunks = record.hunks.len();
+                let target = record.target.clone();
+                let id = record.id.clone();
+                match proposal::save(self.root, &record) {
+                    Ok(()) => ToolOutcome::ProposalCreated { id, target, hunks },
+                    Err(error) => ToolOutcome::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Err(error) => ToolOutcome::Failed {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    /// Propose-write: stage the creation of a new narrative document. The
+    /// target must not exist; apply uses create-only IO.
+    fn propose_document_create(&self, call: &ToolCall, origin: &Origin) -> ToolOutcome {
+        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «path» ausente".to_string(),
+            };
+        };
+        if !is_document_proposal_path(path) {
+            return ToolOutcome::Failed {
+                message: format!(
+                    "«{path}» no es un documento creable de la biblia, \
+                     estructura, notas o investigación"
+                ),
+            };
+        }
+        let Some(instruction) = call.arguments.get("instruction").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «instruction» ausente".to_string(),
+            };
+        };
+        let Some(content) = call.arguments.get("content").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «content» ausente".to_string(),
+            };
+        };
+        if instruction.trim().is_empty() {
+            return ToolOutcome::Failed {
+                message: "la instrucción no puede estar vacía".to_string(),
+            };
+        }
+        if content.trim().is_empty() {
+            return ToolOutcome::Failed {
+                message: "el documento nuevo no puede estar vacío".to_string(),
+            };
+        }
+        if content.len() > MAX_DOCUMENT_REWRITE_BYTES {
+            return ToolOutcome::Failed {
+                message: format!(
+                    "el documento propuesto supera {MAX_DOCUMENT_REWRITE_BYTES} bytes"
+                ),
+            };
+        }
+        let project = match crate::project::open_project(self.root) {
+            Ok(project) => project,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        if project.root().join(path).exists() {
+            return ToolOutcome::Failed {
+                message: format!("«{path}» ya existe; usa propose_document_edit para editarlo"),
+            };
+        }
+        let origin = Origin {
+            task: origin.task.clone(),
+            adapter: origin.adapter.clone(),
+            model: origin.model.clone(),
+            task_input: json!({
+                "path": path,
+                "instruction": instruction,
+                "create": true,
+            }),
+        };
+        match FileProposal::new_document(
+            path.to_string(),
+            content,
             instruction,
             origin,
             head_oid(self.root),
@@ -1186,6 +1295,92 @@ mod tests {
             "the proposal must not write canon"
         );
         assert_eq!(proposal::list(&root).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn propose_document_create_stages_a_new_bible_file_without_writing_it() {
+        let root = sample_project();
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = GrantPolicy::new().allow("propose_document_create");
+        let result = executor.execute(
+            &call(
+                "new-1",
+                "propose_document_create",
+                json!({
+                    "path": "bible/characters/elena.md",
+                    "instruction": "crea la ficha",
+                    "content": "# Elena\n\nHermana de Marta.\n"
+                }),
+            ),
+            &mut policy,
+            &origin(),
+        );
+        assert!(result.succeeded(), "{result:?}");
+        let created_id = match &result.outcome {
+            ToolOutcome::ProposalCreated { id, target, .. } => {
+                assert_eq!(target, "bible/characters/elena.md");
+                id.clone()
+            }
+            other => panic!("expected proposal: {other:?}"),
+        };
+        assert!(!root.join("bible/characters/elena.md").exists());
+        let proposals = proposal::list(&root).expect("list");
+        assert_eq!(proposals.len(), 1);
+        assert!(proposals[0].base_missing);
+        proposal::apply(&root, &created_id, None).expect("apply created proposal");
+
+        let existing = executor.execute(
+            &call(
+                "new-2",
+                "propose_document_create",
+                json!({
+                    "path": "bible/characters/elena.md",
+                    "instruction": "repite",
+                    "content": "# Elena\n"
+                }),
+            ),
+            &mut policy,
+            &origin(),
+        );
+        assert!(matches!(existing.outcome, ToolOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn propose_document_create_needs_a_grant_and_rejects_non_narrative_paths() {
+        let root = sample_project();
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = GrantPolicy::new();
+        let asked = executor.execute(
+            &call(
+                "new-1",
+                "propose_document_create",
+                json!({
+                    "path": "bible/characters/elena.md",
+                    "instruction": "crea",
+                    "content": "# Elena\n"
+                }),
+            ),
+            &mut policy,
+            &origin(),
+        );
+        assert!(matches!(asked.decision, PermissionDecision::Ask(_)));
+        let mut granted = GrantPolicy::new().allow("propose_document_create");
+        for path in ["screenplay/new.fountain", "project.yaml", "bible/empty.md"] {
+            let content = if path == "bible/empty.md" { "" } else { "x" };
+            let result = executor.execute(
+                &call(
+                    "new-2",
+                    "propose_document_create",
+                    json!({"path": path, "instruction": "crea", "content": content}),
+                ),
+                &mut granted,
+                &origin(),
+            );
+            assert!(
+                matches!(result.outcome, ToolOutcome::Failed { .. }),
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -50,6 +50,18 @@ impl MockAdapter {
         }
     }
 
+    /// Next scripted response, or the deterministic default once the script
+    /// is exhausted. Shared by `complete` and `complete_streaming` so a
+    /// streamed tool round consumes exactly one script entry.
+    fn next_response(&self, request: &ModelRequest) -> ModelResponse {
+        if let Some(script) = &self.script
+            && let Some(next) = script.lock().expect("script lock").pop_front()
+        {
+            return next;
+        }
+        response_for(request)
+    }
+
     /// Cooperative latency: wake in 5 ms slices, observing cancellation.
     fn wait_latency(&self, cancel: &CancellationToken) -> Result<(), AgentError> {
         let mut waited = Duration::ZERO;
@@ -88,14 +100,7 @@ impl ModelAdapter for MockAdapter {
         self.wait_latency(cancel)?;
 
         // Scripted runs (tool loops) replay their fixed sequence first.
-        if let Some(script) = &self.script
-            && let Some(next) = script.lock().expect("script lock").pop_front()
-        {
-            return Ok(next);
-        }
-
-        // Deterministic output derived only from the request.
-        Ok(response_for(request))
+        Ok(self.next_response(request))
     }
 
     fn complete_streaming(
@@ -104,10 +109,10 @@ impl ModelAdapter for MockAdapter {
         cancel: &CancellationToken,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ModelResponse, AgentError> {
-        // Same deterministic text, delivered in fixed-size chunks with the
-        // simulated latency spread between them: cancellation is observed
-        // *between* chunks, mirroring a real streaming provider.
-        let response = response_for(request);
+        // Same deterministic or scripted response, delivered in fixed-size
+        // chunks with the simulated latency spread between them: cancellation
+        // is observed *between* chunks, mirroring a real streaming provider.
+        let response = self.next_response(request);
         let chunks: Vec<&str> = chunked(&response.text, 12);
         let slice = if chunks.is_empty() {
             Duration::ZERO

@@ -18,6 +18,7 @@
 //! - no provider SDK is used — the wire format is small and stable, and a
 //!   dependency-free client keeps provider code behind one trait.
 
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::time::Duration;
 
@@ -258,6 +259,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
         let mut text = String::new();
         let mut model: Option<String> = None;
         let mut usage: Option<Value> = None;
+        let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
         let mut line = String::new();
 
         loop {
@@ -306,25 +308,76 @@ impl ModelAdapter for OpenAiCompatAdapter {
                 text.push_str(piece);
                 on_delta(piece);
             }
+            // OpenAI streams function calls as deltas: `id`/`name` normally
+            // arrive first, `arguments` in fragments, all keyed by `index`.
+            if let Some(calls) = chunk
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+            {
+                for (position, call) in calls.iter().enumerate() {
+                    let index = call
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|index| index as usize)
+                        .unwrap_or(position);
+                    let partial = tool_calls.entry(index).or_default();
+                    if let Some(id) = call.get("id").and_then(Value::as_str)
+                        && !id.is_empty()
+                    {
+                        partial.id = id.to_string();
+                    }
+                    if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                        && !name.is_empty()
+                    {
+                        partial.name.push_str(name);
+                    }
+                    if let Some(arguments) =
+                        call.pointer("/function/arguments").and_then(Value::as_str)
+                    {
+                        partial.arguments.push_str(arguments);
+                    }
+                }
+            }
         }
 
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        if text.is_empty() {
+        if text.is_empty() && tool_calls.is_empty() {
             return Err(AgentError::Adapter(
-                "el stream terminó sin contenido de texto".to_string(),
+                "el stream terminó sin contenido de texto ni tool_calls".to_string(),
             ));
+        }
+
+        let mut parsed_calls = Vec::with_capacity(tool_calls.len());
+        for partial in tool_calls.into_values() {
+            if partial.name.trim().is_empty() {
+                return Err(AgentError::Adapter(
+                    "el stream contiene un tool_call sin function.name".to_string(),
+                ));
+            }
+            let arguments = if partial.arguments.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str::<Value>(&partial.arguments).map_err(|_| {
+                    AgentError::Adapter(format!(
+                        "los argumentos de la herramienta «{}» no son JSON válido",
+                        partial.name
+                    ))
+                })?
+            };
+            parsed_calls.push(ToolCall {
+                id: partial.id,
+                name: partial.name,
+                arguments,
+            });
         }
 
         let usage = usage.unwrap_or(Value::Null);
         Ok(ModelResponse {
             text,
             model: model.unwrap_or_else(|| "desconocido".to_string()),
-            // Streaming delivers text deltas; the tool loop runs on the
-            // non-streaming `complete` path, so streamed responses never
-            // carry tool calls (documented limitation, not silent data).
-            tool_calls: Vec::new(),
+            tool_calls: parsed_calls,
             input_tokens: usage
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
@@ -335,6 +388,13 @@ impl ModelAdapter for OpenAiCompatAdapter {
                 .map(|tokens| tokens as u32),
         })
     }
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl OpenAiCompatAdapter {

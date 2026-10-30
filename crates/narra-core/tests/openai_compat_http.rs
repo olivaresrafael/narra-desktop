@@ -452,6 +452,53 @@ fn streaming_delivers_deltas_in_order_and_assembles_the_text() {
 }
 
 #[test]
+fn streaming_assembles_tool_call_deltas() {
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_document", "arguments": ""}}
+            ]}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"path\":\"bible/"}}
+            ]}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "characters/marta.md\"}"}}
+            ]}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 2}
+        })),
+        "data: [DONE]".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::from_millis(5), None);
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let mut deltas: Vec<String> = Vec::new();
+    let response = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |chunk| {
+            deltas.push(chunk.to_string())
+        })
+        .expect("stream completes");
+
+    assert!(deltas.is_empty(), "tool-only stream has no text deltas");
+    assert_eq!(response.text, "");
+    assert_eq!(response.tool_calls.len(), 1);
+    let call = &response.tool_calls[0];
+    assert_eq!(call.id, "call_1");
+    assert_eq!(call.name, "read_document");
+    assert_eq!(call.arguments["path"], "bible/characters/marta.md");
+}
+
+#[test]
 fn streaming_cancel_between_chunks_stops_before_the_stall() {
     // The server stalls 30 s after the first event; the consumer cancels as
     // soon as the first delta arrives. The adapter must return Cancelled

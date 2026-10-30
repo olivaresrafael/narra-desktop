@@ -73,6 +73,9 @@ pub enum ProposalError {
     #[error("the model produced no changes for `{target}`")]
     NoChanges { target: String },
 
+    #[error("cannot create `{target}`: the file now exists; renewed review required")]
+    TargetExists { target: String },
+
     #[error("failed to persist proposal: {0}")]
     Io(#[source] std::io::Error),
 
@@ -144,6 +147,14 @@ pub struct FileProposal {
     pub base_revision: Option<String>,
     /// SHA-256 (hex) of the target content the hunks were computed from.
     pub base_sha256: String,
+    /// True when the target did not exist and the proposal creates it. Apply
+    /// uses create-only IO and refuses if the file appeared meanwhile.
+    #[serde(default)]
+    pub base_missing: bool,
+    /// Whether a created document should end with a newline. Existing-file
+    /// proposals keep the base's ending through `apply_hunks`.
+    #[serde(default)]
+    pub trailing_newline: bool,
     /// Why the change was requested (the user-facing instruction).
     pub rationale: String,
     pub origin: Origin,
@@ -179,6 +190,40 @@ impl FileProposal {
             target: target.into(),
             base_revision,
             base_sha256: sha256_hex(base),
+            base_missing: false,
+            trailing_newline: false,
+            rationale: rationale.into(),
+            origin,
+            hunks,
+            applied_hunks: Vec::new(),
+        })
+    }
+
+    /// Build a proposal that creates a new file. The diff is computed from an
+    /// empty base; apply refuses if the target exists.
+    pub fn new_document(
+        target: impl Into<String>,
+        proposed: &str,
+        rationale: impl Into<String>,
+        origin: Origin,
+        base_revision: Option<String>,
+    ) -> Result<Self, ProposalError> {
+        let target = target.into();
+        let hunks = compute_hunks("", proposed);
+        if hunks.is_empty() {
+            return Err(ProposalError::NoChanges { target });
+        }
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .expect("RFC 3339 formatting cannot fail for UTC timestamps"),
+            state: ProposalState::ReadyForReview,
+            target,
+            base_revision,
+            base_sha256: sha256_hex(""),
+            base_missing: true,
+            trailing_newline: proposed.ends_with('\n'),
             rationale: rationale.into(),
             origin,
             hunks,
@@ -435,15 +480,34 @@ pub fn apply(
         }
     }
 
-    let base = document::read_document(root, &proposal.target)?;
-    if sha256_hex(&base) != proposal.base_sha256 {
-        proposal.state = ProposalState::Stale;
-        save(root, &proposal)?;
-        return Err(ProposalError::Stale {
-            id: id.to_string(),
-            target: proposal.target.clone(),
-        });
-    }
+    let base = if proposal.base_missing {
+        match document::read_document(root, &proposal.target) {
+            Ok(_) => {
+                proposal.state = ProposalState::Stale;
+                save(root, &proposal)?;
+                return Err(ProposalError::TargetExists {
+                    target: proposal.target.clone(),
+                });
+            }
+            Err(DocumentError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                String::new()
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        let base = document::read_document(root, &proposal.target)?;
+        if sha256_hex(&base) != proposal.base_sha256 {
+            proposal.state = ProposalState::Stale;
+            save(root, &proposal)?;
+            return Err(ProposalError::Stale {
+                id: id.to_string(),
+                target: proposal.target.clone(),
+            });
+        }
+        base
+    };
     if proposal.hunks.is_empty() {
         return Err(ProposalError::Empty { id: id.to_string() });
     }
@@ -466,13 +530,21 @@ pub fn apply(
         None => (0..proposal.hunks.len()).collect(),
     };
 
-    let content = apply_hunks(&base, &proposal.hunks, &applied).map_err(|error| match error {
-        ProposalError::AnchorMismatch { .. } => ProposalError::AnchorMismatch {
-            path: proposal.target.clone(),
-        },
-        other => other,
-    })?;
-    document::write_document(root, &proposal.target, &content)?;
+    let mut content =
+        apply_hunks(&base, &proposal.hunks, &applied).map_err(|error| match error {
+            ProposalError::AnchorMismatch { .. } => ProposalError::AnchorMismatch {
+                path: proposal.target.clone(),
+            },
+            other => other,
+        })?;
+    if proposal.base_missing && proposal.trailing_newline && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if proposal.base_missing {
+        document::create_document(root, &proposal.target, &content)?;
+    } else {
+        document::write_document(root, &proposal.target, &content)?;
+    }
 
     // Bookkeeping runs after the canonical write; a failure here is reported
     // honestly (the file changed, the record did not).
@@ -634,6 +706,52 @@ mod tests {
         assert_eq!(state, "\"ready_for_review\"");
         let stale = serde_json::to_string(&ProposalState::Stale).expect("json");
         assert_eq!(stale, "\"stale\"");
+    }
+
+    #[test]
+    fn new_document_proposal_applies_create_only() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let origin = Origin {
+            task: "chat".into(),
+            adapter: "mock".into(),
+            model: "mock-1".into(),
+            task_input: serde_json::json!({"path": "bible/characters/elena.md"}),
+        };
+        let proposal = FileProposal::new_document(
+            "bible/characters/elena.md",
+            "# Elena\n\nHermana de Marta.\n",
+            "crea la ficha",
+            origin.clone(),
+            None,
+        )
+        .expect("new document proposal");
+        assert!(proposal.base_missing);
+        save(root.path(), &proposal).expect("save");
+        let outcome = apply(root.path(), &proposal.id, None).expect("apply create");
+        assert_eq!(outcome.applied_hunks, vec![0]);
+        assert_eq!(
+            document::read_document(root.path(), "bible/characters/elena.md").expect("created"),
+            "# Elena\n\nHermana de Marta.\n"
+        );
+
+        let existing = FileProposal::new_document(
+            "bible/characters/elena.md",
+            "# Elena\n\nOtra versión.\n",
+            "repite",
+            origin,
+            None,
+        )
+        .expect("proposal");
+        save(root.path(), &existing).expect("save");
+        let error = apply(root.path(), &existing.id, None).expect_err("target exists");
+        assert!(
+            matches!(error, ProposalError::TargetExists { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            load(root.path(), &existing.id).expect("reload").state,
+            ProposalState::Stale
+        );
     }
 
     #[test]
