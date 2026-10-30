@@ -810,6 +810,41 @@ enum ChatRunMessage {
     Done(Result<narra_core::agent::TaskOutput, AgentError>),
 }
 
+/// Small popovers in the chat surface. Only one is open at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatMenu {
+    Compose,
+    Model,
+    Top,
+}
+
+#[derive(Debug, Clone)]
+struct ChatMentionState {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatMentionAction {
+    File(String),
+    Scene,
+    Selection,
+}
+
+#[derive(Debug, Clone)]
+struct ChatMentionItem {
+    label: String,
+    detail: String,
+    action: ChatMentionAction,
+}
+
+enum ChatModelsMessage {
+    Done {
+        request: u64,
+        result: Result<Vec<String>, String>,
+    },
+}
+
 /// What to do once the unsaved-changes prompt is resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingUnsaved {
@@ -1911,9 +1946,22 @@ struct Editor {
     /// Saved chat threads and whether the history list is visible.
     chat_history: Vec<ChatThread>,
     chat_history_open: bool,
+    /// Zed-style chat popovers: compose actions, model picker or top actions.
+    chat_menu: Option<ChatMenu>,
+    /// Whether the transcript follows new agent text (Zed's follow mode).
+    chat_follow: bool,
+    /// `@` autocomplete query and selected row.
+    chat_mention: Option<ChatMentionState>,
+    /// Models shown in the inline picker; refreshed from the provider when
+    /// the picker opens.
+    chat_models: Vec<String>,
+    chat_models_request: u64,
+    chat_models_loading: bool,
     /// Scroll state of the chat transcript (M16 slice 4); the app draws the
     /// scrollbar because GPUI 0.2.2 paints none.
     chat_scroll: ScrollHandle,
+    /// Scroll state for the read-only Markdown preview.
+    preview_scroll: ScrollHandle,
     /// Active chat-scrollbar drag.
     chat_scroll_drag: Option<ChatScrollDrag>,
     /// Parsed Markdown for assistant turns, keyed by a content hash (M16
@@ -2016,6 +2064,9 @@ impl Editor {
         }
         self.check_backup_notice();
         self.chat.focused = false;
+        // The preview scroll handle is per active surface, not per tab; a new
+        // tab starts at the top rather than inheriting the previous offset.
+        self.preview_scroll = ScrollHandle::new();
         true
     }
 
@@ -6868,6 +6919,10 @@ impl Editor {
             self.palette_move(-1, cx);
             return;
         }
+        if self.chat.focused && self.chat_mention.is_some() {
+            self.chat_mention_move(-1, cx);
+            return;
+        }
         if self.with_new_project_text(|field| field.move_up(false)) {
             cx.notify();
             return;
@@ -6884,6 +6939,10 @@ impl Editor {
         }
         if self.palette.is_some() {
             self.palette_move(1, cx);
+            return;
+        }
+        if self.chat.focused && self.chat_mention.is_some() {
+            self.chat_mention_move(1, cx);
             return;
         }
         if self.with_new_project_text(|field| field.move_down(false)) {
@@ -11307,6 +11366,7 @@ impl Editor {
         }
         if self.chat.focused {
             self.chat.backspace();
+            self.chat_refresh_mention();
             cx.notify();
             return;
         }
@@ -11467,6 +11527,15 @@ impl Editor {
         }
         if self.palette.is_some() {
             self.palette_activate(window, cx);
+            return;
+        }
+        if self.chat.focused && self.chat_mention.is_some() {
+            let index = self
+                .chat_mention
+                .as_ref()
+                .map(|state| state.selected)
+                .unwrap_or(0);
+            self.chat_accept_mention(index, cx);
             return;
         }
         if self.chat.focused {
@@ -11985,6 +12054,12 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.chat_menu.is_some() || self.chat_mention.is_some() {
+            self.chat_menu = None;
+            self.chat_mention = None;
+            cx.notify();
+            return;
+        }
         // Escape closes whichever bar owns the keystrokes (single bar model:
         // find, the instruction bar and the focus bar are never open at the
         // same time). The unsaved-changes prompt wins over all of them.
@@ -12149,13 +12224,29 @@ impl Editor {
         if on {
             let text = self.doc.buffer.slice(0..self.doc.buffer.doc_len());
             self.doc.preview_document = MarkdownDocument::parse(&text);
+            self.preview_scroll = ScrollHandle::new();
             self.doc.diff.open = false;
             self.doc.find.open = false;
             self.doc.find.matches.clear();
             self.doc.find.current = 0;
         }
         self.doc.preview = on;
+        if on {
+            self.refresh_preview_scrollbar(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// The thumb is read from the handle's last layout, so the first preview
+    /// frame has `max_offset == 0`. A second frame paints the real thumb.
+    fn refresh_preview_scrollbar(&mut self, cx: &mut Context<Self>) {
         cx.notify();
+        cx.spawn(async move |view, cx| {
+            Timer::after(Duration::from_millis(16)).await;
+            view.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
     }
 
     fn on_toggle_preview(
@@ -12165,6 +12256,31 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.set_preview(!self.doc.preview, cx);
+    }
+
+    /// A thin scrollbar for the Markdown preview. GPUI paints none by
+    /// default; the handle is updated by the preview's `track_scroll`.
+    fn preview_scrollbar(&self) -> gpui::Div {
+        let viewport_h = f32::from(self.preview_scroll.bounds().size.height);
+        let max_offset = f32::from(self.preview_scroll.max_offset().height);
+        let offset_y = f32::from(self.preview_scroll.offset().y);
+        let mut bar = div()
+            .w(px(scrollbar::WIDTH))
+            .h_full()
+            .relative()
+            .flex_shrink_0();
+        if let Some((top, height)) = scrollbar::thumb(viewport_h, max_offset, offset_y) {
+            bar = bar.child(
+                div()
+                    .absolute()
+                    .right(px((scrollbar::WIDTH - scrollbar::THUMB_W) / 2.0))
+                    .top(px(top))
+                    .h(px(height))
+                    .w(px(scrollbar::THUMB_W))
+                    .bg(rgb(theme::gutter_fg())),
+            );
+        }
+        bar
     }
 
     /// Slim per-document toolbar for Markdown. The toggle is per tab because
@@ -13674,16 +13790,6 @@ impl Editor {
         cx.notify();
     }
 
-    fn open_ai_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_none() {
-            self.on_open_settings(&OpenSettings, window, cx);
-        }
-        if let Some(settings) = self.settings.as_mut() {
-            settings.section = SettingsSection::Ai;
-        }
-        cx.notify();
-    }
-
     fn chat_attach_scene(&mut self, cx: &mut Context<Self>) {
         let caret_line = self.doc.buffer.position_at(self.caret()).line;
         if self.doc.scene_lines.is_empty() {
@@ -13883,7 +13989,11 @@ impl Editor {
             .begin_run(instruction.clone(), attachments.clone());
         // Sending is an explicit action: show the new turn even if the reader
         // had scrolled up. Streaming afterwards follows only while at bottom.
-        self.chat_scroll.scroll_to_bottom();
+        if self.chat_follow {
+            self.chat_scroll.scroll_to_bottom();
+        }
+        self.chat_mention = None;
+        self.chat_menu = None;
         self.chat.focused = true;
         self.agent_panel_open = true;
         self.right_tab = RightTab::Chat;
@@ -13969,7 +14079,7 @@ impl Editor {
     /// Follow new assistant text only while the reader is at the bottom;
     /// scrolling up pauses the follow until they return (D-042).
     fn chat_follow_stream(&mut self) {
-        if self.chat_at_bottom() {
+        if self.chat_follow && self.chat_at_bottom() {
             self.chat_scroll.scroll_to_bottom();
         }
     }
@@ -14004,6 +14114,252 @@ impl Editor {
         cx.notify();
     }
 
+    fn chat_toggle_menu(&mut self, menu: ChatMenu, cx: &mut Context<Self>) {
+        self.chat_mention = None;
+        if self.chat_menu == Some(menu) {
+            self.chat_menu = None;
+        } else {
+            self.chat_menu = Some(menu);
+            if menu == ChatMenu::Model {
+                self.chat_prepare_models(cx);
+            }
+        }
+        self.chat.focused = false;
+        cx.notify();
+    }
+
+    fn chat_toggle_follow(&mut self, cx: &mut Context<Self>) {
+        self.chat_follow = !self.chat_follow;
+        if self.chat_follow {
+            self.chat_scroll.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    fn current_scene_number(&self) -> Option<usize> {
+        let caret_line = self.doc.buffer.position_at(self.caret()).line;
+        scene_number_at(&self.doc.scene_lines, caret_line)
+    }
+
+    fn chat_mention_query(&self) -> Option<String> {
+        let input = self.chat.input.as_str();
+        let at = input.rfind('@')?;
+        if at > 0 && !input[..at].chars().last().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let query = &input[at + 1..];
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(query.to_lowercase())
+    }
+
+    fn chat_refresh_mention(&mut self) {
+        match self.chat_mention_query() {
+            Some(query) => {
+                let selected = self
+                    .chat_mention
+                    .as_ref()
+                    .filter(|state| state.query == query)
+                    .map(|state| state.selected)
+                    .unwrap_or(0);
+                self.chat_mention = Some(ChatMentionState { query, selected });
+            }
+            None => self.chat_mention = None,
+        }
+    }
+
+    fn chat_mention_items(&self) -> Vec<ChatMentionItem> {
+        let Some(state) = self.chat_mention.as_ref() else {
+            return Vec::new();
+        };
+        let query = state.query.as_str();
+        let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(query);
+        let mut items = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (kind, prefix) in [
+            ("character", "bible/characters/"),
+            ("location", "bible/locations/"),
+            ("object", "bible/objects/"),
+        ] {
+            if !self.profile.allows_entity(kind) {
+                continue;
+            }
+            for path in &self.explorer {
+                if !path.starts_with(prefix) {
+                    continue;
+                }
+                let name = path
+                    .trim_start_matches(prefix)
+                    .trim_end_matches(".md")
+                    .to_string();
+                if matches(&name) {
+                    let label = format!("{}: {}", self.t(entity_kind_key(kind)), name);
+                    if seen.insert(path.clone()) {
+                        items.push(ChatMentionItem {
+                            label,
+                            detail: path.clone(),
+                            action: ChatMentionAction::File(path.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        for path in explorer::visible_paths(&self.explorer, self.show_config_files)
+            .into_iter()
+            .filter(|path| explorer::is_attachable_path(path))
+            .take(6)
+        {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            if (matches(&name) || matches(&path)) && seen.insert(path.clone()) {
+                items.push(ChatMentionItem {
+                    label: name,
+                    detail: path.clone(),
+                    action: ChatMentionAction::File(path),
+                });
+            }
+        }
+        if self.profile.screenplay
+            && matches(self.t("chat.attach_scene"))
+            && let Some(scene) = self.current_scene_number()
+        {
+            items.push(ChatMentionItem {
+                label: format!("{} {}", self.t("chat.attach_scene"), scene),
+                detail: self.t("chat.mention_scene_detail").to_string(),
+                action: ChatMentionAction::Scene,
+            });
+        }
+        if !self.doc.selected.is_empty() && matches(self.t("chat.attachment_selection")) {
+            items.push(ChatMentionItem {
+                label: self.t("chat.attachment_selection").to_string(),
+                detail: self.t("chat.mention_selection_detail").to_string(),
+                action: ChatMentionAction::Selection,
+            });
+        }
+        items.truncate(10);
+        items
+    }
+
+    fn chat_mention_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.chat_mention_items().len();
+        if let Some(state) = self.chat_mention.as_mut()
+            && count > 0
+        {
+            let current = state.selected.min(count - 1) as isize;
+            state.selected = (current + delta).clamp(0, count as isize - 1) as usize;
+        }
+        cx.notify();
+    }
+
+    fn chat_accept_mention(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(item) = self.chat_mention_items().get(index).cloned() else {
+            return;
+        };
+        if let Some(at) = self.chat.input.rfind('@') {
+            self.chat.input.truncate(at);
+            self.chat.input = self.chat.input.trim_end().to_string();
+        }
+        self.chat_mention = None;
+        self.chat_menu = None;
+        match item.action {
+            ChatMentionAction::File(path) => self.chat_attach_path(&path, cx),
+            ChatMentionAction::Scene => self.chat_attach_scene(cx),
+            ChatMentionAction::Selection => self.chat_attach_selection(cx),
+        }
+        self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn chat_prepare_models(&mut self, cx: &mut Context<Self>) {
+        let provider = self.agent_settings.provider;
+        let mut models = provider
+            .known_models()
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>();
+        if !self.agent_settings.model.trim().is_empty()
+            && !models
+                .iter()
+                .any(|model| model == &self.agent_settings.model)
+        {
+            models.insert(0, self.agent_settings.model.clone());
+        }
+        self.chat_models = models;
+        self.chat_models_loading = false;
+        if provider == AiProvider::Mock {
+            return;
+        }
+        let Some(models_url) = provider.models_url(&self.agent_settings.base_url) else {
+            return;
+        };
+        let request = self.chat_models_request.saturating_add(1);
+        self.chat_models_request = request;
+        self.chat_models_loading = true;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let key = resolve_provider_key(provider).ok().flatten();
+            let result = fetch_model_ids(&models_url, key.as_deref(), Duration::from_secs(20))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(ChatModelsMessage::Done { request, result });
+        });
+        Self::spawn_message_pump(cx, rx, |view, message| {
+            let ChatModelsMessage::Done { request, result } = message;
+            if view.chat_models_request != request {
+                return true;
+            }
+            view.chat_models_loading = false;
+            match result {
+                Ok(mut models) => {
+                    models.sort();
+                    models.dedup();
+                    if !models.is_empty() {
+                        view.chat_models = models;
+                    }
+                }
+                Err(error) => {
+                    view.notice = Some(view.tf("chat.models_failed", &[("error", &error)]));
+                }
+            }
+            true
+        });
+    }
+
+    fn chat_set_model(&mut self, model: String, cx: &mut Context<Self>) {
+        self.agent_settings.model = model.clone();
+        self.app_settings.model = model.clone();
+        if let Err(error) = self.app_settings.save() {
+            self.notice = Some(self.tf("chat.model_save_failed", &[("error", &error)]));
+        }
+        self.chat_menu = None;
+        self.chat.focused = true;
+        cx.notify();
+    }
+
+    fn chat_open_settings_section(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.is_none() {
+            self.on_open_settings(&OpenSettings, window, cx);
+        }
+        if let Some(settings) = self.settings.as_mut() {
+            settings.section = section;
+        }
+        self.chat_menu = None;
+        cx.notify();
+    }
+
+    fn chat_edit_instructions(&mut self, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        if let Err(message) = self.open_document_path(narra_core::project::INSTRUCTIONS_FILE, true)
+        {
+            self.notice = Some(message);
+        }
+        cx.notify();
+    }
+
     fn chat_new_thread(&mut self, cx: &mut Context<Self>) {
         if self.chat.status == ChatStatus::Running {
             return;
@@ -14011,6 +14367,8 @@ impl Editor {
         let mode = self.chat.mode();
         self.chat = ChatUiState::new(mode);
         self.chat_markdown.borrow_mut().clear();
+        self.chat_menu = None;
+        self.chat_mention = None;
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
         self.chat.focused = true;
@@ -14039,6 +14397,8 @@ impl Editor {
         };
         self.chat = ChatUiState::from_thread(thread);
         self.chat_markdown.borrow_mut().clear();
+        self.chat_menu = None;
+        self.chat_mention = None;
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
         self.chat_scroll.scroll_to_bottom();
@@ -14369,14 +14729,66 @@ impl Editor {
             )
             .child(
                 div()
-                    .id("chat-history")
+                    .id("chat-top-menu")
                     .px_2()
                     .py_1()
                     .cursor_pointer()
                     .text_color(rgb(theme::status_fg()))
-                    .child(icon("list-tree", theme::status_fg(), 14.0))
-                    .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_history(cx))),
+                    .child("…")
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.chat_toggle_menu(ChatMenu::Top, cx)),
+                    ),
             );
+        if self.chat_menu == Some(ChatMenu::Top) {
+            let mut menu = div()
+                .id("chat-top-actions")
+                .mx_2()
+                .mb_1()
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(rgb(theme::explorer_border()))
+                .bg(rgb(theme::bg()));
+            for (index, (label, action)) in [
+                ("chat.new_thread", 0u8),
+                ("chat.history", 1),
+                ("chat.settings", 2),
+                ("chat.skills", 3),
+                ("chat.edit_instructions", 4),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                menu = menu.child(
+                    div()
+                        .id(("chat-top-action", index))
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::status_fg()))
+                        .hover(|row| row.bg(rgb(theme::status_bg())))
+                        .child(self.t(label))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.chat_menu = None;
+                            match action {
+                                0 => this.chat_new_thread(cx),
+                                1 => this.chat_toggle_history(cx),
+                                2 => {
+                                    this.chat_open_settings_section(SettingsSection::Ai, window, cx)
+                                }
+                                3 => this.chat_open_settings_section(
+                                    SettingsSection::Packages,
+                                    window,
+                                    cx,
+                                ),
+                                _ => this.chat_edit_instructions(cx),
+                            }
+                        })),
+                );
+            }
+            panel = panel.child(menu);
+        }
         if self.chat_history_open {
             let mut history = div()
                 .id("chat-history-list")
@@ -14795,53 +15207,133 @@ impl Editor {
                     ),
             );
         }
-        let mut modes = div().flex().items_center().gap_1();
-        for mode in ChatMode::ALL {
-            let selected = self.chat.mode() == mode;
-            modes = modes.child(
+
+        let mention_items = self.chat_mention_items();
+        let mut mention_list = div()
+            .id("chat-mention-list")
+            .mb_1()
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::bg()));
+        if mention_items.is_empty() {
+            mention_list = mention_list.child(
                 div()
-                    .id(mode.key())
                     .px_2()
                     .py_1()
                     .text_xs()
-                    .cursor_pointer()
-                    .bg(rgb(if selected {
-                        theme::doc_selected_bg()
-                    } else {
-                        theme::bg()
-                    }))
-                    .text_color(rgb(if selected {
-                        theme::default_fg()
-                    } else {
-                        theme::status_fg()
-                    }))
-                    .child(t(chat_mode_key(mode)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.chat_set_mode(mode, cx))),
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(t("chat.mention_empty")),
             );
         }
-        let commands = [
-            "/plan",
-            "/build",
-            "/review",
-            "/rewrite",
-            "/continuity",
-            "/character",
-        ];
-        let mut command_row = div().flex().flex_wrap().gap_1();
-        for command in commands {
-            command_row = command_row.child(
+        let selected_mention = self
+            .chat_mention
+            .as_ref()
+            .map(|state| state.selected)
+            .unwrap_or(0);
+        for (index, item) in mention_items.iter().enumerate() {
+            let selected = index == selected_mention;
+            mention_list = mention_list.child(
+                div()
+                    .id(("chat-mention", index))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(item.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(item.detail.clone()),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.chat_accept_mention(index, cx)),
+                    ),
+            );
+        }
+
+        let mut compose_menu = div()
+            .id("chat-compose-menu")
+            .mb_1()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::bg()));
+        for (index, mode) in ChatMode::ALL.into_iter().enumerate() {
+            let selected = self.chat.mode() == mode;
+            compose_menu = compose_menu.child(
+                div()
+                    .id(("chat-mode", index))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .text_color(rgb(theme::default_fg()))
+                    .child(self.t(chat_mode_key(mode)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chat_set_mode(mode, cx);
+                        this.chat_menu = None;
+                    })),
+            );
+        }
+        for (index, (label, action)) in [
+            ("chat.attach_scene", 0u8),
+            ("chat.attach_selection", 1),
+            ("chat.attach_document", 2),
+            ("chat.attach_file", 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            compose_menu = compose_menu.child(
+                div()
+                    .id(("chat-attach-action", index))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::status_fg()))
+                    .hover(|row| row.bg(rgb(theme::status_bg())))
+                    .child(format!("@ {}", self.t(label)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chat_menu = None;
+                        match action {
+                            0 => this.chat_attach_scene(cx),
+                            1 => this.chat_attach_selection(cx),
+                            2 => this.chat_attach_document(cx),
+                            _ => this.chat_open_attach_file(cx),
+                        }
+                    })),
+            );
+        }
+        for command in ["/rewrite", "/continuity", "/character"] {
+            compose_menu = compose_menu.child(
                 div()
                     .id(command)
                     .px_2()
                     .py_1()
-                    .text_xs()
+                    .text_sm()
                     .cursor_pointer()
-                    .bg(rgb(theme::bg()))
-                    .border_1()
-                    .border_color(rgb(theme::explorer_border()))
                     .text_color(rgb(theme::gutter_fg()))
+                    .hover(|row| row.bg(rgb(theme::status_bg())))
                     .child(command)
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        this.chat_menu = None;
                         this.chat.focused = true;
                         this.chat.set_input(format!("{command} "));
                         window.focus(&this.focus_handle(cx));
@@ -14849,15 +15341,69 @@ impl Editor {
                     })),
             );
         }
+
+        let mut model_menu = div()
+            .id("chat-model-menu")
+            .mb_1()
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::bg()));
+        if self.chat_models.is_empty() {
+            model_menu = model_menu.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(t("chat.models_empty")),
+            );
+        }
+        for (index, model) in self.chat_models.iter().enumerate() {
+            let selected = model == &self.agent_settings.model;
+            let choice = model.clone();
+            model_menu = model_menu.child(
+                div()
+                    .id(("chat-model-choice", index))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(rgb(theme::doc_selected_bg())))
+                    .text_color(rgb(if selected {
+                        theme::default_fg()
+                    } else {
+                        theme::status_fg()
+                    }))
+                    .child(choice.clone())
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.chat_set_model(choice.clone(), cx)),
+                    ),
+            );
+        }
+        if self.chat_models_loading {
+            model_menu = model_menu.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(t("chat.models_loading")),
+            );
+        }
+
         let input = if self.chat.input.is_empty() {
             format!("{}▌", t("chat.placeholder"))
         } else {
             format!("{}▌", self.chat.input)
         };
-        let send_label = if self.chat.status == ChatStatus::Running {
-            t("chat.stop")
+        let follow_color = if self.chat_follow {
+            theme::cue_fg()
         } else {
-            t("chat.send")
+            theme::gutter_fg()
         };
         div()
             .border_t_1()
@@ -14865,64 +15411,23 @@ impl Editor {
             .p_2()
             .flex()
             .flex_col()
-            // The composer keeps its height while the transcript scrolls.
             .flex_shrink_0()
             .gap_1()
             .child(attachments)
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("chat-attach-scene")
-                            .px_1()
-                            .py_1()
-                            .text_xs()
-                            .cursor_pointer()
-                            .text_color(rgb(theme::status_fg()))
-                            .child(format!("@ {}", t("chat.attach_scene")))
-                            .on_click(cx.listener(|this, _, _, cx| this.chat_attach_scene(cx))),
-                    )
-                    .child(
-                        div()
-                            .id("chat-attach-selection")
-                            .px_1()
-                            .py_1()
-                            .text_xs()
-                            .cursor_pointer()
-                            .text_color(rgb(theme::status_fg()))
-                            .child(format!("@ {}", t("chat.attach_selection")))
-                            .on_click(cx.listener(|this, _, _, cx| this.chat_attach_selection(cx))),
-                    )
-                    .child(
-                        div()
-                            .id("chat-attach-document")
-                            .px_1()
-                            .py_1()
-                            .text_xs()
-                            .cursor_pointer()
-                            .text_color(rgb(theme::status_fg()))
-                            .child(format!("@ {}", t("chat.attach_document")))
-                            .on_click(cx.listener(|this, _, _, cx| this.chat_attach_document(cx))),
-                    )
-                    .child(
-                        div()
-                            .id("chat-attach-file")
-                            .px_1()
-                            .py_1()
-                            .text_xs()
-                            .cursor_pointer()
-                            .text_color(rgb(theme::status_fg()))
-                            .child(format!("@ {}", t("chat.attach_file")))
-                            .on_click(cx.listener(|this, _, _, cx| this.chat_open_attach_file(cx))),
-                    ),
-            )
+            .when(self.chat_mention.is_some(), |composer| {
+                composer.child(mention_list)
+            })
+            .when(self.chat_menu == Some(ChatMenu::Compose), |composer| {
+                composer.child(compose_menu)
+            })
+            .when(self.chat_menu == Some(ChatMenu::Model), |composer| {
+                composer.child(model_menu)
+            })
             .child(
                 div()
                     .id("chat-input")
                     .min_h(px(54.0))
-                    .max_h(px(120.0))
+                    .max_h(px(140.0))
                     .overflow_y_scroll()
                     .p_2()
                     .bg(rgb(theme::bg()))
@@ -14942,17 +15447,43 @@ impl Editor {
                     .child(input)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.chat.focused = true;
+                        this.chat_menu = None;
                         window.focus(&this.focus_handle(cx));
                         cx.notify();
                     })),
             )
-            .child(command_row)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child(modes)
+                    .child(
+                        div()
+                            .id("chat-compose-menu-button")
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::status_fg()))
+                            .child("+")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chat_toggle_menu(ChatMenu::Compose, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("chat-follow")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(rgb(follow_color))
+                            .child(if self.chat_follow {
+                                t("chat.follow_on")
+                            } else {
+                                t("chat.follow_off")
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_follow(cx))),
+                    )
                     .child(
                         div()
                             .id("chat-model")
@@ -14961,30 +15492,15 @@ impl Editor {
                             .whitespace_nowrap()
                             .text_xs()
                             .cursor_pointer()
-                            .text_color(rgb(theme::gutter_fg()))
-                            .child(format!(
-                                "{} · {}",
-                                self.agent_settings.provider.key(),
-                                self.agent_settings.model
-                            ))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_ai_settings(window, cx)
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("chat-ai-settings")
-                            .px_1()
-                            .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
-                            .child(icon("sliders-horizontal", theme::status_fg(), 14.0))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_ai_settings(window, cx)
-                                }),
-                            ),
+                            .child(if self.agent_settings.model.is_empty() {
+                                self.agent_settings.provider.key().to_string()
+                            } else {
+                                self.agent_settings.model.clone()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chat_toggle_menu(ChatMenu::Model, cx)
+                            })),
                     )
                     .child(
                         div()
@@ -14998,7 +15514,11 @@ impl Editor {
                             }))
                             .text_color(rgb(theme::default_fg()))
                             .cursor_pointer()
-                            .child(send_label)
+                            .child(if self.chat.status == ChatStatus::Running {
+                                "■".to_string()
+                            } else {
+                                "↑".to_string()
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.chat.status == ChatStatus::Running {
                                     this.chat_stop(cx);
@@ -17547,6 +18067,7 @@ impl Editor {
         let panels_dump = format!(
             "{{\"explorer\":{},\"agent\":{},\"git\":{},\"explorer_w\":{},\"right_w\":{},\"wrap_w\":{},\
              \"chat_scroll_offset\":{},\"chat_scroll_max\":{},\"chat_at_bottom\":{},\
+             \"preview_scroll_offset\":{},\"preview_scroll_max\":{},\"preview_scroll_viewport\":{},\
              \"window_title\":\"{}\"}}",
             self.explorer_open,
             self.agent_panel_open,
@@ -17557,6 +18078,9 @@ impl Editor {
             f32::from(self.chat_scroll.offset().y),
             f32::from(self.chat_scroll.max_offset().height),
             self.chat_at_bottom(),
+            f32::from(self.preview_scroll.offset().y),
+            f32::from(self.preview_scroll.max_offset().height),
+            f32::from(self.preview_scroll.bounds().size.height),
             escape_json(&self.window_title)
         );
         let settings_dump = if let Some(state) = self.settings.as_ref() {
@@ -18219,6 +18743,15 @@ fn split_chat_command(input: &str) -> Option<(&str, &str)> {
 }
 
 /// i18n key for a chat mode button.
+fn entity_kind_key(kind: &str) -> &'static str {
+    match kind {
+        "character" => "chat.kind.character",
+        "location" => "chat.kind.location",
+        "object" => "chat.kind.object",
+        _ => "chat.kind.entity",
+    }
+}
+
 fn chat_mode_key(mode: ChatMode) -> &'static str {
     match mode {
         ChatMode::Plan => "chat.mode.plan",
@@ -18590,6 +19123,7 @@ impl EntityInputHandler for Editor {
         }
         if self.chat.focused {
             self.chat.push_input(new_text);
+            self.chat_refresh_mention();
             cx.notify();
             return;
         }
@@ -18742,6 +19276,7 @@ impl EntityInputHandler for Editor {
         }
         if self.chat.focused {
             self.chat.push_input(new_text);
+            self.chat_refresh_mention();
             cx.notify();
             return;
         }
@@ -19106,10 +19641,21 @@ impl Render for Editor {
                                 )
                             })
                             .when(!self.doc.diff.open && self.doc.preview, |host| {
-                                host.child(markdown_view::render(
-                                    &self.doc.preview_document,
-                                    self.lang,
-                                ))
+                                host.child(
+                                    div()
+                                        .absolute()
+                                        .size_full()
+                                        .flex()
+                                        .on_scroll_wheel(cx.listener(
+                                            |_, _, _, cx| cx.notify(),
+                                        ))
+                                        .child(markdown_view::render(
+                                            &self.doc.preview_document,
+                                            self.lang,
+                                            &self.preview_scroll,
+                                        ))
+                                        .child(self.preview_scrollbar()),
+                                )
                             })
                             .when(!self.doc.diff.open && !self.doc.preview, |host| {
                                 host.child(
@@ -20003,7 +20549,14 @@ fn run() -> Result<(), String> {
                 chat_cancel: None,
                 chat_history: Vec::new(),
                 chat_history_open: false,
+                chat_menu: None,
+                chat_follow: true,
+                chat_mention: None,
+                chat_models: Vec::new(),
+                chat_models_request: 0,
+                chat_models_loading: false,
                 chat_scroll: ScrollHandle::new(),
+                preview_scroll: ScrollHandle::new(),
                 chat_scroll_drag: None,
                 chat_markdown: RefCell::new(HashMap::new()),
                 rename: None,

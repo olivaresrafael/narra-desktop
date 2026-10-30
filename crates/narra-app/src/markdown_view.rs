@@ -5,8 +5,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Div, IntoElement, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px,
-    rgb, rgba,
+    Div, IntoElement, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px, rgb, rgba,
 };
 use narra_core::markdown::{Block, InlineSpan, MarkdownDocument};
 
@@ -15,10 +14,17 @@ use crate::{FONT_FAMILY, theme};
 
 /// Paint a derived Markdown document inside an independently scrollable
 /// read-only surface.
-pub fn render(document: &MarkdownDocument, lang: Lang) -> AnyElement {
+pub fn render(
+    document: &MarkdownDocument,
+    lang: Lang,
+    scroll: &gpui::ScrollHandle,
+) -> impl IntoElement {
     div()
         .id("markdown-preview")
-        .size_full()
+        .flex_1()
+        .min_h(px(0.0))
+        .min_w(px(0.0))
+        .track_scroll(scroll)
         .overflow_y_scroll()
         .bg(rgb(theme::bg()))
         .child(
@@ -31,7 +37,6 @@ pub fn render(document: &MarkdownDocument, lang: Lang) -> AnyElement {
                     .child(blocks(document, lang)),
             ),
         )
-        .into_any_element()
 }
 
 /// The block column without the preview's scroll container, padding or max

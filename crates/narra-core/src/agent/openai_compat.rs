@@ -359,7 +359,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
             let arguments = if partial.arguments.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str::<Value>(&partial.arguments).map_err(|_| {
+                super::scaffold::parse_any_json_object(&partial.arguments).ok_or_else(|| {
                     AgentError::Adapter(format!(
                         "los argumentos de la herramienta «{}» no son JSON válido",
                         partial.name
@@ -488,12 +488,15 @@ fn parse_response(payload: Value) -> Result<ModelResponse, AgentError> {
                     AgentError::Adapter("tool_call sin function.name en la respuesta".to_string())
                 })?;
             let arguments = match call.pointer("/function/arguments") {
-                // Wire format: JSON-encoded string.
-                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).map_err(|_| {
-                    AgentError::Adapter(format!(
-                        "los argumentos de la herramienta «{name}» no son JSON válido"
-                    ))
-                })?,
+                // Wire format: JSON-encoded string. Models often emit raw
+                // newlines or trailing commas inside long content; use the
+                // same conservative repair as the scaffold plan parser.
+                Some(Value::String(raw)) => super::scaffold::parse_any_json_object(raw)
+                    .ok_or_else(|| {
+                        AgentError::Adapter(format!(
+                            "los argumentos de la herramienta «{name}» no son JSON válido"
+                        ))
+                    })?,
                 // Some local servers already send an object.
                 Some(value @ Value::Object(_)) => value.clone(),
                 _ => json!({}),
@@ -657,6 +660,27 @@ mod tests {
         assert_eq!(response.model, "qwen2.5vl:7b");
         assert_eq!(response.input_tokens, Some(12));
         assert_eq!(response.output_tokens, Some(5));
+    }
+
+    #[test]
+    fn tool_arguments_tolerate_raw_newlines_and_trailing_commas() {
+        let payload = json!({
+            "model": "x",
+            "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "propose_document_create",
+                    "arguments": "{\"path\":\"bible/characters/elena.md\",\"instruction\":\"crea\",\"content\":\"# Elena\n\nHermana de Marta.\",}"
+                }
+            }]}}]
+        });
+        let response = parse_response(payload).expect("tolerant tool args");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            response.tool_calls[0].arguments["content"],
+            "# Elena\n\nHermana de Marta."
+        );
     }
 
     #[test]

@@ -499,6 +499,45 @@ fn streaming_assembles_tool_call_deltas() {
 }
 
 #[test]
+fn streaming_tolerates_raw_newlines_and_trailing_commas_in_tool_arguments() {
+    // Real providers sometimes serialize long `content` strings with literal
+    // newlines and leave a trailing comma. The adapter repairs those two
+    // conservative issues instead of dropping the proposal (D-050 flow).
+    let arguments = "{\"path\":\"notes/idea.md\",\"content\":\"# Idea\n\nLinea uno\nLinea dos\",}";
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_2", "type": "function", "function": {"name": "propose_document_create", "arguments": ""}}
+            ]}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": arguments}}
+            ]}}]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+        })),
+        "data: [DONE]".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::from_millis(5), None);
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let response = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect("tolerant tool arguments");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    let call = &response.tool_calls[0];
+    assert_eq!(call.name, "propose_document_create");
+    assert_eq!(call.arguments["path"], "notes/idea.md");
+    assert_eq!(call.arguments["content"], "# Idea\n\nLinea uno\nLinea dos");
+}
+
+#[test]
 fn streaming_cancel_between_chunks_stops_before_the_stall() {
     // The server stalls 30 s after the first event; the consumer cancels as
     // soon as the first delta arrives. The adapter must return Cancelled

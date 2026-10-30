@@ -186,6 +186,22 @@ fn parse_json_object(text: &str) -> Result<Value, ScaffoldError> {
     ))
 }
 
+/// Lenient object parser for provider tool arguments: fences, prose, raw
+/// control characters inside strings and trailing commas are tolerated.
+pub(crate) fn parse_any_json_object(text: &str) -> Option<Value> {
+    for candidate in balanced_json_objects(text) {
+        let repaired = repair_json_text(&candidate);
+        for attempt in [candidate.as_str(), repaired.as_str()] {
+            if let Ok(value) = serde_json::from_str::<Value>(attempt)
+                && value.is_object()
+            {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 /// Extract balanced `{...}` candidates. The scanner tracks JSON strings so a
 /// brace in a Markdown body or a quoted prompt does not end the object.
 fn balanced_json_objects(text: &str) -> Vec<String> {
