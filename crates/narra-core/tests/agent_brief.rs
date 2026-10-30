@@ -103,9 +103,10 @@ fn brief_reports_git_status_when_repository_exists() {
         .expect("task succeeds");
     let git = output.data["git"].as_str().expect("git summary");
     assert!(git.contains("rama main"), "{git}");
-    // The fresh project's template files are all untracked: status sees them.
+    // The fresh project's template files plus .narra/instructions.md are
+    // untracked: status sees them.
     assert!(
-        git.contains("4 archivos"),
+        git.contains("5 archivos"),
         "template files untracked: {git}"
     );
 }

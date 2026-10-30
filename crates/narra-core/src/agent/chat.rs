@@ -25,13 +25,15 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use super::adapter::{ModelAdapter, ModelRequest};
+use super::context::{project_context, truncate};
 use super::proposal;
+use super::skill::Skill;
 use super::tools::{
-    self, ChatMessage, ChatRole, GrantPolicy, ToolExecutor, ToolOutcome, ToolResult,
+    self, ChatMessage, ChatRole, GrantPolicy, ToolExecutor, ToolOutcome, ToolPermission, ToolResult,
 };
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::document;
-use crate::project::{Project, open_project};
+use crate::project::open_project;
 
 /// Chat modes exposed by the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -58,12 +60,12 @@ impl ChatMode {
         Self::ALL.into_iter().find(|mode| mode.key() == value)
     }
 
-    /// Tools available to this mode. `Plan`/`Review` are read-only by
-    /// construction (no tools), not by prompt wording alone.
+    /// Tools available to this mode. `Plan`/`Review` receive only the
+    /// read-only subset; write/proposal tools exist only in `Build`.
     pub fn tools(self) -> Vec<tools::ToolSpec> {
         match self {
             ChatMode::Build => tools::tool_specs(),
-            ChatMode::Plan | ChatMode::Review => Vec::new(),
+            ChatMode::Plan | ChatMode::Review => tools::read_only_specs(),
         }
     }
 
@@ -72,25 +74,43 @@ impl ChatMode {
             ChatMode::Plan => {
                 "Eres un colaborador de guion en modo PLAN. Trabajas en solo \
                  lectura: analiza, propone ideas, estructura y preguntas de \
-                 continuidad, pero no afirmes haber cambiado archivos. \
-                 Responde en el idioma del usuario, con claridad y sin \
-                 inventar canon del proyecto."
+                 continuidad, pero no afirmes haber cambiado archivos. Puedes \
+                 usar las herramientas de lectura para listar, buscar y leer \
+                 documentos del proyecto antes de responder. Si no encuentras \
+                 un dato, dilo; no inventes canon. Responde en el idioma del \
+                 usuario."
             }
             ChatMode::Build => {
-                "Eres un colaborador de guion en modo BUILD. Puedes usar \
-                 read_scene para leer escenas y propose_scene_edit para \
-                 proponer una reescritura. Una propuesta NO se aplica: queda \
-                 para revisión humana. Nunca digas que aplicaste un cambio ni \
-                 escribas archivos canónicos. Si falta información, pídela o \
-                 lee la escena con la herramienta. Responde en el idioma del \
-                 usuario."
+                "Eres un colaborador de guion en modo BUILD. Puedes usar las \
+                 herramientas de lectura para consultar el proyecto, read_scene \
+                 para leer escenas y propose_scene_edit para proponer una \
+                 reescritura. Una propuesta NO se aplica: queda para revisión \
+                 humana. Nunca digas que aplicaste un cambio ni escribas \
+                 archivos canónicos. Si falta información, búscala o pídela. \
+                 Responde en el idioma del usuario."
             }
             ChatMode::Review => {
                 "Eres un editor de guion en modo REVIEW. Haz una crítica \
-                 concreta de estructura, ritmo, personajes y continuidad, \
-                 apoyándote solo en el contexto entregado. No propongas \
-                 archivos ni afirmes haber modificado nada. Responde en el \
-                 idioma del usuario."
+                 concreta de estructura, ritmo, personajes y continuidad. \
+                 Puedes usar las herramientas de lectura para consultar los \
+                 documentos del proyecto; no propongas archivos ni afirmes \
+                 haber modificado nada. Si no encuentras un dato, dilo; no \
+                 inventes canon. Responde en el idioma del usuario."
+            }
+        }
+    }
+
+    fn tool_hint(self) -> &'static str {
+        match self {
+            ChatMode::Plan | ChatMode::Review => {
+                "Usa list_documents, search_project o read_document si \
+                 necesitas consultar el proyecto antes de responder. Cita la \
+                 ruta que consultaste."
+            }
+            ChatMode::Build => {
+                "Usa las herramientas de lectura si necesitas consultar el \
+                 proyecto, cita la ruta consultada, y propose_scene_edit para \
+                 proponer el cambio. La propuesta queda para revisión humana."
             }
         }
     }
@@ -298,6 +318,9 @@ pub struct ChatTask {
     /// Add a bounded project inventory and the generated base documents
     /// (premise, outline, decisions, open questions) to the context.
     pub include_project_context: bool,
+    /// Trusted skills available to `load_skill`; only metadata goes in the
+    /// prompt until the model asks for a body.
+    pub skills: Vec<Skill>,
 }
 
 impl ChatTask {
@@ -316,6 +339,7 @@ impl ChatTask {
             instruction: instruction.into(),
             attachments: Vec::new(),
             include_project_context: false,
+            skills: Vec::new(),
         }
     }
 
@@ -329,6 +353,11 @@ impl ChatTask {
         self
     }
 
+    pub fn with_skills(mut self, skills: Vec<Skill>) -> Self {
+        self.skills = skills;
+        self
+    }
+
     fn validate(&self) -> Result<(), AgentError> {
         if self.instruction.trim().is_empty() {
             return Err(AgentError::InvalidInput("instruction must not be empty"));
@@ -337,14 +366,13 @@ impl ChatTask {
     }
 
     /// Run one turn. `emit` receives streaming deltas in Plan/Review and
-    /// tool/proposal events in Build.
+    /// tool events in every mode and proposal events in Build.
     pub fn run(
         &self,
         adapter: &dyn ModelAdapter,
         options: &TaskOptions,
         mut emit: impl FnMut(TaskEvent),
     ) -> Result<TaskOutput, AgentError> {
-        let started = Instant::now();
         let root = Path::new(&self.project_root);
         self.validate()?;
         emit(TaskEvent::Started {
@@ -397,6 +425,19 @@ impl ChatTask {
                 attachment.kind, attachment.location, text
             ));
         }
+        if !self.skills.is_empty() {
+            context.push_str("\n[skills disponibles]\n");
+            for skill in &self.skills {
+                context.push_str(&format!(
+                    "- {} — {}: {}\n",
+                    skill.id, skill.name, skill.description
+                ));
+            }
+            context.push_str(
+                "Usa load_skill(id) cuando la tarea encaje con una skill; \
+                 el cuerpo completo no se incluye hasta entonces.\n",
+            );
+        }
         if context.is_empty() {
             context.push_str("(sin adjuntos; usa solo la conversación)\n");
         }
@@ -406,11 +447,12 @@ impl ChatTask {
 
         let transcript = transcript(&self.history);
         let prompt = format!(
-            "PROYECTO: {}\nIDIOMA PRIMARIO: {}\nMODO: {}\n\n\
+            "PROYECTO: {}\nTIPO DE PROYECTO: {}\nIDIOMA PRIMARIO: {}\nMODO: {}\n\n\
              CONVERSACIÓN PREVIA:\n{}\n\n\
              CONTEXTO ADJUNTO:\n{}\n\n\
              NUEVO MENSAJE DEL USUARIO:\n{}",
             manifest.title,
+            manifest.project_type_id,
             manifest.primary_language,
             self.mode.key(),
             transcript,
@@ -419,76 +461,20 @@ impl ChatTask {
         );
         let system = self.mode.system_prompt().to_string();
 
-        if self.mode == ChatMode::Build {
-            return self.run_build(
-                root,
-                adapter,
-                options,
-                BuildPrompt {
-                    system,
-                    prompt,
-                    sources,
-                },
-                emit,
-            );
-        }
-
-        let request = ModelRequest {
-            system,
-            prompt,
-            max_output_tokens: 4096,
-            tools: Vec::new(),
-            history: Vec::new(),
-        };
-        let remaining = options
-            .timeout
-            .checked_sub(started.elapsed())
-            .ok_or(AgentError::Timeout(options.timeout))?;
-        let adapter_options = TaskOptions {
-            timeout: remaining,
-            cancel: options.cancel.clone(),
-            stream: options.stream,
-        };
-        let mut streamed = String::new();
-        let response = if options.stream {
-            adapter.complete_streaming(&request, &adapter_options.cancel, &mut |delta| {
-                streamed.push_str(delta);
-                emit(TaskEvent::ModelDelta {
-                    text: delta.to_string(),
-                });
-            })?
-        } else {
-            adapter.complete(&request, &adapter_options.cancel)?
-        };
-        emit(TaskEvent::ModelResponded {
-            model: response.model.clone(),
-            output_chars: response.text.chars().count(),
-        });
-        if options.cancel.is_cancelled() {
-            return Err(AgentError::Cancelled);
-        }
-        let final_text = response.text;
-        emit(TaskEvent::Completed {
-            summary: final_text.clone(),
-        });
-        Ok(TaskOutput {
-            exit: TaskExit::Success,
-            summary: final_text.clone(),
-            data: json!({
-                "mode": self.mode.key(),
-                "final_text": final_text,
-                "adapter": adapter.name(),
-                "model": response.model,
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
-                "tools": [],
-                "sources": sources,
-            }),
-            sources,
-        })
+        self.run_with_tools(
+            root,
+            adapter,
+            options,
+            BuildPrompt {
+                system,
+                prompt,
+                sources,
+            },
+            emit,
+        )
     }
 
-    fn run_build(
+    fn run_with_tools(
         &self,
         root: &Path,
         adapter: &dyn ModelAdapter,
@@ -499,7 +485,7 @@ impl ChatTask {
         let BuildPrompt {
             system,
             prompt,
-            sources,
+            mut sources,
         } = input;
         let started = Instant::now();
         let specs = self.mode.tools();
@@ -508,7 +494,10 @@ impl ChatTask {
         let mut proposals = Vec::new();
         let mut model_name = "desconocido".to_string();
         let mut final_text: Option<String> = None;
-        let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+        let mut policy = match self.mode {
+            ChatMode::Build => GrantPolicy::new().allow("propose_scene_edit"),
+            ChatMode::Plan | ChatMode::Review => GrantPolicy::new(),
+        };
 
         for round in 0..6 {
             if options.cancel.is_cancelled() {
@@ -525,11 +514,7 @@ impl ChatTask {
             let request = ModelRequest {
                 system: system.clone(),
                 prompt: if history.is_empty() {
-                    format!(
-                        "{prompt}\n\nUsa read_scene si necesitas leer una escena y \
-                         propose_scene_edit para proponer el cambio. La propuesta \
-                         queda para revisión humana."
-                    )
+                    format!("{prompt}\n\n{}", self.mode.tool_hint())
                 } else {
                     format!("{prompt}\n\nContinúa según los resultados de las herramientas.")
                 },
@@ -570,7 +555,7 @@ impl ChatTask {
                     "history_len": self.history.len(),
                 }),
             };
-            let mut executor = ToolExecutor::new(root);
+            let mut executor = ToolExecutor::new(root).with_skills(self.skills.clone());
             for call in &calls {
                 if options.cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
@@ -590,6 +575,15 @@ impl ChatTask {
                     allowed: result.succeeded(),
                     outcome: format!("{:?}", result.outcome),
                 });
+                if result.permission == ToolPermission::ReadOnly
+                    && result.succeeded()
+                    && let Some(source) = tool_context_source(call)
+                {
+                    sources.push(source);
+                    emit(TaskEvent::ContextCollected {
+                        sources: sources.clone(),
+                    });
+                }
                 let content = match &result.outcome {
                     ToolOutcome::Text(text) => text.clone(),
                     ToolOutcome::ProposalCreated { id, target, hunks } => format!(
@@ -641,6 +635,41 @@ impl ChatTask {
     }
 }
 
+/// A successful read-only call is a visible source, not hidden context.
+fn tool_context_source(call: &tools::ToolCall) -> Option<ContextSource> {
+    let (location, detail) = match call.name.as_str() {
+        "read_document" => (
+            call.arguments.get("path")?.as_str()?.to_string(),
+            "documento leído por la herramienta".to_string(),
+        ),
+        "search_project" => (
+            format!("búsqueda: {}", call.arguments.get("query")?.as_str()?),
+            "resultados de search_project".to_string(),
+        ),
+        "list_documents" => (
+            "project".to_string(),
+            "lista de documentos del proyecto".to_string(),
+        ),
+        "load_skill" => (
+            format!("skill: {}", call.arguments.get("id")?.as_str()?),
+            "cuerpo de skill cargado".to_string(),
+        ),
+        "read_scene" => (
+            format!(
+                "escena {}",
+                call.arguments.get("scene")?.as_u64().unwrap_or(0)
+            ),
+            "escena leída por la herramienta".to_string(),
+        ),
+        _ => return None,
+    };
+    Some(ContextSource {
+        kind: "tool".to_string(),
+        location,
+        detail,
+    })
+}
+
 fn transcript(history: &[ChatTurn]) -> String {
     if history.is_empty() {
         return "(sin mensajes previos)".to_string();
@@ -661,70 +690,6 @@ fn transcript(history: &[ChatTurn]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Generated/base documents included automatically. Other files appear in
-/// the inventory; their content still requires an explicit attachment.
-const BASE_CONTEXT_DOCS: [&str; 4] = [
-    "bible/premise.md",
-    "structure/outline.md",
-    "notes/decisions.md",
-    "notes/open-questions.md",
-];
-const MAX_INVENTORY_FILES: usize = 200;
-const MAX_BASE_DOC_CHARS: usize = 8_000;
-
-fn project_context(project: &Project) -> (String, Vec<ContextSource>) {
-    let mut context = String::new();
-    let mut sources = Vec::new();
-    let documents = project.list_documents().unwrap_or_default();
-    if !documents.is_empty() {
-        let shown = documents.len().min(MAX_INVENTORY_FILES);
-        context.push_str("\n[inventario del proyecto]\n");
-        for path in documents.iter().take(shown) {
-            let size = std::fs::metadata(project.root().join(path))
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            context.push_str(&format!("- {path} ({size} B)\n"));
-        }
-        if documents.len() > shown {
-            context.push_str(&format!(
-                "- … {} archivos más no listados\n",
-                documents.len() - shown
-            ));
-        }
-        sources.push(ContextSource {
-            kind: "inventory".to_string(),
-            location: "project".to_string(),
-            detail: format!("{shown} archivos del proyecto"),
-        });
-    }
-    for path in BASE_CONTEXT_DOCS {
-        let Ok(content) = project.read_document(path) else {
-            continue;
-        };
-        let chars = content.chars().count();
-        let text = truncate(&content, MAX_BASE_DOC_CHARS);
-        context.push_str(&format!("\n[documento: {path}]\n{text}\n"));
-        sources.push(ContextSource {
-            kind: "document".to_string(),
-            location: path.to_string(),
-            detail: if chars > MAX_BASE_DOC_CHARS {
-                format!("{chars} caracteres (truncados a {MAX_BASE_DOC_CHARS})")
-            } else {
-                format!("{chars} caracteres")
-            },
-        });
-    }
-    (context, sources)
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut out: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        out.push('…');
-    }
-    out
 }
 
 fn now_rfc3339() -> String {
@@ -756,8 +721,19 @@ mod tests {
 
     #[test]
     fn modes_encode_tools_and_permissions_by_construction() {
-        assert!(ChatMode::Plan.tools().is_empty());
-        assert!(ChatMode::Review.tools().is_empty());
+        for mode in [ChatMode::Plan, ChatMode::Review] {
+            let tools = mode.tools();
+            assert!(tools.iter().any(|tool| tool.name == "list_documents"));
+            assert!(tools.iter().any(|tool| tool.name == "search_project"));
+            assert!(tools.iter().any(|tool| tool.name == "read_document"));
+            assert!(tools.iter().any(|tool| tool.name == "load_skill"));
+            assert!(tools.iter().any(|tool| tool.name == "read_scene"));
+            assert!(
+                tools
+                    .iter()
+                    .all(|tool| tool.permission == tools::ToolPermission::ReadOnly)
+            );
+        }
         let build = ChatMode::Build.tools();
         assert!(build.iter().any(|tool| tool.name == "read_scene"));
         assert!(build.iter().any(|tool| tool.name == "propose_scene_edit"));
@@ -876,6 +852,101 @@ mod tests {
                 source.location == "bible/premise.md" && source.kind == "document"
             }),
             "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn plan_chat_can_read_a_project_document_and_reports_it_as_a_source() {
+        let root = project();
+        fs::create_dir_all(root.join("bible/characters")).expect("bible");
+        fs::write(
+            root.join("bible/characters/marta.md"),
+            "# Marta\n\nMarta es la protagonista.\n",
+        )
+        .expect("character");
+        let adapter = crate::agent::MockAdapter::scripted(vec![
+            crate::agent::ModelResponse {
+                text: String::new(),
+                model: "mock".to_string(),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "read-1".to_string(),
+                    name: "read_document".to_string(),
+                    arguments: json!({"path": "bible/characters/marta.md"}),
+                }],
+                input_tokens: None,
+                output_tokens: None,
+            },
+            crate::agent::ModelResponse {
+                text: "Marta es la protagonista.".to_string(),
+                model: "mock".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]);
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Plan,
+            Vec::new(),
+            "¿Quién es Marta?",
+        );
+        let output = task
+            .run(&adapter, &TaskOptions::default(), |_event| {})
+            .expect("plan chat");
+        assert_eq!(output.data["final_text"], "Marta es la protagonista.");
+        assert_eq!(output.data["tools"].as_array().map(Vec::len), Some(1));
+        assert!(output.sources.iter().any(|source| {
+            source.kind == "tool" && source.location == "bible/characters/marta.md"
+        }));
+    }
+
+    #[test]
+    fn chat_exposes_skill_metadata_and_loads_the_body_on_demand() {
+        let root = project();
+        let skill = Skill {
+            id: "brief".to_string(),
+            name: "Brief reviewer".to_string(),
+            description: "Revisa briefs.".to_string(),
+            body: "Revisa objetivo y audiencia.".to_string(),
+            origin: crate::agent::SkillOrigin::User,
+            hash: "hash".to_string(),
+        };
+        let adapter = crate::agent::MockAdapter::scripted(vec![
+            crate::agent::ModelResponse {
+                text: String::new(),
+                model: "mock".to_string(),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "skill-1".to_string(),
+                    name: "load_skill".to_string(),
+                    arguments: json!({"id": "brief"}),
+                }],
+                input_tokens: None,
+                output_tokens: None,
+            },
+            crate::agent::ModelResponse {
+                text: "Revisé el brief.".to_string(),
+                model: "mock".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]);
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Plan,
+            Vec::new(),
+            "Revisa el brief",
+        )
+        .with_skills(vec![skill]);
+        let output = task
+            .run(&adapter, &TaskOptions::default(), |_event| {})
+            .expect("skill chat");
+        assert_eq!(output.data["final_text"], "Revisé el brief.");
+        assert!(
+            output
+                .sources
+                .iter()
+                .any(|source| { source.kind == "tool" && source.location == "skill: brief" })
         );
     }
 

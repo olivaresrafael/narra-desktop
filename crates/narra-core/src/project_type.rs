@@ -40,8 +40,9 @@ const MAX_NAME_CHARS: usize = 80;
 const MAX_DESCRIPTION_CHARS: usize = 500;
 const MAX_PATH_CHARS: usize = 160;
 const MAX_SKILLS: usize = 32;
+const MAX_PINNED_CONTEXT: usize = 32;
 
-const PACKAGE_KEYS: [&str; 9] = [
+const PACKAGE_KEYS: [&str; 10] = [
     "schema_version",
     "api_version",
     "id",
@@ -51,6 +52,7 @@ const PACKAGE_KEYS: [&str; 9] = [
     "files",
     "skills",
     "capabilities",
+    "context",
 ];
 
 /// Where a package was loaded from.
@@ -89,6 +91,28 @@ impl LocalizedText {
 pub struct TemplateFile {
     pub path: String,
     pub content: LocalizedText,
+}
+
+/// Context material the type wants available to the assistant without an
+/// explicit attachment. `None` on the package means "inherit the safe
+/// default (`bible/` when present)"; an explicit empty list pins nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextPolicy {
+    pub pinned: Vec<String>,
+}
+
+impl ContextPolicy {
+    /// Default pinned material for the built-in screenplay packages.
+    pub fn screenplay() -> Self {
+        Self {
+            pinned: vec![
+                "bible".to_string(),
+                "structure".to_string(),
+                "notes/decisions.md".to_string(),
+                "notes/open-questions.md".to_string(),
+            ],
+        }
+    }
 }
 
 /// What the editor exposes for a type. The UI consumes this profile instead
@@ -165,6 +189,9 @@ pub struct ProjectTypePackage {
     pub files: Vec<TemplateFile>,
     pub skills: Vec<String>,
     pub capabilities: TypeCapabilities,
+    /// Pinned context declared by the package. `None` means the safe default
+    /// for a custom type; built-ins declare their own list.
+    pub context: Option<ContextPolicy>,
     pub origin: TypeOrigin,
     /// Source directory for user/project packages, used when copying the
     /// package into a created project. Built-ins have no source directory.
@@ -184,6 +211,15 @@ impl ProjectTypePackage {
             screenplay: self.capabilities.screenplay,
             entity_kinds: self.capabilities.entity_kinds.clone(),
             export_pdf: self.capabilities.export_pdf,
+        }
+    }
+
+    /// Pinned paths for the chat brief. A custom package that omits
+    /// `context` inherits `bible/`; an explicit empty list pins nothing.
+    pub fn pinned_context(&self) -> Vec<String> {
+        match &self.context {
+            Some(policy) => policy.pinned.clone(),
+            None => vec!["bible".to_string()],
         }
     }
 
@@ -281,6 +317,24 @@ impl ProjectTypePackage {
                     field: "skills",
                     detail: format!("duplicate skill `{skill}`"),
                 });
+            }
+        }
+        if let Some(policy) = &self.context {
+            if policy.pinned.len() > MAX_PINNED_CONTEXT {
+                return Err(TypePackageError::Invalid {
+                    field: "context.pinned",
+                    detail: format!("at most {MAX_PINNED_CONTEXT} paths are allowed"),
+                });
+            }
+            let mut pinned = BTreeSet::new();
+            for path in &policy.pinned {
+                validate_relative_path("context.pinned", path)?;
+                if !pinned.insert(path.as_str()) {
+                    return Err(TypePackageError::Invalid {
+                        field: "context.pinned",
+                        detail: format!("duplicate path `{path}`"),
+                    });
+                }
             }
         }
         if self.capabilities.entity_kinds.len() > 16 {
@@ -472,6 +526,7 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         files,
         skills: Vec::new(),
         capabilities: TypeCapabilities::screenplay(),
+        context: Some(ContextPolicy::screenplay()),
         origin: TypeOrigin::Builtin,
         source_dir: None,
         content_hash: builtin_hash(id),
@@ -580,6 +635,23 @@ pub fn registry(
     Ok(by_id.into_values().collect())
 }
 
+/// Resolve the active type for a project without user-scope packages. The
+/// project copy is preferred (it travels with the repository); an untrusted
+/// project package is ignored so its pinned paths cannot steer the prompt.
+pub fn resolve(project_root: &Path, id: &str) -> Option<ProjectTypePackage> {
+    if let Some(package) = builtin(id) {
+        return Some(package);
+    }
+    let package = registry(Some(project_root), None)
+        .ok()?
+        .into_iter()
+        .find(|package| package.id == id)?;
+    if untrusted_project_type(project_root, &package).unwrap_or(true) {
+        return None;
+    }
+    Some(package)
+}
+
 /// Parse a `type.yaml` document without a directory (used by tests and the
 /// loader). The id is validated but not compared with a directory here.
 pub fn parse_package(
@@ -633,6 +705,10 @@ pub fn parse_package(
     let capabilities = match root.as_mapping_get("capabilities") {
         Some(value) => parse_capabilities(value)?,
         None => TypeCapabilities::default(),
+    };
+    let context = match root.as_mapping_get("context") {
+        Some(value) => Some(parse_context(value)?),
+        None => None,
     };
 
     let directories = match root.as_mapping_get("directories") {
@@ -707,12 +783,39 @@ pub fn parse_package(
         files,
         skills,
         capabilities,
+        context,
         origin,
         source_dir: None,
         content_hash: String::new(),
     };
     package.validate()?;
     Ok(package)
+}
+
+fn parse_context(value: &Yaml) -> Result<ContextPolicy, TypePackageError> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "context",
+            detail: "must be a mapping".to_string(),
+        })?;
+    for key in mapping.keys() {
+        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+            field: "context",
+            detail: "keys must be strings".to_string(),
+        })?;
+        if key != "pinned" {
+            return Err(TypePackageError::Invalid {
+                field: "context",
+                detail: format!("unknown key `{key}`"),
+            });
+        }
+    }
+    let pinned = match mapping_get(mapping, "pinned") {
+        Some(value) => string_sequence(value, "context.pinned")?,
+        None => Vec::new(),
+    };
+    Ok(ContextPolicy { pinned })
 }
 
 fn parse_capabilities(value: &Yaml) -> Result<TypeCapabilities, TypePackageError> {
@@ -1078,6 +1181,44 @@ mod tests {
         assert!(typed.profile().screenplay);
         assert_eq!(typed.profile().entity_kinds, ["audience", "channel"]);
         assert!(typed.profile().export_pdf);
+    }
+
+    #[test]
+    fn context_pinned_parses_defaults_and_rejects_unsafe_paths() {
+        let explicit = parse_package(
+            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncontext:\n  pinned: [brief, notes/decisions.md]\n",
+            TypeOrigin::User,
+        )
+        .expect("explicit context");
+        assert_eq!(
+            explicit.pinned_context(),
+            vec!["brief".to_string(), "notes/decisions.md".to_string()]
+        );
+
+        let omitted = parse_package(
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            TypeOrigin::User,
+        )
+        .expect("omitted context");
+        assert_eq!(omitted.pinned_context(), vec!["bible".to_string()]);
+
+        let empty = parse_package(
+            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ncontext:\n  pinned: []\n",
+            TypeOrigin::User,
+        )
+        .expect("empty context");
+        assert!(empty.pinned_context().is_empty());
+
+        let builtin = builtin("feature").expect("feature");
+        assert!(builtin.pinned_context().contains(&"bible".to_string()));
+        assert!(builtin.pinned_context().contains(&"structure".to_string()));
+
+        for bad in ["../outside", ".narra/instructions.md", "project.yaml"] {
+            let text = format!(
+                "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncontext:\n  pinned: [{bad}]\n"
+            );
+            assert!(parse_package(&text, TypeOrigin::User).is_err(), "{bad}");
+        }
     }
 
     #[test]

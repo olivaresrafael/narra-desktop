@@ -191,7 +191,11 @@ impl ToolLoopTask {
                 model: response.model.clone(),
                 task_input: json!({"instruction": self.instruction}),
             };
-            let mut executor = tools::ToolExecutor::new(root);
+            let skills = super::skill::load_skills(root, None)
+                .ok()
+                .and_then(|all| super::skill::active_skills(root, &all).ok())
+                .unwrap_or_default();
+            let mut executor = tools::ToolExecutor::new(root).with_skills(skills);
             for call in &assistant_calls {
                 if options.cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);

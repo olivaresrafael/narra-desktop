@@ -221,8 +221,8 @@ fn review_is_read_only_and_shows_every_source() {
     let after = snapshot(&root);
     assert_eq!(before, after, "scene_review must not touch any file");
     assert!(
-        !root.join(".narra").exists(),
-        "a read-only task must not create proposal state"
+        !root.join(".narra/proposals").exists() && !root.join(".narra/chats").exists(),
+        "a read-only task must not create proposal or chat state"
     );
 }
 

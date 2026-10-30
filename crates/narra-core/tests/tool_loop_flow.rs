@@ -349,10 +349,26 @@ fn loop_honors_cancellation_between_rounds() {
 #[test]
 fn tool_specs_declare_permissions_and_schemas() {
     let specs: Vec<ToolSpec> = narra_core::agent::tools::tool_specs();
-    assert_eq!(specs.len(), 3);
+    assert_eq!(specs.len(), 7);
     for spec in &specs {
         assert_eq!(spec.parameters["type"], "object", "{}", spec.name);
         assert!(!spec.description.is_empty());
+    }
+    for name in [
+        "list_documents",
+        "search_project",
+        "read_document",
+        "load_skill",
+        "read_scene",
+    ] {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .expect("read-only tool declared");
+        assert_eq!(
+            spec.permission,
+            narra_core::agent::tools::ToolPermission::ReadOnly
+        );
     }
     let apply = specs
         .iter()

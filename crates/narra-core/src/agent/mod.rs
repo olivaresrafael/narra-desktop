@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod brief;
 pub mod chat;
+pub mod context;
 pub mod mock;
 pub mod openai_compat;
 pub mod package;

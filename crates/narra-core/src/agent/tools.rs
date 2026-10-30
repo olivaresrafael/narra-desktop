@@ -27,7 +27,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::proposal::{self, FileProposal, Origin};
+use super::skill::Skill;
 use crate::fountain;
+
+/// Maximum characters returned by `read_document` in one call.
+const READ_DOCUMENT_MAX_CHARS: usize = 8_000;
+
+/// A document the read-only tools may open: project-relative, non-hidden,
+/// narrative text only. The manifest, agent config and coding-agent
+/// instructions stay out; the brief already carries the manifest and the
+/// dedicated `.narra/instructions.md`.
+fn is_tool_document_path(path: &str) -> bool {
+    if !super::context::is_text_path(path)
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path == "project.yaml"
+        || path == "agents.yaml"
+        || path == "AGENTS.md"
+        || path == "exports"
+        || path.starts_with("exports/")
+    {
+        return false;
+    }
+    !path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == ".." || part.starts_with('.'))
+}
 
 /// How much a tool is allowed to do. Every tool carries exactly one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,11 +245,63 @@ impl ToolResult {
 /// first and recording an audit [`ToolResult`] for every call.
 pub struct ToolExecutor<'a> {
     root: &'a Path,
+    skills: Vec<Skill>,
 }
 
 /// Tools the executor understands, with their permission class and schema.
 pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
+        ToolSpec {
+            name: "list_documents".to_string(),
+            description: "Lista los documentos narrativos del proyecto, en \
+                          orden alfabético, con su tamaño en bytes."
+                .to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+            permission: ToolPermission::ReadOnly,
+        },
+        ToolSpec {
+            name: "search_project".to_string(),
+            description: "Busca un texto literal en todos los documentos del \
+                          proyecto y devuelve documento, línea, columna y una \
+                          vista previa."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+            permission: ToolPermission::ReadOnly,
+        },
+        ToolSpec {
+            name: "read_document".to_string(),
+            description: "Lee un documento del proyecto, opcionalmente un \
+                          rango de líneas 1-based. La salida está acotada; usa \
+                          start_line/end_line para continuar un archivo largo."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"]
+            }),
+            permission: ToolPermission::ReadOnly,
+        },
+        ToolSpec {
+            name: "load_skill".to_string(),
+            description: "Carga el cuerpo de una skill de confianza por su id. \
+                          El prompt solo muestra el catálogo; usa esta \
+                          herramienta cuando la tarea encaje con una skill."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+            permission: ToolPermission::ReadOnly,
+        },
         ToolSpec {
             name: "read_scene".to_string(),
             description: "Devuelve el texto de una escena del guion principal \
@@ -270,6 +347,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Read-only subset used by Plan and Review.
+pub fn read_only_specs() -> Vec<ToolSpec> {
+    tool_specs()
+        .into_iter()
+        .filter(|spec| spec.permission == ToolPermission::ReadOnly)
+        .collect()
+}
+
 fn permission_of(name: &str) -> Option<ToolPermission> {
     tool_specs()
         .into_iter()
@@ -279,7 +364,17 @@ fn permission_of(name: &str) -> Option<ToolPermission> {
 
 impl<'a> ToolExecutor<'a> {
     pub fn new(root: &'a Path) -> Self {
-        Self { root }
+        Self {
+            root,
+            skills: Vec::new(),
+        }
+    }
+
+    /// Make the trusted skills available to `load_skill`. The caller is
+    /// responsible for passing only active/trusted skills.
+    pub fn with_skills(mut self, skills: Vec<Skill>) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// Run one call: the policy rules first, then the tool executes (or the
@@ -344,6 +439,10 @@ impl<'a> ToolExecutor<'a> {
             ToolPermission::ReadOnly | ToolPermission::ProposeWrite | ToolPermission::Destructive
         ));
         match call.name.as_str() {
+            "list_documents" => self.list_documents(),
+            "search_project" => self.search_project(call),
+            "read_document" => self.read_document(call),
+            "load_skill" => self.load_skill(call),
             "read_scene" => self.read_scene(call),
             "propose_scene_edit" => self.propose_scene_edit(call, origin),
             "apply_proposal" => self.apply_proposal(call),
@@ -353,6 +452,201 @@ impl<'a> ToolExecutor<'a> {
                 message: format!("sin implementación para «{other}»"),
             },
         }
+    }
+
+    /// Read-only: list the project documents the assistant may open. Hidden
+    /// state and exports are already excluded by `Project::list_documents`.
+    fn list_documents(&self) -> ToolOutcome {
+        let project = match crate::project::open_project(self.root) {
+            Ok(project) => project,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let documents = match project.list_documents() {
+            Ok(documents) => documents,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let shown = documents.len().min(200);
+        let mut out = String::from("Documentos del proyecto:\n");
+        for path in documents.iter().take(shown) {
+            let size = std::fs::metadata(project.root().join(path))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            out.push_str(&format!("- {path} ({size} B)\n"));
+        }
+        if documents.len() > shown {
+            out.push_str(&format!(
+                "- … {} documentos más no listados\n",
+                documents.len() - shown
+            ));
+        }
+        ToolOutcome::Text(out)
+    }
+
+    /// Read-only: literal project search, filtered to documents the read tool
+    /// may open. The search core already bounds the scan and hit count.
+    fn search_project(&self, call: &ToolCall) -> ToolOutcome {
+        let Some(query) = call.arguments.get("query").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «query» ausente".to_string(),
+            };
+        };
+        if query.trim().is_empty() {
+            return ToolOutcome::Failed {
+                message: "la búsqueda no puede estar vacía".to_string(),
+            };
+        }
+        let project = match crate::project::open_project(self.root) {
+            Ok(project) => project,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let report = match crate::search::search(&project, query) {
+            Ok(report) => report,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let hits: Vec<_> = report
+            .hits
+            .iter()
+            .filter(|hit| is_tool_document_path(&hit.document))
+            .take(80)
+            .collect();
+        if hits.is_empty() {
+            return ToolOutcome::Text(format!(
+                "Sin coincidencias para «{}» en los documentos del proyecto.",
+                query.trim()
+            ));
+        }
+        let mut out = format!(
+            "Coincidencias para «{}» ({} mostradas de {}):\n",
+            query.trim(),
+            hits.len(),
+            report.hits.len()
+        );
+        for hit in hits {
+            out.push_str(&format!(
+                "- {}:{}:{} — {}\n",
+                hit.document, hit.line, hit.column, hit.preview
+            ));
+        }
+        if report.truncated {
+            out.push_str("- … la búsqueda alcanzó el límite de resultados\n");
+        }
+        ToolOutcome::Text(out)
+    }
+
+    /// Read-only: read one text document, optionally a 1-based line range.
+    /// The result is capped so a large file cannot flood the model context.
+    fn read_document(&self, call: &ToolCall) -> ToolOutcome {
+        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «path» ausente".to_string(),
+            };
+        };
+        if !is_tool_document_path(path) {
+            return ToolOutcome::Failed {
+                message: format!(
+                    "«{path}» no es un documento narrativo legible; usa \
+                     list_documents para ver las rutas disponibles"
+                ),
+            };
+        }
+        let start = call
+            .arguments
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|value| value.max(1) as usize);
+        let end = call
+            .arguments
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|value| value.max(1) as usize);
+        if let (Some(start), Some(end)) = (start, end)
+            && end < start
+        {
+            return ToolOutcome::Failed {
+                message: "«end_line» no puede ser menor que «start_line»".to_string(),
+            };
+        }
+        let project = match crate::project::open_project(self.root) {
+            Ok(project) => project,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let content = match project.read_document(path) {
+            Ok(content) => content,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        if total == 0 {
+            return ToolOutcome::Text(format!("{path} está vacío."));
+        }
+        let first = start.unwrap_or(1);
+        if first > total {
+            return ToolOutcome::Failed {
+                message: format!("«{path}» solo tiene {total} líneas"),
+            };
+        }
+        let last = end.unwrap_or(total).min(total);
+        let mut out = format!("{path} (líneas {first}–{last} de {total}):\n");
+        let mut used = 0usize;
+        for (index, line) in lines[first - 1..last].iter().enumerate() {
+            let remaining = READ_DOCUMENT_MAX_CHARS.saturating_sub(used);
+            if remaining == 0 {
+                out.push_str("… (salida truncada; pide otro rango)\n");
+                break;
+            }
+            let numbered = format!("{}: {line}\n", first + index);
+            let chunk: String = numbered.chars().take(remaining).collect();
+            used += chunk.chars().count();
+            out.push_str(&chunk);
+            if chunk.chars().count() < numbered.chars().count() {
+                out.push_str("… (salida truncada; pide otro rango)\n");
+                break;
+            }
+        }
+        ToolOutcome::Text(out)
+    }
+
+    /// Read-only: return a trusted skill body. The catalog is supplied by
+    /// the caller, so untrusted or changed skills never reach this tool.
+    fn load_skill(&self, call: &ToolCall) -> ToolOutcome {
+        let Some(id) = call.arguments.get("id").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «id» ausente".to_string(),
+            };
+        };
+        let Some(skill) = self.skills.iter().find(|skill| skill.id == id) else {
+            return ToolOutcome::Failed {
+                message: format!("skill «{id}» no disponible o no confiada"),
+            };
+        };
+        ToolOutcome::Text(format!(
+            "# Skill: {}\n\n{}\n\n{}",
+            skill.name, skill.description, skill.body
+        ))
     }
 
     /// Read-only: extract one scene, exactly like the context retrieval the
@@ -618,6 +912,117 @@ mod tests {
             matches!(&result.outcome, ToolOutcome::Text(text) if text.contains("ELENA")),
             "{:?}",
             result.outcome
+        );
+    }
+
+    #[test]
+    fn read_only_tools_list_search_and_read_project_documents() {
+        let root = sample_project();
+        std::fs::create_dir_all(root.join("bible/characters")).expect("bible");
+        std::fs::write(
+            root.join("bible/characters/marta.md"),
+            "# Marta\n\nMarta es la protagonista.\n",
+        )
+        .expect("character");
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = GrantPolicy::new();
+
+        let listed = executor.execute(
+            &call("c1", "list_documents", json!({})),
+            &mut policy,
+            &origin(),
+        );
+        assert!(
+            matches!(&listed.outcome, ToolOutcome::Text(text) if text.contains("bible/characters/marta.md")),
+            "{:?}",
+            listed.outcome
+        );
+
+        let searched = executor.execute(
+            &call("c2", "search_project", json!({"query": "protagonista"})),
+            &mut policy,
+            &origin(),
+        );
+        assert!(
+            matches!(&searched.outcome, ToolOutcome::Text(text) if text.contains("bible/characters/marta.md:3")),
+            "{:?}",
+            searched.outcome
+        );
+
+        let read = executor.execute(
+            &call(
+                "c3",
+                "read_document",
+                json!({"path": "bible/characters/marta.md", "start_line": 3, "end_line": 3}),
+            ),
+            &mut policy,
+            &origin(),
+        );
+        assert!(
+            matches!(&read.outcome, ToolOutcome::Text(text) if text.contains("Marta es la protagonista.") && !text.contains("# Marta")),
+            "{:?}",
+            read.outcome
+        );
+    }
+
+    #[test]
+    fn read_document_rejects_config_hidden_and_non_text_paths() {
+        let root = sample_project();
+        std::fs::create_dir_all(root.join(".narra")).expect("narra");
+        std::fs::write(root.join(".narra/instructions.md"), "secreto").expect("instructions");
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = GrantPolicy::new();
+        for path in [
+            "project.yaml",
+            "AGENTS.md",
+            ".narra/instructions.md",
+            "../fuera.md",
+        ] {
+            let result = executor.execute(
+                &call("c1", "read_document", json!({"path": path})),
+                &mut policy,
+                &origin(),
+            );
+            assert!(
+                matches!(result.outcome, ToolOutcome::Failed { .. }),
+                "{path} must be rejected: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    #[test]
+    fn load_skill_only_returns_trusted_catalogue_bodies() {
+        let root = sample_project();
+        let skill = Skill {
+            id: "brief".to_string(),
+            name: "Brief reviewer".to_string(),
+            description: "Revisa briefs.".to_string(),
+            body: "Revisa objetivo y audiencia.".to_string(),
+            origin: crate::agent::SkillOrigin::User,
+            hash: "hash".to_string(),
+        };
+        let mut executor = ToolExecutor::new(&root).with_skills(vec![skill]);
+        let mut policy = GrantPolicy::new();
+        let loaded = executor.execute(
+            &call("c1", "load_skill", json!({"id": "brief"})),
+            &mut policy,
+            &origin(),
+        );
+        assert!(
+            matches!(&loaded.outcome, ToolOutcome::Text(text) if text.contains("Revisa objetivo y audiencia.")),
+            "{:?}",
+            loaded.outcome
+        );
+        let missing = executor.execute(
+            &call("c2", "load_skill", json!({"id": "other"})),
+            &mut policy,
+            &origin(),
+        );
+        assert!(
+            matches!(missing.outcome, ToolOutcome::Failed { .. }),
+            "{:?}",
+            missing.outcome
         );
     }
 

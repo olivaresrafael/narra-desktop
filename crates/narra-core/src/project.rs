@@ -29,6 +29,8 @@ pub const TEMPLATE_DIRS: &[&str] = &[
 
 /// Files created by `create_project`.
 pub const MANIFEST_FILE: &str = "project.yaml";
+/// Versioned project-level instructions for the assistant (D-047).
+pub const INSTRUCTIONS_FILE: &str = ".narra/instructions.md";
 pub const DEFAULT_SCREENPLAY: &str = "screenplay/main.fountain";
 /// Export artifacts (M7): written by `narra-harness export` and the app's
 /// ⌘E, and excluded from the document scan — they are outputs, never
@@ -307,6 +309,7 @@ pub fn create_project(
     let manifest = Manifest::new_v1(title, project_type, primary_language, DEFAULT_SCREENPLAY);
     let text = manifest::serialize_manifest(&manifest)?;
     document::write_document(root, MANIFEST_FILE, &text)?;
+    write_project_instructions(root, primary_language)?;
 
     // Seed content files. Empty screenplay: the writer starts from a blank page.
     document::write_document(root, DEFAULT_SCREENPLAY, "")?;
@@ -399,10 +402,23 @@ pub fn create_project_base_from_package(
         Manifest::new_v1_with_type_id(title, &package.id, primary_language, DEFAULT_SCREENPLAY)?;
     let text = manifest::serialize_manifest(&manifest)?;
     document::write_document(root, MANIFEST_FILE, &text)?;
+    write_project_instructions(root, primary_language)?;
     Ok(Project {
         root: root.to_path_buf(),
         manifest,
     })
+}
+
+/// A new project starts with a small, editable instruction file. It is
+/// create-only and lives in versioned `.narra/` config, not workflow state.
+fn write_project_instructions(root: &Path, primary_language: &str) -> Result<(), ProjectError> {
+    let text = if primary_language.starts_with("es") {
+        "# Instrucciones del proyecto\n\nIndica al asistente cómo ayudar en este proyecto: tono, reglas de canon, qué evitar y qué documentos son prioritarios.\n"
+    } else {
+        "# Project instructions\n\nTell the assistant how to help with this project: tone, canon rules, what to avoid, and which documents matter most.\n"
+    };
+    document::create_document(root, INSTRUCTIONS_FILE, text)?;
+    Ok(())
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<(), ProjectError> {
@@ -600,6 +616,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn new_projects_get_project_instructions() {
+        let root = temp_root();
+        create_project(&root, "Instrucciones", ProjectType::Feature, "es").expect("create");
+        let text = fs::read_to_string(root.join(INSTRUCTIONS_FILE)).expect("instructions");
+        assert!(text.starts_with("# Instrucciones del proyecto"));
     }
 
     #[test]
