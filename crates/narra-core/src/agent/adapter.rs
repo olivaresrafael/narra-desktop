@@ -31,6 +31,14 @@ pub struct ModelRequest {
     pub history: Vec<ChatMessage>,
 }
 
+/// One streamed piece: user-visible text or provider reasoning. Adapters that
+/// do not expose reasoning simply never emit the second variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPart<'a> {
+    Content(&'a str),
+    Reasoning(&'a str),
+}
+
 /// Minimal model output contract. The raw text stays available for display;
 /// structured payloads are parsed by the calling task, not the adapter.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,5 +88,19 @@ pub trait ModelAdapter {
         let response = self.complete(request, cancel)?;
         on_delta(&response.text);
         Ok(response)
+    }
+
+    /// Streaming variant that can also deliver provider reasoning. The
+    /// default preserves the old behavior for adapters without a reasoning
+    /// channel.
+    fn complete_streaming_with_reasoning(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(StreamPart<'_>),
+    ) -> Result<ModelResponse, AgentError> {
+        self.complete_streaming(request, cancel, &mut |text| {
+            on_delta(StreamPart::Content(text))
+        })
     }
 }

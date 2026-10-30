@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use narra_core::agent::{
-    AgentError, ModelAdapter, ModelRequest, OpenAiCompatAdapter, OpenAiCompatConfig,
+    AgentError, ModelAdapter, ModelRequest, OpenAiCompatAdapter, OpenAiCompatConfig, StreamPart,
 };
 use narra_core::cancel::CancellationToken;
 
@@ -449,6 +449,48 @@ fn streaming_delivers_deltas_in_order_and_assembles_the_text() {
     assert_eq!(response.model, "qwen", "model from chunks");
     assert_eq!(response.input_tokens, Some(9), "usage from final chunk");
     assert_eq!(response.output_tokens, Some(2), "usage from final chunk");
+}
+
+#[test]
+fn streaming_delivers_reasoning_before_content() {
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {"reasoning_content": "Pienso"}}]
+        })),
+        sse(serde_json::json!({
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {"reasoning_content": " un poco"}}]
+        })),
+        sse(serde_json::json!({
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {"content": "4"}}]
+        })),
+        sse(serde_json::json!({
+            "model": "deepseek",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        })),
+        "data: [DONE]".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::from_millis(5), None);
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let mut parts: Vec<(bool, String)> = Vec::new();
+    let response = adapter
+        .complete_streaming_with_reasoning(&request("s", "p"), &token, &mut |part| match part {
+            StreamPart::Reasoning(text) => parts.push((true, text.to_string())),
+            StreamPart::Content(text) => parts.push((false, text.to_string())),
+        })
+        .expect("stream completes");
+    assert_eq!(
+        parts,
+        vec![
+            (true, "Pienso".to_string()),
+            (true, " un poco".to_string()),
+            (false, "4".to_string()),
+        ]
+    );
+    assert_eq!(response.text, "4");
 }
 
 #[test]

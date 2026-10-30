@@ -29,7 +29,7 @@ pub mod skill;
 pub mod tool_loop;
 pub mod tools;
 
-pub use adapter::{ModelAdapter, ModelRequest, ModelResponse};
+pub use adapter::{ModelAdapter, ModelRequest, ModelResponse, StreamPart};
 pub use brief::ProjectBriefTask;
 pub use chat::{
     ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatProposalRef, ChatTask,
@@ -110,6 +110,11 @@ pub enum TaskEvent {
     /// One incremental text chunk while streaming (Spike C). Only emitted
     /// when `TaskOptions::stream` is set; never carries credentials.
     ModelDelta {
+        text: String,
+    },
+    /// Provider reasoning while the model thinks. Only emitted when the
+    /// provider exposes a reasoning channel; never synthesized by us.
+    ReasoningDelta {
         text: String,
     },
     /// A reviewable edit proposal was persisted; canonical files untouched.

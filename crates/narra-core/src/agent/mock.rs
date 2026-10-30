@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::AgentError;
-use super::adapter::{ModelAdapter, ModelRequest, ModelResponse};
+use super::adapter::{ModelAdapter, ModelRequest, ModelResponse, StreamPart};
 use crate::cancel::CancellationToken;
 
 /// A provider that never talks to a network.
@@ -24,6 +24,8 @@ pub struct MockAdapter {
     /// Optional scripted responses, replayed one per `complete` call (tool
     /// loop tests). Empty script = the default deterministic answer.
     script: Option<Mutex<VecDeque<ModelResponse>>>,
+    /// Optional reasoning text emitted before the answer in streamed runs.
+    reasoning: Option<String>,
 }
 
 impl MockAdapter {
@@ -31,6 +33,7 @@ impl MockAdapter {
         Self {
             simulated_latency: Duration::ZERO,
             script: None,
+            reasoning: None,
         }
     }
 
@@ -38,6 +41,7 @@ impl MockAdapter {
         Self {
             simulated_latency: latency,
             script: None,
+            reasoning: None,
         }
     }
 
@@ -47,7 +51,15 @@ impl MockAdapter {
         Self {
             simulated_latency: Duration::ZERO,
             script: Some(Mutex::new(VecDeque::from(responses))),
+            reasoning: None,
         }
+    }
+
+    /// Emit a fixed reasoning trace before the streamed answer. Used by
+    /// tests and the offline demo; real providers supply their own deltas.
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
+        self
     }
 
     /// Next scripted response, or the deterministic default once the script
@@ -127,6 +139,42 @@ impl ModelAdapter for MockAdapter {
                 thread::sleep(slice);
             }
             on_delta(chunk);
+        }
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        Ok(response)
+    }
+
+    fn complete_streaming_with_reasoning(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(StreamPart<'_>),
+    ) -> Result<ModelResponse, AgentError> {
+        if let Some(reasoning) = &self.reasoning {
+            for chunk in chunked(reasoning, 12) {
+                if cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
+                on_delta(StreamPart::Reasoning(chunk));
+            }
+        }
+        let response = self.next_response(request);
+        let chunks: Vec<&str> = chunked(&response.text, 12);
+        let slice = if chunks.is_empty() {
+            Duration::ZERO
+        } else {
+            self.simulated_latency / chunks.len().max(1) as u32
+        };
+        for chunk in chunks {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            if slice > Duration::ZERO {
+                thread::sleep(slice);
+            }
+            on_delta(StreamPart::Content(chunk));
         }
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);

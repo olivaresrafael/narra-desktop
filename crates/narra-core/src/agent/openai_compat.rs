@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::AgentError;
-use super::adapter::{ModelAdapter, ModelRequest, ModelResponse};
+use super::adapter::{ModelAdapter, ModelRequest, ModelResponse, StreamPart};
 use super::tools::{ChatRole, ToolCall, ToolSpec};
 use crate::cancel::CancellationToken;
 
@@ -329,6 +329,19 @@ impl ModelAdapter for OpenAiCompatAdapter {
         cancel: &CancellationToken,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ModelResponse, AgentError> {
+        self.complete_streaming_with_reasoning(request, cancel, &mut |part| {
+            if let StreamPart::Content(text) = part {
+                on_delta(text);
+            }
+        })
+    }
+
+    fn complete_streaming_with_reasoning(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        on_delta: &mut dyn FnMut(StreamPart<'_>),
+    ) -> Result<ModelResponse, AgentError> {
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
@@ -401,12 +414,20 @@ impl ModelAdapter for OpenAiCompatAdapter {
             if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
                 usage = chunk.get("usage").cloned();
             }
+            if let Some(reasoning) = chunk
+                .pointer("/choices/0/delta/reasoning_content")
+                .or_else(|| chunk.pointer("/choices/0/delta/reasoning"))
+                .and_then(Value::as_str)
+                && !reasoning.is_empty()
+            {
+                on_delta(StreamPart::Reasoning(reasoning));
+            }
             if let Some(delta) = chunk.pointer("/choices/0/delta/content")
                 && let Some(piece) = delta.as_str()
                 && !piece.is_empty()
             {
                 text.push_str(piece);
-                on_delta(piece);
+                on_delta(StreamPart::Content(piece));
             }
             // OpenAI streams function calls as deltas: `id`/`name` normally
             // arrive first, `arguments` in fragments, all keyed by `index`.

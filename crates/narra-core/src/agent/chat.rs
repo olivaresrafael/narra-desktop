@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::adapter::{ModelAdapter, ModelRequest};
+use super::adapter::{ModelAdapter, ModelRequest, StreamPart};
 use super::context::{project_context, truncate};
 use super::proposal;
 use super::skill::Skill;
@@ -195,6 +195,7 @@ pub enum ChatActivityKind {
     Scene,
     Skill,
     Edit,
+    Thinking,
     Error,
 }
 
@@ -207,6 +208,7 @@ impl ChatActivityKind {
             ChatActivityKind::Scene => "scene",
             ChatActivityKind::Skill => "skill",
             ChatActivityKind::Edit => "edit",
+            ChatActivityKind::Thinking => "thinking",
             ChatActivityKind::Error => "error",
         }
     }
@@ -693,11 +695,18 @@ impl ChatTask {
                 ),
             });
             let response = if options.stream {
-                adapter.complete_streaming(&request, &options.cancel, &mut |delta| {
-                    emit(TaskEvent::ModelDelta {
-                        text: delta.to_string(),
-                    });
-                })?
+                adapter.complete_streaming_with_reasoning(
+                    &request,
+                    &options.cancel,
+                    &mut |part| match part {
+                        StreamPart::Content(delta) => emit(TaskEvent::ModelDelta {
+                            text: delta.to_string(),
+                        }),
+                        StreamPart::Reasoning(delta) => emit(TaskEvent::ReasoningDelta {
+                            text: delta.to_string(),
+                        }),
+                    },
+                )?
             } else {
                 adapter.complete(&request, &options.cancel)?
             };
@@ -1269,6 +1278,29 @@ mod tests {
         let proposals = output.data["proposals"].as_array().expect("proposals");
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0]["target"], "bible/characters/marta.md");
+    }
+
+    #[test]
+    fn streaming_reasoning_is_forwarded_as_a_separate_event() {
+        let root = project();
+        let adapter = crate::agent::MockAdapter::new().with_reasoning("traza");
+        let options = TaskOptions {
+            stream: true,
+            ..TaskOptions::default()
+        };
+        let mut events = Vec::new();
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Plan,
+            Vec::new(),
+            "Responde",
+        );
+        task.run(&adapter, &options, |event| events.push(event))
+            .expect("chat");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TaskEvent::ReasoningDelta { text } if text == "traza"
+        )));
     }
 
     #[test]

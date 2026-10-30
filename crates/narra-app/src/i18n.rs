@@ -911,6 +911,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("chat.jump_to_change", "Go to change", "Ir al cambio"),
     ("chat.context.title", "Context", "Contexto"),
+    ("chat.thinking", "Thinking", "Pensando"),
+    (
+        "chat.thinking_hint",
+        "Provider reasoning; not part of the answer.",
+        "Razonamiento del proveedor; no forma parte de la respuesta.",
+    ),
     (
         "chat.context.approx",
         "Approximate tokens; the provider replaces this after the turn.",
@@ -1069,16 +1075,10 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "No Git repository in this project",
         "Este proyecto no tiene repositorio Git",
     ),
-    ("chat.menu.images", "Image…", "Imagen…"),
     (
         "chat.menu.file_picker_detail",
         "Open the file picker",
         "Abrir el selector de archivos",
-    ),
-    (
-        "chat.menu.images_detail",
-        "Image attachments are not supported yet",
-        "Las imágenes aún no se pueden adjuntar",
     ),
     (
         "chat.menu.commands_hint",

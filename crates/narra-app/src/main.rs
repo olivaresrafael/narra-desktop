@@ -833,7 +833,6 @@ enum ChatMentionCategory {
     Selection,
     Threads,
     Git,
-    Images,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -845,7 +844,6 @@ enum ChatMentionAction {
     FilePicker,
     OpenHistory,
     OpenGit,
-    Disabled(String),
 }
 
 #[derive(Debug, Clone)]
@@ -14532,17 +14530,6 @@ impl Editor {
             }
         }
 
-        let image_label = self.t("chat.menu.images").to_string();
-        if matches(&image_label) {
-            items.push(ChatMentionItem {
-                category: ChatMentionCategory::Images,
-                icon: "image",
-                label: image_label,
-                detail: self.t("chat.menu.images_detail").to_string(),
-                action: ChatMentionAction::Disabled(self.t("chat.menu.images_detail").to_string()),
-            });
-        }
-
         if let Some(filter) = self.chat_context_filter {
             items.retain(|item| item.category == filter);
         }
@@ -14590,9 +14577,6 @@ impl Editor {
                 self.request_git_branches(cx);
                 self.git_remotes_stale = true;
             }
-            ChatMentionAction::Disabled(reason) => {
-                self.notice = Some(reason);
-            }
         }
         self.chat.focused = true;
         cx.notify();
@@ -14638,12 +14622,6 @@ impl Editor {
                 self.request_git_history(cx);
                 self.request_git_branches(cx);
                 self.git_remotes_stale = true;
-            }
-            ChatMentionCategory::Images => {
-                self.chat_menu = None;
-                self.chat_mention = None;
-                self.chat_context_filter = None;
-                self.notice = Some(self.t("chat.menu.images_detail").to_string());
             }
         }
         cx.notify();
@@ -15112,7 +15090,12 @@ impl Editor {
         activity: &ChatActivity,
         index: usize,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        if activity.kind == ChatActivityKind::Thinking {
+            return self
+                .chat_thinking_card(&activity.detail, cx)
+                .into_any_element();
+        }
         let (icon_name, label) = match activity.kind {
             ChatActivityKind::Read => (
                 "file-text",
@@ -15136,6 +15119,7 @@ impl Editor {
                 self.tf("chat.activity.error", &[("target", &activity.target)]),
             ),
             ChatActivityKind::Edit => ("pencil", activity.target.clone()),
+            ChatActivityKind::Thinking => ("brain", self.t("chat.thinking").to_string()),
         };
         let error = activity.kind == ChatActivityKind::Error;
         let color = if error {
@@ -15187,7 +15171,59 @@ impl Editor {
                     cx.notify();
                 }));
         }
-        row
+        row.into_any_element()
+    }
+
+    fn chat_thinking_card(&self, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.chat.thinking_open;
+        let chevron = if open {
+            "chevron-down"
+        } else {
+            "chevron-right"
+        };
+        div()
+            .id(("chat-thinking", markdown_key(text) as usize))
+            .mb_1()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::status_bg()))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("chat-thinking-toggle")
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(theme::status_fg()))
+                    .child(icon("brain", theme::cue_fg(), 13.0))
+                    .child(self.t("chat.thinking").to_string())
+                    .child(div().flex_1())
+                    .child(icon(chevron, theme::status_fg(), 12.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.chat.thinking_open = !this.chat.thinking_open;
+                        cx.notify();
+                    })),
+            )
+            .when(open, |card| {
+                card.child(
+                    div()
+                        .id(("chat-thinking-body", markdown_key(text) as usize))
+                        .px_2()
+                        .pb_2()
+                        .max_h(px(260.0))
+                        .overflow_y_scroll()
+                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                        .text_xs()
+                        .text_color(rgb(theme::gutter_fg()))
+                        .whitespace_normal()
+                        .child(text.to_string()),
+                )
+            })
     }
 
     fn chat_follow_bar(
@@ -15485,6 +15521,9 @@ impl Editor {
                 messages = messages.child(self.chat_proposal_card(view, index, cx));
                 child_index += 1;
             }
+        }
+        if self.chat.status == ChatStatus::Running && !self.chat.reasoning.is_empty() {
+            messages = messages.child(self.chat_thinking_card(&self.chat.reasoning, cx));
         }
         if self.chat.status == ChatStatus::Running {
             let streaming = if self.chat.streaming.is_empty() {
@@ -16039,12 +16078,7 @@ impl Editor {
             let label_key = chat_mention_category_key(category);
             let detail_key = chat_mention_category_detail_key(category);
             let selected = index == self.chat_context_selected;
-            let disabled = category == ChatMentionCategory::Images;
-            let color = if disabled {
-                theme::gutter_fg()
-            } else {
-                theme::default_fg()
-            };
+            let color = theme::default_fg();
             context_menu = context_menu.child(
                 div()
                     .id(("chat-context-category", index))
@@ -16136,12 +16170,7 @@ impl Editor {
                 last_category = Some(item.category);
             }
             let selected = index == selected_mention;
-            let disabled = matches!(item.action, ChatMentionAction::Disabled(_));
-            let label_color = if disabled {
-                theme::gutter_fg()
-            } else {
-                theme::default_fg()
-            };
+            let label_color = theme::default_fg();
             mention_list = mention_list.child(
                 div()
                     .id(("chat-mention", index))
@@ -19752,18 +19781,16 @@ fn chat_mention_category_key(category: ChatMentionCategory) -> &'static str {
         ChatMentionCategory::Selection => "chat.menu.selection",
         ChatMentionCategory::Threads => "chat.menu.threads",
         ChatMentionCategory::Git => "chat.menu.git",
-        ChatMentionCategory::Images => "chat.menu.images",
     }
 }
 
-const CHAT_CONTEXT_CATEGORIES: [ChatMentionCategory; 7] = [
+const CHAT_CONTEXT_CATEGORIES: [ChatMentionCategory; 6] = [
     ChatMentionCategory::Files,
     ChatMentionCategory::Entities,
     ChatMentionCategory::Scenes,
     ChatMentionCategory::Selection,
     ChatMentionCategory::Threads,
     ChatMentionCategory::Git,
-    ChatMentionCategory::Images,
 ];
 
 fn chat_mention_category_icon(category: ChatMentionCategory) -> &'static str {
@@ -19774,7 +19801,6 @@ fn chat_mention_category_icon(category: ChatMentionCategory) -> &'static str {
         ChatMentionCategory::Selection => "copy",
         ChatMentionCategory::Threads => "message-square",
         ChatMentionCategory::Git => "git-branch",
-        ChatMentionCategory::Images => "image",
     }
 }
 
@@ -19786,7 +19812,6 @@ fn chat_mention_category_detail_key(category: ChatMentionCategory) -> &'static s
         ChatMentionCategory::Selection => "chat.mention_selection_detail",
         ChatMentionCategory::Threads => "chat.menu.threads_detail",
         ChatMentionCategory::Git => "chat.menu.git_detail",
-        ChatMentionCategory::Images => "chat.menu.images_detail",
     }
 }
 

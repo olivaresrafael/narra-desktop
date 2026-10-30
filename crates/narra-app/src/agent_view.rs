@@ -148,6 +148,7 @@ impl AgentState {
                 }
                 TaskEvent::ModelDelta { text } => self.output.push_str(&text),
                 TaskEvent::ContextBudget { .. } => {}
+                TaskEvent::ReasoningDelta { .. } => {}
                 TaskEvent::Completed { summary } => self.summary = summary,
                 TaskEvent::Failed { error } => {
                     self.status = AgentStatus::Failed;
@@ -416,6 +417,7 @@ impl ProposeView {
                     self.stage = tr(self.lang, "stage.proposal_persisted").to_string();
                 }
                 TaskEvent::ContextBudget { .. } => {}
+                TaskEvent::ReasoningDelta { .. } => {}
                 TaskEvent::Completed { summary } => self.summary = summary,
                 TaskEvent::Failed { error } => {
                     self.status = ProposeStatus::Failed;

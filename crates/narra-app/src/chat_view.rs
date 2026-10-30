@@ -129,6 +129,10 @@ pub struct ChatUiState {
     pub error: String,
     pub sources: Vec<narra_core::agent::ContextSource>,
     pub streaming: String,
+    /// Live provider reasoning for the current round, if any.
+    pub reasoning: String,
+    /// Whether thinking cards are expanded.
+    pub thinking_open: bool,
     pub proposals: Vec<ChatProposalView>,
     pub attachments: Vec<ChatAttachment>,
     /// Token usage accumulated across this chat session, when the provider
@@ -156,6 +160,8 @@ impl ChatUiState {
             error: String::new(),
             sources: Vec::new(),
             streaming: String::new(),
+            reasoning: String::new(),
+            thinking_open: true,
             proposals: Vec::new(),
             attachments: Vec::new(),
             input_tokens: 0,
@@ -186,6 +192,8 @@ impl ChatUiState {
             error: String::new(),
             sources: Vec::new(),
             streaming: String::new(),
+            reasoning: String::new(),
+            thinking_open: true,
             proposals,
             attachments: Vec::new(),
             input_tokens,
@@ -244,6 +252,7 @@ impl ChatUiState {
         self.error.clear();
         self.sources.clear();
         self.streaming.clear();
+        self.reasoning.clear();
         self.context_budget = None;
         self.last_run_input_tokens = None;
         self.last_run_output_tokens = None;
@@ -282,6 +291,9 @@ impl ChatUiState {
             }
             TaskEvent::ModelDelta { text } => {
                 self.streaming.push_str(text);
+            }
+            TaskEvent::ReasoningDelta { text } => {
+                self.reasoning.push_str(text);
             }
             TaskEvent::ProposalCreated { id, target, hunks } => {
                 if !self.proposals.iter().any(|proposal| proposal.id == *id) {
@@ -357,6 +369,18 @@ impl ChatUiState {
                     .as_str()
                     .unwrap_or(output.summary.as_str())
                     .to_string();
+                if !self.reasoning.trim().is_empty() {
+                    let detail: String = self.reasoning.chars().take(16_000).collect();
+                    let run = self.thread.current_run();
+                    self.thread.push_activity(ChatActivity {
+                        run,
+                        kind: ChatActivityKind::Thinking,
+                        target: String::new(),
+                        detail,
+                        proposal_id: None,
+                    });
+                }
+                self.reasoning.clear();
                 if !text.trim().is_empty() {
                     self.thread.push_assistant(text);
                 }
@@ -417,6 +441,7 @@ impl ChatUiState {
                 self.status = ChatStatus::Cancelled;
                 self.error = "chat cancelled".to_string();
                 self.streaming.clear();
+                self.reasoning.clear();
                 self.stage.clear();
                 self.attachments.clear();
             }
@@ -424,6 +449,7 @@ impl ChatUiState {
                 self.status = ChatStatus::Failed;
                 self.error = error.to_string();
                 self.streaming.clear();
+                self.reasoning.clear();
                 self.stage.clear();
                 self.attachments.clear();
             }
@@ -511,6 +537,7 @@ impl ChatUiState {
         format!(
             "{{\"thread\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"status\":\"{}\",\
              \"input\":\"{}\",\"focused\":{},\"streaming\":\"{}\",\"error\":\"{}\",\
+             \"reasoning_len\":{},\"thinking_open\":{},\
              \"sources\":{},\"attachments\":{},\"usage\":{{\"input\":{},\"output\":{},\"reported\":{},\"cost_micros\":{}}},\
              \"context\":{{\"estimated\":{},\"limit\":{},\"last_input\":{}}},\
              \"activities\":[{}],\"messages\":[{}],\"proposals\":[{}]}}",
@@ -522,6 +549,8 @@ impl ChatUiState {
             self.focused,
             json_escape(&self.streaming),
             json_escape(&self.error),
+            self.reasoning.chars().count(),
+            self.thinking_open,
             self.sources.len(),
             self.attachments.len(),
             self.input_tokens,
@@ -794,6 +823,24 @@ mod tests {
         chat.finish_with_prices(Ok(task), 0.0, 0.0);
         assert_eq!(chat.last_run_input_tokens, Some(12));
         assert_eq!(chat.last_run_output_tokens, Some(7));
+    }
+
+    #[test]
+    fn reasoning_deltas_become_a_persisted_thinking_activity() {
+        let mut chat = ChatUiState::new(ChatMode::Plan);
+        chat.begin_run("piensa".to_string(), Vec::new());
+        chat.apply_event(&TaskEvent::ReasoningDelta {
+            text: "traza ".to_string(),
+        });
+        chat.apply_event(&TaskEvent::ReasoningDelta {
+            text: "interna".to_string(),
+        });
+        assert_eq!(chat.reasoning, "traza interna");
+        chat.finish_with_prices(Ok(output("respuesta", serde_json::json!([]))), 0.0, 0.0);
+        assert!(chat.reasoning.is_empty());
+        assert_eq!(chat.thread.activities.len(), 1);
+        assert_eq!(chat.thread.activities[0].kind, ChatActivityKind::Thinking);
+        assert_eq!(chat.thread.activities[0].detail, "traza interna");
     }
 
     #[test]
