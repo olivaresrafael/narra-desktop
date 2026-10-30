@@ -383,6 +383,31 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // --- projects (M10 slice 2b) -----------------------------------------
     ("menu.new_project", "New Project…", "Nuevo proyecto…"),
     ("menu.open_project", "Open Project…", "Abrir proyecto…"),
+    ("menu.close_project", "Close Project", "Cerrar proyecto"),
+    ("welcome.title", "Welcome to Narra", "Bienvenido a Narra"),
+    (
+        "welcome.body",
+        "Open a project or create a new one to start writing.",
+        "Abre un proyecto o crea uno nuevo para empezar a escribir.",
+    ),
+    ("welcome.open", "Open Project…", "Abrir proyecto…"),
+    ("welcome.new", "New Project…", "Nuevo proyecto…"),
+    ("welcome.recent", "Recent projects", "Proyectos recientes"),
+    (
+        "welcome.no_recent",
+        "No recent projects yet.",
+        "Todavía no hay proyectos recientes.",
+    ),
+    (
+        "welcome.hint",
+        "⌘O to open · ⇧⌘N to create",
+        "⌘O para abrir · ⇧⌘N para crear",
+    ),
+    (
+        "notice.project_closed",
+        "Project closed.",
+        "Proyecto cerrado.",
+    ),
     ("menu.open_recent", "Open Recent", "Abrir reciente"),
     ("menu.clear_recents", "Clear Menu", "Borrar menú"),
     ("dialog.open_project", "Open Project", "Abrir proyecto"),

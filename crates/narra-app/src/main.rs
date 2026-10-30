@@ -303,6 +303,7 @@ actions!(
         // projects (M10 slice 2b)
         OpenProject,
         NewProject,
+        CloseProject,
         ClearRecentProjects,
         // tabs (M10 slice 3b)
         CloseTab,
@@ -662,6 +663,7 @@ enum PaletteCommand {
     NewFile,
     NewProject,
     OpenProject,
+    CloseProject,
     Save,
     ExportPdf,
     ToggleExplorer,
@@ -680,12 +682,13 @@ enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    const ALL: [PaletteCommand; 20] = [
+    const ALL: [PaletteCommand; 21] = [
         PaletteCommand::OpenSettings,
         PaletteCommand::OpenProjectSettings,
         PaletteCommand::NewFile,
         PaletteCommand::NewProject,
         PaletteCommand::OpenProject,
+        PaletteCommand::CloseProject,
         PaletteCommand::Save,
         PaletteCommand::ExportPdf,
         PaletteCommand::ToggleExplorer,
@@ -710,6 +713,7 @@ impl PaletteCommand {
             PaletteCommand::NewFile => "menu.new_file",
             PaletteCommand::NewProject => "menu.new_project",
             PaletteCommand::OpenProject => "menu.open_project",
+            PaletteCommand::CloseProject => "menu.close_project",
             PaletteCommand::Save => "menu.save",
             PaletteCommand::ExportPdf => "menu.export_pdf",
             PaletteCommand::ToggleExplorer => "menu.toggle_explorer",
@@ -735,6 +739,7 @@ impl PaletteCommand {
             PaletteCommand::NewFile => "⌘N",
             PaletteCommand::NewProject => "⇧⌘N",
             PaletteCommand::OpenProject => "⌘O",
+            PaletteCommand::CloseProject => "⇧⌘W",
             PaletteCommand::Save => "⌘S",
             PaletteCommand::ExportPdf => "⌘E",
             PaletteCommand::ToggleExplorer => "⌘B",
@@ -799,6 +804,7 @@ enum ChatRunMessage {
 enum PendingUnsaved {
     Quit,
     CloseTab(usize),
+    CloseProject,
 }
 
 /// The generalized save/discard/cancel prompt (M9 slice 6, generalized for
@@ -1767,6 +1773,9 @@ struct Editor {
     workspace_generation: u64,
     /// Last title written to the native window bar (M16 slice 7).
     window_title: String,
+    /// Set just before the app quits so the window-close guard does not treat
+    /// the system close as a project close.
+    quitting: bool,
 
     /// Local Git status against HEAD (M10 S3c): files, folder aggregates and
     /// branch/ahead/behind. Refreshed on a worker, never on the UI thread.
@@ -4244,6 +4253,9 @@ impl Editor {
             PaletteCommand::NewFile => self.on_new_file(&NewFile, window, cx),
             PaletteCommand::NewProject => self.on_new_project(&NewProject, window, cx),
             PaletteCommand::OpenProject => self.on_open_project(&OpenProject, window, cx),
+            PaletteCommand::CloseProject => {
+                self.on_close_project(&CloseProject, window, cx);
+            }
             PaletteCommand::Save => self.on_save(&Save, window, cx),
             PaletteCommand::ExportPdf => self.on_export_pdf(&ExportPdf, window, cx),
             PaletteCommand::ToggleExplorer => {
@@ -5470,7 +5482,8 @@ impl Editor {
     /// must not run behind it (M17 slice 0); text fields route their own
     /// input before reaching the buffer.
     fn modal_owns_keyboard(&self) -> bool {
-        self.settings.is_some()
+        self.project.is_none()
+            || self.settings.is_some()
             || self.project_settings.is_some()
             || self.unsaved_prompt.is_some()
             || self.new_file.is_some()
@@ -7364,6 +7377,113 @@ impl Editor {
     }
 
     /// ⇧⌘N / File → New Project…: toggle the title/kind/language dialog.
+    /// File → Close Project (and the window close button): return to the
+    /// welcome screen instead of leaving the process alive without a window.
+    fn on_close_project(&mut self, _: &CloseProject, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.is_none()
+            || self.unsaved_prompt.is_some()
+            || self.new_project.as_ref().is_some_and(|state| state.picking)
+        {
+            return;
+        }
+        // The close action owns the surface; dialogs must not stay on top of
+        // the save prompt or the welcome screen.
+        self.new_file = None;
+        self.new_project = None;
+        self.new_project_generation = self.new_project_generation.saturating_add(1);
+        self.settings = None;
+        self.project_settings = None;
+        self.palette = None;
+        self.context_menu = None;
+        let dirty = self.dirty_tab_count();
+        if dirty > 0 {
+            self.unsaved_prompt = Some(UnsavedPrompt {
+                action: PendingUnsaved::CloseProject,
+                dirty,
+            });
+            cx.notify();
+            return;
+        }
+        self.finish_close_project(window, cx);
+    }
+
+    /// Clear every surface tied to the closed project. `install_project`
+    /// resets the same state when the next project opens.
+    fn finish_close_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_generation = self.workspace_generation.saturating_add(1);
+        self.agent_generation = self.agent_generation.saturating_add(1);
+        self.chat_generation = self.chat_generation.saturating_add(1);
+        if let Some(cancel) = self.chat_cancel.take() {
+            cancel.cancel();
+        }
+        self.project = None;
+        self.explorer.clear();
+        self.profile = ProjectProfile::default();
+        self.skills.clear();
+        self.skill_trust = None;
+        self.type_trust = None;
+        self.entities = EntityIndex::default();
+        self.collapsed.clear();
+        self.git = GitStatus::default();
+        self.git_pending = false;
+        self.git_request = self.git_request.saturating_add(1);
+        self.git_refreshed_at = None;
+        self.git_history.clear();
+        self.git_history_loading = false;
+        self.git_history_error.clear();
+        self.git_history_stale = false;
+        self.git_branches.clear();
+        self.git_branches_loading = false;
+        self.git_branches_error.clear();
+        self.git_branches_stale = false;
+        self.git_remotes.clear();
+        self.git_remotes_loading = false;
+        self.git_remotes_error.clear();
+        self.git_remotes_stale = false;
+        self.git_commit = None;
+        self.git_diff = None;
+        self.git_restore = None;
+        self.git_branch_prompt = None;
+        self.github_publish = None;
+        self.git_sync = None;
+        self.github_pr = None;
+        self.git_busy = false;
+        self.search = SearchState::default();
+        self.export = ExportState::default();
+        self.agent = AgentState::new();
+        self.agent.lang = self.lang;
+        self.agent_cancel = None;
+        self.chat = ChatUiState::new(ChatMode::Plan);
+        self.chat_markdown.borrow_mut().clear();
+        self.chat_scroll = ScrollHandle::new();
+        self.chat_scroll_drag = None;
+        self.chat_history.clear();
+        self.chat_history_open = false;
+        self.right_tab = RightTab::Chat;
+        self.propose = ProposeView::new();
+        self.propose.lang = self.lang;
+        self.propose_bar = ProposeBar::default();
+        self.focus_bar = FocusBar::default();
+        self.review_focus.clear();
+        self.new_file = None;
+        self.new_project = None;
+        self.new_project_generation = self.new_project_generation.saturating_add(1);
+        self.settings = None;
+        self.project_settings = None;
+        self.palette = None;
+        self.context_menu = None;
+        self.context_target = None;
+        self.rename = None;
+        self.delete_prompt = None;
+        self.unsaved_prompt = None;
+        self.reset_tabs();
+        self.doc = DocumentState::new(String::new(), "");
+        self.refresh_menus(cx);
+        self.notice = Some(self.t("notice.project_closed").to_string());
+        window.focus(&self.focus_handle(cx));
+        cx.notify();
+    }
+
     fn on_new_project(&mut self, _: &NewProject, _window: &mut Window, cx: &mut Context<Self>) {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
@@ -7941,7 +8061,13 @@ impl Editor {
 
     /// Rebuild the native menus with the current language and recents.
     fn refresh_menus(&self, cx: &gpui::App) {
-        install_menus(self.lang, self.recents.paths(), Some(&self.profile), cx);
+        install_menus(
+            self.lang,
+            self.recents.paths(),
+            Some(&self.profile),
+            self.project.is_some(),
+            cx,
+        );
     }
 
     // ---- live page count (M9 slice 7) ------------------------------------
@@ -10439,6 +10565,14 @@ impl Editor {
                     cx.notify();
                 }
             }
+            PendingUnsaved::CloseProject => {
+                if self.save_all_tabs(window, cx) {
+                    self.unsaved_prompt = None;
+                    self.finish_close_project(window, cx);
+                } else {
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -10454,6 +10588,7 @@ impl Editor {
                 window.focus(&self.focus_handle(cx));
                 cx.notify();
             }
+            PendingUnsaved::CloseProject => self.finish_close_project(window, cx),
         }
     }
 
@@ -10463,6 +10598,7 @@ impl Editor {
     }
 
     fn finish_quit(&mut self, cx: &mut Context<Self>) {
+        self.quitting = true;
         println!("{}", self.metrics.borrow().report());
         cx.quit();
     }
@@ -15464,6 +15600,119 @@ impl Editor {
         panel.into_any_element()
     }
 
+    /// Welcome screen shown when no project is open. It deliberately replaces
+    /// the editor surface: after Close Project the same window is the place
+    /// to open another project or create one.
+    fn welcome_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut recent_rows = div().flex().flex_col().gap_1();
+        if self.recents.paths().is_empty() {
+            recent_rows = recent_rows.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::gutter_fg()))
+                    .child(self.t("welcome.no_recent")),
+            );
+        } else {
+            for (index, path) in self.recents.paths().iter().take(6).enumerate() {
+                let path = path.clone();
+                let label = recent::display_path(&path);
+                recent_rows = recent_rows.child(
+                    div()
+                        .id(("welcome-recent", index))
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .text_color(rgb(theme::status_fg()))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(theme::status_bg())))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.on_open_recent(
+                                &OpenRecentProject { path: path.clone() },
+                                window,
+                                cx,
+                            );
+                        })),
+                );
+            }
+        }
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(theme::bg()))
+            .child(
+                div()
+                    .w(px(560.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_6()
+                    .bg(rgb(theme::explorer_bg()))
+                    .border_1()
+                    .border_color(rgb(theme::explorer_border()))
+                    .child(
+                        div()
+                            .text_xl()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(self.t("welcome.title")),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme::status_fg()))
+                            .child(self.t("welcome.body")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("welcome-open-project")
+                                    .px_3()
+                                    .py_2()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("welcome.open"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_open_project(&OpenProject, window, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("welcome-new-project")
+                                    .px_3()
+                                    .py_2()
+                                    .bg(rgb(theme::status_bg()))
+                                    .text_color(rgb(theme::default_fg()))
+                                    .cursor_pointer()
+                                    .child(self.t("welcome.new"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_new_project(&NewProject, window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("welcome.recent")),
+                    )
+                    .child(recent_rows)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::gutter_fg()))
+                            .child(self.t("welcome.hint")),
+                    ),
+            )
+    }
+
     /// Localized explorer section label. Unknown custom ids fall back to the
     /// id so a project package can introduce groups without a core change.
     fn explorer_group_label(&self, id: &str) -> String {
@@ -16831,6 +17080,7 @@ impl Editor {
                 let (action, tab) = match prompt.action {
                     PendingUnsaved::Quit => ("quit", "null".to_string()),
                     PendingUnsaved::CloseTab(index) => ("close_tab", index.to_string()),
+                    PendingUnsaved::CloseProject => ("close_project", "null".to_string()),
                 };
                 format!(
                     "{{\"open\":true,\"action\":\"{action}\",\"tab\":{tab},\"dirty\":{}}}",
@@ -17137,6 +17387,7 @@ fn install_menus(
     lang: Lang,
     recents: &[PathBuf],
     profile: Option<&ProjectProfile>,
+    has_project: bool,
     cx: &gpui::App,
 ) {
     let label = |key: &str| i18n::tr(lang, key);
@@ -17170,6 +17421,12 @@ fn install_menus(
         }));
     }
     file_items.push(gpui::MenuItem::separator());
+    if has_project {
+        file_items.push(gpui::MenuItem::action(
+            label("menu.close_project"),
+            CloseProject,
+        ));
+    }
     file_items.push(gpui::MenuItem::action(label("menu.close_tab"), CloseTab));
     file_items.push(gpui::MenuItem::action(label("menu.save"), Save));
     if profile.is_none_or(|profile| profile.export_pdf) {
@@ -18079,6 +18336,7 @@ impl Render for Editor {
             // projects (M10 slice 2b)
             .on_action(cx.listener(Self::on_open_project))
             .on_action(cx.listener(Self::on_new_project))
+            .on_action(cx.listener(Self::on_close_project))
             .on_action(cx.listener(Self::on_open_recent))
             .on_action(cx.listener(Self::on_clear_recents))
             // tabs (M10 slice 3b)
@@ -18250,6 +18508,9 @@ impl Render for Editor {
                     }),
             )
             .child(self.bottom_bar(cx))
+            .when(self.project.is_none(), |root| {
+                root.child(self.welcome_overlay(cx))
+            })
             .when(self.unsaved_prompt.is_some(), |root| {
                 root.child(self.quit_overlay(cx))
             })
@@ -18907,6 +19168,10 @@ fn run() -> Result<(), String> {
                 // the new-project dialog (native save panel for the location).
                 KeyBinding::new("cmd-o", OpenProject, None),
                 KeyBinding::new("cmd-shift-n", NewProject, None),
+                // Closing the project returns to the welcome screen; closing
+                // the native window does the same instead of leaving a
+                // process with no window.
+                KeyBinding::new("cmd-shift-w", CloseProject, None),
                 // tabs (M10 slice 3b): ⌘W closes the active tab, ⌘⇧[/] walk the
                 // strip; unsaved tabs get the save/discard/cancel prompt.
                 KeyBinding::new("cmd-w", CloseTab, None),
@@ -18995,7 +19260,13 @@ fn run() -> Result<(), String> {
             let (startup_skills, startup_skill_trust) =
                 project.as_ref().map(project_skills).unwrap_or_default();
             let startup_type_trust = project.as_ref().and_then(project_type_trust);
-            install_menus(lang, recents.paths(), Some(&startup_profile), cx);
+            install_menus(
+                lang,
+                recents.paths(),
+                Some(&startup_profile),
+                project.is_some(),
+                cx,
+            );
 
             let entity = cx.new(|cx| Editor {
                 doc: DocumentState::new(doc_path, &content),
@@ -19013,6 +19284,7 @@ fn run() -> Result<(), String> {
                 recents,
                 workspace_generation: 0,
                 window_title: "Narra".to_string(),
+                quitting: false,
                 git: GitStatus::default(),
                 git_pending: false,
                 git_request: 0,
@@ -19110,6 +19382,27 @@ fn run() -> Result<(), String> {
 
             window
                 .update(cx, |view, window, cx| {
+                    // Closing the native window means closing the project,
+                    // not leaving the process alive with no window. Cmd-Q sets
+                    // `quitting` first so the real quit still closes the app.
+                    window.on_window_should_close(cx, {
+                        let entity = entity.clone();
+                        move |window, cx| {
+                            entity.update(cx, |view, cx| {
+                                if view.quitting {
+                                    return true;
+                                }
+                                if view.project.is_some() {
+                                    view.on_close_project(&CloseProject, window, cx);
+                                    false
+                                } else {
+                                    view.quitting = true;
+                                    cx.quit();
+                                    false
+                                }
+                            })
+                        }
+                    });
                     // M6 slice 9: the reducers follow the startup language.
                     view.agent.lang = lang;
                     view.propose.lang = lang;
