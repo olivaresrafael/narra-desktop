@@ -83,8 +83,10 @@ impl ChatMode {
             ChatMode::Build => {
                 "Eres un colaborador de guion en modo BUILD. Puedes usar las \
                  herramientas de lectura para consultar el proyecto, read_scene \
-                 para leer escenas y propose_scene_edit para proponer una \
-                 reescritura. Una propuesta NO se aplica: queda para revisión \
+                 para leer escenas, propose_scene_edit para proponer una \
+                 reescritura de escena y propose_document_edit para proponer \
+                 una reescritura de la biblia, estructura, notas o \
+                 investigación. Una propuesta NO se aplica: queda para revisión \
                  humana. Nunca digas que aplicaste un cambio ni escribas \
                  archivos canónicos. Si falta información, búscala o pídela. \
                  Responde en el idioma del usuario."
@@ -109,8 +111,10 @@ impl ChatMode {
             }
             ChatMode::Build => {
                 "Usa las herramientas de lectura si necesitas consultar el \
-                 proyecto, cita la ruta consultada, y propose_scene_edit para \
-                 proponer el cambio. La propuesta queda para revisión humana."
+                 proyecto y cita la ruta consultada. Para escenas usa \
+                 propose_scene_edit; para bible, structure, notes o research \
+                 usa propose_document_edit. La propuesta queda para revisión \
+                 humana."
             }
         }
     }
@@ -495,7 +499,9 @@ impl ChatTask {
         let mut model_name = "desconocido".to_string();
         let mut final_text: Option<String> = None;
         let mut policy = match self.mode {
-            ChatMode::Build => GrantPolicy::new().allow("propose_scene_edit"),
+            ChatMode::Build => GrantPolicy::new()
+                .allow("propose_scene_edit")
+                .allow("propose_document_edit"),
             ChatMode::Plan | ChatMode::Review => GrantPolicy::new(),
         };
 
@@ -994,6 +1000,57 @@ mod tests {
                 .as_array()
                 .is_some_and(Vec::is_empty)
         );
+    }
+
+    #[test]
+    fn build_chat_stages_a_document_proposal_but_leaves_the_bible_untouched() {
+        let root = project();
+        fs::create_dir_all(root.join("bible/characters")).expect("bible");
+        let path = root.join("bible/characters/marta.md");
+        let before = "# Marta\n\nQuiere recuperar el faro.\n";
+        fs::write(&path, before).expect("character");
+        let adapter = crate::agent::MockAdapter::scripted(vec![
+            crate::agent::ModelResponse {
+                text: String::new(),
+                model: "mock".to_string(),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "document-1".to_string(),
+                    name: "propose_document_edit".to_string(),
+                    arguments: json!({
+                        "path": "bible/characters/marta.md",
+                        "instruction": "hazla más decidida",
+                        "rewritten_document": "# Marta\n\nQuiere recuperar el faro y no duda.\n"
+                    }),
+                }],
+                input_tokens: None,
+                output_tokens: None,
+            },
+            crate::agent::ModelResponse {
+                text: "Propuse el cambio de Marta.".to_string(),
+                model: "mock".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]);
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Build,
+            Vec::new(),
+            "Haz a Marta más decidida",
+        );
+        let output = task
+            .run(&adapter, &TaskOptions::default(), |_event| {})
+            .expect("chat build");
+        assert_eq!(output.data["final_text"], "Propuse el cambio de Marta.");
+        assert_eq!(
+            fs::read_to_string(&path).expect("after"),
+            before,
+            "the proposal must not write canon"
+        );
+        let proposals = output.data["proposals"].as_array().expect("proposals");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0]["target"], "bible/characters/marta.md");
     }
 
     #[test]

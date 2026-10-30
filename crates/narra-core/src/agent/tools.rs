@@ -32,6 +32,17 @@ use crate::fountain;
 
 /// Maximum characters returned by `read_document` in one call.
 const READ_DOCUMENT_MAX_CHARS: usize = 8_000;
+/// Maximum rewritten document size accepted by `propose_document_edit`.
+const MAX_DOCUMENT_REWRITE_BYTES: usize = 128 * 1024;
+
+/// Documents `propose_document_edit` may target. The screenplay keeps its
+/// scene-level tool; configuration, reviews and hidden state stay out.
+fn is_document_proposal_path(path: &str) -> bool {
+    is_tool_document_path(path)
+        && ["bible/", "structure/", "notes/", "research/"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+}
 
 /// A document the read-only tools may open: project-relative, non-hidden,
 /// narrative text only. The manifest, agent config and coding-agent
@@ -332,6 +343,25 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             permission: ToolPermission::ProposeWrite,
         },
         ToolSpec {
+            name: "propose_document_edit".to_string(),
+            description: "Propone una reescritura completa de un documento de \
+                          la biblia, estructura, notas o investigación. La \
+                          modificación NO se aplica: queda como propuesta con \
+                          diff para revisión humana. No sirve para el guion; \
+                          usa propose_scene_edit para escenas."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "rewritten_document": {"type": "string"}
+                },
+                "required": ["path", "instruction", "rewritten_document"]
+            }),
+            permission: ToolPermission::ProposeWrite,
+        },
+        ToolSpec {
             name: "apply_proposal".to_string(),
             description: "Aplica una propuesta revisada a su archivo \
                           canónico. Operación destructiva: solo con \
@@ -445,6 +475,7 @@ impl<'a> ToolExecutor<'a> {
             "load_skill" => self.load_skill(call),
             "read_scene" => self.read_scene(call),
             "propose_scene_edit" => self.propose_scene_edit(call, origin),
+            "propose_document_edit" => self.propose_document_edit(call, origin),
             "apply_proposal" => self.apply_proposal(call),
             other => ToolOutcome::Failed {
                 // Unreachable while `permission_of` and `dispatch` agree;
@@ -757,6 +788,101 @@ impl<'a> ToolExecutor<'a> {
         }
     }
 
+    /// Propose-write: stage a full-document rewrite for a bible, structure,
+    /// notes or research document. Canonical files are untouched.
+    fn propose_document_edit(&self, call: &ToolCall, origin: &Origin) -> ToolOutcome {
+        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «path» ausente".to_string(),
+            };
+        };
+        if !is_document_proposal_path(path) {
+            return ToolOutcome::Failed {
+                message: format!(
+                    "«{path}» no es un documento editable de la biblia, \
+                     estructura, notas o investigación"
+                ),
+            };
+        }
+        let Some(instruction) = call.arguments.get("instruction").and_then(Value::as_str) else {
+            return ToolOutcome::Failed {
+                message: "argumento «instruction» ausente".to_string(),
+            };
+        };
+        let Some(rewritten) = call
+            .arguments
+            .get("rewritten_document")
+            .and_then(Value::as_str)
+        else {
+            return ToolOutcome::Failed {
+                message: "argumento «rewritten_document» ausente".to_string(),
+            };
+        };
+        if instruction.trim().is_empty() {
+            return ToolOutcome::Failed {
+                message: "la instrucción no puede estar vacía".to_string(),
+            };
+        }
+        if rewritten.len() > MAX_DOCUMENT_REWRITE_BYTES {
+            return ToolOutcome::Failed {
+                message: format!(
+                    "el documento propuesto supera {MAX_DOCUMENT_REWRITE_BYTES} bytes"
+                ),
+            };
+        }
+        let project = match crate::project::open_project(self.root) {
+            Ok(project) => project,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let base = match project.read_document(path) {
+            Ok(base) => base,
+            Err(error) => {
+                return ToolOutcome::Failed {
+                    message: format!(
+                        "no se pudo leer «{path}»; esta herramienta solo \
+                         edita documentos existentes: {error}"
+                    ),
+                };
+            }
+        };
+        let origin = Origin {
+            task: origin.task.clone(),
+            adapter: origin.adapter.clone(),
+            model: origin.model.clone(),
+            task_input: json!({
+                "path": path,
+                "instruction": instruction,
+            }),
+        };
+        match FileProposal::new(
+            path.to_string(),
+            &base,
+            rewritten,
+            instruction,
+            origin,
+            head_oid(self.root),
+        ) {
+            Ok(record) => {
+                let hunks = record.hunks.len();
+                let target = record.target.clone();
+                let id = record.id.clone();
+                match proposal::save(self.root, &record) {
+                    Ok(()) => ToolOutcome::ProposalCreated { id, target, hunks },
+                    Err(error) => ToolOutcome::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Err(error) => ToolOutcome::Failed {
+                message: error.to_string(),
+            },
+        }
+    }
+
     /// Destructive: applies a reviewed proposal to its canonical file.
     fn apply_proposal(&self, call: &ToolCall) -> ToolOutcome {
         let Some(id) = call.arguments.get("id").and_then(Value::as_str) else {
@@ -1024,6 +1150,93 @@ mod tests {
             "{:?}",
             missing.outcome
         );
+    }
+
+    #[test]
+    fn propose_document_edit_stages_a_bible_proposal_without_touching_canon() {
+        let root = sample_project();
+        std::fs::create_dir_all(root.join("bible/characters")).expect("bible");
+        let path = root.join("bible/characters/marta.md");
+        std::fs::write(&path, "# Marta\n\nQuiere recuperar el faro.\n").expect("character");
+        let before = std::fs::read_to_string(&path).expect("before");
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = GrantPolicy::new().allow("propose_document_edit");
+        let result = executor.execute(
+            &call(
+                "doc-1",
+                "propose_document_edit",
+                json!({
+                    "path": "bible/characters/marta.md",
+                    "instruction": "hazla más decidida",
+                    "rewritten_document": "# Marta\n\nQuiere recuperar el faro y no duda.\n"
+                }),
+            ),
+            &mut policy,
+            &origin(),
+        );
+        assert!(result.succeeded(), "{result:?}");
+        assert!(
+            matches!(&result.outcome, ToolOutcome::ProposalCreated { target, .. } if target == "bible/characters/marta.md"),
+            "{:?}",
+            result.outcome
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("after"),
+            before,
+            "the proposal must not write canon"
+        );
+        assert_eq!(proposal::list(&root).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn propose_document_edit_is_ask_without_grant_and_rejects_non_bible_paths() {
+        let root = sample_project();
+        std::fs::create_dir_all(root.join("bible")).expect("bible");
+        std::fs::write(root.join("bible/world.md"), "# Mundo\n").expect("world");
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = GrantPolicy::new();
+        let requested = executor.execute(
+            &call(
+                "doc-1",
+                "propose_document_edit",
+                json!({
+                    "path": "bible/world.md",
+                    "instruction": "amplía",
+                    "rewritten_document": "# Mundo\n\nMás detalle.\n"
+                }),
+            ),
+            &mut policy,
+            &origin(),
+        );
+        assert!(matches!(requested.decision, PermissionDecision::Ask(_)));
+        assert!(matches!(requested.outcome, ToolOutcome::Denied { .. }));
+
+        let mut granted = GrantPolicy::new().allow("propose_document_edit");
+        for path in [
+            "screenplay/main.fountain",
+            "project.yaml",
+            ".narra/instructions.md",
+            "bible/missing.md",
+        ] {
+            let result = executor.execute(
+                &call(
+                    "doc-2",
+                    "propose_document_edit",
+                    json!({
+                        "path": path,
+                        "instruction": "cambia",
+                        "rewritten_document": "contenido"
+                    }),
+                ),
+                &mut granted,
+                &origin(),
+            );
+            assert!(
+                matches!(result.outcome, ToolOutcome::Failed { .. }),
+                "{path} must be rejected: {:?}",
+                result.outcome
+            );
+        }
     }
 
     #[test]
