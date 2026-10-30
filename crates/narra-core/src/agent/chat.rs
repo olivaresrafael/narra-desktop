@@ -1102,6 +1102,75 @@ mod tests {
     }
 
     #[test]
+    fn build_chat_denies_apply_proposal_from_the_model() {
+        let root = project();
+        fs::create_dir_all(root.join("bible/characters")).expect("bible");
+        let origin = proposal::Origin {
+            task: "chat".to_string(),
+            adapter: "mock".to_string(),
+            model: "mock-1".to_string(),
+            task_input: json!({"create": true}),
+        };
+        let record = proposal::FileProposal::new_document(
+            "bible/characters/elena.md",
+            "# Elena\n\nNueva.\n",
+            "crea la ficha",
+            origin,
+            None,
+        )
+        .expect("proposal");
+        let id = record.id.clone();
+        proposal::save(&root, &record).expect("save proposal");
+
+        let adapter = crate::agent::MockAdapter::scripted(vec![
+            crate::agent::ModelResponse {
+                text: String::new(),
+                model: "mock".to_string(),
+                tool_calls: vec![crate::agent::ToolCall {
+                    id: "apply-1".to_string(),
+                    name: "apply_proposal".to_string(),
+                    arguments: json!({"id": id}),
+                }],
+                input_tokens: None,
+                output_tokens: None,
+            },
+            crate::agent::ModelResponse {
+                text: "No aplicado sin revisión.".to_string(),
+                model: "mock".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        ]);
+        let task = ChatTask::new(
+            root.to_string_lossy(),
+            ChatMode::Build,
+            Vec::new(),
+            "Aplica la propuesta",
+        );
+        let output = task
+            .run(&adapter, &TaskOptions::default(), |_event| {})
+            .expect("chat build");
+        let tools = output.data["tools"].as_array().expect("audit");
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools[0]["decision"]["Deny"].is_string(),
+            "{}",
+            tools[0]["decision"]
+        );
+        assert!(
+            !root.join("bible/characters/elena.md").exists(),
+            "canon must not be created"
+        );
+        let loaded = proposal::load(&root, &id).expect("proposal record");
+        assert_eq!(
+            format!("{:?}", loaded.state),
+            "ReadyForReview",
+            "proposal must stay reviewable"
+        );
+    }
+
+    #[test]
     fn streaming_survives_a_tool_round_and_streams_the_final_text() {
         let root = project();
         fs::create_dir_all(root.join("bible/characters")).expect("bible");

@@ -2923,6 +2923,7 @@ impl Editor {
             provider,
             base_url: self.app_settings.resolved_base_url(),
             model,
+            session: None,
             latency_ms: self.agent_settings.latency_ms,
         };
         theme::set_mode(self.app_settings.theme);
@@ -3568,6 +3569,19 @@ impl Editor {
                     .flex_col()
                     .gap_2()
                     .child(providers)
+                    .when(
+                        matches!(
+                            state.provider,
+                            AiProvider::OpenCode | AiProvider::OpenCodeGo
+                        ),
+                        |card| {
+                            card.child(
+                                div()
+                                    .text_color(rgb(theme::status_fg()))
+                                    .child(self.t("settings.provider_hint")),
+                            )
+                        },
+                    )
                     .when(state.provider == AiProvider::Mock, |card| {
                         card.child(
                             div()
@@ -14005,7 +14019,8 @@ impl Editor {
             .with_attachments(attachments)
             .with_project_context(true)
             .with_skills(self.skills.clone());
-        let settings = self.agent_settings.clone();
+        let mut settings = self.agent_settings.clone();
+        settings.session = Some(format!("narra-chat-{}", self.chat.thread.id));
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let options = TaskOptions {
@@ -19770,6 +19785,9 @@ struct AgentSettings {
     provider: AiProvider,
     base_url: String,
     model: String,
+    /// Stable OpenCode Go session for one conversation. `None` means a
+    /// one-off run (the adapter generates a unique id).
+    session: Option<String>,
     /// Simulated mock latency in ms (lets a driver observe the running
     /// state; real providers ignore it).
     latency_ms: u64,
@@ -19781,6 +19799,7 @@ impl Default for AgentSettings {
             provider: AiProvider::Mock,
             base_url: LOCAL_DEFAULT_BASE_URL.to_string(),
             model: String::new(),
+            session: None,
             latency_ms: 0,
         }
     }
@@ -19967,6 +19986,7 @@ impl AgentSettings {
             provider: settings.provider,
             base_url: settings.resolved_base_url(),
             model,
+            session: None,
             latency_ms: 0,
         }
     }
@@ -19999,15 +20019,18 @@ impl AgentSettings {
             ));
             if self.provider == AiProvider::OpenCodeGo {
                 // OpenCode Go asks clients for a stable session id for
-                // routing/caching; this run is one conversation.
-                let session = format!(
-                    "narra-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|duration| duration.as_nanos())
-                        .unwrap_or(0)
-                );
+                // routing/caching. Chat passes its thread id; one-off runs
+                // (review, scaffold) get a unique id.
+                let session = self.session.clone().unwrap_or_else(|| {
+                    format!(
+                        "narra-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_nanos())
+                            .unwrap_or(0)
+                    )
+                });
                 extra_headers.push(("x-opencode-session".to_string(), session));
             }
         }

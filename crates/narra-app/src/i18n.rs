@@ -1210,6 +1210,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "OpenCode Go",
         "OpenCode Go",
     ),
+    (
+        "settings.provider_hint",
+        "OpenCode Go needs an active Go plan. OpenCode (Zen) uses prepaid balance and rejects Go-only keys.",
+        "OpenCode Go requiere un plan Go activo. OpenCode (Zen) usa saldo prepago y rechaza las claves solo de Go.",
+    ),
     ("settings.base_url", "Endpoint:", "Endpoint:"),
     ("settings.model", "Model:", "Modelo:"),
     ("settings.api_key", "API key:", "Clave API:"),
