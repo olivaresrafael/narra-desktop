@@ -165,11 +165,11 @@ use gpui::{
 };
 use i18n::Lang;
 use narra_core::agent::{
-    AgentError, ChatAttachment, ChatMode, ChatTask, ChatThread, LOCAL_DEFAULT_BASE_URL,
-    MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig, ProjectScaffoldTask,
-    ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill, SkillOrigin, TaskOptions, active_skills,
-    fetch_model_ids, load_scope, load_skills, proposal, roles, trust_skill,
-    untrusted_project_skills, write_plan,
+    AgentError, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask, ChatThread,
+    LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, OpenAiCompatAdapter, OpenAiCompatConfig,
+    ProjectScaffoldTask, ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill, SkillOrigin,
+    TaskOptions, active_skills, fetch_model_ids, load_scope, load_skills, proposal, roles,
+    trust_skill, untrusted_project_skills, write_plan,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
@@ -1962,6 +1962,8 @@ struct Editor {
     chat_scroll: ScrollHandle,
     /// Scroll state for the read-only Markdown preview.
     preview_scroll: ScrollHandle,
+    /// Scroll state for the explorer tree, separate from the fixed header.
+    explorer_scroll: ScrollHandle,
     /// Active chat-scrollbar drag.
     chat_scroll_drag: Option<ChatScrollDrag>,
     /// Parsed Markdown for assistant turns, keyed by a content hash (M16
@@ -12297,6 +12299,31 @@ impl Editor {
         bar
     }
 
+    /// Same drawn bar for the explorer tree. The header stays fixed; only
+    /// the tree body scrolls.
+    fn explorer_scrollbar(&self) -> gpui::Div {
+        let viewport_h = f32::from(self.explorer_scroll.bounds().size.height);
+        let max_offset = f32::from(self.explorer_scroll.max_offset().height);
+        let offset_y = f32::from(self.explorer_scroll.offset().y);
+        let mut bar = div()
+            .w(px(scrollbar::WIDTH))
+            .h_full()
+            .relative()
+            .flex_shrink_0();
+        if let Some((top, height)) = scrollbar::thumb(viewport_h, max_offset, offset_y) {
+            bar = bar.child(
+                div()
+                    .absolute()
+                    .right(px((scrollbar::WIDTH - scrollbar::THUMB_W) / 2.0))
+                    .top(px(top))
+                    .h(px(height))
+                    .w(px(scrollbar::THUMB_W))
+                    .bg(rgb(theme::gutter_fg())),
+            );
+        }
+        bar
+    }
+
     /// Slim per-document toolbar for Markdown. The toggle is per tab because
     /// `preview` lives in `DocumentState`; switching tabs keeps each document
     /// in the mode the writer left it in.
@@ -14044,7 +14071,15 @@ impl Editor {
             let done = matches!(message, ChatRunMessage::Done(_));
             match message {
                 ChatRunMessage::Event(event) => {
+                    let proposal =
+                        matches!(event, narra_core::agent::TaskEvent::ProposalCreated { .. });
                     view.chat.apply_event(&event);
+                    if proposal {
+                        view.load_chat_proposal_diffs();
+                        if view.chat_follow {
+                            view.chat_scroll.scroll_to_bottom();
+                        }
+                    }
                     view.chat_follow_stream();
                 }
                 ChatRunMessage::Done(result) => {
@@ -14699,6 +14734,162 @@ impl Editor {
         .detach();
     }
 
+    fn chat_user_turn(&self, content: &str, index: usize) -> impl IntoElement {
+        div()
+            .id(("chat-user", index))
+            .w_full()
+            .p_2()
+            .border_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::bg()))
+            .text_color(rgb(theme::default_fg()))
+            .whitespace_normal()
+            .child(content.to_string())
+    }
+
+    fn chat_assistant_turn(&self, content: &str, index: usize) -> impl IntoElement {
+        let key = markdown_key(content);
+        let mut cache = self.chat_markdown.borrow_mut();
+        let document = cache
+            .entry(key)
+            .or_insert_with(|| MarkdownDocument::parse(content));
+        div()
+            .id(("chat-assistant", index))
+            .w_full()
+            .px_2()
+            .py_1()
+            .text_color(rgb(theme::default_fg()))
+            .child(markdown_view::blocks(document, self.lang))
+    }
+
+    fn chat_activity_row(
+        &self,
+        activity: &ChatActivity,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (icon_name, label) = match activity.kind {
+            ChatActivityKind::Read => (
+                "file-text",
+                self.tf("chat.activity.read", &[("target", &activity.target)]),
+            ),
+            ChatActivityKind::Search => (
+                "search",
+                self.tf("chat.activity.search", &[("target", &activity.target)]),
+            ),
+            ChatActivityKind::List => ("list-tree", self.t("chat.activity.list").to_string()),
+            ChatActivityKind::Scene => (
+                "clapperboard",
+                self.tf("chat.activity.scene", &[("target", &activity.target)]),
+            ),
+            ChatActivityKind::Skill => (
+                "package",
+                self.tf("chat.activity.skill", &[("target", &activity.target)]),
+            ),
+            ChatActivityKind::Error => (
+                "x",
+                self.tf("chat.activity.error", &[("target", &activity.target)]),
+            ),
+            ChatActivityKind::Edit => ("pencil", activity.target.clone()),
+        };
+        let error = activity.kind == ChatActivityKind::Error;
+        let color = if error {
+            theme::agent_err_fg()
+        } else {
+            theme::status_fg()
+        };
+        let mut row = div()
+            .id(("chat-activity", index))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(color))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(icon(icon_name, color, 13.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(label),
+                    ),
+            );
+        if error && !activity.detail.is_empty() {
+            row = row.child(
+                div()
+                    .pl(px(17.0))
+                    .text_color(rgb(theme::agent_err_fg()))
+                    .child(activity.detail.clone()),
+            );
+        }
+        if activity.kind == ChatActivityKind::Read && activity.target.contains('/') {
+            let target = activity.target.clone();
+            row = row
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Err(message) = this.open_document_path(&target, true) {
+                        this.notice = Some(message);
+                    }
+                    cx.notify();
+                }));
+        }
+        row
+    }
+
+    fn chat_follow_bar(
+        &self,
+        view: &ChatProposalView,
+        change_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("chat-following")
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(rgb(theme::explorer_border()))
+            .bg(rgb(theme::status_bg()))
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .text_color(rgb(theme::default_fg()))
+            .child(icon("pencil", theme::git_modified_fg(), 12.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(self.tf("chat.following_file", &[("target", &view.target)])),
+            )
+            .child(
+                div()
+                    .id("chat-jump-change")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::cue_fg()))
+                    .child(self.t("chat.jump_to_change"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(index) = change_index {
+                            this.chat_scroll.scroll_to_item(index);
+                        } else {
+                            this.chat_scroll.scroll_to_bottom();
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn chat_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = |key: &str| self.t(key).to_string();
         let mut panel = div()
@@ -14723,33 +14914,45 @@ impl Editor {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_color(rgb(theme::default_fg()))
-                    .child(if self.chat.thread.title.is_empty() {
-                        t("chat.new")
-                    } else {
-                        self.chat.thread.title.clone()
-                    }),
+                    .child(icon("message-square", theme::status_fg(), 14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(if self.chat.thread.title.is_empty() {
+                                t("chat.new")
+                            } else {
+                                self.chat.thread.title.clone()
+                            }),
+                    ),
             )
             .child(
                 div()
                     .id("chat-new")
-                    .px_2()
+                    .px_1()
                     .py_1()
                     .cursor_pointer()
                     .text_color(rgb(theme::status_fg()))
-                    .child("+")
+                    .child(icon("plus", theme::status_fg(), 14.0))
                     .on_click(cx.listener(|this, _, _, cx| this.chat_new_thread(cx))),
             )
             .child(
                 div()
                     .id("chat-top-menu")
-                    .px_2()
+                    .px_1()
                     .py_1()
                     .cursor_pointer()
                     .text_color(rgb(theme::status_fg()))
-                    .child("…")
+                    .child(icon("ellipsis", theme::status_fg(), 14.0))
                     .on_click(
                         cx.listener(|this, _, _, cx| this.chat_toggle_menu(ChatMenu::Top, cx)),
                     ),
@@ -14859,119 +15062,72 @@ impl Editor {
             .flex_col()
             .gap_2()
             .p_2();
-        if self.chat.thread.messages.is_empty() && self.chat.streaming.is_empty() {
-            messages = messages
-                .child(
-                    div()
-                        .text_color(rgb(theme::status_fg()))
-                        .child(t("chat.empty_title")),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(theme::gutter_fg()))
-                        .child(t("chat.empty_hint")),
-                );
-        }
+        let mut used_proposals: HashSet<String> = HashSet::new();
+        let mut run = 0usize;
+        let mut first_user = true;
+        let mut child_index = 0usize;
+        let mut active_change_index: Option<usize> = None;
         for (index, turn) in self.chat.thread.messages.iter().enumerate() {
-            let user = turn.role == narra_core::agent::ChatTurnRole::User;
-            // Assistant answers are Markdown; the cache keys on content so a
-            // re-render (streaming, scroll) does not re-parse every turn
-            // (M16 slice 5). Streaming text below stays plain until complete,
-            // which avoids flicker and half-written code fences.
-            let body = if user {
-                div()
-                    .whitespace_normal()
-                    .child(turn.content.clone())
-                    .into_any_element()
+            if turn.role == narra_core::agent::ChatTurnRole::User {
+                if !first_user {
+                    run += 1;
+                }
+                first_user = false;
+                messages = messages.child(self.chat_user_turn(&turn.content, index));
+                child_index += 1;
+                for (activity_index, activity) in self.chat.thread.activities_for(run).enumerate() {
+                    if activity.kind == ChatActivityKind::Edit
+                        && let Some(proposal_id) = activity.proposal_id.as_deref()
+                        && let Some(view) = self.chat.proposal(proposal_id)
+                    {
+                        used_proposals.insert(proposal_id.to_string());
+                        if view.status == ProposalCardStatus::Ready {
+                            active_change_index = Some(child_index);
+                        }
+                        messages =
+                            messages.child(self.chat_proposal_card(view, activity_index, cx));
+                        child_index += 1;
+                        continue;
+                    }
+                    messages = messages.child(self.chat_activity_row(activity, activity_index, cx));
+                    child_index += 1;
+                }
             } else {
-                let key = markdown_key(&turn.content);
-                let mut cache = self.chat_markdown.borrow_mut();
-                let document = cache
-                    .entry(key)
-                    .or_insert_with(|| MarkdownDocument::parse(&turn.content));
-                markdown_view::blocks(document, self.lang).into_any_element()
-            };
-            let mut card = div()
-                .id(("chat-turn", index))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .border_1()
-                .border_color(rgb(theme::explorer_border()))
-                .bg(rgb(if user {
-                    theme::bg()
-                } else {
-                    theme::explorer_bg()
-                }))
-                .text_color(rgb(if user {
-                    theme::cue_fg()
-                } else {
-                    theme::default_fg()
-                }))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::gutter_fg()))
-                        .child(t(if user { "chat.you" } else { "chat.assistant" })),
-                )
-                .child(body);
-            if !user {
-                card = card.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::gutter_fg()))
-                        .child(t("chat.assistant_note")),
-                );
+                messages = messages.child(self.chat_assistant_turn(&turn.content, index));
+                child_index += 1;
             }
-            messages = messages.child(card);
+        }
+        // Old threads have no activity order; keep their proposal cards
+        // reachable at the end instead of hiding them.
+        for (index, view) in self.chat.proposals.iter().enumerate() {
+            if !used_proposals.contains(&view.id) {
+                if view.status == ProposalCardStatus::Ready {
+                    active_change_index = Some(child_index);
+                }
+                messages = messages.child(self.chat_proposal_card(view, index, cx));
+                child_index += 1;
+            }
         }
         if self.chat.status == ChatStatus::Running {
             let streaming = if self.chat.streaming.is_empty() {
-                t("chat.working")
+                self.t("chat.working").to_string()
             } else {
                 self.chat.streaming.clone()
             };
             messages = messages.child(
                 div()
+                    .id("chat-streaming")
+                    .w_full()
                     .px_2()
                     .py_1()
-                    .border_1()
-                    .border_color(rgb(theme::explorer_border()))
-                    .text_color(rgb(theme::status_fg()))
+                    .text_color(rgb(if self.chat.streaming.is_empty() {
+                        theme::gutter_fg()
+                    } else {
+                        theme::default_fg()
+                    }))
+                    .whitespace_normal()
                     .child(streaming),
             );
-        }
-        if !self.chat.sources.is_empty() {
-            let mut sources = div()
-                .mx_2()
-                .mb_2()
-                .border_1()
-                .border_color(rgb(theme::explorer_border()))
-                .flex()
-                .flex_col();
-            sources = sources.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(theme::gutter_fg()))
-                    .child(self.tf(
-                        "chat.sources",
-                        &[("n", &self.chat.sources.len().to_string())],
-                    )),
-            );
-            for source in &self.chat.sources {
-                sources = sources.child(
-                    div()
-                        .px_2()
-                        .text_xs()
-                        .text_color(rgb(theme::gutter_fg()))
-                        .child(format!("{} · {}", source.kind, source.location)),
-                );
-            }
-            messages = messages.child(sources);
         }
         if self.chat.usage_reported {
             let mut label = self.tf(
@@ -14995,14 +15151,14 @@ impl Editor {
                     .child(label),
             );
         }
-        for (index, view) in self.chat.proposals.iter().enumerate() {
-            messages = messages.child(self.chat_proposal_card(view, index, cx));
-        }
         if !self.chat.error.is_empty() {
             messages = messages.child(
                 div()
-                    .px_2()
-                    .py_1()
+                    .mx_2()
+                    .my_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(rgb(theme::agent_err_fg()))
                     .text_color(rgb(theme::agent_err_fg()))
                     .child(self.chat.error.clone()),
             );
@@ -15017,6 +15173,16 @@ impl Editor {
             .child(messages)
             .child(self.chat_scrollbar(cx));
         panel = panel.child(transcript);
+        if self.chat_follow
+            && let Some(view) = self
+                .chat
+                .proposals
+                .iter()
+                .rev()
+                .find(|view| view.status == ProposalCardStatus::Ready)
+        {
+            panel = panel.child(self.chat_follow_bar(view, active_change_index, cx));
+        }
         panel = panel.child(self.chat_composer(cx));
         panel.into_any_element()
     }
@@ -15024,12 +15190,16 @@ impl Editor {
     fn chat_proposal_card(
         &self,
         view: &ChatProposalView,
-        index: usize,
+        _index: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let status = view.status_key();
+        let status_key = chat_proposal_status_key(view.status);
+        let status_color = match view.status {
+            ProposalCardStatus::Ready => theme::git_modified_fg(),
+            ProposalCardStatus::Applied => theme::git_added_fg(),
+            ProposalCardStatus::Rejected | ProposalCardStatus::Failed => theme::agent_err_fg(),
+        };
         let mut card = div()
-            .mx_2()
             .mb_2()
             .border_1()
             .border_color(rgb(if view.status == ProposalCardStatus::Ready {
@@ -15043,20 +15213,34 @@ impl Editor {
             .p_2()
             .child(
                 div()
-                    .text_color(rgb(theme::default_fg()))
-                    .child(if view.is_new {
-                        format!(
-                            "{} · {} · {}",
-                            view.target,
-                            status,
-                            self.t("chat.new_document")
-                        )
-                    } else {
-                        format!("{} · {}", view.target, status)
-                    }),
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(icon("file-text", status_color, 13.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(rgb(theme::default_fg()))
+                            .child(view.target.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(status_color))
+                            .child(self.t(status_key)),
+                    ),
             )
             .when(view.is_new, |card| {
                 card.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::cue_fg()))
+                        .child(self.t("chat.new_document")),
+                )
+                .child(
                     div()
                         .text_xs()
                         .text_color(rgb(theme::gutter_fg()))
@@ -15067,13 +15251,9 @@ impl Editor {
                 div()
                     .text_xs()
                     .text_color(rgb(theme::gutter_fg()))
-                    .child(format!(
-                        "{} hunks · {} selected",
-                        view.hunks,
-                        view.selected_hunks().len()
-                    )),
+                    .child(self.tf("chat.change_summary", &[("n", &view.hunks.to_string())])),
             );
-        if view.hunks > 0 {
+        if view.hunks > 1 {
             let checked = view.selected.get(view.cursor).copied().unwrap_or(false);
             card = card.child(
                 div()
@@ -15083,7 +15263,7 @@ impl Editor {
                     .text_xs()
                     .child(
                         div()
-                            .id(("chat-hunk-prev", index))
+                            .id(chat_element_id("chat-hunk-prev", &view.id))
                             .px_1()
                             .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
@@ -15095,7 +15275,7 @@ impl Editor {
                     )
                     .child(
                         div()
-                            .id(("chat-hunk-toggle", index))
+                            .id(chat_element_id("chat-hunk-toggle", &view.id))
                             .px_1()
                             .cursor_pointer()
                             .text_color(rgb(if checked {
@@ -15116,7 +15296,7 @@ impl Editor {
                     )
                     .child(
                         div()
-                            .id(("chat-hunk-next", index))
+                            .id(chat_element_id("chat-hunk-next", &view.id))
                             .px_1()
                             .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
@@ -15136,18 +15316,31 @@ impl Editor {
             );
         }
         for row in view.diff_rows.iter().take(20) {
-            card = card.child(
-                div()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_xs()
-                    .text_color(rgb(match row.0 {
-                        '+' => theme::git_added_fg(),
-                        '-' => theme::agent_err_fg(),
-                        _ => theme::gutter_fg(),
-                    }))
-                    .child(format!("{}{}", row.0, row.1)),
-            );
+            let (color, background) = match row.0 {
+                '+' => (
+                    theme::git_added_fg(),
+                    Some(rgba((theme::git_added_fg() << 8) | 0x22)),
+                ),
+                '-' => (
+                    theme::agent_err_fg(),
+                    Some(rgba((theme::agent_err_fg() << 8) | 0x22)),
+                ),
+                '#' => (theme::gutter_fg(), Some(rgb(theme::status_bg()))),
+                _ => (theme::gutter_fg(), None),
+            };
+            let mut line = div()
+                .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_xs()
+                .py(px(1.0))
+                .px_1()
+                .text_color(rgb(color))
+                .child(format!("{}{}", row.0, row.1));
+            if let Some(background) = background {
+                line = line.bg(background);
+            }
+            card = card.child(line);
         }
         if view.status == ProposalCardStatus::Ready {
             card = card.child(
@@ -15156,7 +15349,7 @@ impl Editor {
                     .gap_1()
                     .child(
                         div()
-                            .id(("chat-reject", index))
+                            .id(chat_element_id("chat-reject", &view.id))
                             .px_2()
                             .py_1()
                             .cursor_pointer()
@@ -15170,7 +15363,7 @@ impl Editor {
                     )
                     .child(
                         div()
-                            .id(("chat-apply", index))
+                            .id(chat_element_id("chat-apply", &view.id))
                             .px_2()
                             .py_1()
                             .cursor_pointer()
@@ -15188,6 +15381,26 @@ impl Editor {
                                 }
                             })),
                     ),
+            );
+        }
+        if !view.is_new || view.status == ProposalCardStatus::Applied {
+            let target = view.target.clone();
+            card = card.child(
+                div().flex().gap_1().child(
+                    div()
+                        .id(chat_element_id("chat-open", &view.id))
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::cue_fg()))
+                        .child(self.t("chat.open_file"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Err(message) = this.open_document_path(&target, true) {
+                                this.notice = Some(message);
+                            }
+                            cx.notify();
+                        })),
+                ),
             );
         }
         card
@@ -15420,6 +15633,7 @@ impl Editor {
         } else {
             theme::gutter_fg()
         };
+        let follow_tip = self.git_tooltip(cx, "", self.t("chat.follow").to_string());
         div()
             .border_t_1()
             .border_color(rgb(theme::explorer_border()))
@@ -15475,11 +15689,11 @@ impl Editor {
                     .child(
                         div()
                             .id("chat-compose-menu-button")
-                            .px_2()
+                            .px_1()
                             .py_1()
                             .cursor_pointer()
                             .text_color(rgb(theme::status_fg()))
-                            .child("+")
+                            .child(icon("plus", theme::status_fg(), 14.0))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.chat_toggle_menu(ChatMenu::Compose, cx)
                             })),
@@ -15487,16 +15701,12 @@ impl Editor {
                     .child(
                         div()
                             .id("chat-follow")
-                            .px_2()
+                            .px_1()
                             .py_1()
-                            .text_xs()
                             .cursor_pointer()
                             .text_color(rgb(follow_color))
-                            .child(if self.chat_follow {
-                                t("chat.follow_on")
-                            } else {
-                                t("chat.follow_off")
-                            })
+                            .child(icon("crosshair", follow_color, 14.0))
+                            .tooltip(move |_, _| follow_tip.clone())
                             .on_click(cx.listener(|this, _, _, cx| this.chat_toggle_follow(cx))),
                     )
                     .child(
@@ -15529,11 +15739,15 @@ impl Editor {
                             }))
                             .text_color(rgb(theme::default_fg()))
                             .cursor_pointer()
-                            .child(if self.chat.status == ChatStatus::Running {
-                                "■".to_string()
-                            } else {
-                                "↑".to_string()
-                            })
+                            .child(icon(
+                                if self.chat.status == ChatStatus::Running {
+                                    "square"
+                                } else {
+                                    "arrow-up"
+                                },
+                                theme::default_fg(),
+                                13.0,
+                            ))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.chat.status == ChatStatus::Running {
                                     this.chat_stop(cx);
@@ -16904,13 +17118,12 @@ impl Editor {
             .as_ref()
             .map(|project| project.manifest().title.clone())
             .unwrap_or_default();
-        let mut panel = div()
+        let panel = div()
             .id("explorer")
             .w(px(self.explorer_w))
             .h_full()
             .flex()
             .flex_col()
-            .overflow_y_scroll()
             .bg(rgb(theme::explorer_bg()))
             .border_r_1()
             .border_color(rgb(theme::explorer_border()))
@@ -16944,6 +17157,17 @@ impl Editor {
                             .on_click(cx.listener(|this, _, _, cx| this.open_new_file(cx))),
                     ),
             );
+        let mut body = div()
+            .id("explorer-body")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .flex()
+            .flex_col()
+            .track_scroll(&self.explorer_scroll)
+            .overflow_y_scroll()
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()));
+        let mut tree = div().w_full().flex().flex_col().flex_none();
         // Tree rows (M9 slice 4 / S3c): type is an icon, color is state.
         // Dirty is an accent dot; Git status tints the icon and adds a letter
         // so the information does not depend on color alone.
@@ -16957,7 +17181,7 @@ impl Editor {
             let row = &item.row;
             if let Some(group) = item.group.as_deref() {
                 if current_group != Some(group) {
-                    panel = panel.child(
+                    tree = tree.child(
                         div()
                             .px_2()
                             .pt_2()
@@ -17022,7 +17246,7 @@ impl Editor {
             let path = row.path.clone();
             let is_dir = row.is_dir;
             let right_path = path.clone();
-            panel = panel.child(
+            tree = tree.child(
                 div()
                     .id(("tree", index))
                     .pl(px(8.0 + row.depth as f32 * 12.0))
@@ -17068,7 +17292,7 @@ impl Editor {
                 LanguageId::Yaml => "panel.outline_title_keys",
                 _ => "panel.outline_title",
             };
-            panel = panel.child(
+            tree = tree.child(
                 div()
                     .px_2()
                     .py_1()
@@ -17081,7 +17305,7 @@ impl Editor {
                 let selected = current_outline == Some(index + 1);
                 let level = self.doc.outline_levels.get(index).copied().unwrap_or(1);
                 let indent = (level.saturating_sub(1) as f32) * 10.0;
-                panel = panel.child(
+                tree = tree.child(
                     div()
                         .id(("outline", index))
                         .ml(px(indent))
@@ -17104,7 +17328,7 @@ impl Editor {
                 );
             }
             if self.doc.outline.len() > visible {
-                panel = panel.child(
+                tree = tree.child(
                     div()
                         .px_2()
                         .py_1()
@@ -17119,7 +17343,7 @@ impl Editor {
         }
         if !self.doc.language.diagnostics.is_empty() {
             let total = self.doc.language.diagnostics.len();
-            panel = panel.child(
+            tree = tree.child(
                 div()
                     .px_2()
                     .py_1()
@@ -17133,7 +17357,7 @@ impl Editor {
                     DiagnosticSeverity::Warning => theme::git_modified_fg(),
                     DiagnosticSeverity::Info => theme::status_fg(),
                 };
-                panel = panel.child(
+                tree = tree.child(
                     div()
                         .id(("diagnostic", index))
                         .px_2()
@@ -17148,7 +17372,7 @@ impl Editor {
                 );
             }
             if total > 4 {
-                panel = panel.child(
+                tree = tree.child(
                     div()
                         .px_2()
                         .py_1()
@@ -17160,7 +17384,21 @@ impl Editor {
                 );
             }
         }
-        panel.into_any_element()
+        body = body.child(tree);
+        let body_width = (self.explorer_w - scrollbar::WIDTH).max(1.0);
+        panel
+            .child(
+                div()
+                    .id("explorer-scroll")
+                    .flex_1()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .overflow_hidden()
+                    .child(body.w(px(body_width)).flex_none().h_full())
+                    .child(self.explorer_scrollbar()),
+            )
+            .into_any_element()
     }
 
     fn status_text(&self) -> String {
@@ -18083,6 +18321,7 @@ impl Editor {
             "{{\"explorer\":{},\"agent\":{},\"git\":{},\"explorer_w\":{},\"right_w\":{},\"wrap_w\":{},\
              \"chat_scroll_offset\":{},\"chat_scroll_max\":{},\"chat_at_bottom\":{},\
              \"preview_scroll_offset\":{},\"preview_scroll_max\":{},\"preview_scroll_viewport\":{},\
+             \"explorer_scroll_offset\":{},\"explorer_scroll_max\":{},\"explorer_scroll_viewport\":{},\
              \"window_title\":\"{}\"}}",
             self.explorer_open,
             self.agent_panel_open,
@@ -18096,6 +18335,9 @@ impl Editor {
             f32::from(self.preview_scroll.offset().y),
             f32::from(self.preview_scroll.max_offset().height),
             f32::from(self.preview_scroll.bounds().size.height),
+            f32::from(self.explorer_scroll.offset().y),
+            f32::from(self.explorer_scroll.max_offset().height),
+            f32::from(self.explorer_scroll.bounds().size.height),
             escape_json(&self.window_title)
         );
         let settings_dump = if let Some(state) = self.settings.as_ref() {
@@ -18773,6 +19015,21 @@ fn chat_mode_key(mode: ChatMode) -> &'static str {
         ChatMode::Build => "chat.mode.build",
         ChatMode::Review => "chat.mode.review",
     }
+}
+
+fn chat_proposal_status_key(status: ProposalCardStatus) -> &'static str {
+    match status {
+        ProposalCardStatus::Ready => "chat.proposal.ready",
+        ProposalCardStatus::Applied => "chat.proposal.applied",
+        ProposalCardStatus::Rejected => "chat.proposal.rejected",
+        ProposalCardStatus::Failed => "chat.proposal.failed",
+    }
+}
+
+/// Stable element id for controls scoped to one proposal. GPUI's tuple ids
+/// accept a usize, so the proposal UUID is hashed instead of formatted.
+fn chat_element_id(prefix: &'static str, id: &str) -> gpui::ElementId {
+    gpui::ElementId::named_usize(prefix, markdown_key(id) as usize)
 }
 
 /// Split a project-relative path into `(parent, stem, extension)`; the
@@ -20580,6 +20837,7 @@ fn run() -> Result<(), String> {
                 chat_models_loading: false,
                 chat_scroll: ScrollHandle::new(),
                 preview_scroll: ScrollHandle::new(),
+                explorer_scroll: ScrollHandle::new(),
                 chat_scroll_drag: None,
                 chat_markdown: RefCell::new(HashMap::new()),
                 rename: None,

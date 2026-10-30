@@ -12,6 +12,10 @@ use gpui::{AssetSource, Result, SharedString};
 /// Icon name → bytes. Paths are the strings passed to `svg().path(...)`.
 const ICONS: &[(&str, &[u8])] = &[
     (
+        "icons/arrow-up.svg",
+        include_bytes!("../assets/icons/arrow-up.svg"),
+    ),
+    (
         "icons/clapperboard.svg",
         include_bytes!("../assets/icons/clapperboard.svg"),
     ),
@@ -22,6 +26,33 @@ const ICONS: &[(&str, &[u8])] = &[
     (
         "icons/chevron-right.svg",
         include_bytes!("../assets/icons/chevron-right.svg"),
+    ),
+    ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
+    (
+        "icons/crosshair.svg",
+        include_bytes!("../assets/icons/crosshair.svg"),
+    ),
+    (
+        "icons/ellipsis.svg",
+        include_bytes!("../assets/icons/ellipsis.svg"),
+    ),
+    (
+        "icons/expand.svg",
+        include_bytes!("../assets/icons/expand.svg"),
+    ),
+    (
+        "icons/image.svg",
+        include_bytes!("../assets/icons/image.svg"),
+    ),
+    ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
+    (
+        "icons/square.svg",
+        include_bytes!("../assets/icons/square.svg"),
+    ),
+    ("icons/user.svg", include_bytes!("../assets/icons/user.svg")),
+    (
+        "icons/pencil.svg",
+        include_bytes!("../assets/icons/pencil.svg"),
     ),
     (
         "icons/book-open.svg",

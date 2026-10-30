@@ -9,7 +9,8 @@
 //! proposal tools). This state never writes canonical files.
 
 use narra_core::agent::{
-    AgentError, ChatAttachment, ChatMode, ChatProposalRef, ChatThread, TaskEvent, TaskOutput,
+    AgentError, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatProposalRef,
+    ChatThread, ContextSource, TaskEvent, TaskOutput,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +244,20 @@ impl ChatUiState {
                 self.stage = stage.clone();
             }
             TaskEvent::ContextCollected { sources } => {
+                let run = self.thread.current_run();
+                for source in sources.iter().skip(self.sources.len()) {
+                    if source.kind != "tool" {
+                        continue;
+                    }
+                    let (kind, target) = activity_from_source(source);
+                    self.thread.push_activity(ChatActivity {
+                        run,
+                        kind,
+                        target,
+                        detail: source.detail.clone(),
+                        proposal_id: None,
+                    });
+                }
                 self.sources = sources.clone();
             }
             TaskEvent::ModelResponded { .. } => {
@@ -258,9 +273,39 @@ impl ChatUiState {
                 }
                 self.thread
                     .push_proposal(id.clone(), target.clone(), *hunks);
+                if !self
+                    .thread
+                    .activities
+                    .iter()
+                    .any(|activity| activity.proposal_id.as_deref() == Some(id.as_str()))
+                {
+                    let run = self.thread.current_run();
+                    self.thread.push_activity(ChatActivity {
+                        run,
+                        kind: ChatActivityKind::Edit,
+                        target: target.clone(),
+                        detail: String::new(),
+                        proposal_id: Some(id.clone()),
+                    });
+                }
             }
-            TaskEvent::ToolExecuted { tool, .. } => {
+            TaskEvent::ToolExecuted {
+                tool,
+                allowed,
+                outcome,
+                ..
+            } => {
                 self.stage = format!("tool:{tool}");
+                if !allowed || outcome.starts_with("Failed") {
+                    let run = self.thread.current_run();
+                    self.thread.push_activity(ChatActivity {
+                        run,
+                        kind: ChatActivityKind::Error,
+                        target: tool.clone(),
+                        detail: outcome.clone(),
+                        proposal_id: None,
+                    });
+                }
             }
             TaskEvent::Completed { .. } => {
                 self.stage.clear();
@@ -429,11 +474,26 @@ impl ChatUiState {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let activities = self
+            .thread
+            .activities
+            .iter()
+            .map(|activity| {
+                format!(
+                    "{{\"run\":{},\"kind\":\"{}\",\"target\":\"{}\",\"proposal\":\"{}\"}}",
+                    activity.run,
+                    activity.kind.key(),
+                    json_escape(&activity.target),
+                    json_escape(activity.proposal_id.as_deref().unwrap_or(""))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
             "{{\"thread\":\"{}\",\"title\":\"{}\",\"mode\":\"{}\",\"status\":\"{}\",\
              \"input\":\"{}\",\"focused\":{},\"streaming\":\"{}\",\"error\":\"{}\",\
              \"sources\":{},\"attachments\":{},\"usage\":{{\"input\":{},\"output\":{},\"reported\":{},\"cost_micros\":{}}},\
-             \"messages\":[{}],\"proposals\":[{}]}}",
+             \"activities\":[{}],\"messages\":[{}],\"proposals\":[{}]}}",
             json_escape(&self.thread.id),
             json_escape(&self.thread.title),
             self.thread.mode.key(),
@@ -450,9 +510,25 @@ impl ChatUiState {
             self.cost_micros
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
+            activities,
             messages,
             proposals
         )
+    }
+}
+
+fn activity_from_source(source: &ContextSource) -> (ChatActivityKind, String) {
+    let location = source.location.as_str();
+    if let Some(query) = location.strip_prefix("búsqueda: ") {
+        (ChatActivityKind::Search, query.to_string())
+    } else if location == "project" {
+        (ChatActivityKind::List, "documents".to_string())
+    } else if let Some(skill) = location.strip_prefix("skill: ") {
+        (ChatActivityKind::Skill, skill.to_string())
+    } else if let Some(scene) = location.strip_prefix("escena ") {
+        (ChatActivityKind::Scene, scene.to_string())
+    } else {
+        (ChatActivityKind::Read, location.to_string())
     }
 }
 
@@ -595,6 +671,68 @@ mod tests {
             }],
         });
         assert_eq!(chat.sources.len(), 1);
+    }
+
+    #[test]
+    fn tool_sources_and_proposals_become_ordered_inline_activities() {
+        let mut chat = ChatUiState::new(ChatMode::Build);
+        chat.begin_run("mejora la ficha".to_string(), Vec::new());
+        chat.apply_event(&TaskEvent::ContextCollected {
+            sources: vec![
+                ContextSource {
+                    kind: "manifest".to_string(),
+                    location: "project.yaml".to_string(),
+                    detail: "manifest".to_string(),
+                },
+                ContextSource {
+                    kind: "tool".to_string(),
+                    location: "bible/characters/marta.md".to_string(),
+                    detail: "documento leído por la herramienta".to_string(),
+                },
+            ],
+        });
+        chat.apply_event(&TaskEvent::ContextCollected {
+            sources: vec![
+                ContextSource {
+                    kind: "manifest".to_string(),
+                    location: "project.yaml".to_string(),
+                    detail: "manifest".to_string(),
+                },
+                ContextSource {
+                    kind: "tool".to_string(),
+                    location: "bible/characters/marta.md".to_string(),
+                    detail: "documento leído por la herramienta".to_string(),
+                },
+                ContextSource {
+                    kind: "tool".to_string(),
+                    location: "búsqueda: faro".to_string(),
+                    detail: "resultados".to_string(),
+                },
+            ],
+        });
+        chat.apply_event(&TaskEvent::ProposalCreated {
+            id: "p1".to_string(),
+            target: "bible/characters/marta.md".to_string(),
+            hunks: 1,
+        });
+
+        let kinds: Vec<ChatActivityKind> = chat
+            .thread
+            .activities
+            .iter()
+            .map(|activity| activity.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ChatActivityKind::Read,
+                ChatActivityKind::Search,
+                ChatActivityKind::Edit
+            ]
+        );
+        assert_eq!(chat.thread.activities[0].run, 0);
+        assert_eq!(chat.thread.activities[2].proposal_id.as_deref(), Some("p1"));
+        assert_eq!(chat.thread.activities[1].target, "faro");
     }
 
     #[test]

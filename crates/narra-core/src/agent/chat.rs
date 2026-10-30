@@ -183,6 +183,49 @@ impl ChatTurn {
     }
 }
 
+/// A compact, human-readable step shown inline in the conversation (a tool
+/// read, a search, a skill load or an edit). The full tool audit still lives
+/// in the task output; this is the part the writer needs to follow the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatActivityKind {
+    Read,
+    Search,
+    List,
+    Scene,
+    Skill,
+    Edit,
+    Error,
+}
+
+impl ChatActivityKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            ChatActivityKind::Read => "read",
+            ChatActivityKind::Search => "search",
+            ChatActivityKind::List => "list",
+            ChatActivityKind::Scene => "scene",
+            ChatActivityKind::Skill => "skill",
+            ChatActivityKind::Edit => "edit",
+            ChatActivityKind::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatActivity {
+    /// Zero-based user turn this activity belongs to.
+    pub run: usize,
+    pub kind: ChatActivityKind,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub detail: String,
+    /// Set for edit activities so the renderer can place the proposal card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+}
+
 /// A proposal created during a chat, persisted so the card survives a
 /// restart. The diff itself stays in the proposal record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +257,8 @@ pub struct ChatThread {
     pub updated_at: String,
     pub messages: Vec<ChatTurn>,
     #[serde(default)]
+    pub activities: Vec<ChatActivity>,
+    #[serde(default)]
     pub proposals: Vec<ChatProposalRef>,
     #[serde(default)]
     pub usage: ChatUsage,
@@ -232,9 +277,32 @@ impl ChatThread {
             mode,
             updated_at: now_rfc3339(),
             messages: Vec::new(),
+            activities: Vec::new(),
             proposals: Vec::new(),
             usage: ChatUsage::default(),
         }
+    }
+
+    /// Number of user turns in this thread.
+    pub fn run_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|turn| turn.role == ChatTurnRole::User)
+            .count()
+    }
+
+    /// Zero-based index of the current (last) user turn.
+    pub fn current_run(&self) -> usize {
+        self.run_count().saturating_sub(1)
+    }
+
+    pub fn push_activity(&mut self, activity: ChatActivity) {
+        self.activities.push(activity);
+        self.touch();
+    }
+
+    pub fn activities_for(&self, run: usize) -> impl Iterator<Item = &ChatActivity> {
+        self.activities.iter().filter(move |item| item.run == run)
     }
 
     pub fn push_proposal(
@@ -796,6 +864,13 @@ mod tests {
         thread.push_user("Resume la escena 1");
         thread.push_assistant("La escena plantea el conflicto.");
         thread.push_proposal("proposal-1", "screenplay/main.fountain", 2);
+        thread.push_activity(ChatActivity {
+            run: 0,
+            kind: ChatActivityKind::Read,
+            target: "bible/characters/marta.md".to_string(),
+            detail: "documento leído por la herramienta".to_string(),
+            proposal_id: None,
+        });
         thread.usage = ChatUsage {
             input_tokens: 120,
             output_tokens: 80,
@@ -813,9 +888,29 @@ mod tests {
         assert_eq!(loaded.messages[0].role, ChatTurnRole::User);
         assert_eq!(loaded.proposals.len(), 1);
         assert_eq!(loaded.proposals[0].hunks, 2);
+        assert_eq!(loaded.activities.len(), 1);
+        assert_eq!(loaded.activities[0].kind, ChatActivityKind::Read);
+        assert_eq!(loaded.activities[0].run, 0);
         assert_eq!(loaded.usage.input_tokens, 120);
         assert_eq!(loaded.usage.output_tokens, 80);
         assert_eq!(loaded.usage.cost_micros, Some(34_000));
+    }
+
+    #[test]
+    fn threads_without_activities_still_load() {
+        let root = project();
+        let mut thread = ChatThread::new(ChatMode::Plan);
+        thread.push_user("hola");
+        thread.push_assistant("mundo");
+        thread.save(&root).expect("save");
+        let path = root.join(CHATS_DIR).join(format!("{}.json", thread.id));
+        let text = fs::read_to_string(&path).expect("read");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        value.as_object_mut().expect("object").remove("activities");
+        fs::write(&path, serde_json::to_string(&value).expect("encode")).expect("write");
+        let loaded = ChatThread::load(&root, &thread.id).expect("load old thread");
+        assert!(loaded.activities.is_empty());
+        assert_eq!(loaded.messages.len(), 2);
     }
 
     #[test]
