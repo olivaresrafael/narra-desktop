@@ -153,6 +153,33 @@ impl Project {
         Ok(document::delete_document(&self.root, relative)?)
     }
 
+    /// Repair a stale default screenplay pointer after an external rename:
+    /// when the configured file is gone and exactly one `.fountain` remains,
+    /// point the manifest at it. This never guesses between multiple scripts
+    /// and never creates or deletes content.
+    pub fn repair_default_screenplay(&mut self) -> Result<Option<String>, ProjectError> {
+        let current = self.manifest.default_screenplay_path.clone();
+        if self.root.join(&current).exists() {
+            return Ok(None);
+        }
+        let mut candidates: Vec<String> = self
+            .list_documents()?
+            .into_iter()
+            .filter(|path| path.ends_with(".fountain"))
+            .collect();
+        if candidates.len() != 1 {
+            return Ok(None);
+        }
+        let path = candidates.remove(0);
+        if path == current {
+            return Ok(None);
+        }
+        let mut manifest = self.manifest.clone();
+        manifest.default_screenplay_path = path.clone();
+        self.update_manifest(manifest)?;
+        Ok(Some(path))
+    }
+
     /// Scan the canonical narrative sources and rebuild the derived index.
     ///
     /// The index is a convenience only; source files remain authoritative
@@ -398,8 +425,11 @@ pub fn create_project_base_from_package(
             .join(&package.id);
         copy_directory(source, &destination)?;
     }
+    let default_screenplay = package
+        .default_screenplay_path()
+        .unwrap_or_else(|| DEFAULT_SCREENPLAY.to_string());
     let manifest =
-        Manifest::new_v1_with_type_id(title, &package.id, primary_language, DEFAULT_SCREENPLAY)?;
+        Manifest::new_v1_with_type_id(title, &package.id, primary_language, &default_screenplay)?;
     let text = manifest::serialize_manifest(&manifest)?;
     document::write_document(root, MANIFEST_FILE, &text)?;
     write_project_instructions(root, primary_language)?;
@@ -624,6 +654,46 @@ mod tests {
         create_project(&root, "Instrucciones", ProjectType::Feature, "es").expect("create");
         let text = fs::read_to_string(root.join(INSTRUCTIONS_FILE)).expect("instructions");
         assert!(text.starts_with("# Instrucciones del proyecto"));
+    }
+
+    #[test]
+    fn stale_default_screenplay_is_repaired_when_one_script_remains() {
+        let root = temp_root();
+        let mut project =
+            create_project(&root, "Renombrado", ProjectType::Feature, "es").expect("create");
+        fs::remove_file(root.join(DEFAULT_SCREENPLAY)).expect("remove original");
+        fs::write(root.join("screenplay/pilot.fountain"), "INT. CASA - DÍA\n").expect("pilot");
+        let repaired = project.repair_default_screenplay().expect("repair");
+        assert_eq!(repaired.as_deref(), Some("screenplay/pilot.fountain"));
+        assert_eq!(
+            project.manifest().default_screenplay_path,
+            "screenplay/pilot.fountain"
+        );
+        let reopened = open_project(&root).expect("reopen");
+        assert_eq!(
+            reopened.manifest().default_screenplay_path,
+            "screenplay/pilot.fountain"
+        );
+    }
+
+    #[test]
+    fn custom_package_uses_its_own_screenplay_as_default() {
+        let root = temp_root();
+        let package = crate::project_type::parse_package(
+            "schema_version: 1\napi_version: 1\nid: pilot\nname: Pilot\ndirectories: [screenplay]\nfiles:\n  - path: screenplay/S01E01.fountain\n    content: INT. CASA - DÍA\n",
+            crate::project_type::TypeOrigin::User,
+        )
+        .expect("package");
+        let project = create_project_from_package(&root, "Piloto", &package, "es")
+            .expect("create custom screenplay package");
+        assert_eq!(
+            project.manifest().default_screenplay_path,
+            "screenplay/S01E01.fountain"
+        );
+        assert!(
+            root.join("screenplay/S01E01.fountain").is_file(),
+            "custom screenplay template must be written"
+        );
     }
 
     #[test]

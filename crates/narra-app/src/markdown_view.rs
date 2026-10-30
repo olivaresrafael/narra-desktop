@@ -44,7 +44,7 @@ pub fn render(
 /// inside their own card (M16 slice 5); the caller scopes the element ids by
 /// putting the result under an element with its own id.
 pub fn blocks(document: &MarkdownDocument, lang: Lang) -> Div {
-    let mut content = div().w_full().flex().flex_col();
+    let mut content = div().w_full().min_w(px(0.0)).flex().flex_col();
     if document.blocks.is_empty() {
         content = content.child(
             div()
@@ -75,12 +75,16 @@ fn render_block(block: &Block, index: usize) -> Div {
             div()
                 .mt_4()
                 .mb_2()
+                .w_full()
+                .min_w(px(0.0))
                 .text_size(px(theme::text_size() * factor))
                 .text_color(rgb(theme::default_fg()))
                 .child(inline_column(&heading))
         }
         Block::Paragraph { spans } => div()
             .mb_3()
+            .w_full()
+            .min_w(px(0.0))
             .text_size(px(theme::text_size()))
             .text_color(rgb(theme::default_fg()))
             .child(inline_column(spans)),
@@ -92,6 +96,8 @@ fn render_block(block: &Block, index: usize) -> Div {
         } => div()
             .mb_1()
             .ml(px(*depth as f32 * 18.0))
+            .w_full()
+            .min_w(px(0.0))
             .flex()
             .flex_row()
             .gap_2()
@@ -108,6 +114,8 @@ fn render_block(block: &Block, index: usize) -> Div {
         Block::Quote { depth, spans } => div()
             .mb_3()
             .ml(px(*depth as f32 * 12.0))
+            .w_full()
+            .min_w(px(0.0))
             .pl_3()
             .border_l_1()
             .border_color(rgb(theme::status_fg()))
@@ -174,6 +182,8 @@ fn render_block(block: &Block, index: usize) -> Div {
             .bg(rgb(theme::explorer_border())),
         Block::Raw(text) => div()
             .mb_3()
+            .w_full()
+            .min_w(px(0.0))
             .p_3()
             .bg(rgb(theme::status_bg()))
             .text_xs()
@@ -214,7 +224,7 @@ fn table_row(cells: &[Vec<InlineSpan>], header: bool) -> Div {
 /// Render inline spans as a column of lines so hard breaks and any future
 /// multiline spans keep their line structure. Soft breaks arrive as spaces.
 fn inline_column(spans: &[InlineSpan]) -> Div {
-    let mut column = div().flex().flex_col();
+    let mut column = div().w_full().min_w(px(0.0)).flex().flex_col();
     for line in inline_lines(spans) {
         column = column.child(styled_text(&line));
     }

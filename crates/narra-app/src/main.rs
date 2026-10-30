@@ -8037,6 +8037,9 @@ impl Editor {
         if root != project.root() {
             project = open_project(&root).map_err(|error| error.to_string())?;
         }
+        let repaired_screenplay = project
+            .repair_default_screenplay()
+            .map_err(|error| error.to_string())?;
         let doc_path = project.manifest().default_screenplay_path.clone();
         let title = project.manifest().title.clone();
         let content = match project.read_document(&doc_path) {
@@ -8071,7 +8074,7 @@ impl Editor {
         if let Some(cancel) = self.chat_cancel.take() {
             cancel.cancel();
         }
-        self.chat = ChatUiState::new(ChatMode::Plan);
+        self.chat = ChatUiState::new(ChatMode::Build);
         self.chat_markdown.borrow_mut().clear();
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
@@ -8105,6 +8108,9 @@ impl Editor {
         // `load_document` clears the notice, so surface a newer recovery
         // backup once more before the project-opened confirmation.
         self.check_backup_notice();
+        if let Some(path) = repaired_screenplay {
+            self.notice = Some(self.tf("notice.screenplay_repaired", &[("path", &path)]));
+        }
 
         self.recents.record(&root);
         self.recents.save();
@@ -8223,7 +8229,7 @@ impl Editor {
         self.agent = AgentState::new();
         self.agent.lang = self.lang;
         self.agent_cancel = None;
-        self.chat = ChatUiState::new(ChatMode::Plan);
+        self.chat = ChatUiState::new(ChatMode::Build);
         self.chat_markdown.borrow_mut().clear();
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
@@ -15079,6 +15085,7 @@ impl Editor {
         div()
             .id(("chat-assistant", index))
             .w_full()
+            .min_w(px(0.0))
             .px_2()
             .py_1()
             .text_color(rgb(theme::default_fg()))
@@ -21289,13 +21296,16 @@ fn run() -> Result<(), String> {
 
     // M6 slice 1: `--project` goes through narra-core (validated manifest,
     // boundary-checked IO); `--fixture` is the untouched spike path.
-    let project = match &args.project {
+    let mut project = match &args.project {
         Some(root) => Some(
             open_project(Path::new(root))
                 .map_err(|error| format!("no se pudo abrir el proyecto {root}: {error}"))?,
         ),
         None => None,
     };
+    if let Some(project) = project.as_mut() {
+        project.repair_default_screenplay().ok();
+    }
     if let Some(project) = project.as_ref() {
         recents.record(project.root());
         recents.save();
@@ -21645,7 +21655,7 @@ fn run() -> Result<(), String> {
                 github_pr: None,
                 git_busy: false,
                 right_tab: RightTab::Chat,
-                chat: ChatUiState::new(ChatMode::Plan),
+                chat: ChatUiState::new(ChatMode::Build),
                 chat_generation: 0,
                 chat_cancel: None,
                 chat_history: Vec::new(),

@@ -237,6 +237,21 @@ impl ProjectTypePackage {
         self.files.iter().find(|file| file.path == path)
     }
 
+    /// The screenplay template path this package wants the project to open.
+    /// A custom package can name its pilot `screenplay/S01E01.fountain`; the
+    /// manifest must point at that file instead of the built-in default.
+    pub fn default_screenplay_path(&self) -> Option<String> {
+        self.files
+            .iter()
+            .find(|file| file.path.starts_with("screenplay/") && file.path.ends_with(".fountain"))
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .find(|file| file.path.ends_with(".fountain"))
+            })
+            .map(|file| file.path.clone())
+    }
+
     pub fn profile(&self) -> ProjectProfile {
         ProjectProfile {
             type_id: self.id.clone(),

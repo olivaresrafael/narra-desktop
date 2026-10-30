@@ -616,7 +616,13 @@ impl ChatTask {
             context,
             self.instruction
         );
-        let system = self.mode.system_prompt().to_string();
+        let system = format!(
+            "{}\n\nEl manifiesto ya está en el contexto de la tarea. \
+             project.yaml, agents.yaml, AGENTS.md y .narra/ son configuración, \
+             no documentos narrativos: no intentes leerlos con read_document. \
+             Si necesitas rutas, usa list_documents.",
+            self.mode.system_prompt()
+        );
 
         self.run_with_tools(
             root,

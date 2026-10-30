@@ -569,6 +569,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "abierto {title} · {path}",
     ),
     (
+        "notice.screenplay_repaired",
+        "default screenplay updated to {path}",
+        "guion predeterminado actualizado a {path}",
+    ),
+    (
         "notice.recents_cleared",
         "recent-projects menu cleared",
         "menú de proyectos recientes borrado",
