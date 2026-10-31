@@ -178,7 +178,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let package = narra_core::project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\n",
             narra_core::project_type::TypeOrigin::User,
         )
         .expect("package");

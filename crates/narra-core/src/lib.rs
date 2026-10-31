@@ -57,8 +57,9 @@ pub use project::{
     create_project_from_type, open_project,
 };
 pub use project_type::{
-    ExplorerGroup, ProjectProfile, ProjectTypePackage, TemplateFile, TypeCapabilities, TypeOrigin,
-    TypePackageError, builtin, builtins, registry,
+    ContextAction, ContextActionKind, DocumentFormat, EntityDefinition, ExplorerGroup,
+    ExportCapability, ProjectProfile, ProjectTypePackage, SeedFile, TemplateFile, TypeOrigin,
+    TypePackageError, WriteRoot, builtin, builtins, registry,
 };
 
 /// Marker for the core boundary, so the crate is exercised by CI from day one.

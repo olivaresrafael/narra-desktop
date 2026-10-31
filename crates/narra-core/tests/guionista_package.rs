@@ -11,10 +11,81 @@ use std::fs;
 use std::path::PathBuf;
 
 use narra_core::agent::skill::{SkillOrigin, load_scope};
+use narra_core::project_type::{TypeOrigin, load_package};
 use saphyr::{LoadableYamlNode, Yaml};
 
 fn package_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/packages/guionista")
+}
+
+/// The real v2 parser must accept and validate the ported package.
+#[test]
+fn the_real_v2_parser_loads_the_package() {
+    let package = load_package(&package_root(), TypeOrigin::User).expect("load guionista");
+    assert_eq!(package.id, "guionista");
+    assert_eq!(package.format.key(), "fountain");
+    assert_eq!(
+        package.default_document.as_deref(),
+        Some("guion/main.fountain")
+    );
+    assert_eq!(package.pinned_context(), ["biblia", "estructura"]);
+    assert_eq!(package.skills.len(), 9);
+    assert_eq!(package.commands.len(), 8);
+    assert_eq!(package.agents.len(), 4);
+
+    let profile = package.profile();
+    assert!(
+        profile.screenplay,
+        "fountain types keep screenplay mechanics"
+    );
+    assert!(profile.export_pdf);
+    assert_eq!(profile.entity_kinds, ["personaje", "mundo"]);
+    assert_eq!(profile.explorer_groups.len(), 4);
+
+    let roots: Vec<&str> = package
+        .write_roots
+        .iter()
+        .map(|root| root.path.as_str())
+        .collect();
+    assert_eq!(
+        roots,
+        ["biblia", "estructura", "investigacion", "notas", "guion"]
+    );
+
+    let kinds: Vec<&str> = package
+        .context_actions
+        .iter()
+        .map(|action| match action.kind {
+            narra_core::project_type::ContextActionKind::ConvertSelectionTo => "convert",
+            narra_core::project_type::ContextActionKind::NewFileFromTemplate => "create",
+            narra_core::project_type::ContextActionKind::RunCommand => "command",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "convert", "convert", "create", "create", "command", "command"
+        ]
+    );
+}
+
+/// A package cannot widen the sandbox: a write root outside the declared
+/// tree is rejected by the validator.
+#[test]
+fn write_roots_cannot_escape_the_declared_tree() {
+    let text = "\
+schema_version: 2
+api_version: 1
+id: escape
+name: Escape
+directories: [docs]
+write_roots:
+  - path: ../outside
+    extensions: [.md]
+";
+    let error = narra_core::project_type::parse_package(text, TypeOrigin::User)
+        .expect_err("escaping write root must be rejected");
+    assert!(error.to_string().contains("write_roots"), "{error}");
 }
 
 fn type_yaml_text() -> String {

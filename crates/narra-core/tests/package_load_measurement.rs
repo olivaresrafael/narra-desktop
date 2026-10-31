@@ -20,15 +20,14 @@ fn temp_root(label: &str) -> PathBuf {
 
 fn template_type_yaml() -> String {
     let mut yaml = String::from(
-        "schema_version: 1\napi_version: 1\nid: measured\nname: Measured\n\
-         description: Load measurement package\ndirectories: [docs]\nfiles:\n",
+        "schema_version: 2\napi_version: 1\nid: measured\nname: Measured\n\
+         description: Load measurement package\ndirectories: [docs]\npinned_context: [docs]\nfiles:\n",
     );
     for index in 0..30 {
         yaml.push_str(&format!(
             "  - path: docs/file-{index:02}.md\n    content:\n      en: |\n        # File {index}\n        English body {index}.\n      es: |\n        # Archivo {index}\n        Cuerpo en español {index}.\n"
         ));
     }
-    yaml.push_str("context:\n  pinned: [docs]\n");
     yaml
 }
 

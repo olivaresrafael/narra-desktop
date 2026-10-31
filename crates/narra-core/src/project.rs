@@ -680,7 +680,7 @@ mod tests {
     fn custom_package_uses_its_own_screenplay_as_default() {
         let root = temp_root();
         let package = crate::project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: pilot\nname: Pilot\ndirectories: [screenplay]\nfiles:\n  - path: screenplay/S01E01.fountain\n    content: INT. CASA - DÍA\n",
+            "schema_version: 2\napi_version: 1\nid: pilot\nname: Pilot\ndirectories: [screenplay]\nformat: fountain\nfiles:\n  - path: screenplay/S01E01.fountain\n    content: INT. CASA - DÍA\n",
             crate::project_type::TypeOrigin::User,
         )
         .expect("package");
@@ -700,7 +700,7 @@ mod tests {
     fn custom_package_creates_and_reopens_a_custom_type_id() {
         let root = temp_root();
         let package = crate::project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content:\n      en: Brief\n      es: Guion\ncapabilities:\n  screenplay: false\n  export_pdf: false\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content:\n      en: Brief\n      es: Guion\n",
             crate::project_type::TypeOrigin::User,
         )
         .expect("package");
@@ -723,7 +723,7 @@ mod tests {
         fs::create_dir_all(&package_dir).expect("package dir");
         fs::write(
             package_dir.join(crate::project_type::TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content: Brief\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content: Brief\n",
         )
         .expect("type.yaml");
         let package =

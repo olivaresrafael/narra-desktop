@@ -2,10 +2,9 @@
 # Draft of the v2 contract: every creative rule here is data, not Rust.
 
 schema_version: 2
-api_version: 2
+api_version: 1
 id: guionista
 name: Guionista
-version: 0.1.0
 description: >-
   Proyecto de escritura creativa en español: biblia narrativa, método de
   estructura, escaleta y guion en Fountain. Puerto del kit guionista-kit.
@@ -111,11 +110,9 @@ entities:
   - id: personaje
     label: { es: Personaje, en: Character }
     folder: biblia/personajes
-    mention: "@"
   - id: mundo
     label: { es: Lugar, en: Location }
     folder: biblia/mundo
-    mention: "@"
 
 # Export capabilities offered in the UI. Kinds are engine formats.
 export:
@@ -130,13 +127,11 @@ context_actions:
     kind: convert_selection_to
     entity: personaje
     label: { es: "Convertir a personaje", en: "Convert to character" }
-    requires: selection
     group: entities
   - id: convert_to_mundo
     kind: convert_selection_to
     entity: mundo
     label: { es: "Convertir a lugar", en: "Convert to location" }
-    requires: selection
     group: entities
   - id: new_personaje
     kind: new_file_from_template
@@ -160,7 +155,3 @@ context_actions:
     command: revisar
     label: { es: "Pedir notas de editor…", en: "Ask for editor notes…" }
     group: ai
-
-# Trust: packages shipped with the app are trusted by signature; cloned or
-# imported packages require hash confirmation (unchanged from D-045).
-trust: hash

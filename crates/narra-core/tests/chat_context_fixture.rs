@@ -68,7 +68,7 @@ fn campaign_project() -> PathBuf {
     fs::create_dir_all(&package_dir).expect("package dir");
     fs::write(
         package_dir.join("type.yaml"),
-        "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief]\nfiles:\n  - path: brief/brief.md\n    content:\n      en: |\n        # Brief\n        Launch the new product.\n      es: |\n        # Brief\n        Lanzar el producto nuevo.\ncontext:\n  pinned: [brief]\n",
+        "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief]\npinned_context: [brief]\nfiles:\n  - path: brief/brief.md\n    content:\n      en: |\n        # Brief\n        Launch the new product.\n      es: |\n        # Brief\n        Lanzar el producto nuevo.\n",
     )
     .expect("type.yaml");
     let package: ProjectTypePackage =

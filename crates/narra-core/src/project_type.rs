@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::project::DEFAULT_SCREENPLAY;
+
 /// File inside each package directory.
 pub const TYPE_FILE: &str = "type.yaml";
 /// Project-local type packages, relative to the project root.
@@ -26,8 +28,9 @@ pub const PROJECT_TYPES_DIR: &str = ".narra/types";
 pub const USER_TYPES_DIR: &str = "project-types";
 /// Trust record for project-level type packages.
 pub const TYPE_TRUST_FILE: &str = ".narra/trusted-types.json";
-/// Package format this build reads.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Package format this build reads. There is no legacy: only schema 2, the
+/// creative-writing contract from D-062.
+pub const SCHEMA_VERSION: u32 = 2;
 /// Capability API this build implements.
 pub const API_VERSION: u32 = 1;
 
@@ -41,8 +44,14 @@ const MAX_DESCRIPTION_CHARS: usize = 500;
 const MAX_PATH_CHARS: usize = 160;
 const MAX_SKILLS: usize = 32;
 const MAX_PINNED_CONTEXT: usize = 32;
+const MAX_ENTITIES: usize = 16;
+const MAX_WRITE_ROOTS: usize = 16;
+const MAX_EXTENSIONS: usize = 8;
+const MAX_CONTEXT_ACTIONS: usize = 32;
+const MAX_EXPORTS: usize = 4;
+const MAX_SEEDS: usize = 64;
 
-const PACKAGE_KEYS: [&str; 10] = [
+const PACKAGE_KEYS: [&str; 20] = [
     "schema_version",
     "api_version",
     "id",
@@ -51,9 +60,111 @@ const PACKAGE_KEYS: [&str; 10] = [
     "directories",
     "files",
     "skills",
-    "capabilities",
-    "context",
+    "format",
+    "default_document",
+    "content_layout",
+    "pinned_context",
+    "write_roots",
+    "entities",
+    "export",
+    "context_actions",
+    "agents",
+    "commands",
+    "instructions",
+    "templates",
 ];
+
+/// Editor format the type declares. The core applies Fountain mechanics only
+/// when a package asks for `fountain`; other formats stay generic text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentFormat {
+    Fountain,
+    Markdown,
+    Plain,
+}
+
+impl DocumentFormat {
+    pub fn key(self) -> &'static str {
+        match self {
+            DocumentFormat::Fountain => "fountain",
+            DocumentFormat::Markdown => "markdown",
+            DocumentFormat::Plain => "plain",
+        }
+    }
+}
+
+/// One explorer section declared by a type. The app localizes `id` and shows
+/// the named top-level folders under that section. `folders` are
+/// project-relative, exactly as they appear in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplorerGroup {
+    pub id: String,
+    pub folders: Vec<String>,
+}
+
+/// A folder where the assistant may propose writes, with the extensions
+/// allowed inside it. The kernel still sandbox-checks every path; a package
+/// can only narrow what the engine permits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRoot {
+    pub path: String,
+    pub extensions: Vec<String>,
+}
+
+/// A narrative entity the editor offers (dossier, mentions, convert menu).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityDefinition {
+    pub id: String,
+    pub label: LocalizedText,
+    /// Folder that holds the entity documents, e.g. `bible/characters`.
+    pub folder: String,
+}
+
+/// An export format offered in the UI for the listed roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportCapability {
+    /// Engine export kind, e.g. `pdf`.
+    pub kind: String,
+    pub roots: Vec<String>,
+}
+
+/// What a declared context-menu action invokes. Actions may only call engine
+/// mechanisms; a package can never inject code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextActionKind {
+    /// Convert the current selection into an entity document.
+    ConvertSelectionTo,
+    /// Create a new file from a seeded template.
+    NewFileFromTemplate,
+    /// Run a bundled slash command.
+    RunCommand,
+}
+
+/// One editor context-menu action declared by the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextAction {
+    pub id: String,
+    pub kind: ContextActionKind,
+    pub label: LocalizedText,
+    /// `convert_selection_to`: entity id from `entities`.
+    pub entity: Option<String>,
+    /// `new_file_from_template`: template path from `templates[].target`.
+    pub template: Option<String>,
+    /// `new_file_from_template`: destination folder inside a write root.
+    pub target: Option<String>,
+    /// `run_command`: command id from `commands`.
+    pub command: Option<String>,
+    /// Menu section the action belongs to (`entities`, `create`, `ai`…).
+    pub group: Option<String>,
+}
+
+/// A file copied from the package into a new project. `source` is
+/// package-relative; `target` is project-relative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedFile {
+    pub source: String,
+    pub target: String,
+}
 
 /// Where a package was loaded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,102 +204,29 @@ pub struct TemplateFile {
     pub content: LocalizedText,
 }
 
-/// Context material the type wants available to the assistant without an
-/// explicit attachment. `None` on the package means "inherit the safe
-/// default (`bible/` when present)"; an explicit empty list pins nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ContextPolicy {
-    pub pinned: Vec<String>,
-}
-
-impl ContextPolicy {
-    /// Default pinned material for the built-in screenplay packages.
-    pub fn screenplay() -> Self {
-        Self {
-            pinned: vec![
-                "bible".to_string(),
-                "structure".to_string(),
-                "notes/decisions.md".to_string(),
-                "notes/open-questions.md".to_string(),
-            ],
-        }
-    }
-}
-
-/// What the editor exposes for a type. The UI consumes this profile instead
-/// of matching on a type id. Unknown entity ids are ignored by this build.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TypeCapabilities {
-    /// Fountain document support: element cycling, scene review and PDF.
+/// UI-neutral view of one type's contract. The app renders from this profile
+/// instead of matching on a type id; it is derived from the v2 package data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProfile {
+    pub type_id: String,
+    /// The type declares `format: fountain`; the editor applies screenplay
+    /// mechanics (element cycling, scene structure, PDF layout).
     pub screenplay: bool,
-    /// Entity kinds that can be created from a selection.
+    /// Entity ids the type offers for dossiers, mentions and the convert menu.
     pub entity_kinds: Vec<String>,
-    /// PDF export is available for this type.
+    /// PDF export is offered for this type.
     pub export_pdf: bool,
     /// Explorer sections declared by the type, in display order.
     pub explorer_groups: Vec<ExplorerGroup>,
 }
 
-impl TypeCapabilities {
-    pub fn screenplay() -> Self {
-        Self {
-            screenplay: true,
-            entity_kinds: vec![
-                "character".to_string(),
-                "location".to_string(),
-                "object".to_string(),
-            ],
-            export_pdf: true,
-            explorer_groups: vec![
-                ExplorerGroup {
-                    id: "story".to_string(),
-                    folders: vec!["bible".to_string(), "structure".to_string()],
-                },
-                ExplorerGroup {
-                    id: "script".to_string(),
-                    folders: vec!["screenplay".to_string()],
-                },
-                ExplorerGroup {
-                    id: "research".to_string(),
-                    folders: vec!["research".to_string()],
-                },
-                ExplorerGroup {
-                    id: "notes".to_string(),
-                    folders: vec!["notes".to_string(), "reviews".to_string()],
-                },
-            ],
-        }
-    }
-}
-
-/// One explorer section declared by a type. The app localizes `id` and shows
-/// the named top-level folders under that section. `folders` are
-/// project-relative, exactly as they appear in the tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplorerGroup {
-    pub id: String,
-    pub folders: Vec<String>,
-}
-
-/// UI-neutral view of one type's capabilities.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectProfile {
-    pub type_id: String,
-    pub screenplay: bool,
-    pub entity_kinds: Vec<String>,
-    pub export_pdf: bool,
-    pub explorer_groups: Vec<ExplorerGroup>,
-}
-
 impl ProjectProfile {
+    /// The profile of the built-in screenplay packages (`feature`, `series`…).
     pub fn screenplay(type_id: impl Into<String>) -> Self {
-        let capabilities = TypeCapabilities::screenplay();
+        let package = builtin("feature").expect("built-in feature type");
         Self {
             type_id: type_id.into(),
-            screenplay: capabilities.screenplay,
-            entity_kinds: capabilities.entity_kinds,
-            export_pdf: capabilities.export_pdf,
-            explorer_groups: capabilities.explorer_groups,
+            ..package.profile()
         }
     }
 
@@ -218,12 +256,33 @@ pub struct ProjectTypePackage {
     pub name: String,
     pub description: String,
     pub directories: Vec<String>,
+    /// Inline-content template files (legacy-free: the only file seeding API).
     pub files: Vec<TemplateFile>,
     pub skills: Vec<String>,
-    pub capabilities: TypeCapabilities,
-    /// Pinned context declared by the package. `None` means the safe default
-    /// for a custom type; built-ins declare their own list.
-    pub context: Option<ContextPolicy>,
+    /// Editor format the type declares.
+    pub format: DocumentFormat,
+    /// Document a new project opens first.
+    pub default_document: Option<String>,
+    /// Explorer sections rendered from the package.
+    pub content_layout: Vec<ExplorerGroup>,
+    /// Paths pinned into every chat without an explicit attachment.
+    pub pinned_context: Vec<String>,
+    /// Folders where the assistant may propose writes.
+    pub write_roots: Vec<WriteRoot>,
+    /// Narrative entities offered by the editor.
+    pub entities: Vec<EntityDefinition>,
+    /// Export formats offered in the UI.
+    pub exports: Vec<ExportCapability>,
+    /// Editor context-menu actions declared by the type.
+    pub context_actions: Vec<ContextAction>,
+    /// Bundled portable agents (`.narra/agents/<id>/AGENT.md`).
+    pub agents: Vec<String>,
+    /// Bundled slash commands (`.narra/commands/<id>.md`).
+    pub commands: Vec<String>,
+    /// Instruction files seeded into the project (e.g. `AGENTS.md`).
+    pub instructions: Vec<SeedFile>,
+    /// Non-inline template files copied from the package directory.
+    pub templates: Vec<SeedFile>,
     pub origin: TypeOrigin,
     /// Source directory for user/project packages, used when copying the
     /// package into a created project. Built-ins have no source directory.
@@ -238,9 +297,15 @@ impl ProjectTypePackage {
     }
 
     /// The screenplay template path this package wants the project to open.
-    /// A custom package can name its pilot `screenplay/S01E01.fountain`; the
-    /// manifest must point at that file instead of the built-in default.
+    /// Only Fountain types have one; the manifest must point at it instead of
+    /// the built-in default.
     pub fn default_screenplay_path(&self) -> Option<String> {
+        if self.format != DocumentFormat::Fountain {
+            return None;
+        }
+        if let Some(document) = &self.default_document {
+            return Some(document.clone());
+        }
         self.files
             .iter()
             .find(|file| file.path.starts_with("screenplay/") && file.path.ends_with(".fountain"))
@@ -252,23 +317,31 @@ impl ProjectTypePackage {
             .map(|file| file.path.clone())
     }
 
+    /// UI view derived from the package data; the app never matches on ids.
     pub fn profile(&self) -> ProjectProfile {
         ProjectProfile {
             type_id: self.id.clone(),
-            screenplay: self.capabilities.screenplay,
-            entity_kinds: self.capabilities.entity_kinds.clone(),
-            export_pdf: self.capabilities.export_pdf,
-            explorer_groups: self.capabilities.explorer_groups.clone(),
+            screenplay: self.format == DocumentFormat::Fountain,
+            entity_kinds: self
+                .entities
+                .iter()
+                .map(|entity| entity.id.clone())
+                .collect(),
+            export_pdf: self.exports.iter().any(|export| export.kind == "pdf"),
+            explorer_groups: self.content_layout.clone(),
         }
     }
 
-    /// Pinned paths for the chat brief. A custom package that omits
-    /// `context` inherits `bible/`; an explicit empty list pins nothing.
+    /// Pinned paths for the chat brief.
     pub fn pinned_context(&self) -> Vec<String> {
-        match &self.context {
-            Some(policy) => policy.pinned.clone(),
-            None => vec!["bible".to_string()],
-        }
+        self.pinned_context.clone()
+    }
+
+    /// Whether `path` is a declared directory or lives under one.
+    fn declares(&self, path: &str) -> bool {
+        self.directories
+            .iter()
+            .any(|directory| directory == path || directory.starts_with(&format!("{path}/")))
     }
 
     /// Validate the package without touching the filesystem. The id must be
@@ -367,39 +440,271 @@ impl ProjectTypePackage {
                 });
             }
         }
-        if let Some(policy) = &self.context {
-            if policy.pinned.len() > MAX_PINNED_CONTEXT {
+
+        if let Some(document) = &self.default_document {
+            validate_relative_path("default_document", document)?;
+        }
+
+        if self.content_layout.len() > 8 {
+            return Err(TypePackageError::Invalid {
+                field: "content_layout",
+                detail: "at most 8 groups are allowed".to_string(),
+            });
+        }
+        let mut group_ids = BTreeSet::new();
+        for group in &self.content_layout {
+            validate_id(&group.id)?;
+            if !group_ids.insert(group.id.as_str()) {
                 return Err(TypePackageError::Invalid {
-                    field: "context.pinned",
-                    detail: format!("at most {MAX_PINNED_CONTEXT} paths are allowed"),
+                    field: "content_layout",
+                    detail: format!("duplicate group `{}`", group.id),
                 });
             }
-            let mut pinned = BTreeSet::new();
-            for path in &policy.pinned {
-                validate_relative_path("context.pinned", path)?;
-                if !pinned.insert(path.as_str()) {
-                    return Err(TypePackageError::Invalid {
-                        field: "context.pinned",
-                        detail: format!("duplicate path `{path}`"),
-                    });
+            if group.folders.len() > 16 {
+                return Err(TypePackageError::Invalid {
+                    field: "content_layout",
+                    detail: "at most 16 folders per group are allowed".to_string(),
+                });
+            }
+            for folder in &group.folders {
+                validate_relative_path("content_layout", folder)?;
+            }
+        }
+
+        if self.pinned_context.len() > MAX_PINNED_CONTEXT {
+            return Err(TypePackageError::Invalid {
+                field: "pinned_context",
+                detail: format!("at most {MAX_PINNED_CONTEXT} paths are allowed"),
+            });
+        }
+        let mut pinned = BTreeSet::new();
+        for path in &self.pinned_context {
+            validate_relative_path("pinned_context", path)?;
+            if !pinned.insert(path.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "pinned_context",
+                    detail: format!("duplicate path `{path}`"),
+                });
+            }
+        }
+
+        if self.write_roots.len() > MAX_WRITE_ROOTS {
+            return Err(TypePackageError::Invalid {
+                field: "write_roots",
+                detail: format!("at most {MAX_WRITE_ROOTS} write roots are allowed"),
+            });
+        }
+        let mut roots = BTreeSet::new();
+        for root in &self.write_roots {
+            validate_relative_path("write_roots", &root.path)?;
+            if !self.declares(&root.path) {
+                return Err(TypePackageError::Invalid {
+                    field: "write_roots",
+                    detail: format!("`{}` is not a declared directory", root.path),
+                });
+            }
+            if !roots.insert(root.path.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "write_roots",
+                    detail: format!("duplicate write root `{}`", root.path),
+                });
+            }
+            if root.extensions.is_empty() || root.extensions.len() > MAX_EXTENSIONS {
+                return Err(TypePackageError::Invalid {
+                    field: "write_roots",
+                    detail: format!("`{}` needs 1–{MAX_EXTENSIONS} extensions", root.path),
+                });
+            }
+            for extension in &root.extensions {
+                validate_extension("write_roots", extension)?;
+            }
+        }
+
+        if self.entities.len() > MAX_ENTITIES {
+            return Err(TypePackageError::Invalid {
+                field: "entities",
+                detail: format!("at most {MAX_ENTITIES} entities are allowed"),
+            });
+        }
+        let mut entity_ids = BTreeSet::new();
+        for entity in &self.entities {
+            validate_id(&entity.id)?;
+            if !entity_ids.insert(entity.id.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "entities",
+                    detail: format!("duplicate entity `{}`", entity.id),
+                });
+            }
+            validate_localized("entities", &entity.label)?;
+            validate_relative_path("entities", &entity.folder)?;
+            if !self.declares(&entity.folder) {
+                return Err(TypePackageError::Invalid {
+                    field: "entities",
+                    detail: format!("`{}` is not a declared directory", entity.folder),
+                });
+            }
+        }
+
+        if self.exports.len() > MAX_EXPORTS {
+            return Err(TypePackageError::Invalid {
+                field: "export",
+                detail: format!("at most {MAX_EXPORTS} exports are allowed"),
+            });
+        }
+        for export in &self.exports {
+            if export.kind != "pdf" {
+                return Err(TypePackageError::Invalid {
+                    field: "export",
+                    detail: format!("unknown export kind `{}`", export.kind),
+                });
+            }
+            if export.roots.is_empty() {
+                return Err(TypePackageError::Invalid {
+                    field: "export",
+                    detail: format!("`{}` needs at least one root", export.kind),
+                });
+            }
+            for root in &export.roots {
+                validate_relative_path("export", root)?;
+            }
+        }
+
+        let mut command_ids = BTreeSet::new();
+        for command in &self.commands {
+            validate_id(command)?;
+            if !command_ids.insert(command.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "commands",
+                    detail: format!("duplicate command `{command}`"),
+                });
+            }
+        }
+        let mut agent_ids = BTreeSet::new();
+        for agent in &self.agents {
+            validate_id(agent)?;
+            if !agent_ids.insert(agent.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "agents",
+                    detail: format!("duplicate agent `{agent}`"),
+                });
+            }
+        }
+
+        if self.context_actions.len() > MAX_CONTEXT_ACTIONS {
+            return Err(TypePackageError::Invalid {
+                field: "context_actions",
+                detail: format!("at most {MAX_CONTEXT_ACTIONS} actions are allowed"),
+            });
+        }
+        let mut action_ids = BTreeSet::new();
+        for action in &self.context_actions {
+            validate_id(&action.id)?;
+            if !action_ids.insert(action.id.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "context_actions",
+                    detail: format!("duplicate action `{}`", action.id),
+                });
+            }
+            validate_localized("context_actions", &action.label)?;
+            if let Some(group) = &action.group {
+                validate_id(group)?;
+            }
+            match action.kind {
+                ContextActionKind::ConvertSelectionTo => {
+                    let entity =
+                        action
+                            .entity
+                            .as_deref()
+                            .ok_or_else(|| TypePackageError::Invalid {
+                                field: "context_actions",
+                                detail: format!(
+                                    "`{}` needs `entity` for convert_selection_to",
+                                    action.id
+                                ),
+                            })?;
+                    if !entity_ids.contains(entity) {
+                        return Err(TypePackageError::Invalid {
+                            field: "context_actions",
+                            detail: format!("`{}` references unknown entity `{entity}`", action.id),
+                        });
+                    }
+                }
+                ContextActionKind::NewFileFromTemplate => {
+                    let template =
+                        action
+                            .template
+                            .as_deref()
+                            .ok_or_else(|| TypePackageError::Invalid {
+                                field: "context_actions",
+                                detail: format!(
+                                    "`{}` needs `template` for new_file_from_template",
+                                    action.id
+                                ),
+                            })?;
+                    let seeded = self.templates.iter().any(|seed| seed.target == template)
+                        || paths.contains(template);
+                    if !seeded {
+                        return Err(TypePackageError::Invalid {
+                            field: "context_actions",
+                            detail: format!(
+                                "`{}` references template `{template}` that the package does not seed",
+                                action.id
+                            ),
+                        });
+                    }
+                    let target =
+                        action
+                            .target
+                            .as_deref()
+                            .ok_or_else(|| TypePackageError::Invalid {
+                                field: "context_actions",
+                                detail: format!(
+                                    "`{}` needs `target` for new_file_from_template",
+                                    action.id
+                                ),
+                            })?;
+                    validate_relative_path("context_actions", target)?;
+                    if !self.declares(target) {
+                        return Err(TypePackageError::Invalid {
+                            field: "context_actions",
+                            detail: format!(
+                                "`{}` target `{target}` is not a declared directory",
+                                action.id
+                            ),
+                        });
+                    }
+                }
+                ContextActionKind::RunCommand => {
+                    let command =
+                        action
+                            .command
+                            .as_deref()
+                            .ok_or_else(|| TypePackageError::Invalid {
+                                field: "context_actions",
+                                detail: format!("`{}` needs `command` for run_command", action.id),
+                            })?;
+                    if !command_ids.contains(command) {
+                        return Err(TypePackageError::Invalid {
+                            field: "context_actions",
+                            detail: format!(
+                                "`{}` references unknown command `{command}`",
+                                action.id
+                            ),
+                        });
+                    }
                 }
             }
         }
-        if self.capabilities.entity_kinds.len() > 16 {
+
+        if self.instructions.len() + self.templates.len() > MAX_SEEDS {
             return Err(TypePackageError::Invalid {
-                field: "capabilities.entity_kinds",
-                detail: "at most 16 entity kinds are allowed".to_string(),
+                field: "templates",
+                detail: format!("at most {MAX_SEEDS} seeded files are allowed"),
             });
         }
-        let mut entities = BTreeSet::new();
-        for entity in &self.capabilities.entity_kinds {
-            validate_id(entity)?;
-            if !entities.insert(entity.as_str()) {
-                return Err(TypePackageError::Invalid {
-                    field: "capabilities.entity_kinds",
-                    detail: format!("duplicate entity kind `{entity}`"),
-                });
-            }
+        for seed in self.instructions.iter().chain(&self.templates) {
+            validate_seed_path("instructions", &seed.source)?;
+            validate_seed_path("templates", &seed.target)?;
         }
         Ok(())
     }
@@ -590,12 +895,84 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         directories,
         files,
         skills: Vec::new(),
-        capabilities: TypeCapabilities::screenplay(),
-        context: Some(ContextPolicy::screenplay()),
+        format: DocumentFormat::Fountain,
+        default_document: Some(DEFAULT_SCREENPLAY.to_string()),
+        content_layout: builtin_content_layout(),
+        pinned_context: vec![
+            "bible".to_string(),
+            "structure".to_string(),
+            "notes/decisions.md".to_string(),
+            "notes/open-questions.md".to_string(),
+        ],
+        write_roots: builtin_write_roots(),
+        entities: builtin_entities(),
+        exports: vec![ExportCapability {
+            kind: "pdf".to_string(),
+            roots: vec!["screenplay".to_string()],
+        }],
+        context_actions: Vec::new(),
+        agents: Vec::new(),
+        commands: Vec::new(),
+        instructions: Vec::new(),
+        templates: Vec::new(),
         origin: TypeOrigin::Builtin,
         source_dir: None,
         content_hash: builtin_hash(id),
     })
+}
+
+/// Explorer groups the built-in screenplay types render.
+fn builtin_content_layout() -> Vec<ExplorerGroup> {
+    let groups: [(&str, &[&str]); 4] = [
+        ("story", &["bible", "structure"]),
+        ("script", &["screenplay"]),
+        ("research", &["research"]),
+        ("notes", &["notes", "reviews"]),
+    ];
+    groups
+        .iter()
+        .map(|(id, folders)| ExplorerGroup {
+            id: (*id).to_string(),
+            folders: folders.iter().map(|folder| (*folder).to_string()).collect(),
+        })
+        .collect()
+}
+
+/// Write roots the built-in screenplay types grant to the assistant.
+fn builtin_write_roots() -> Vec<WriteRoot> {
+    let roots: [(&str, &[&str]); 5] = [
+        ("bible", &[".md"]),
+        ("structure", &[".md"]),
+        ("research", &[".md"]),
+        ("notes", &[".md"]),
+        ("screenplay", &[".fountain", ".md"]),
+    ];
+    roots
+        .iter()
+        .map(|(path, extensions)| WriteRoot {
+            path: (*path).to_string(),
+            extensions: extensions.iter().map(|ext| (*ext).to_string()).collect(),
+        })
+        .collect()
+}
+
+/// Narrative entities the built-in screenplay types offer.
+fn builtin_entities() -> Vec<EntityDefinition> {
+    [
+        ("character", "Character", "Personaje", "bible/characters"),
+        ("location", "Location", "Lugar", "bible/locations"),
+        ("object", "Object", "Objeto", "bible/objects"),
+    ]
+    .iter()
+    .map(|(id, en, es, folder)| EntityDefinition {
+        id: (*id).to_string(),
+        label: LocalizedText {
+            en: (*en).to_string(),
+            es: (*es).to_string(),
+        },
+        folder: (*folder).to_string(),
+    })
+    .collect()
 }
 
 /// All six built-in packages, in menu order.
@@ -913,14 +1290,6 @@ pub fn parse_package(
     let id = required_string(&root, "id")?.to_string();
     let name = required_string(&root, "name")?.to_string();
     let description = optional_string(&root, "description").unwrap_or_default();
-    let capabilities = match root.as_mapping_get("capabilities") {
-        Some(value) => parse_capabilities(value)?,
-        None => TypeCapabilities::default(),
-    };
-    let context = match root.as_mapping_get("context") {
-        Some(value) => Some(parse_context(value)?),
-        None => None,
-    };
 
     let directories = match root.as_mapping_get("directories") {
         Some(value) => string_sequence(value, "directories")?,
@@ -928,6 +1297,62 @@ pub fn parse_package(
     };
     let skills = match root.as_mapping_get("skills") {
         Some(value) => string_sequence(value, "skills")?,
+        None => Vec::new(),
+    };
+    let agents = match root.as_mapping_get("agents") {
+        Some(value) => string_sequence(value, "agents")?,
+        None => Vec::new(),
+    };
+    let commands = match root.as_mapping_get("commands") {
+        Some(value) => string_sequence(value, "commands")?,
+        None => Vec::new(),
+    };
+    let format = match root.as_mapping_get("format") {
+        Some(value) => parse_format(value)?,
+        None => DocumentFormat::Markdown,
+    };
+    let default_document = match root.as_mapping_get("default_document") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| TypePackageError::Invalid {
+                    field: "default_document",
+                    detail: "must be a string".to_string(),
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let pinned_context = match root.as_mapping_get("pinned_context") {
+        Some(value) => string_sequence(value, "pinned_context")?,
+        None => Vec::new(),
+    };
+    let content_layout = match root.as_mapping_get("content_layout") {
+        Some(value) => parse_content_layout(value)?,
+        None => Vec::new(),
+    };
+    let write_roots = match root.as_mapping_get("write_roots") {
+        Some(value) => parse_write_roots(value)?,
+        None => Vec::new(),
+    };
+    let entities = match root.as_mapping_get("entities") {
+        Some(value) => parse_entities(value)?,
+        None => Vec::new(),
+    };
+    let exports = match root.as_mapping_get("export") {
+        Some(value) => parse_exports(value)?,
+        None => Vec::new(),
+    };
+    let context_actions = match root.as_mapping_get("context_actions") {
+        Some(value) => parse_context_actions(value)?,
+        None => Vec::new(),
+    };
+    let instructions = match root.as_mapping_get("instructions") {
+        Some(value) => parse_seeds(value, "instructions")?,
+        None => Vec::new(),
+    };
+    let templates = match root.as_mapping_get("templates") {
+        Some(value) => parse_seeds(value, "templates")?,
         None => Vec::new(),
     };
     let files = match root.as_mapping_get("files") {
@@ -993,8 +1418,18 @@ pub fn parse_package(
         directories,
         files,
         skills,
-        capabilities,
-        context,
+        format,
+        default_document,
+        content_layout,
+        pinned_context,
+        write_roots,
+        entities,
+        exports,
+        context_actions,
+        agents,
+        commands,
+        instructions,
+        templates,
         origin,
         source_dir: None,
         content_hash: String::new(),
@@ -1003,112 +1438,43 @@ pub fn parse_package(
     Ok(package)
 }
 
-fn parse_context(value: &Yaml) -> Result<ContextPolicy, TypePackageError> {
-    let mapping = value
-        .as_mapping()
-        .ok_or_else(|| TypePackageError::Invalid {
-            field: "context",
-            detail: "must be a mapping".to_string(),
-        })?;
-    for key in mapping.keys() {
-        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
-            field: "context",
-            detail: "keys must be strings".to_string(),
-        })?;
-        if key != "pinned" {
-            return Err(TypePackageError::Invalid {
-                field: "context",
-                detail: format!("unknown key `{key}`"),
-            });
-        }
+fn parse_format(value: &Yaml) -> Result<DocumentFormat, TypePackageError> {
+    match value.as_str() {
+        Some("fountain") => Ok(DocumentFormat::Fountain),
+        Some("markdown") => Ok(DocumentFormat::Markdown),
+        Some("plain") => Ok(DocumentFormat::Plain),
+        Some(found) => Err(TypePackageError::Invalid {
+            field: "format",
+            detail: format!("must be fountain, markdown or plain; found `{found}`"),
+        }),
+        None => Err(TypePackageError::Invalid {
+            field: "format",
+            detail: "must be a string".to_string(),
+        }),
     }
-    let pinned = match mapping_get(mapping, "pinned") {
-        Some(value) => string_sequence(value, "context.pinned")?,
-        None => Vec::new(),
-    };
-    Ok(ContextPolicy { pinned })
 }
 
-fn parse_capabilities(value: &Yaml) -> Result<TypeCapabilities, TypePackageError> {
-    let mapping = value
-        .as_mapping()
-        .ok_or_else(|| TypePackageError::Invalid {
-            field: "capabilities",
-            detail: "must be a mapping".to_string(),
-        })?;
-    for key in mapping.keys() {
-        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
-            field: "capabilities",
-            detail: "keys must be strings".to_string(),
-        })?;
-        if !matches!(
-            key,
-            "screenplay" | "entity_kinds" | "export_pdf" | "explorer_groups"
-        ) {
-            return Err(TypePackageError::Invalid {
-                field: "capabilities",
-                detail: format!("unknown key `{key}`"),
-            });
-        }
-    }
-    let screenplay = match value.as_mapping_get("screenplay") {
-        Some(node) => node.as_bool().ok_or_else(|| TypePackageError::Invalid {
-            field: "capabilities.screenplay",
-            detail: "must be a boolean".to_string(),
-        })?,
-        None => false,
-    };
-    let export_pdf = match value.as_mapping_get("export_pdf") {
-        Some(node) => node.as_bool().ok_or_else(|| TypePackageError::Invalid {
-            field: "capabilities.export_pdf",
-            detail: "must be a boolean".to_string(),
-        })?,
-        None => false,
-    };
-    let entity_kinds = match value.as_mapping_get("entity_kinds") {
-        Some(node) => string_sequence(node, "capabilities.entity_kinds")?,
-        None => Vec::new(),
-    };
-    let explorer_groups = match value.as_mapping_get("explorer_groups") {
-        Some(node) => parse_explorer_groups(node)?,
-        None => Vec::new(),
-    };
-    Ok(TypeCapabilities {
-        screenplay,
-        entity_kinds,
-        export_pdf,
-        explorer_groups,
-    })
-}
-
-fn parse_explorer_groups(value: &Yaml) -> Result<Vec<ExplorerGroup>, TypePackageError> {
+fn parse_content_layout(value: &Yaml) -> Result<Vec<ExplorerGroup>, TypePackageError> {
     let sequence = value
         .as_sequence()
         .ok_or_else(|| TypePackageError::Invalid {
-            field: "capabilities.explorer_groups",
+            field: "content_layout",
             detail: "must be a list".to_string(),
         })?;
-    if sequence.len() > 8 {
-        return Err(TypePackageError::Invalid {
-            field: "capabilities.explorer_groups",
-            detail: "at most 8 groups are allowed".to_string(),
-        });
-    }
     let mut groups = Vec::with_capacity(sequence.len());
-    let mut ids = BTreeSet::new();
     for item in sequence {
         let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
-            field: "capabilities.explorer_groups",
+            field: "content_layout",
             detail: "each group must be a mapping".to_string(),
         })?;
         for key in mapping.keys() {
             let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
-                field: "capabilities.explorer_groups",
+                field: "content_layout",
                 detail: "keys must be strings".to_string(),
             })?;
             if key != "id" && key != "folders" {
                 return Err(TypePackageError::Invalid {
-                    field: "capabilities.explorer_groups",
+                    field: "content_layout",
                     detail: format!("unknown group key `{key}`"),
                 });
             }
@@ -1116,33 +1482,268 @@ fn parse_explorer_groups(value: &Yaml) -> Result<Vec<ExplorerGroup>, TypePackage
         let id = mapping_get(mapping, "id")
             .and_then(Yaml::as_str)
             .ok_or_else(|| TypePackageError::Invalid {
-                field: "capabilities.explorer_groups",
+                field: "content_layout",
                 detail: "each group needs a string `id`".to_string(),
             })?
             .to_string();
-        validate_id(&id)?;
-        if !ids.insert(id.clone()) {
-            return Err(TypePackageError::Invalid {
-                field: "capabilities.explorer_groups",
-                detail: format!("duplicate group `{id}`"),
-            });
-        }
         let folders = match mapping_get(mapping, "folders") {
-            Some(node) => string_sequence(node, "capabilities.explorer_groups.folders")?,
+            Some(node) => string_sequence(node, "content_layout.folders")?,
             None => Vec::new(),
         };
-        if folders.len() > 16 {
-            return Err(TypePackageError::Invalid {
-                field: "capabilities.explorer_groups.folders",
-                detail: "at most 16 folders are allowed".to_string(),
-            });
-        }
-        for folder in &folders {
-            validate_relative_path("capabilities.explorer_groups.folders", folder)?;
-        }
         groups.push(ExplorerGroup { id, folders });
     }
     Ok(groups)
+}
+
+fn parse_write_roots(value: &Yaml) -> Result<Vec<WriteRoot>, TypePackageError> {
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "write_roots",
+            detail: "must be a list".to_string(),
+        })?;
+    let mut roots = Vec::with_capacity(sequence.len());
+    for item in sequence {
+        let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field: "write_roots",
+            detail: "each entry must be a mapping".to_string(),
+        })?;
+        for key in mapping.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field: "write_roots",
+                detail: "keys must be strings".to_string(),
+            })?;
+            if key != "path" && key != "extensions" {
+                return Err(TypePackageError::Invalid {
+                    field: "write_roots",
+                    detail: format!("unknown key `{key}`"),
+                });
+            }
+        }
+        let path = mapping_get(mapping, "path")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "write_roots",
+                detail: "each entry needs a string `path`".to_string(),
+            })?
+            .to_string();
+        let extensions = match mapping_get(mapping, "extensions") {
+            Some(node) => string_sequence(node, "write_roots.extensions")?,
+            None => Vec::new(),
+        };
+        roots.push(WriteRoot { path, extensions });
+    }
+    Ok(roots)
+}
+
+fn parse_entities(value: &Yaml) -> Result<Vec<EntityDefinition>, TypePackageError> {
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "entities",
+            detail: "must be a list".to_string(),
+        })?;
+    let mut entities = Vec::with_capacity(sequence.len());
+    for item in sequence {
+        let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field: "entities",
+            detail: "each entity must be a mapping".to_string(),
+        })?;
+        for key in mapping.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field: "entities",
+                detail: "keys must be strings".to_string(),
+            })?;
+            if key != "id" && key != "label" && key != "folder" {
+                return Err(TypePackageError::Invalid {
+                    field: "entities",
+                    detail: format!("unknown key `{key}`"),
+                });
+            }
+        }
+        let id = mapping_get(mapping, "id")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "entities",
+                detail: "each entity needs a string `id`".to_string(),
+            })?
+            .to_string();
+        let label = mapping_get(mapping, "label").ok_or_else(|| TypePackageError::Invalid {
+            field: "entities",
+            detail: format!("`{id}` needs `label`"),
+        })?;
+        let label = parse_localized_at(label, "entities")?;
+        let folder = mapping_get(mapping, "folder")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "entities",
+                detail: format!("`{id}` needs a string `folder`"),
+            })?
+            .to_string();
+        entities.push(EntityDefinition { id, label, folder });
+    }
+    Ok(entities)
+}
+
+fn parse_exports(value: &Yaml) -> Result<Vec<ExportCapability>, TypePackageError> {
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "export",
+            detail: "must be a list".to_string(),
+        })?;
+    let mut exports = Vec::with_capacity(sequence.len());
+    for item in sequence {
+        let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field: "export",
+            detail: "each entry must be a mapping".to_string(),
+        })?;
+        for key in mapping.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field: "export",
+                detail: "keys must be strings".to_string(),
+            })?;
+            if key != "kind" && key != "roots" {
+                return Err(TypePackageError::Invalid {
+                    field: "export",
+                    detail: format!("unknown key `{key}`"),
+                });
+            }
+        }
+        let kind = mapping_get(mapping, "kind")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "export",
+                detail: "each entry needs a string `kind`".to_string(),
+            })?
+            .to_string();
+        let roots = match mapping_get(mapping, "roots") {
+            Some(node) => string_sequence(node, "export.roots")?,
+            None => Vec::new(),
+        };
+        exports.push(ExportCapability { kind, roots });
+    }
+    Ok(exports)
+}
+
+fn parse_context_actions(value: &Yaml) -> Result<Vec<ContextAction>, TypePackageError> {
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "context_actions",
+            detail: "must be a list".to_string(),
+        })?;
+    let mut actions = Vec::with_capacity(sequence.len());
+    for item in sequence {
+        let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field: "context_actions",
+            detail: "each action must be a mapping".to_string(),
+        })?;
+        for key in mapping.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field: "context_actions",
+                detail: "keys must be strings".to_string(),
+            })?;
+            if !matches!(
+                key,
+                "id" | "kind" | "label" | "entity" | "template" | "target" | "command" | "group"
+            ) {
+                return Err(TypePackageError::Invalid {
+                    field: "context_actions",
+                    detail: format!("unknown key `{key}`"),
+                });
+            }
+        }
+        let id = mapping_get(mapping, "id")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "context_actions",
+                detail: "each action needs a string `id`".to_string(),
+            })?
+            .to_string();
+        let kind = mapping_get(mapping, "kind")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "context_actions",
+                detail: format!("`{id}` needs a string `kind`"),
+            })?;
+        let kind = match kind {
+            "convert_selection_to" => ContextActionKind::ConvertSelectionTo,
+            "new_file_from_template" => ContextActionKind::NewFileFromTemplate,
+            "run_command" => ContextActionKind::RunCommand,
+            other => {
+                return Err(TypePackageError::Invalid {
+                    field: "context_actions",
+                    detail: format!("`{id}` has unknown kind `{other}`"),
+                });
+            }
+        };
+        let label = mapping_get(mapping, "label").ok_or_else(|| TypePackageError::Invalid {
+            field: "context_actions",
+            detail: format!("`{id}` needs `label`"),
+        })?;
+        let label = parse_localized_at(label, "context_actions")?;
+        let optional = |key: &str| -> Option<String> {
+            mapping_get(mapping, key)
+                .and_then(Yaml::as_str)
+                .map(str::to_string)
+        };
+        actions.push(ContextAction {
+            id,
+            kind,
+            label,
+            entity: optional("entity"),
+            template: optional("template"),
+            target: optional("target"),
+            command: optional("command"),
+            group: optional("group"),
+        });
+    }
+    Ok(actions)
+}
+
+fn parse_seeds(value: &Yaml, field: &'static str) -> Result<Vec<SeedFile>, TypePackageError> {
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: "must be a list".to_string(),
+        })?;
+    let mut seeds = Vec::with_capacity(sequence.len());
+    for item in sequence {
+        let mapping = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: "each entry must be a mapping".to_string(),
+        })?;
+        for key in mapping.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field,
+                detail: "keys must be strings".to_string(),
+            })?;
+            if key != "source" && key != "target" {
+                return Err(TypePackageError::Invalid {
+                    field,
+                    detail: format!("unknown key `{key}`"),
+                });
+            }
+        }
+        let source = mapping_get(mapping, "source")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field,
+                detail: "each entry needs a string `source`".to_string(),
+            })?
+            .to_string();
+        let target = mapping_get(mapping, "target")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field,
+                detail: "each entry needs a string `target`".to_string(),
+            })?
+            .to_string();
+        seeds.push(SeedFile { source, target });
+    }
+    Ok(seeds)
 }
 
 fn mapping_get<'a>(mapping: &'a saphyr::Mapping<'a>, key: &str) -> Option<&'a Yaml<'a>> {
@@ -1191,6 +1792,135 @@ fn parse_localized(value: &Yaml) -> Result<LocalizedText, TypePackageError> {
         .map(str::to_string)
         .unwrap_or_else(|| en.clone());
     Ok(LocalizedText { en, es })
+}
+
+/// Parse a localized label (`{en, es}` mapping or plain string) for a named
+/// v2 section.
+fn parse_localized_at(
+    value: &Yaml,
+    field: &'static str,
+) -> Result<LocalizedText, TypePackageError> {
+    if let Some(text) = value.as_str() {
+        if text.trim().is_empty() {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: "label must not be empty".to_string(),
+            });
+        }
+        return Ok(LocalizedText {
+            en: text.to_string(),
+            es: text.to_string(),
+        });
+    }
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: "label must be a string or an {en, es} mapping".to_string(),
+        })?;
+    for key in mapping.keys() {
+        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: "label keys must be strings".to_string(),
+        })?;
+        if key != "en" && key != "es" {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!("unknown label language `{key}`"),
+            });
+        }
+    }
+    let en = value
+        .as_mapping_get("en")
+        .and_then(Yaml::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: "label needs a non-empty `en` string".to_string(),
+        })?
+        .to_string();
+    let es = value
+        .as_mapping_get("es")
+        .and_then(Yaml::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| en.clone());
+    Ok(LocalizedText { en, es })
+}
+
+/// Validate a localized label already parsed into the struct.
+fn validate_localized(field: &'static str, label: &LocalizedText) -> Result<(), TypePackageError> {
+    if label.en.trim().is_empty() || label.es.trim().is_empty() {
+        return Err(TypePackageError::Invalid {
+            field,
+            detail: "labels must not be empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Extensions are lowercase ASCII, dot-prefixed, short (`.md`, `.fountain`).
+fn validate_extension(field: &'static str, extension: &str) -> Result<(), TypePackageError> {
+    let body = extension
+        .strip_prefix('.')
+        .filter(|body| !body.is_empty() && body.len() <= 16)
+        .ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: format!("`{extension}` must look like `.md`"),
+        })?;
+    if !body
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
+        return Err(TypePackageError::Invalid {
+            field,
+            detail: format!("`{extension}` must use lowercase letters and digits"),
+        });
+    }
+    Ok(())
+}
+
+/// Seed paths (`instructions`/`templates`) are package- or project-relative
+/// paths. Unlike other package paths, `AGENTS.md` is an intended target; the
+/// manifest and trust files stay reserved.
+fn validate_seed_path(field: &'static str, path: &str) -> Result<(), TypePackageError> {
+    if path.is_empty() || path.chars().count() > MAX_PATH_CHARS {
+        return Err(TypePackageError::Invalid {
+            field,
+            detail: format!("`{path}` must be 1–{MAX_PATH_CHARS} characters"),
+        });
+    }
+    if path.starts_with('/') || path.contains('\\') || path.ends_with('/') {
+        return Err(TypePackageError::Invalid {
+            field,
+            detail: format!("`{path}` must be a relative forward-slash path"),
+        });
+    }
+    for component in Path::new(path).components() {
+        let Component::Normal(name) = component else {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!("`{path}` cannot contain `.` or `..`"),
+            });
+        };
+        let name = name.to_str().ok_or_else(|| TypePackageError::Invalid {
+            field,
+            detail: format!("`{path}` must be UTF-8"),
+        })?;
+        if name.is_empty() || name.starts_with('.') {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!("`{path}` cannot contain hidden names"),
+            });
+        }
+        if matches!(name, "project.yaml" | "agents.yaml" | ".gitignore") {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!("`{path}` is reserved"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_id(id: &str) -> Result<(), TypePackageError> {
@@ -1446,9 +2176,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_parse_and_default_to_generic() {
+    fn contract_fields_parse_and_default_to_generic() {
         let generic = parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\n",
             TypeOrigin::User,
         )
         .expect("generic package");
@@ -1456,14 +2186,16 @@ mod tests {
         assert!(generic.profile().entity_kinds.is_empty());
         assert!(!generic.profile().export_pdf);
         assert!(generic.profile().explorer_groups.is_empty());
+        assert!(generic.pinned_context().is_empty());
+        assert!(generic.write_roots.is_empty());
 
         let typed = parse_package(
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncapabilities:\n  screenplay: true\n  entity_kinds: [audience, channel]\n  export_pdf: true\n  explorer_groups:\n    - id: campaign\n      folders: [brief, audiences]\n",
+            "schema_version: 2\napi_version: 1\nid: campaign\ndirectories: [brief, audiences]\nname: Campaign\nformat: markdown\nexport:\n  - kind: pdf\n    roots: [brief]\ncontent_layout:\n  - id: campaign\n    folders: [brief, audiences]\nentities:\n  - id: audience\n    label: { en: Audience, es: Audiencia }\n    folder: audiences\n",
             TypeOrigin::User,
         )
         .expect("typed package");
-        assert!(typed.profile().screenplay);
-        assert_eq!(typed.profile().entity_kinds, ["audience", "channel"]);
+        assert!(!typed.profile().screenplay);
+        assert_eq!(typed.profile().entity_kinds, ["audience"]);
         assert!(typed.profile().export_pdf);
         assert_eq!(typed.profile().explorer_groups.len(), 1);
         assert_eq!(typed.profile().explorer_groups[0].id, "campaign");
@@ -1483,9 +2215,9 @@ mod tests {
     }
 
     #[test]
-    fn context_pinned_parses_defaults_and_rejects_unsafe_paths() {
+    fn pinned_context_parses_and_rejects_unsafe_paths() {
         let explicit = parse_package(
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncontext:\n  pinned: [brief, notes/decisions.md]\n",
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\npinned_context: [brief, notes/decisions.md]\n",
             TypeOrigin::User,
         )
         .expect("explicit context");
@@ -1495,18 +2227,11 @@ mod tests {
         );
 
         let omitted = parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\n",
             TypeOrigin::User,
         )
         .expect("omitted context");
-        assert_eq!(omitted.pinned_context(), vec!["bible".to_string()]);
-
-        let empty = parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ncontext:\n  pinned: []\n",
-            TypeOrigin::User,
-        )
-        .expect("empty context");
-        assert!(empty.pinned_context().is_empty());
+        assert!(omitted.pinned_context().is_empty());
 
         let builtin = builtin("feature").expect("feature");
         assert!(builtin.pinned_context().contains(&"bible".to_string()));
@@ -1514,7 +2239,7 @@ mod tests {
 
         for bad in ["../outside", ".narra/instructions.md", "project.yaml"] {
             let text = format!(
-                "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ncontext:\n  pinned: [{bad}]\n"
+                "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\npinned_context: [{bad}]\n"
             );
             assert!(parse_package(&text, TypeOrigin::User).is_err(), "{bad}");
         }
@@ -1561,7 +2286,7 @@ mod tests {
         fs::create_dir_all(source.join("docs")).expect("docs");
         fs::write(
             source.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles: []\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\ndirectories: [docs]\nfiles: []\n",
         )
         .expect("type");
         fs::write(source.join("docs/brief.md"), "# Brief\n").expect("brief");
@@ -1581,7 +2306,7 @@ mod tests {
         // Update requires an explicit replace.
         fs::write(
             source.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary v2\ndirectories: [docs]\nfiles: []\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary v2\ndirectories: [docs]\nfiles: []\n",
         )
         .expect("type v2");
         assert!(
@@ -1605,7 +2330,7 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::write(
             source.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: feature\nname: Fake\n",
+            "schema_version: 2\napi_version: 1\nid: feature\nname: Fake\n",
         )
         .expect("type");
         let config = temp_root();
@@ -1619,7 +2344,7 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::write(
             source.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\n",
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\n",
         )
         .expect("type");
         let imported = import_package(&source, TypeOrigin::Project, Some(&project), None, false)
@@ -1650,7 +2375,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("dir");
         fs::write(
             dir.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\n",
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\n",
         )
         .expect("type");
         let mut package = load_package(&dir, TypeOrigin::Project).expect("package");
@@ -1659,7 +2384,7 @@ mod tests {
         assert!(!untrusted_project_type(&root, &package).expect("trusted"));
         fs::write(
             dir.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign v2\n",
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign v2\n",
         )
         .expect("change");
         package = load_package(&dir, TypeOrigin::Project).expect("reload");
@@ -1674,7 +2399,7 @@ mod tests {
         fs::create_dir_all(&user).expect("user dir");
         fs::write(
             user.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ndescription: Doc\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content:\n      en: Brief\n      es: Guion\nskills: []\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\ndescription: Doc\ndirectories: [docs]\nfiles:\n  - path: docs/brief.md\n    content:\n      en: Brief\n      es: Guion\nskills: []\n",
         )
         .expect("user package");
         let loaded = registry(Some(&project), Some(&config)).expect("registry");
@@ -1685,7 +2410,7 @@ mod tests {
         fs::create_dir_all(&project_package).expect("project dir");
         fs::write(
             project_package.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Project Documentary\ndirectories: []\nfiles: []\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Project Documentary\ndirectories: []\nfiles: []\n",
         )
         .expect("project package");
         let loaded = registry(Some(&project), Some(&config)).expect("registry");
@@ -1700,7 +2425,7 @@ mod tests {
         fs::create_dir_all(&reserved).expect("reserved dir");
         fs::write(
             reserved.join(TYPE_FILE),
-            "schema_version: 1\napi_version: 1\nid: feature\nname: Fake\n",
+            "schema_version: 2\napi_version: 1\nid: feature\nname: Fake\n",
         )
         .expect("reserved package");
         assert!(matches!(
