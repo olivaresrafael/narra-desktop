@@ -331,6 +331,20 @@ pub fn discover(
     let mut packages = Vec::with_capacity(names.len());
     for name in names {
         validate_id(&name)?;
+        // Coexistence with the portable contract (D-062): a directory that
+        // holds an `AGENT.md` but no `agent.yaml` belongs to the portable
+        // loader; a directory with neither file is an explicit error so a
+        // typo cannot silently drop the agent.
+        let directory = dir.join(&name);
+        if !directory.join(PACKAGE_FILE).is_file() {
+            if directory.join(super::portable::AGENT_FILE).is_file() {
+                continue;
+            }
+            return Err(PackageError::Parse(format!(
+                "directory `{name}` has neither {PACKAGE_FILE} nor {}",
+                super::portable::AGENT_FILE
+            )));
+        }
         let relative = if relative_dir.is_empty() {
             format!("{name}/{PACKAGE_FILE}")
         } else {
@@ -359,7 +373,9 @@ pub fn user_packages_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("agents")
 }
 
-fn validate_id(id: &str) -> Result<(), PackageError> {
+/// Package ids are directory names: a-z, 0-9 and `-`, starting with a
+/// letter. Portable `AGENT.md`/command ids reuse the same rule.
+pub(crate) fn validate_id(id: &str) -> Result<(), PackageError> {
     let valid = !id.is_empty()
         && id.len() <= MAX_ID_CHARS
         && id.starts_with(|character: char| character.is_ascii_lowercase())
@@ -506,5 +522,35 @@ trust: instructions
         let error = discover(dir.path(), PROJECT_PACKAGES_DIR, PackageOrigin::Project)
             .expect_err("id mismatch");
         assert!(matches!(error, PackageError::IdMismatch { .. }), "{error}");
+    }
+
+    #[test]
+    fn discovery_coexists_with_portable_agent_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents = dir.path().join(PROJECT_PACKAGES_DIR);
+
+        // Portable-only directory: the yaml loader skips it (the AGENT.md
+        // loader owns it) instead of failing on a missing agent.yaml.
+        fs::create_dir_all(agents.join("portatil")).expect("dirs");
+        fs::write(
+            agents.join("portatil/AGENT.md"),
+            "---\nname: Portátil\ndescription: Solo instrucciones.\nmode: plan\n---\nLee el proyecto.\n",
+        )
+        .expect("write");
+        let packages =
+            discover(dir.path(), PROJECT_PACKAGES_DIR, PackageOrigin::Project).expect("discover");
+        assert!(packages.is_empty(), "portable agents are not yaml packages");
+
+        // A directory with neither contract file is an explicit error, so a
+        // typo'd filename cannot silently drop the agent.
+        fs::create_dir_all(agents.join("vacio")).expect("dirs");
+        let error = discover(dir.path(), PROJECT_PACKAGES_DIR, PackageOrigin::Project)
+            .expect_err("neither file");
+        assert!(
+            error
+                .to_string()
+                .contains("neither agent.yaml nor AGENT.md"),
+            "{error}"
+        );
     }
 }

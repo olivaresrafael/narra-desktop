@@ -1,16 +1,15 @@
 //! Spike I (D-062) fixture integrity: the portable `guionista` package.
 //!
 //! The package is *data*, not runtime: this test validates that the port of
-//! `guionista-kit` is internally consistent — skills load with the real
-//! loader, cross-references between `type.yaml` v2 and the shipped files
-//! resolve, and declared write roots stay inside the seeded tree. Runtime
-//! support for `format`, `context_actions`, commands and portable agents
-//! lands in Fase 1; until then this test only guards the contract draft.
+//! `guionista-kit` is internally consistent — skills, portable agents
+//! (`AGENT.md`) and slash commands load with the real loaders, and the
+//! cross-references between `type.yaml` v2 and the shipped files resolve.
 
 use std::fs;
 use std::path::PathBuf;
 
 use narra_core::agent::skill::{SkillOrigin, load_scope};
+use narra_core::agent::{PackageOrigin, portable};
 use narra_core::project_type::{TypeOrigin, load_package};
 use saphyr::{LoadableYamlNode, Yaml};
 
@@ -258,46 +257,123 @@ fn context_actions_resolve_inside_the_package() {
 }
 
 #[test]
-fn portable_agents_declare_mode_and_roots() {
-    let agents = package_root().join(".narra/agents");
-    let mut seen = 0;
-    for entry in fs::read_dir(&agents).expect("agents dir") {
-        let dir = entry.expect("entry").path();
-        if !dir.is_dir() {
-            continue;
-        }
-        seen += 1;
-        let file = dir.join("AGENT.md");
-        let text =
-            fs::read_to_string(&file).unwrap_or_else(|_| panic!("missing {}", file.display()));
-        assert!(
-            text.starts_with("---"),
-            "frontmatter required: {}",
-            file.display()
-        );
-        let front = text
-            .split("---")
-            .nth(1)
-            .expect("closing frontmatter")
-            .trim();
-        let parsed = Yaml::load_from_str(front).expect("frontmatter yaml");
-        let agent = parsed.first().expect("frontmatter document");
-        for key in ["name", "description", "mode", "write_roots"] {
+fn bundled_portable_agents_load_with_the_real_loader() {
+    let root = package_root();
+    let agents = portable::discover_agents(&root, ".narra/agents", PackageOrigin::Project)
+        .expect("portable AGENT.md files must satisfy the agent contract");
+    let ids: Vec<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
+    assert_eq!(ids, ["editor", "guionista", "investigador", "personaje"]);
+
+    let mode_of = |id: &str| {
+        agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .unwrap_or_else(|| panic!("missing agent {id}"))
+            .mode
+    };
+    assert_eq!(mode_of("guionista"), portable::AgentMode::Build);
+    assert_eq!(mode_of("investigador"), portable::AgentMode::Build);
+    assert_eq!(mode_of("editor"), portable::AgentMode::Review);
+    assert_eq!(mode_of("personaje"), portable::AgentMode::Plan);
+
+    // `type.yaml` declares which agents ship, and every declared agent loads.
+    let text = type_yaml_text();
+    let doc = load_type_yaml(&text);
+    let mut declared = string_list(doc.as_mapping_get("agents"));
+    declared.sort();
+    assert_eq!(declared, ids, "type.yaml and .narra/agents must agree");
+
+    // Agents may only narrow the package contract: their write roots and
+    // skills must be subsets of what `type.yaml` declares.
+    let package = load_package(&root, TypeOrigin::User).expect("package");
+    let package_roots: Vec<&str> = package
+        .write_roots
+        .iter()
+        .map(|root| root.path.as_str())
+        .collect();
+    for agent in &agents {
+        for write_root in &agent.write_roots {
             assert!(
-                agent.as_mapping_get(key).is_some(),
-                "{} lacks `{key}`",
-                file.display()
+                package_roots.contains(&write_root.as_str()),
+                "agent `{}` declares write root `{write_root}` outside the package's write roots",
+                agent.id
             );
         }
-        let mode = agent
-            .as_mapping_get("mode")
-            .and_then(Yaml::as_str)
-            .expect("mode");
+        for skill in &agent.skills {
+            assert!(
+                package.skills.contains(skill),
+                "agent `{}` asks for skill `{skill}` the package does not ship",
+                agent.id
+            );
+        }
+    }
+    let guionista = agents
+        .iter()
+        .find(|agent| agent.id == "guionista")
+        .expect("guionista");
+    assert_eq!(
+        guionista.write_roots,
+        ["biblia", "estructura", "guion", "investigacion"]
+    );
+    assert!(guionista.skills.contains(&"escaleta".to_string()));
+    assert!(guionista.instructions.contains("AGENTS.md"));
+    assert_eq!(
+        guionista.hash.len(),
+        64,
+        "the file hash is the trust anchor"
+    );
+}
+
+#[test]
+fn bundled_commands_load_with_the_real_loader_and_resolve_their_agents() {
+    let root = package_root();
+    let commands = portable::discover_commands(&root, ".narra/commands", PackageOrigin::Project)
+        .expect("command .md files must satisfy the slash-command contract");
+    assert_eq!(commands.len(), 8, "the package ships eight commands");
+    for id in [
+        "idea",
+        "investigar",
+        "personaje",
+        "estructura",
+        "escaleta",
+        "escena",
+        "revisar",
+        "voz",
+    ] {
         assert!(
-            ["plan", "build", "review"].contains(&mode),
-            "unknown mode `{mode}` in {}",
-            file.display()
+            commands.iter().any(|command| command.id == id),
+            "missing command {id}"
         );
     }
-    assert_eq!(seen, 4, "the package ships four portable agents");
+
+    // `type.yaml`'s `commands` list (and every `run_command` context action)
+    // must resolve to a command that actually loads.
+    let text = type_yaml_text();
+    let doc = load_type_yaml(&text);
+    let mut declared = string_list(doc.as_mapping_get("commands"));
+    declared.sort();
+    let mut loaded: Vec<String> = commands.iter().map(|command| command.id.clone()).collect();
+    loaded.sort();
+    assert_eq!(declared, loaded, "type.yaml and .narra/commands must agree");
+
+    // Every command resolves its `agent:` to a bundled portable agent.
+    let agents =
+        portable::discover_agents(&root, ".narra/agents", PackageOrigin::Project).expect("agents");
+    for command in &commands {
+        let agent = command
+            .agent
+            .as_deref()
+            .unwrap_or_else(|| panic!("command `{}` must name an agent", command.id));
+        assert!(
+            agents.iter().any(|candidate| candidate.id == agent),
+            "command `{}` references unknown agent `{agent}`",
+            command.id
+        );
+        assert!(
+            !command.prompt.trim().is_empty(),
+            "command `{}` has no prompt",
+            command.id
+        );
+        assert!(!command.description.trim().is_empty());
+    }
 }
