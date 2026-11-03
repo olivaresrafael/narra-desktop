@@ -4,6 +4,7 @@
 //! existing `TextField` model and forward clicks to the editor actions.
 
 use super::*;
+use gpui::prelude::*;
 
 /// How a new project starts (M16 slices 8–9, D-044).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,12 +462,18 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
+            .p_6()
             .bg(rgba(0x00000099))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
-                    .w(px(600.0))
+                    .id("new-project-card")
+                    .w_full()
+                    .max_w(px(680.0))
+                    .h_full()
+                    .max_h(px(700.0))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_3()

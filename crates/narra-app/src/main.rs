@@ -3535,14 +3535,25 @@ impl Editor {
                 )
                 .child(div().text_color(rgb(theme::default_fg())).child(label))
         };
-        let mut tabs = div().flex().gap_1();
+        let mut sidebar = div()
+            .id("settings-nav")
+            .w(px(200.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .border_r_1()
+            .border_color(rgb(theme::explorer_border()));
         for (index, section) in SettingsSection::ALL.into_iter().enumerate() {
             let selected = section == state.section;
-            tabs = tabs.child(
+            sidebar = sidebar.child(
                 div()
                     .id(("settings-section", index))
+                    .w_full()
                     .px_3()
-                    .py_1()
+                    .py_2()
                     .bg(rgb(if selected {
                         theme::doc_selected_bg()
                     } else {
@@ -4436,90 +4447,122 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
+            .p_6()
             .bg(rgba(0x00000099))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
-                    .w(px(760.0))
                     .id("settings-card")
-                    .max_h(px(640.0))
-                    .overflow_y_scroll()
+                    .w_full()
+                    .max_w(px(920.0))
+                    .h_full()
+                    .max_h(px(700.0))
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_4()
+                    .flex_row()
                     .bg(rgb(theme::explorer_bg()))
                     .border_1()
                     .border_color(rgb(theme::explorer_border()))
+                    .child(sidebar)
                     .child(
                         div()
-                            .text_color(rgb(theme::default_fg()))
-                            .child(self.t("settings.title")),
-                    )
-                    .child(tabs)
-                    .child(content)
-                    .when(!state.error.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .text_color(rgb(theme::agent_err_fg()))
-                                .child(state.error.clone()),
-                        )
-                    })
-                    .when(!state.status.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .text_color(rgb(theme::status_fg()))
-                                .child(state.status.clone()),
-                        )
-                    })
-                    .child(
-                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
                             .flex()
-                            .gap_2()
-                            .when(state.section == SettingsSection::Ai, |row| {
-                                row.child(
-                                    div()
-                                        .id("settings-fetch")
-                                        .px_3()
-                                        .py_1()
-                                        .bg(rgb(theme::status_bg()))
-                                        .text_color(rgb(theme::default_fg()))
-                                        .cursor_pointer()
-                                        .child(if state.fetching_models {
-                                            self.t("settings.fetching")
-                                        } else {
-                                            self.t("settings.fetch_models")
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.settings_fetch_models(cx)
-                                        })),
-                                )
-                            })
+                            .flex_col()
                             .child(
                                 div()
-                                    .id("settings-save")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(theme::status_bg()))
+                                    .px_6()
+                                    .py_4()
+                                    .text_size(px(theme::text_size() * 1.4))
                                     .text_color(rgb(theme::default_fg()))
-                                    .cursor_pointer()
-                                    .child(self.t("settings.save"))
-                                    .on_click(cx.listener(|this, _, _, cx| this.settings_save(cx))),
+                                    .child(self.t("settings.title")),
                             )
                             .child(
                                 div()
-                                    .id("settings-cancel")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(theme::status_bg()))
-                                    .text_color(rgb(theme::status_fg()))
-                                    .cursor_pointer()
-                                    .child(self.t("settings.cancel"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.settings = None;
-                                        cx.notify();
-                                    })),
+                                    .id("settings-content")
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scroll()
+                                    .px_6()
+                                    .pb_4()
+                                    .child(content),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .px_6()
+                                    .py_3()
+                                    .border_t_1()
+                                    .border_color(rgb(theme::explorer_border()))
+                                    .when(!state.error.is_empty(), |footer| {
+                                        footer.child(
+                                            div()
+                                                .text_color(rgb(theme::agent_err_fg()))
+                                                .child(state.error.clone()),
+                                        )
+                                    })
+                                    .when(!state.status.is_empty(), |footer| {
+                                        footer.child(
+                                            div()
+                                                .text_color(rgb(theme::status_fg()))
+                                                .child(state.status.clone()),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .when(state.section == SettingsSection::Ai, |row| {
+                                                row.child(
+                                                    div()
+                                                        .id("settings-fetch")
+                                                        .px_3()
+                                                        .py_1()
+                                                        .bg(rgb(theme::status_bg()))
+                                                        .text_color(rgb(theme::default_fg()))
+                                                        .cursor_pointer()
+                                                        .child(if state.fetching_models {
+                                                            self.t("settings.fetching")
+                                                        } else {
+                                                            self.t("settings.fetch_models")
+                                                        })
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.settings_fetch_models(cx)
+                                                        })),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .id("settings-save")
+                                                    .px_3()
+                                                    .py_1()
+                                                    .bg(rgb(theme::status_bg()))
+                                                    .text_color(rgb(theme::default_fg()))
+                                                    .cursor_pointer()
+                                                    .child(self.t("settings.save"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.settings_save(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-cancel")
+                                                    .px_3()
+                                                    .py_1()
+                                                    .bg(rgb(theme::status_bg()))
+                                                    .text_color(rgb(theme::status_fg()))
+                                                    .cursor_pointer()
+                                                    .child(self.t("settings.cancel"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.settings = None;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
                             ),
                     ),
             )
@@ -4775,14 +4818,17 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
+            .p_6()
             .bg(rgba(0x00000099))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
                     .id("project-settings-card")
-                    .w(px(680.0))
-                    .max_h(px(640.0))
+                    .w_full()
+                    .max_w(px(760.0))
+                    .h_full()
+                    .max_h(px(700.0))
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
