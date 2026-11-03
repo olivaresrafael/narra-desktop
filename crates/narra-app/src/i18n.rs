@@ -574,6 +574,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "guion predeterminado actualizado a {path}",
     ),
     (
+        "notice.commands_invalid",
+        "commands: {error}",
+        "comandos: {error}",
+    ),
+    (
         "notice.recents_cleared",
         "recent-projects menu cleared",
         "menú de proyectos recientes borrado",
@@ -1106,14 +1111,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "No se pudo adjuntar {path}: {error}",
     ),
     (
-        "chat.rewrite_prompt",
-        "Rewrite the attached scene to…",
-        "Reescribe la escena adjunta para…",
-    ),
-    (
-        "chat.continuity_prompt",
-        "Check the continuity of…",
-        "Revisa la continuidad de…",
+        "chat.command_unknown",
+        "Unknown command `{command}`. Available: {commands}.",
+        "Comando desconocido `{command}`. Disponibles: {commands}.",
     ),
     (
         "chat.character_prompt",

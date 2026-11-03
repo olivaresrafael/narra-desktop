@@ -164,12 +164,14 @@ use gpui::{
     WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use i18n::Lang;
+use narra_core::agent::portable::SlashCommand;
 use narra_core::agent::{
-    AgentError, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask, ChatThread,
-    LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
-    OpenAiCompatConfig, ProjectScaffoldTask, ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill,
-    SkillOrigin, TaskOptions, active_skills, fetch_model_ids, fetch_models, load_scope,
-    load_skills, proposal, roles, trust_skill, untrusted_project_skills, write_plan,
+    AgentError, AgentMode, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask,
+    ChatThread, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
+    OpenAiCompatConfig, PackageOrigin, ProjectScaffoldTask, ScaffoldPlan, SceneEditTask,
+    SceneReviewTask, Skill, SkillOrigin, TaskOptions, active_skills, fetch_model_ids, fetch_models,
+    load_scope, load_skills, portable, proposal, roles, trust_skill, untrusted_project_skills,
+    write_plan,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
@@ -1218,7 +1220,13 @@ fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
     if let Some(package) = project_type_package(project)
         && let Some(source) = &package.source_dir
     {
+        // Legacy package layout (`skills/`) and the portable `.narra/skills/`.
         for skill in load_scope(&source.join("skills"), SkillOrigin::Project).unwrap_or_default() {
+            by_id.insert(skill.id.clone(), skill);
+        }
+        for skill in
+            load_scope(&source.join(".narra/skills"), SkillOrigin::Project).unwrap_or_default()
+        {
             by_id.insert(skill.id.clone(), skill);
         }
     }
@@ -1242,6 +1250,63 @@ fn project_type_package(project: &Project) -> Option<ProjectTypePackage> {
             .into_iter()
             .find(|package| package.id == type_id)
     })
+}
+
+/// Slash commands available to a project (D-062): user scope first, then
+/// commands bundled with the active type package, then the project's own
+/// `.narra/commands/`, which win by id. A malformed command is reported but
+/// never prevents the project from opening.
+fn project_commands(
+    project: &Project,
+    config: &std::path::Path,
+) -> (Vec<SlashCommand>, Option<String>) {
+    let mut by_id: std::collections::BTreeMap<String, SlashCommand> =
+        std::collections::BTreeMap::new();
+    let mut error = None;
+    merge_command_scope(
+        &mut by_id,
+        config,
+        portable::USER_COMMANDS_DIR,
+        PackageOrigin::User,
+        &mut error,
+    );
+    if let Some(package) = project_type_package(project)
+        && let Some(source) = &package.source_dir
+    {
+        merge_command_scope(
+            &mut by_id,
+            source,
+            portable::PROJECT_COMMANDS_DIR,
+            PackageOrigin::Project,
+            &mut error,
+        );
+    }
+    merge_command_scope(
+        &mut by_id,
+        project.root(),
+        portable::PROJECT_COMMANDS_DIR,
+        PackageOrigin::Project,
+        &mut error,
+    );
+    (by_id.into_values().collect(), error)
+}
+
+fn merge_command_scope(
+    by_id: &mut std::collections::BTreeMap<String, SlashCommand>,
+    root: &std::path::Path,
+    relative_dir: &str,
+    origin: PackageOrigin,
+    error: &mut Option<String>,
+) {
+    match portable::discover_commands(root, relative_dir, origin) {
+        Ok(commands) => {
+            for command in commands {
+                by_id.insert(command.id.clone(), command);
+            }
+        }
+        Err(found) if error.is_none() => *error = Some(found.to_string()),
+        Err(_) => {}
+    }
 }
 
 fn generic_profile(type_id: &str) -> ProjectProfile {
@@ -1980,6 +2045,8 @@ struct Editor {
     profile: ProjectProfile,
     /// Trusted/user skills active for chat commands.
     skills: Vec<Skill>,
+    /// Package slash commands available in chat (`.narra/commands/*.md`).
+    commands: Vec<SlashCommand>,
     /// Project skills awaiting an explicit trust confirmation.
     skill_trust: Option<Vec<Skill>>,
     /// Project-level type package awaiting confirmation.
@@ -8050,6 +8117,8 @@ impl Editor {
         self.profile = project_profile(&project);
         self.type_trust = project_type_trust(&project);
         (self.skills, self.skill_trust) = project_skills(&project);
+        let (commands, command_error) = project_commands(&project, &recent::config_dir());
+        self.commands = commands;
         self.project = Some(project);
         self.explorer = explorer;
         self.refresh_entities();
@@ -8094,6 +8163,11 @@ impl Editor {
         self.check_backup_notice();
         if let Some(path) = repaired_screenplay {
             self.notice = Some(self.tf("notice.screenplay_repaired", &[("path", &path)]));
+        }
+        if self.notice.is_none()
+            && let Some(error) = command_error
+        {
+            self.notice = Some(self.tf("notice.commands_invalid", &[("error", &error)]));
         }
 
         self.recents.record(&root);
@@ -8180,6 +8254,7 @@ impl Editor {
         self.explorer.clear();
         self.profile = ProjectProfile::default();
         self.skills.clear();
+        self.commands.clear();
         self.skill_trust = None;
         self.type_trust = None;
         self.entities = EntityIndex::default();
@@ -14074,6 +14149,44 @@ impl Editor {
         cx.notify();
     }
 
+    /// Chat mode a package command runs in, taken from its declared agent's
+    /// `mode` (D-062). Commands without an agent, or with one the project does
+    /// not resolve, keep the current chat mode.
+    fn command_mode(&self, command: &SlashCommand) -> ChatMode {
+        let Some(agent_id) = command.agent.as_deref() else {
+            return self.chat.mode();
+        };
+        let Some(project) = self.project.as_ref() else {
+            return self.chat.mode();
+        };
+        let mode = roles::load_roles_with_packages(project.root(), Some(&recent::config_dir()))
+            .ok()
+            .and_then(|roles| roles.into_iter().find(|role| role.id == agent_id))
+            .and_then(|role| role.mode)
+            .or_else(|| {
+                // Agents bundled with the active type package are not roles
+                // until the package is copied into the project; read them
+                // from the package source so a command still knows its mode.
+                let package = project_type_package(project)?;
+                let source = package.source_dir.as_ref()?;
+                portable::discover_agents(
+                    source,
+                    narra_core::agent::PROJECT_PACKAGES_DIR,
+                    PackageOrigin::Project,
+                )
+                .ok()?
+                .into_iter()
+                .find(|agent| agent.id == agent_id)
+                .map(|agent| agent.mode)
+            });
+        mode.map(|mode| match mode {
+            AgentMode::Plan => ChatMode::Plan,
+            AgentMode::Build => ChatMode::Build,
+            AgentMode::Review => ChatMode::Review,
+        })
+        .unwrap_or_else(|| self.chat.mode())
+    }
+
     fn chat_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat.status == ChatStatus::Running || !self.chat.can_send() {
             return;
@@ -14084,12 +14197,30 @@ impl Editor {
         }
         // A slash command that matches a trusted skill attaches its body as
         // explicit context; known built-in commands keep precedence.
-        let skill = if split_chat_command(&raw).is_none() {
+        // Precedence: built-in chat modes, then package slash commands, then
+        // trusted skills. A `/name` that matches nothing is reported instead
+        // of being sent as prose.
+        let builtin = split_chat_command(&raw);
+        let package_command = if builtin.is_none() {
+            split_package_command(&self.commands, &raw)
+        } else {
+            None
+        };
+        let skill = if builtin.is_none() && package_command.is_none() {
             split_skill_command(&self.skills, &raw)
         } else {
             None
         };
-        let (mode, instruction) = if let Some((_, rest)) = &skill {
+        let (mode, instruction) = if let Some((command, rest)) = &package_command {
+            let mode = self.command_mode(command);
+            self.chat.set_mode(mode);
+            let instruction = if rest.is_empty() {
+                command.prompt.clone()
+            } else {
+                format!("{}\n\n{}", command.prompt, rest)
+            };
+            (mode, instruction)
+        } else if let Some((_, rest)) = &skill {
             if rest.is_empty() {
                 self.notice = Some(self.t("chat.skill_prompt_required").to_string());
                 cx.notify();
@@ -14097,7 +14228,7 @@ impl Editor {
             }
             (self.chat.mode(), rest.clone())
         } else {
-            match split_chat_command(&raw) {
+            match builtin {
                 Some(("/plan", rest)) => {
                     self.chat.set_mode(ChatMode::Plan);
                     if rest.is_empty() {
@@ -14125,27 +14256,29 @@ impl Editor {
                     }
                     (ChatMode::Review, rest.to_string())
                 }
-                Some(("/rewrite", rest)) => {
-                    self.chat.set_mode(ChatMode::Build);
-                    if rest.is_empty() {
-                        self.chat
-                            .set_input(self.t("chat.rewrite_prompt").to_string());
+                _ => {
+                    if raw.trim_start().starts_with('/') {
+                        let token = raw.split_whitespace().next().unwrap_or("/");
+                        let available = self
+                            .commands
+                            .iter()
+                            .map(|command| format!("/{}", command.id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let available = if available.is_empty() {
+                            "—".to_string()
+                        } else {
+                            available
+                        };
+                        self.notice = Some(self.tf(
+                            "chat.command_unknown",
+                            &[("command", token), ("commands", &available)],
+                        ));
                         cx.notify();
                         return;
                     }
-                    (ChatMode::Build, rest.to_string())
+                    (self.chat.mode(), raw.clone())
                 }
-                Some(("/continuity", rest)) => {
-                    self.chat.set_mode(ChatMode::Review);
-                    if rest.is_empty() {
-                        self.chat
-                            .set_input(self.t("chat.continuity_prompt").to_string());
-                        cx.notify();
-                        return;
-                    }
-                    (ChatMode::Review, rest.to_string())
-                }
-                _ => (self.chat.mode(), raw),
             }
         };
         let Some(project) = self.project.as_ref() else {
@@ -19730,9 +19863,26 @@ fn split_skill_command(skills: &[Skill], input: &str) -> Option<(Skill, String)>
         .map(|skill| (skill, rest.to_string()))
 }
 
+/// Resolve `/command-id rest` against the package commands (D-062). Built-in
+/// chat commands are checked first by the caller.
+fn split_package_command<'a>(
+    commands: &'a [SlashCommand],
+    input: &str,
+) -> Option<(&'a SlashCommand, String)> {
+    let trimmed = input.trim_start().strip_prefix('/')?;
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let id = parts.next()?;
+    let rest = parts.next().unwrap_or("").trim_start().to_string();
+    commands
+        .iter()
+        .find(|command| command.id == id)
+        .map(|command| (command, rest))
+}
+
 /// Parse `/command rest` at the start of a chat message. Returns the command
 /// (including slash) and the remaining instruction; unknown text returns
-/// `None` and is sent untouched.
+/// `None` and is sent untouched. Only engine-level mode switches live here:
+/// creative commands come from the project type package.
 fn split_chat_command(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim_start();
     if !trimmed.starts_with('/') {
@@ -19742,9 +19892,7 @@ fn split_chat_command(input: &str) -> Option<(&str, &str)> {
     let command = parts.next()?;
     let rest = parts.next().unwrap_or("").trim_start();
     match command {
-        "/plan" | "/build" | "/review" | "/rewrite" | "/continuity" | "/character" => {
-            Some((command, rest))
-        }
+        "/plan" | "/build" | "/review" => Some((command, rest)),
         _ => None,
     }
 }
@@ -21583,6 +21731,10 @@ fn run() -> Result<(), String> {
                 diff_probe_total: diff_steps,
                 profile: startup_profile,
                 skills: startup_skills,
+                commands: project
+                    .as_ref()
+                    .map(|project| project_commands(project, &recent::config_dir()).0)
+                    .unwrap_or_default(),
                 skill_trust: startup_skill_trust,
                 type_trust: startup_type_trust,
                 project,
@@ -22114,5 +22266,106 @@ mod tests {
         assert_eq!(utf16_to_byte_in("a\u{1f600}b", 2..4), 5..6);
         // Offsets past the end clamp to the text length.
         assert_eq!(utf16_to_byte_in("ab", 5..9), 2..2);
+    }
+
+    fn command(id: &str, agent: Option<&str>, prompt: &str) -> SlashCommand {
+        SlashCommand {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: format!("{id} command"),
+            agent: agent.map(str::to_string),
+            prompt: prompt.to_string(),
+            origin: PackageOrigin::Project,
+            hash: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn package_commands_resolve_before_skills_with_their_arguments() {
+        let commands = vec![command(
+            "escaleta",
+            Some("guionista"),
+            "Desglosa la estructura.",
+        )];
+        let (resolved, rest) =
+            split_package_command(&commands, "/escaleta 12 escenas").expect("command");
+        assert_eq!(resolved.id, "escaleta");
+        assert_eq!(rest, "12 escenas");
+        assert_eq!(
+            split_package_command(&commands, "/escaleta").map(|(_, rest)| rest),
+            Some(String::new())
+        );
+        assert!(split_package_command(&commands, "/idea").is_none());
+
+        // Mode switches stay engine commands; creative commands come from the
+        // package, so the retired built-ins are no longer special.
+        assert_eq!(split_chat_command("/plan"), Some(("/plan", "")));
+        assert_eq!(
+            split_chat_command("/review algo"),
+            Some(("/review", "algo"))
+        );
+        assert!(split_chat_command("/rewrite").is_none());
+        assert!(split_chat_command("/continuity").is_none());
+        assert!(split_chat_command("/character").is_none());
+    }
+
+    #[test]
+    fn project_commands_merge_user_package_and_project_scopes() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("narra-commands-{}-{stamp}", std::process::id()));
+        let config = std::env::temp_dir().join(format!(
+            "narra-commands-config-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&config);
+        let project =
+            narra_core::project::create_project(&root, "Comandos", ProjectType::Feature, "es")
+                .expect("project");
+
+        let user_commands = config.join("commands");
+        std::fs::create_dir_all(&user_commands).expect("user commands");
+        std::fs::write(
+            user_commands.join("idea.md"),
+            "---\nname: Idea\ndescription: User idea\nagent: guionista\n---\nUser prompt\n",
+        )
+        .expect("user command");
+
+        let project_commands_dir = root.join(".narra/commands");
+        std::fs::create_dir_all(&project_commands_dir).expect("project commands");
+        std::fs::write(
+            project_commands_dir.join("idea.md"),
+            "---\nname: Idea\ndescription: Project idea\nagent: guionista\n---\nProject prompt\n",
+        )
+        .expect("project command");
+        std::fs::write(
+            project_commands_dir.join("escaleta.md"),
+            "---\nname: Escaleta\ndescription: Outline\nagent: guionista\n---\nOutline prompt\n",
+        )
+        .expect("project command");
+
+        let (commands, error) = project_commands(&project, &config);
+        assert!(error.is_none(), "{error:?}");
+        let ids: Vec<&str> = commands.iter().map(|command| command.id.as_str()).collect();
+        assert_eq!(ids, ["escaleta", "idea"]);
+        let idea = commands
+            .iter()
+            .find(|command| command.id == "idea")
+            .expect("idea");
+        assert_eq!(idea.prompt, "Project prompt", "project scope wins by id");
+        assert_eq!(idea.agent.as_deref(), Some("guionista"));
+
+        // A malformed command is reported, never fatal.
+        std::fs::write(project_commands_dir.join("rota.md"), "sin frontmatter")
+            .expect("broken command");
+        let (_, error) = project_commands(&project, &config);
+        assert!(error.is_some(), "malformed commands surface an error");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&config);
     }
 }
