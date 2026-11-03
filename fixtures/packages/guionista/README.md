@@ -46,10 +46,13 @@ Estado a 2026-11-03 (commits `dfb9e57`, `32b9c40`, `fb24441`):
   (frontmatter `name`/`description`/`mode`/`write_roots`/`skills`) junto a
   `agent.yaml`; `agent.yaml` gana si conviven. Los agentes se convierten en
   roles con trust de solo instrucciones y `mode` como perfil de permisos.
-- ⚠️ **Comandos**: existe el loader `.narra/commands/*.md` (frontmatter
-  `name`/`description`/`agent` + prompt) y la validación contra
-  `type.yaml`, pero falta el **despacho** desde el menú `/` del chat y la
-  UI. Ese es el resto de Fase 1/Fase 3.
+- ✅ **Comandos**: loader `.narra/commands/*.md` (frontmatter
+  `name`/`description`/`agent` + prompt), validación contra `type.yaml` y
+  despacho en el chat: `/nombre args` resuelve al prompt del comando y usa
+  el `mode` del agente declarado. Los comandos se cargan del scope usuario,
+  del paquete activo y de `.narra/commands/` del proyecto (el proyecto gana
+  por id). Falta el listado visual de comandos en el menú `/` (hoy se
+  escriben a mano) y la UX de instalación (Fase 3).
 - ✅ **Tools genéricas**: `read_scene`/`propose_scene_edit` retiradas;
   `propose_document_edit`/`propose_document_create` y el scaffold resuelven
   `write_roots` (ruta + extensiones) del paquete en cada llamada. Si el
@@ -62,10 +65,11 @@ Estado a 2026-11-03 (commits `dfb9e57`, `32b9c40`, `fb24441`):
   despacho en `narra-app` (convertir selección, crear archivo desde
   template, lanzar comando) y comprobar que el `target` cae en
   `write_roots`.
-- ⏳ **Entidades**: el catálogo `character`/`location`/`object` sigue
-  cerrado en `narra-app` (`NewFileKind`); el paquete usa ids propios
-  (`personaje`, `mundo`) con etiquetas localizadas, lo que exige hacerlo
-  data-driven.
+- ✅ **Entidades**: `narra-app` construye el diálogo Nuevo archivo, el menú
+  «Convertir a…» y las menciones `@` desde `profile.entities` y
+  `write_roots` del paquete; el catálogo `character`/`location`/`object`
+  ya no está cerrado. Con este paquete se muestran `Personaje` y `Mundo`
+  (más las carpetas restantes con su etiqueta).
 - ⏳ **Plantillas y siembra**: `templates`/`instructions` se validan, pero
   el runtime de creación de proyecto aún no copia el paquete completo
   (Fase 2).
