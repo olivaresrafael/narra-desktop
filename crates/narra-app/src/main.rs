@@ -182,6 +182,7 @@ use narra_core::language::{
     self, Diagnostic, LanguageId, LanguageReport, Severity as DiagnosticSeverity,
 };
 use narra_core::markdown::MarkdownDocument;
+use narra_core::project_type::{ContextAction as PackageContextAction, ContextActionKind};
 use narra_core::provider::{
     CachedSecretStore, GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest,
     NewRepository, OsKeychain, SecretError, SecretStore,
@@ -467,6 +468,8 @@ struct NewFileState {
     kind: NewFileKind,
     name: String,
     error: String,
+    /// Package template body preloaded by a `new_file_from_template` action.
+    template: Option<String>,
 }
 
 /// Field the settings modal is editing. Tab/click moves it; typing and paste
@@ -1307,6 +1310,38 @@ fn merge_command_scope(
         Err(found) if error.is_none() => *error = Some(found.to_string()),
         Err(_) => {}
     }
+}
+
+/// Body of the package template targeted by a `new_file_from_template`
+/// action: seed files are read from the package source directory, inline
+/// `files` entries use their localized content. A missing source falls back
+/// to the generic document body.
+fn package_template_body(
+    package: &ProjectTypePackage,
+    template: &str,
+    language: &str,
+) -> Option<String> {
+    const MAX_TEMPLATE_BYTES: u64 = 64 * 1024;
+    if let Some(seed) = package
+        .templates
+        .iter()
+        .find(|seed| seed.target == template)
+    {
+        // Template sources are relative to the package's `templates/` dir.
+        let source = package
+            .source_dir
+            .as_ref()?
+            .join("templates")
+            .join(&seed.source);
+        let metadata = std::fs::metadata(&source).ok()?;
+        if metadata.len() > MAX_TEMPLATE_BYTES {
+            return None;
+        }
+        return std::fs::read_to_string(source).ok();
+    }
+    package
+        .file(template)
+        .map(|file| file.content.for_language(language).to_string())
 }
 
 fn generic_profile(type_id: &str) -> ProjectProfile {
@@ -5353,8 +5388,24 @@ impl Editor {
             ContextMenuItem::separator(),
             ContextMenuItem::action(ContextAction::Propose, t("context.propose"), "⌘K", true),
         ];
+        // Package-declared context actions (D-062) add to the editor menu;
+        // the generic entity conversion stays available and only hides the
+        // entities a declared `convert_selection_to` action already covers.
+        let package = self.project.as_ref().and_then(project_type_package);
+        let declared = package
+            .as_ref()
+            .map(|package| package.context_actions.as_slice())
+            .unwrap_or(&[]);
+        let declared_conversions: Vec<&str> = declared
+            .iter()
+            .filter(|action| action.kind == ContextActionKind::ConvertSelectionTo)
+            .filter_map(|action| action.entity.as_deref())
+            .collect();
         let mut entity_items = Vec::new();
         for entity in &self.profile.entities {
+            if declared_conversions.contains(&entity.id.as_str()) {
+                continue;
+            }
             entity_items.push(ContextMenuItem::action(
                 ContextAction::Convert(entity.id.clone()),
                 entity.label.for_language(self.lang.key()).to_string(),
@@ -5365,6 +5416,34 @@ impl Editor {
         if !entity_items.is_empty() {
             items.push(ContextMenuItem::separator());
             items.extend(entity_items);
+        }
+        if !declared.is_empty() {
+            items.push(ContextMenuItem::separator());
+            let mut last_group: Option<&str> = None;
+            for action in declared {
+                let group = action.group.as_deref();
+                if last_group.is_some() && group != last_group {
+                    items.push(ContextMenuItem::separator());
+                }
+                let enabled = match action.kind {
+                    ContextActionKind::ConvertSelectionTo => entity_ok,
+                    ContextActionKind::NewFileFromTemplate => true,
+                    ContextActionKind::RunCommand => {
+                        action.command.as_deref().is_some_and(|command| {
+                            self.commands
+                                .iter()
+                                .any(|candidate| candidate.id == command)
+                        })
+                    }
+                };
+                items.push(ContextMenuItem::action(
+                    ContextAction::Package(action.id.clone()),
+                    action.label.for_language(self.lang.key()).to_string(),
+                    "",
+                    enabled,
+                ));
+                last_group = group;
+            }
         }
         if self.profile.screenplay {
             items.push(ContextMenuItem::separator());
@@ -5867,6 +5946,7 @@ impl Editor {
             ContextAction::ProjectSearch => self.on_project_search(&ProjectSearch, window, cx),
             ContextAction::Propose => self.on_open_propose(&OpenPropose, window, cx),
             ContextAction::Convert(entity) => self.context_convert_entity(&entity, cx),
+            ContextAction::Package(id) => self.context_package_action(&id, cx),
             ContextAction::SetElement(kind) => self.context_set_element(kind, cx),
             ContextAction::FileNew => self.open_new_file(cx),
             ContextAction::FileRename => self.begin_rename(cx),
@@ -5952,6 +6032,112 @@ impl Editor {
             ],
         ));
         cx.notify();
+    }
+
+    /// Run a context action declared by the active type package (D-062).
+    /// Actions can only call engine mechanisms: convert the selection, open
+    /// the New File flow from a package template, or prefill a slash command.
+    fn context_package_action(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let Some(package) = project_type_package(project) else {
+            return;
+        };
+        let Some(action) = package
+            .context_actions
+            .iter()
+            .find(|action| action.id == action_id)
+            .cloned()
+        else {
+            return;
+        };
+        match action.kind {
+            ContextActionKind::ConvertSelectionTo => {
+                if let Some(entity) = action.entity.as_deref() {
+                    self.context_convert_entity(entity, cx);
+                }
+            }
+            ContextActionKind::NewFileFromTemplate => {
+                self.open_new_file_from_template(&package, &action, cx);
+            }
+            ContextActionKind::RunCommand => {
+                if let Some(command) = action.command.as_deref() {
+                    self.prefill_package_command(command, cx);
+                }
+            }
+        }
+    }
+
+    /// Open the New File dialog for a `new_file_from_template` action: the
+    /// target folder selects the kind and the package template is preloaded.
+    fn open_new_file_from_template(
+        &mut self,
+        package: &ProjectTypePackage,
+        action: &PackageContextAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = action.target.as_deref() else {
+            return;
+        };
+        if self.project.is_none() {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        }
+        let kind = NewFileKind::for_folder(&self.profile, target);
+        let template = action
+            .template
+            .as_deref()
+            .and_then(|template| package_template_body(package, template, self.lang.key()));
+        self.new_file = Some(NewFileState {
+            kind,
+            name: String::new(),
+            error: String::new(),
+            template,
+        });
+        cx.notify();
+    }
+
+    /// Prefill the chat with a package command from the context menu; the
+    /// user still reviews and sends it.
+    fn prefill_package_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if !self
+            .commands
+            .iter()
+            .any(|candidate| candidate.id == command)
+        {
+            let token = format!("/{command}");
+            let available = self.available_commands();
+            self.notice = Some(self.tf(
+                "chat.command_unknown",
+                &[("command", &token), ("commands", &available)],
+            ));
+            cx.notify();
+            return;
+        }
+        self.chat.set_input(format!("/{command} "));
+        self.chat.focused = true;
+        self.chat_menu = None;
+        self.chat_mention = None;
+        self.agent_panel_open = true;
+        self.right_tab = RightTab::Chat;
+        cx.notify();
+    }
+
+    /// `/id` list for notices and hints.
+    fn available_commands(&self) -> String {
+        let available = self
+            .commands
+            .iter()
+            .map(|command| format!("/{}", command.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if available.is_empty() {
+            "—".to_string()
+        } else {
+            available
+        }
     }
 
     /// Apply a specific Fountain element type to every line touched by the
@@ -7724,6 +7910,7 @@ impl Editor {
             kind,
             name: String::new(),
             error: String::new(),
+            template: None,
         });
         cx.notify();
     }
@@ -7736,6 +7923,7 @@ impl Editor {
         };
         let kind = state.kind.clone();
         let name = state.name.clone();
+        let template = state.template.clone();
         let Some(path) = kind.target_path(&name) else {
             let message = self.t("newfile.invalid_name").to_string();
             if let Some(state) = self.new_file.as_mut() {
@@ -7758,7 +7946,10 @@ impl Editor {
             cx.notify();
             return;
         }
-        let body = kind.template(&name);
+        let body = match template {
+            Some(template) => new_file::render_template(&template, &name),
+            None => kind.template(&name),
+        };
         match project.create_document(&path, &body) {
             Ok(()) => {
                 self.new_file = None;
@@ -14259,17 +14450,7 @@ impl Editor {
                 _ => {
                     if raw.trim_start().starts_with('/') {
                         let token = raw.split_whitespace().next().unwrap_or("/");
-                        let available = self
-                            .commands
-                            .iter()
-                            .map(|command| format!("/{}", command.id))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let available = if available.is_empty() {
-                            "—".to_string()
-                        } else {
-                            available
-                        };
+                        let available = self.available_commands();
                         self.notice = Some(self.tf(
                             "chat.command_unknown",
                             &[("command", token), ("commands", &available)],
@@ -22367,5 +22548,61 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn package_context_actions_resolve_templates_and_targets() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/packages/guionista");
+        let package = narra_core::project_type::load_package(
+            &root,
+            narra_core::project_type::TypeOrigin::User,
+        )
+        .expect("fixture package");
+        let action = package
+            .context_actions
+            .iter()
+            .find(|action| action.id == "new_personaje")
+            .expect("new_personaje action");
+        assert_eq!(action.target.as_deref(), Some("biblia/personajes"));
+        let template = action.template.as_deref().expect("template");
+        let body = package_template_body(&package, template, "es").expect("template body");
+        let rendered = new_file::render_template(&body, "Marta");
+        assert!(
+            rendered.starts_with("# Marta\n\n## Rol en la historia"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("## Voz"));
+
+        let kind = NewFileKind::for_folder(&package.profile(), "biblia/personajes");
+        assert_eq!(kind.key, "personaje");
+        assert_eq!(kind.folder, "biblia/personajes");
+        assert_eq!(kind.extension, "md");
+
+        // Every declared action resolves to an engine mechanism.
+        for action in &package.context_actions {
+            match action.kind {
+                ContextActionKind::ConvertSelectionTo => assert!(
+                    package
+                        .profile()
+                        .allows_entity(action.entity.as_deref().unwrap_or("")),
+                    "{}",
+                    action.id
+                ),
+                ContextActionKind::NewFileFromTemplate => assert!(
+                    action.target.is_some() && action.template.is_some(),
+                    "{}",
+                    action.id
+                ),
+                ContextActionKind::RunCommand => assert!(
+                    package
+                        .commands
+                        .iter()
+                        .any(|command| Some(command.as_str()) == action.command.as_deref()),
+                    "{}",
+                    action.id
+                ),
+            }
+        }
     }
 }

@@ -24,6 +24,9 @@ pub enum ContextAction {
     /// Convert the selection into an entity dossier; the value is the entity
     /// id declared by the active type package (D-062).
     Convert(String),
+    /// Run a context action declared by the active type package; the value is
+    /// the action id from `type.yaml` (`context_actions`).
+    Package(String),
     SetElement(screenplay::ElementType),
     FileNew,
     FileRename,

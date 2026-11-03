@@ -53,6 +53,24 @@ impl Kind {
         kinds
     }
 
+    /// The kind that targets `folder`, or a generic kind built from the
+    /// folder's covering write root. Used by package-declared
+    /// `new_file_from_template` actions, whose target may be a subfolder.
+    pub fn for_folder(profile: &ProjectProfile, folder: &str) -> Kind {
+        if let Some(kind) = Kind::from_profile(profile)
+            .into_iter()
+            .find(|kind| kind.folder == folder)
+        {
+            return kind;
+        }
+        Kind {
+            key: folder.to_string(),
+            label: folder_label(folder),
+            folder: folder.to_string(),
+            extension: extension_for(&profile.write_roots, folder),
+        }
+    }
+
     /// Project-relative path for a new document, or `None` for an invalid name.
     pub fn target_path(&self, name: &str) -> Option<String> {
         let stem = file_stem(name)?;
@@ -110,6 +128,17 @@ fn folder_label(path: &str) -> LocalizedText {
     LocalizedText {
         en: label.clone(),
         es: label,
+    }
+}
+
+/// Fill a package template's title heading with the document name. Templates
+/// start with a Markdown heading; when they do not, the title is prepended so
+/// the new document is never untitled.
+pub fn render_template(body: &str, name: &str) -> String {
+    let title = name.trim();
+    match body.split_once('\n') {
+        Some((first, rest)) if first.starts_with("# ") => format!("# {title}\n{rest}"),
+        _ => format!("# {title}\n\n{body}"),
     }
 }
 
@@ -225,6 +254,27 @@ mod tests {
             Some("screenplay/S01E01 Piloto.fountain")
         );
         assert_eq!(screenplay.template("Piloto"), "");
+    }
+
+    #[test]
+    fn package_templates_keep_their_body_and_take_the_title() {
+        let body = "# <Nombre>\n\n## Rol\n(pendiente)\n";
+        assert_eq!(
+            render_template(body, "Marta"),
+            "# Marta\n\n## Rol\n(pendiente)\n"
+        );
+        assert_eq!(
+            render_template("Notas sueltas\n", "Idea"),
+            "# Idea\n\nNotas sueltas\n"
+        );
+
+        let profile = feature();
+        let character = Kind::for_folder(&profile, "bible/characters");
+        assert_eq!(character.key, "character", "entity folders keep their kind");
+        let custom = Kind::for_folder(&profile, "notes/ideas");
+        assert_eq!(custom.folder, "notes/ideas");
+        assert_eq!(custom.extension, "md");
+        assert_eq!(custom.label.es, "Ideas");
     }
 
     #[test]
