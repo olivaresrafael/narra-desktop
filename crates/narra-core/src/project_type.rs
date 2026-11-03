@@ -112,6 +112,9 @@ pub struct ExplorerGroup {
 pub struct WriteRoot {
     pub path: String,
     pub extensions: Vec<String>,
+    /// Optional localized label for UI choosers (New File, menus). When it
+    /// is absent the app derives a label from the folder name.
+    pub label: Option<LocalizedText>,
 }
 
 /// A narrative entity the editor offers (dossier, mentions, convert menu).
@@ -215,8 +218,12 @@ pub struct ProjectProfile {
     /// The type declares `format: fountain`; the editor applies screenplay
     /// mechanics (element cycling, scene structure, PDF layout).
     pub screenplay: bool,
-    /// Entity ids the type offers for dossiers, mentions and the convert menu.
-    pub entity_kinds: Vec<String>,
+    /// Entities the type offers for dossiers, mentions, the convert menu and
+    /// the New File chooser.
+    pub entities: Vec<EntityDefinition>,
+    /// Folders the assistant may propose writes into, with their extensions
+    /// and optional labels. The New File chooser is built from these roots.
+    pub write_roots: Vec<WriteRoot>,
     /// PDF export is offered for this type.
     pub export_pdf: bool,
     /// Explorer sections declared by the type, in display order.
@@ -233,8 +240,12 @@ impl ProjectProfile {
         }
     }
 
-    pub fn allows_entity(&self, kind: &str) -> bool {
-        self.entity_kinds.iter().any(|candidate| candidate == kind)
+    pub fn allows_entity(&self, id: &str) -> bool {
+        self.entities.iter().any(|entity| entity.id == id)
+    }
+
+    pub fn entity(&self, id: &str) -> Option<&EntityDefinition> {
+        self.entities.iter().find(|entity| entity.id == id)
     }
 }
 
@@ -243,7 +254,8 @@ impl Default for ProjectProfile {
         Self {
             type_id: "other".to_string(),
             screenplay: false,
-            entity_kinds: Vec::new(),
+            entities: Vec::new(),
+            write_roots: Vec::new(),
             export_pdf: false,
             explorer_groups: Vec::new(),
         }
@@ -325,11 +337,8 @@ impl ProjectTypePackage {
         ProjectProfile {
             type_id: self.id.clone(),
             screenplay: self.format == DocumentFormat::Fountain,
-            entity_kinds: self
-                .entities
-                .iter()
-                .map(|entity| entity.id.clone())
-                .collect(),
+            entities: self.entities.clone(),
+            write_roots: self.write_roots.clone(),
             export_pdf: self.exports.iter().any(|export| export.kind == "pdf"),
             explorer_groups: self.content_layout.clone(),
         }
@@ -520,6 +529,9 @@ impl ProjectTypePackage {
             }
             for extension in &root.extensions {
                 validate_extension("write_roots", extension)?;
+            }
+            if let Some(label) = &root.label {
+                validate_localized("write_roots", label)?;
             }
         }
 
@@ -943,18 +955,22 @@ fn builtin_content_layout() -> Vec<ExplorerGroup> {
 
 /// Write roots the built-in screenplay types grant to the assistant.
 fn builtin_write_roots() -> Vec<WriteRoot> {
-    let roots: [(&str, &[&str]); 5] = [
-        ("bible", &[".md"]),
-        ("structure", &[".md"]),
-        ("research", &[".md"]),
-        ("notes", &[".md"]),
-        ("screenplay", &[".fountain", ".md"]),
+    let roots: [(&str, &[&str], (&str, &str)); 5] = [
+        ("bible", &[".md"], ("Bible", "Biblia")),
+        ("structure", &[".md"], ("Structure", "Estructura")),
+        ("research", &[".md"], ("Research", "Investigación")),
+        ("notes", &[".md"], ("Notes", "Notas")),
+        ("screenplay", &[".fountain", ".md"], ("Screenplay", "Guion")),
     ];
     roots
         .iter()
-        .map(|(path, extensions)| WriteRoot {
+        .map(|(path, extensions, (en, es))| WriteRoot {
             path: (*path).to_string(),
             extensions: extensions.iter().map(|ext| (*ext).to_string()).collect(),
+            label: Some(LocalizedText {
+                en: (*en).to_string(),
+                es: (*es).to_string(),
+            }),
         })
         .collect()
 }
@@ -1516,7 +1532,7 @@ fn parse_write_roots(value: &Yaml) -> Result<Vec<WriteRoot>, TypePackageError> {
                 field: "write_roots",
                 detail: "keys must be strings".to_string(),
             })?;
-            if key != "path" && key != "extensions" {
+            if key != "path" && key != "extensions" && key != "label" {
                 return Err(TypePackageError::Invalid {
                     field: "write_roots",
                     detail: format!("unknown key `{key}`"),
@@ -1534,7 +1550,15 @@ fn parse_write_roots(value: &Yaml) -> Result<Vec<WriteRoot>, TypePackageError> {
             Some(node) => string_sequence(node, "write_roots.extensions")?,
             None => Vec::new(),
         };
-        roots.push(WriteRoot { path, extensions });
+        let label = match mapping_get(mapping, "label") {
+            Some(node) => Some(parse_localized_at(node, "write_roots")?),
+            None => None,
+        };
+        roots.push(WriteRoot {
+            path,
+            extensions,
+            label,
+        });
     }
     Ok(roots)
 }
@@ -2186,7 +2210,7 @@ mod tests {
         )
         .expect("generic package");
         assert!(!generic.profile().screenplay);
-        assert!(generic.profile().entity_kinds.is_empty());
+        assert!(generic.profile().entities.is_empty());
         assert!(!generic.profile().export_pdf);
         assert!(generic.profile().explorer_groups.is_empty());
         assert!(generic.pinned_context().is_empty());
@@ -2198,7 +2222,16 @@ mod tests {
         )
         .expect("typed package");
         assert!(!typed.profile().screenplay);
-        assert_eq!(typed.profile().entity_kinds, ["audience"]);
+        assert_eq!(
+            typed
+                .profile()
+                .entities
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            ["audience"]
+        );
+        assert_eq!(typed.profile().entities[0].label.es, "Audiencia");
         assert!(typed.profile().export_pdf);
         assert_eq!(typed.profile().explorer_groups.len(), 1);
         assert_eq!(typed.profile().explorer_groups[0].id, "campaign");

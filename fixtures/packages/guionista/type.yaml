@@ -96,14 +96,19 @@ pinned_context:
 write_roots:
   - path: biblia
     extensions: [.md]
+    label: { es: Biblia, en: Bible }
   - path: estructura
     extensions: [.md]
+    label: { es: Estructura, en: Structure }
   - path: investigacion
     extensions: [.md]
+    label: { es: Investigación, en: Research }
   - path: notas
     extensions: [.md]
+    label: { es: Notas, en: Notes }
   - path: guion
     extensions: [.fountain, .md]
+    label: { es: Guion, en: Screenplay }
 
 # Narrative entities offered by the editor (dossiers, mentions, convert menu).
 entities:

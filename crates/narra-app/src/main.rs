@@ -5287,25 +5287,13 @@ impl Editor {
             ContextMenuItem::action(ContextAction::Propose, t("context.propose"), "⌘K", true),
         ];
         let mut entity_items = Vec::new();
-        for (kind, capability) in [
-            (NewFileKind::Character, "character"),
-            (NewFileKind::Location, "location"),
-            (NewFileKind::Object, "object"),
-        ] {
-            if self.profile.allows_entity(capability) {
-                let key = match kind {
-                    NewFileKind::Character => "context.convert.character",
-                    NewFileKind::Location => "context.convert.location",
-                    NewFileKind::Object => "context.convert.object",
-                    _ => continue,
-                };
-                entity_items.push(ContextMenuItem::action(
-                    ContextAction::Convert(kind),
-                    t(key),
-                    "",
-                    entity_ok,
-                ));
-            }
+        for entity in &self.profile.entities {
+            entity_items.push(ContextMenuItem::action(
+                ContextAction::Convert(entity.id.clone()),
+                entity.label.for_language(self.lang.key()).to_string(),
+                "",
+                entity_ok,
+            ));
         }
         if !entity_items.is_empty() {
             items.push(ContextMenuItem::separator());
@@ -5811,7 +5799,7 @@ impl Editor {
             ContextAction::Find => self.on_toggle_find(&ToggleFind, window, cx),
             ContextAction::ProjectSearch => self.on_project_search(&ProjectSearch, window, cx),
             ContextAction::Propose => self.on_open_propose(&OpenPropose, window, cx),
-            ContextAction::Convert(kind) => self.context_convert_entity(kind, cx),
+            ContextAction::Convert(entity) => self.context_convert_entity(&entity, cx),
             ContextAction::SetElement(kind) => self.context_set_element(kind, cx),
             ContextAction::FileNew => self.open_new_file(cx),
             ContextAction::FileRename => self.begin_rename(cx),
@@ -5835,13 +5823,17 @@ impl Editor {
         self.context_target = None;
     }
 
-    /// Convert the selected word/selection into a bible dossier. Creating a
-    /// dossier is an explicit canonical write; if the file already exists the
-    /// menu opens it instead of overwriting anything.
-    fn context_convert_entity(&mut self, kind: NewFileKind, cx: &mut Context<Self>) {
-        if !kind.is_entity() {
+    /// Convert the selected word/selection into an entity dossier declared by
+    /// the active type package. Creating a dossier is an explicit canonical
+    /// write; if the file already exists the menu opens it instead of
+    /// overwriting anything.
+    fn context_convert_entity(&mut self, entity_id: &str, cx: &mut Context<Self>) {
+        let Some(kind) = NewFileKind::from_profile(&self.profile)
+            .into_iter()
+            .find(|kind| kind.key == entity_id)
+        else {
             return;
-        }
+        };
         let name = self
             .doc
             .buffer
@@ -5853,7 +5845,7 @@ impl Editor {
             cx.notify();
             return;
         }
-        let Some(path) = new_file::target_path(kind, &name) else {
+        let Some(path) = kind.target_path(&name) else {
             self.notice = Some(self.t("notice.entity_invalid").to_string());
             cx.notify();
             return;
@@ -5864,7 +5856,7 @@ impl Editor {
             return;
         };
         if !self.explorer.iter().any(|existing| existing == &path) {
-            let template = new_file::template(kind, &name);
+            let template = kind.template(&name);
             if let Err(error) = project.create_document(&path, &template) {
                 self.notice = Some(self.tf(
                     "notice.entity_create_failed",
@@ -5887,7 +5879,10 @@ impl Editor {
         }
         self.notice = Some(self.tf(
             "notice.entity_opened",
-            &[("kind", self.t(kind.i18n_key())), ("path", &path)],
+            &[
+                ("kind", kind.label.for_language(self.lang.key())),
+                ("path", &path),
+            ],
         ));
         cx.notify();
     }
@@ -5966,7 +5961,7 @@ impl Editor {
             } else {
                 theme::status_fg()
             };
-            let action = item.action.expect("separator handled above");
+            let action = item.action.clone().expect("separator handled above");
             rows = rows.child(
                 div()
                     .id(("context-item", index))
@@ -5998,7 +5993,7 @@ impl Editor {
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             if enabled {
-                                this.context_activate(action, window, cx);
+                                this.context_activate(action.clone(), window, cx);
                             }
                         }),
                     ),
@@ -7653,10 +7648,11 @@ impl Editor {
             cx.notify();
             return;
         }
-        let kind = NewFileKind::ALL
-            .into_iter()
-            .find(|kind| self.new_file_kind_allowed(*kind))
-            .unwrap_or(NewFileKind::Notes);
+        let Some(kind) = NewFileKind::from_profile(&self.profile).into_iter().next() else {
+            self.notice = Some(self.t("notice.capability_unavailable").to_string());
+            cx.notify();
+            return;
+        };
         self.new_file = Some(NewFileState {
             kind,
             name: String::new(),
@@ -7665,26 +7661,15 @@ impl Editor {
         cx.notify();
     }
 
-    /// Whether the active type profile exposes a document kind.
-    fn new_file_kind_allowed(&self, kind: NewFileKind) -> bool {
-        match kind {
-            NewFileKind::Character => self.profile.allows_entity("character"),
-            NewFileKind::Location => self.profile.allows_entity("location"),
-            NewFileKind::Object => self.profile.allows_entity("object"),
-            NewFileKind::Screenplay => self.profile.screenplay,
-            NewFileKind::Notes | NewFileKind::Research => true,
-        }
-    }
-
     /// Create the document described by the dialog: an explicit canonical
     /// write (refusing existing names), then open it.
     fn create_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.new_file.as_ref() else {
             return;
         };
-        let kind = state.kind;
+        let kind = state.kind.clone();
         let name = state.name.clone();
-        let Some(path) = new_file::target_path(kind, &name) else {
+        let Some(path) = kind.target_path(&name) else {
             let message = self.t("newfile.invalid_name").to_string();
             if let Some(state) = self.new_file.as_mut() {
                 state.error = message;
@@ -7706,7 +7691,7 @@ impl Editor {
             cx.notify();
             return;
         }
-        let body = new_file::template(kind, &name);
+        let body = kind.template(&name);
         match project.create_document(&path, &body) {
             Ok(()) => {
                 self.new_file = None;
@@ -7738,20 +7723,18 @@ impl Editor {
         cx.notify();
     }
 
-    /// The New File dialog: kind chooser, name field and the format row
-    /// (Fountain for screenplays, Markdown otherwise — the format is picked
-    /// here until more screenplay formats and Save As exist).
+    /// The New File dialog: kind chooser built from the active package, name
+    /// field and the format row (the extension the chosen root declares).
     fn new_file_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_file.as_ref().expect("overlay only when open");
-        let mut kinds = div().flex().gap_2();
-        for kind in NewFileKind::ALL
-            .into_iter()
-            .filter(|kind| self.new_file_kind_allowed(*kind))
-        {
+        let mut kinds = div().flex().flex_wrap().gap_2();
+        for kind in NewFileKind::from_profile(&self.profile) {
             let selected = kind == state.kind;
+            let label = kind.label.for_language(self.lang.key()).to_string();
+            let kind_for_click = kind.clone();
             kinds = kinds.child(
                 div()
-                    .id(kind.key())
+                    .id(gpui::ElementId::Name(kind.key.clone().into()))
                     .px_3()
                     .py_1()
                     .bg(rgb(if selected {
@@ -7771,19 +7754,20 @@ impl Editor {
                         theme::status_fg()
                     }))
                     .cursor_pointer()
-                    .child(self.t(kind.i18n_key()))
+                    .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_file.as_mut() {
-                            state.kind = kind;
+                            state.kind = kind_for_click.clone();
                             state.error.clear();
                         }
                         cx.notify();
                     })),
             );
         }
-        let format = match state.kind {
-            NewFileKind::Screenplay => self.t("newfile.format_fountain"),
-            _ => self.t("newfile.format_markdown"),
+        let format = if state.kind.extension.eq_ignore_ascii_case("fountain") {
+            self.t("newfile.format_fountain")
+        } else {
+            self.t("newfile.format_markdown")
         };
         div()
             .absolute()
@@ -14459,29 +14443,24 @@ impl Editor {
             });
         }
 
-        // Dossiers allowed by the active project type.
-        for (kind, prefix) in [
-            ("character", "bible/characters/"),
-            ("location", "bible/locations/"),
-            ("object", "bible/objects/"),
-        ] {
-            if !self.profile.allows_entity(kind) {
-                continue;
-            }
+        // Dossiers declared by the active project type (D-062).
+        for entity in &self.profile.entities {
+            let prefix = format!("{}/", entity.folder);
             let mut entity_count = 0usize;
             for path in &self.explorer {
-                if !path.starts_with(prefix) || entity_count >= 4 {
+                if !path.starts_with(&prefix) || entity_count >= 4 {
                     continue;
                 }
                 let name = path
-                    .trim_start_matches(prefix)
+                    .trim_start_matches(prefix.as_str())
                     .trim_end_matches(".md")
                     .to_string();
                 if matches(&name) && seen.insert(path.clone()) {
+                    let icon = explorer::FolderKind::from_path(&entity.folder).icon_name();
                     items.push(ChatMentionItem {
                         category: ChatMentionCategory::Entities,
-                        icon: "users",
-                        label: format!("{}: {}", self.t(entity_kind_key(kind)), name),
+                        icon: if icon == "folder" { "users" } else { icon },
+                        label: format!("{}: {}", entity.label.for_language(self.lang.key()), name),
                         detail: path.clone(),
                         action: ChatMentionAction::File(path.clone()),
                     });
@@ -18947,7 +18926,7 @@ impl Editor {
         let new_file_dump = match &self.new_file {
             Some(state) => format!(
                 "{{\"open\":true,\"kind\":\"{}\",\"name\":\"{}\",\"error\":\"{}\"}}",
-                state.kind.key(),
+                state.kind.key.as_str(),
                 escape_json(&state.name),
                 escape_json(&state.error),
             ),
@@ -19050,9 +19029,9 @@ impl Editor {
         };
         let profile_entities = self
             .profile
-            .entity_kinds
+            .entities
             .iter()
-            .map(|kind| format!("\"{}\"", escape_json(kind)))
+            .map(|entity| format!("\"{}\"", escape_json(&entity.id)))
             .collect::<Vec<_>>()
             .join(",");
         let profile_groups = self
@@ -19075,7 +19054,7 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let profile_dump = format!(
-            "{{\"type\":\"{}\",\"screenplay\":{},\"entity_kinds\":[{}],\"export_pdf\":{},\"explorer_groups\":[{}]}}",
+            "{{\"type\":\"{}\",\"screenplay\":{},\"entities\":[{}],\"export_pdf\":{},\"explorer_groups\":[{}]}}",
             escape_json(&self.profile.type_id),
             self.profile.screenplay,
             profile_entities,
@@ -19767,16 +19746,6 @@ fn split_chat_command(input: &str) -> Option<(&str, &str)> {
             Some((command, rest))
         }
         _ => None,
-    }
-}
-
-/// i18n key for a chat mode button.
-fn entity_kind_key(kind: &str) -> &'static str {
-    match kind {
-        "character" => "chat.kind.character",
-        "location" => "chat.kind.location",
-        "object" => "chat.kind.object",
-        _ => "chat.kind.entity",
     }
 }
 

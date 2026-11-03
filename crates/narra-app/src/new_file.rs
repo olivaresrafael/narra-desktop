@@ -1,82 +1,118 @@
-//! New-document flow (M10 slice 2): the kind chooser and the path/template
-//! rules. Pure and unit-tested; the UI only collects a name and calls
+//! New-document flow (D-062): the chooser is built from the active type
+//! package, never from a closed list in the app. Entities become labeled
+//! options (their folder plus the covering write root's extension); every
+//! other write root becomes a generic document option with the package's
+//! label. Pure and unit-tested; the UI only collects a name and calls
 //! `Project::create_document`.
-//!
-//! For now only Frame Fountain is a screenplay format; when the native format
-//! and other screenplay formats arrive, the screenplay kind grows a format
-//! selector (the path extension follows the chosen format).
 
-/// What kind of document is being created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Kind {
-    Character,
-    Location,
-    Object,
-    Notes,
-    Research,
-    #[default]
-    Screenplay,
+use narra_core::project_type::{LocalizedText, ProjectProfile, WriteRoot};
+
+/// One option in the New File chooser, derived from the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kind {
+    /// Stable key: entity id or write-root path (dumps and UI ids).
+    pub key: String,
+    pub label: LocalizedText,
+    /// Project-relative folder the document lands in.
+    pub folder: String,
+    /// Extension without the dot (`md`, `fountain`).
+    pub extension: String,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [
-        Kind::Character,
-        Kind::Location,
-        Kind::Object,
-        Kind::Notes,
-        Kind::Research,
-        Kind::Screenplay,
-    ];
-
-    /// Dump/CLI key.
-    pub fn key(self) -> &'static str {
-        match self {
-            Kind::Character => "character",
-            Kind::Location => "location",
-            Kind::Object => "object",
-            Kind::Notes => "notes",
-            Kind::Research => "research",
-            Kind::Screenplay => "screenplay",
+    /// Options for a profile: entities first (in declaration order), then
+    /// write roots that are not exactly an entity folder.
+    pub fn from_profile(profile: &ProjectProfile) -> Vec<Kind> {
+        let mut kinds = Vec::new();
+        for entity in &profile.entities {
+            kinds.push(Kind {
+                key: entity.id.clone(),
+                label: entity.label.clone(),
+                folder: entity.folder.clone(),
+                extension: extension_for(&profile.write_roots, &entity.folder),
+            });
         }
+        for root in &profile.write_roots {
+            if profile
+                .entities
+                .iter()
+                .any(|entity| entity.folder == root.path)
+            {
+                continue;
+            }
+            kinds.push(Kind {
+                key: root.path.clone(),
+                label: root
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| folder_label(&root.path)),
+                folder: root.path.clone(),
+                extension: preferred_extension(root),
+            });
+        }
+        kinds
     }
 
-    /// Project folder the document belongs to.
-    pub fn folder(self) -> &'static str {
-        match self {
-            Kind::Character => "bible/characters",
-            Kind::Location => "bible/locations",
-            Kind::Object => "bible/objects",
-            Kind::Notes => "notes",
-            Kind::Research => "research",
-            Kind::Screenplay => "screenplay",
-        }
+    /// Project-relative path for a new document, or `None` for an invalid name.
+    pub fn target_path(&self, name: &str) -> Option<String> {
+        let stem = file_stem(name)?;
+        Some(format!("{}/{}.{}", self.folder, stem, self.extension))
     }
 
-    /// File extension: screenplays are Fountain for now, the rest Markdown.
-    pub fn extension(self) -> &'static str {
-        match self {
-            Kind::Screenplay => "fountain",
-            Kind::Character | Kind::Location | Kind::Object | Kind::Notes | Kind::Research => "md",
+    /// Initial content: a blank Fountain page for `.fountain`, otherwise a
+    /// minimal Markdown title. Section scaffolds belong to package templates,
+    /// never to this module.
+    pub fn template(&self, name: &str) -> String {
+        if self.extension.eq_ignore_ascii_case("fountain") {
+            String::new()
+        } else {
+            format!("# {}\n\n", name.trim())
         }
-    }
-
-    /// i18n key for the chooser label.
-    pub fn i18n_key(self) -> &'static str {
-        match self {
-            Kind::Character => "newfile.kind.character",
-            Kind::Location => "newfile.kind.location",
-            Kind::Object => "newfile.kind.object",
-            Kind::Notes => "newfile.kind.notes",
-            Kind::Research => "newfile.kind.research",
-            Kind::Screenplay => "newfile.kind.screenplay",
-        }
-    }
-
-    /// Whether this kind is a narrative-entity dossier (M11 context menu).
-    pub fn is_entity(self) -> bool {
-        matches!(self, Kind::Character | Kind::Location | Kind::Object)
     }
 }
+
+/// Extension a folder's documents use, from the most specific write root
+/// that covers it. Folders outside every write root fall back to Markdown.
+pub fn extension_for(roots: &[WriteRoot], folder: &str) -> String {
+    let mut best: Option<&WriteRoot> = None;
+    for root in roots {
+        let covers = folder == root.path || folder.starts_with(&format!("{}/", root.path));
+        if !covers {
+            continue;
+        }
+        if best.is_none_or(|current| root.path.len() > current.path.len()) {
+            best = Some(root);
+        }
+    }
+    best.map(preferred_extension)
+        .unwrap_or_else(|| "md".to_string())
+}
+
+/// The first declared extension is the root's primary format: the package
+/// controls the order, so `[.fountain, .md]` means Fountain documents by
+/// default.
+fn preferred_extension(root: &WriteRoot) -> String {
+    root.extensions
+        .first()
+        .map(|extension| extension.trim_start_matches('.').to_string())
+        .unwrap_or_else(|| "md".to_string())
+}
+
+/// Label for a root without one: its last path segment, capitalized. This is
+/// presentation, not a creative rule; packages can override it with `label`.
+fn folder_label(path: &str) -> LocalizedText {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut chars = name.chars();
+    let label = match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => name.to_string(),
+    };
+    LocalizedText {
+        en: label.clone(),
+        es: label,
+    }
+}
+
 /// Sanitize a user-supplied name into a file stem.
 ///
 /// The name is preserved (case and accents included: the file stem is the
@@ -112,56 +148,83 @@ pub fn file_stem(name: &str) -> Option<String> {
     Some(out)
 }
 
-/// Project-relative path for a new document, or `None` for an invalid name.
-pub fn target_path(kind: Kind, name: &str) -> Option<String> {
-    let stem = file_stem(name)?;
-    Some(format!("{}/{}.{}", kind.folder(), stem, kind.extension()))
-}
-
-/// Initial content of a new document.
-pub fn template(kind: Kind, name: &str) -> String {
-    let title = name.trim();
-    match kind {
-        Kind::Character => format!("# {title}\n\n## Rasgos\n\n## Objetivo\n\n## Notas\n"),
-        Kind::Location => format!("# {title}\n\n## Descripción\n\n## Uso narrativo\n\n## Notas\n"),
-        Kind::Object => format!("# {title}\n\n## Descripción\n\n## Importancia\n\n## Notas\n"),
-        Kind::Notes | Kind::Research => format!("# {title}\n\n"),
-        // A screenplay starts from a blank Fountain page, like the project
-        // template's default screenplay.
-        Kind::Screenplay => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use narra_core::project_type::{TypeOrigin, builtin, parse_package};
+
+    fn feature() -> ProjectProfile {
+        builtin("feature").expect("feature package").profile()
+    }
 
     #[test]
-    fn paths_follow_the_kind_and_its_extension() {
+    fn chooser_comes_from_the_package() {
+        let kinds = Kind::from_profile(&feature());
+        let keys: Vec<&str> = kinds.iter().map(|kind| kind.key.as_str()).collect();
         assert_eq!(
-            target_path(Kind::Character, "Marta Ruiz").as_deref(),
+            keys,
+            [
+                "character",
+                "location",
+                "object",
+                "bible",
+                "structure",
+                "research",
+                "notes",
+                "screenplay"
+            ]
+        );
+        let character = kinds
+            .iter()
+            .find(|kind| kind.key == "character")
+            .expect("character");
+        assert_eq!(character.folder, "bible/characters");
+        assert_eq!(character.extension, "md");
+        assert_eq!(character.label.es, "Personaje");
+        let screenplay = kinds
+            .iter()
+            .find(|kind| kind.key == "screenplay")
+            .expect("screenplay");
+        assert_eq!(screenplay.extension, "fountain");
+        assert_eq!(screenplay.label.es, "Guion");
+    }
+
+    #[test]
+    fn custom_package_roots_and_entities_drive_the_chooser() {
+        let package = parse_package(
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief, audiences]\nwrite_roots:\n  - path: brief\n    extensions: [.md]\n    label: { en: Brief, es: Briefing }\nentities:\n  - id: audience\n    label: { en: Audience, es: Audiencia }\n    folder: audiences\n",
+            TypeOrigin::User,
+        )
+        .expect("campaign package");
+        let kinds = Kind::from_profile(&package.profile());
+        let keys: Vec<&str> = kinds.iter().map(|kind| kind.key.as_str()).collect();
+        assert_eq!(keys, ["audience", "brief"]);
+        assert_eq!(kinds[0].extension, "md", "outside a root falls back to md");
+        assert_eq!(kinds[1].label.es, "Briefing", "package label wins");
+    }
+
+    #[test]
+    fn paths_and_templates_follow_the_package() {
+        let kinds = Kind::from_profile(&feature());
+        let character = kinds
+            .iter()
+            .find(|kind| kind.key == "character")
+            .expect("character");
+        assert_eq!(
+            character.target_path("Marta Ruiz").as_deref(),
             Some("bible/characters/Marta Ruiz.md")
         );
+        assert_eq!(character.template("Marta"), "# Marta\n\n");
+
+        let screenplay = kinds
+            .iter()
+            .find(|kind| kind.key == "screenplay")
+            .expect("screenplay");
         assert_eq!(
-            target_path(Kind::Notes, "ideas").as_deref(),
-            Some("notes/ideas.md")
-        );
-        assert_eq!(
-            target_path(Kind::Location, "Casa de Marta").as_deref(),
-            Some("bible/locations/Casa de Marta.md")
-        );
-        assert_eq!(
-            target_path(Kind::Object, "Reloj").as_deref(),
-            Some("bible/objects/Reloj.md")
-        );
-        assert_eq!(
-            target_path(Kind::Research, "policía 1920").as_deref(),
-            Some("research/policía 1920.md")
-        );
-        assert_eq!(
-            target_path(Kind::Screenplay, "S01E01 Piloto").as_deref(),
+            screenplay.target_path("S01E01 Piloto").as_deref(),
             Some("screenplay/S01E01 Piloto.fountain")
         );
+        assert_eq!(screenplay.template("Piloto"), "");
     }
 
     #[test]
@@ -173,6 +236,10 @@ mod tests {
 
     #[test]
     fn unsafe_names_are_refused() {
+        let kind = Kind::from_profile(&feature())
+            .into_iter()
+            .find(|kind| kind.key == "notes")
+            .expect("notes");
         for name in [
             "",
             "   ",
@@ -186,22 +253,7 @@ mod tests {
             "a|b",
             "a\u{0}b",
         ] {
-            assert!(
-                target_path(Kind::Notes, name).is_none(),
-                "{name:?} accepted"
-            );
+            assert!(kind.target_path(name).is_none(), "{name:?} accepted");
         }
-    }
-
-    #[test]
-    fn templates_seed_the_documents() {
-        let character = template(Kind::Character, "Marta");
-        assert!(character.starts_with("# Marta\n"));
-        assert!(character.contains("## Rasgos"));
-        assert!(template(Kind::Location, "Casa").contains("## Descripción"));
-        assert!(template(Kind::Object, "Reloj").contains("## Importancia"));
-        assert!(template(Kind::Notes, "Ideas").contains("# Ideas"));
-        assert!(template(Kind::Research, "Fuentes").contains("# Fuentes"));
-        assert_eq!(template(Kind::Screenplay, "Piloto"), "");
     }
 }

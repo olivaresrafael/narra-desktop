@@ -38,7 +38,15 @@ fn the_real_v2_parser_loads_the_package() {
         "fountain types keep screenplay mechanics"
     );
     assert!(profile.export_pdf);
-    assert_eq!(profile.entity_kinds, ["personaje", "mundo"]);
+    assert_eq!(profile.entities.len(), 2);
+    assert_eq!(profile.entities[0].id, "personaje");
+    assert_eq!(profile.entities[0].label.es, "Personaje");
+    assert_eq!(profile.entities[1].id, "mundo");
+    assert_eq!(profile.write_roots.len(), 5);
+    assert_eq!(
+        profile.write_roots[0].label.as_ref().map(|l| l.es.as_str()),
+        Some("Biblia")
+    );
     assert_eq!(profile.explorer_groups.len(), 4);
 
     let roots: Vec<&str> = package

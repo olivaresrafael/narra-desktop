@@ -9,11 +9,10 @@
 //! context-menu API, and building it in-app keeps the same state machine
 //! testable and usable by the explorer/tab menus later.
 
-use crate::new_file;
 use crate::screenplay;
 
 /// One executable action in the editor context menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextAction {
     Cut,
     Copy,
@@ -22,7 +21,9 @@ pub enum ContextAction {
     Find,
     ProjectSearch,
     Propose,
-    Convert(new_file::Kind),
+    /// Convert the selection into an entity dossier; the value is the entity
+    /// id declared by the active type package (D-062).
+    Convert(String),
     SetElement(screenplay::ElementType),
     FileNew,
     FileRename,
@@ -121,7 +122,7 @@ impl ContextMenuState {
         self.items
             .get(self.selected)
             .filter(|item| item.selectable())
-            .and_then(|item| item.action)
+            .and_then(|item| item.action.clone())
     }
 
     /// Test-only index activation; the UI reads `item.action` because it
@@ -131,7 +132,7 @@ impl ContextMenuState {
         self.items
             .get(index)
             .filter(|item| item.selectable())
-            .and_then(|item| item.action)
+            .and_then(|item| item.action.clone())
     }
 }
 
@@ -145,7 +146,7 @@ mod tests {
             ContextMenuItem::separator(),
             ContextMenuItem::action(ContextAction::Find, "Buscar", "⌘F", true),
             ContextMenuItem::action(
-                ContextAction::Convert(new_file::Kind::Character),
+                ContextAction::Convert("character".to_string()),
                 "Personaje",
                 "",
                 false,

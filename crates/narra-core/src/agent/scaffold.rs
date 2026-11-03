@@ -776,6 +776,7 @@ mod tests {
         let campaign = vec![crate::project_type::WriteRoot {
             path: "brief".to_string(),
             extensions: vec![".md".to_string()],
+            label: None,
         }];
         let plan = parse_plan(&plan_text("brief/premise.md"), &campaign).expect("declared root");
         assert_eq!(plan.files[0].path, "brief/premise.md");
