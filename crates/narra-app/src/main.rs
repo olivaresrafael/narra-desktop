@@ -8352,6 +8352,7 @@ impl Editor {
             .map_err(|error| error.to_string())?;
         let doc_path = project.manifest().default_screenplay_path.clone();
         let title = project.manifest().title.clone();
+        let _ = project.ensure_default_document();
         let content = match project.read_document(&doc_path) {
             Ok(text) => text,
             // A project may legitimately have no screenplay file yet; the
@@ -8359,12 +8360,6 @@ impl Editor {
             Err(ProjectError::Document(DocumentError::Io { source, .. }))
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
-                // The manifest names the official document. An AI-created
-                // base may not have it yet, which leaves the script folder
-                // empty and the chat with nothing to edit: seed it empty.
-                if let Err(error) = project.create_document(&doc_path, "") {
-                    return Err(format!("{doc_path}: {error}"));
-                }
                 String::new()
             }
             Err(error) => return Err(format!("{doc_path}: {error}")),
@@ -14543,6 +14538,14 @@ impl Editor {
             cx.notify();
             return;
         };
+        // Scene requests edit the official document; make sure it exists in
+        // this session even for a base created before the seeding rule.
+        if let Ok(true) = project.ensure_default_document()
+            && let Ok(tree) = project.list_tree()
+        {
+            self.explorer = tree.documents;
+            self.explorer_dirs = tree.directories;
+        }
         let root = project.root().to_string_lossy().into_owned();
         let history = self.chat.thread.messages.clone();
         let mut attachments = self.chat.attachments.clone();

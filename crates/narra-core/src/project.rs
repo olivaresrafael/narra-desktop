@@ -230,6 +230,23 @@ impl Project {
         Ok(self.list_tree()?.documents)
     }
 
+    /// Ensure the manifest's official document exists. AI-created bases may
+    /// start without it, and scene requests need a real file to edit.
+    /// Returns whether the file was created.
+    pub fn ensure_default_document(&self) -> Result<bool, ProjectError> {
+        let path = self.manifest.default_screenplay_path.clone();
+        match self.read_document(&path) {
+            Ok(_) => Ok(false),
+            Err(ProjectError::Document(crate::document::DocumentError::Io { source, .. }))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                self.create_document(&path, "")?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Files and directories in one bounded walk. Empty folders are real
     /// structure (a package may seed them before any document exists), so the
     /// explorer needs them even though `list_documents` only returns files.
@@ -1038,6 +1055,19 @@ mod tests {
         assert!(
             !listed.iter().any(|path| path == "leak.md"),
             "a symlink out of the project must not be listed: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_default_document_seeds_a_missing_official_script() {
+        let root = temp_root();
+        let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
+        fs::remove_file(root.join(DEFAULT_SCREENPLAY)).expect("remove official script");
+        assert!(project.ensure_default_document().expect("seed"));
+        assert!(root.join(DEFAULT_SCREENPLAY).is_file());
+        assert!(
+            !project.ensure_default_document().expect("already present"),
+            "an existing official document is never rewritten"
         );
     }
 
