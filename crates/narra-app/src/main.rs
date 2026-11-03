@@ -2100,6 +2100,9 @@ struct Editor {
     type_trust: Option<ProjectTypePackage>,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
+    /// Directories in the project, including empty ones (the tree shows
+    /// package-seeded folders before any document exists).
+    explorer_dirs: Vec<String>,
     /// Derived bible entities and mention matcher (M11).
     entities: EntityIndex,
     /// Folders the user collapsed in the explorer tree (M9 slice 4);
@@ -5780,9 +5783,10 @@ impl Editor {
                 self.rewrite_open_paths(&state.path, &target);
                 self.rename = None;
                 if let Some(project) = self.project.as_ref()
-                    && let Ok(paths) = project.list_documents()
+                    && let Ok(tree) = project.list_tree()
                 {
-                    self.explorer = paths;
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
                 }
                 self.refresh_entities();
                 self.git_refreshed_at = None;
@@ -5816,9 +5820,10 @@ impl Editor {
         match project.duplicate_document(&path, &target) {
             Ok(()) => {
                 if let Some(project) = self.project.as_ref()
-                    && let Ok(paths) = project.list_documents()
+                    && let Ok(tree) = project.list_tree()
                 {
-                    self.explorer = paths;
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
                 }
                 self.refresh_entities();
                 self.git_refreshed_at = None;
@@ -5862,9 +5867,10 @@ impl Editor {
                 }
                 self.delete_prompt = None;
                 if let Some(project) = self.project.as_ref()
-                    && let Ok(paths) = project.list_documents()
+                    && let Ok(tree) = project.list_tree()
                 {
-                    self.explorer = paths;
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
                 }
                 self.refresh_entities();
                 self.git_refreshed_at = None;
@@ -6072,9 +6078,10 @@ impl Editor {
             }
         }
         if let Some(project) = self.project.as_ref()
-            && let Ok(paths) = project.list_documents()
+            && let Ok(tree) = project.list_tree()
         {
-            self.explorer = paths;
+            self.explorer = tree.documents;
+            self.explorer_dirs = tree.directories;
         }
         self.refresh_entities();
         if let Err(error) = self.open_document_path(&path, true) {
@@ -8011,7 +8018,10 @@ impl Editor {
         match project.create_document(&path, &body) {
             Ok(()) => {
                 self.new_file = None;
-                self.explorer = project.list_documents().unwrap_or_default();
+                if let Ok(tree) = project.list_tree() {
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
+                }
                 self.refresh_entities();
                 let created = self.tf("notice.created", &[("path", &path)]);
                 match project.read_document(&path) {
@@ -8353,9 +8363,7 @@ impl Editor {
             }
             Err(error) => return Err(format!("{doc_path}: {error}")),
         };
-        let explorer = project
-            .list_documents()
-            .map_err(|error| error.to_string())?;
+        let tree = project.list_tree().map_err(|error| error.to_string())?;
 
         self.workspace_generation += 1;
         self.agent_generation += 1;
@@ -8369,7 +8377,8 @@ impl Editor {
         let (commands, command_error) = project_commands(&project, &recent::config_dir());
         self.commands = commands;
         self.project = Some(project);
-        self.explorer = explorer;
+        self.explorer = tree.documents;
+        self.explorer_dirs = tree.directories;
         self.refresh_entities();
         self.collapsed.clear();
         self.chat_generation = self.chat_generation.saturating_add(1);
@@ -8501,6 +8510,7 @@ impl Editor {
         }
         self.project = None;
         self.explorer.clear();
+        self.explorer_dirs.clear();
         self.profile = ProjectProfile::default();
         self.skills.clear();
         self.commands.clear();
@@ -18297,6 +18307,7 @@ impl Editor {
         // so the information does not depend on color alone.
         let rows: Vec<Row> = explorer::build_rows(
             &explorer::visible_paths(&self.explorer, self.show_config_files),
+            &self.explorer_dirs,
             &self.collapsed,
         );
         let grouped = explorer::group_rows(rows, &self.profile.explorer_groups);
@@ -19668,6 +19679,7 @@ impl Editor {
         let entities_dump = self.entities.dump_json(200);
         let tree_rows: Vec<String> = explorer::build_rows(
             &explorer::visible_paths(&self.explorer, self.show_config_files),
+            &self.explorer_dirs,
             &self.collapsed,
         )
         .iter()
@@ -21694,13 +21706,17 @@ fn run() -> Result<(), String> {
     };
     let fixture_read_ms = duration_ms(started.elapsed());
 
-    // The explorer's document list comes from the core: sorted, hidden state
-    // (.git/.narra/dot-files) excluded, symlinks not followed.
-    let explorer = match &project {
-        Some(project) => project
-            .list_documents()
-            .map_err(|error| format!("no se pudo listar el proyecto: {error}"))?,
-        None => Vec::new(),
+    // The explorer's tree comes from the core: sorted, hidden state
+    // (.git/.narra/dot-files) excluded, symlinks not followed, empty folders
+    // included.
+    let (explorer, explorer_dirs) = match &project {
+        Some(project) => {
+            let tree = project
+                .list_tree()
+                .map_err(|error| format!("no se pudo listar el proyecto: {error}"))?;
+            (tree.documents, tree.directories)
+        }
+        None => (Vec::new(), Vec::new()),
     };
     let entities = project
         .as_ref()
@@ -21981,6 +21997,7 @@ fn run() -> Result<(), String> {
                 type_trust: startup_type_trust,
                 project,
                 explorer,
+                explorer_dirs,
                 entities,
                 collapsed: HashSet::new(),
                 notice: None,

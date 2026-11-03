@@ -227,21 +227,43 @@ impl Project {
     /// escapes anyway), and a non-UTF-8 name is skipped because it can never
     /// pass the boundary-checked document IO.
     pub fn list_documents(&self) -> Result<Vec<String>, ProjectError> {
+        Ok(self.list_tree()?.documents)
+    }
+
+    /// Files and directories in one bounded walk. Empty folders are real
+    /// structure (a package may seed them before any document exists), so the
+    /// explorer needs them even though `list_documents` only returns files.
+    pub fn list_tree(&self) -> Result<ProjectTree, ProjectError> {
         let mut documents = Vec::new();
-        walk_documents(&self.root, "", 0, &mut documents)?;
+        let mut directories = Vec::new();
+        walk_tree(&self.root, "", 0, &mut documents, &mut directories)?;
         documents.sort();
         documents.truncate(MAX_LISTED_DOCUMENTS);
-        Ok(documents)
+        directories.sort();
+        directories.truncate(MAX_LISTED_DOCUMENTS);
+        Ok(ProjectTree {
+            documents,
+            directories,
+        })
     }
 }
 
-/// Depth-first collection for [`Project::list_documents`]; `prefix` is the
+/// Bounded scan result: canonical text documents plus the folders that hold
+/// them (including empty ones).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectTree {
+    pub documents: Vec<String>,
+    pub directories: Vec<String>,
+}
+
+/// Depth-first collection for [`Project::list_tree`]; `prefix` is the
 /// project-relative path of `dir` (`""` at the root).
-fn walk_documents(
+fn walk_tree(
     dir: &Path,
     prefix: &str,
     depth: usize,
-    out: &mut Vec<String>,
+    documents: &mut Vec<String>,
+    directories: &mut Vec<String>,
 ) -> Result<(), ProjectError> {
     if depth > MAX_DOC_DEPTH {
         return Ok(());
@@ -278,9 +300,10 @@ fn walk_documents(
             source,
         })?;
         if file_type.is_dir() {
-            walk_documents(&entry.path(), &relative, depth + 1, out)?;
+            directories.push(relative.clone());
+            walk_tree(&entry.path(), &relative, depth + 1, documents, directories)?;
         } else if file_type.is_file() {
-            out.push(relative);
+            documents.push(relative);
         }
         // Symlinks report neither `is_dir` nor `is_file` on the DirEntry
         // type (which does not follow links), so they fall through here by
@@ -1006,5 +1029,26 @@ mod tests {
             !listed.iter().any(|path| path == "leak.md"),
             "a symlink out of the project must not be listed: {listed:?}"
         );
+    }
+
+    #[test]
+    fn list_tree_includes_empty_folders_and_excludes_state() {
+        let root = temp_root();
+        let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
+        fs::create_dir_all(root.join("bible/empty")).expect("empty dir");
+        fs::create_dir_all(root.join(".narra/x")).expect("state dir");
+        fs::create_dir_all(root.join("exports")).expect("exports dir");
+        let tree = project.list_tree().expect("tree");
+        assert!(tree.directories.contains(&"bible/empty".to_string()));
+        assert!(tree.directories.contains(&"bible".to_string()));
+        assert!(
+            !tree
+                .directories
+                .iter()
+                .any(|dir| dir.starts_with(".narra") || dir == "exports"),
+            "{:?}",
+            tree.directories
+        );
+        assert!(tree.documents.iter().any(|doc| doc == "project.yaml"));
     }
 }
