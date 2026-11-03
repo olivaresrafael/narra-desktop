@@ -61,10 +61,13 @@ Estado a 2026-11-03 (commits `dfb9e57`, `32b9c40`, `fb24441`):
 - ✅ **Contexto pineado**: `context.rs` lee `pinned_context` del paquete;
   sin paquete no se pinea nada (no hay fallback `bible/`). El índice de
   archivos es genérico (texto), sin lógica de escenas.
-- ⏳ **`context_actions`**: el contrato y la validación existen; falta el
-  despacho en `narra-app` (convertir selección, crear archivo desde
-  template, lanzar comando) y comprobar que el `target` cae en
-  `write_roots`.
+- ✅ **`context_actions`**: el editor pinta las acciones declaradas en el
+  menú contextual, agrupadas y con etiqueta localizada, y despacha los tres
+  `kind` a mecanismos del motor: convertir selección (reutiliza el flujo de
+  entidades), crear archivo desde template (abre el diálogo Nuevo archivo
+  con la plantilla del paquete precargada y el título sustituido) y lanzar
+  comando (rellena `/comando` en el chat; la fila se desactiva si el
+  comando no está instalado).
 - ✅ **Entidades**: `narra-app` construye el diálogo Nuevo archivo, el menú
   «Convertir a…» y las menciones `@` desde `profile.entities` y
   `write_roots` del paquete; el catálogo `character`/`location`/`object`
