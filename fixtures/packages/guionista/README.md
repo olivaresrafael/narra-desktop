@@ -35,33 +35,42 @@ toda la lógica creativa puede vivir en datos y no en Rust.
 
 ## Gaps de contrato detectados (entradas para Fase 1)
 
-- **`type.yaml` v2**: el parser actual (D-045) ignora `format`,
-  `content_layout`, `write_roots`, `pinned_context`, `entities` como lista
-  de objetos, `context_actions` y las secciones de agentes/comandos.
-  Las capacidades v1 (`capabilities.screenplay`, `entity_kinds`,
-  `explorer_groups`) son el equivalente plano que hay que migrar.
-- **Agentes portables**: `narra-core` hoy solo carga `agent.yaml`
-  (instruction-only). Falta el loader de `AGENT.md` con frontmatter y los
-  campos `mode`/`write_roots`/`skills`; el trust de instrucciones ya existe
-  y debe reaprovecharse.
-- **Comandos**: no hay concepto de comando slashable en el runtime; el menú
-  `/` del chat solo resuelve skills. Falta `.narra/commands/*.md`
-  (frontmatter `name`/`description`/`agent`) y su despacho.
-- **Tools genéricas**: `read_scene`/`propose_scene_edit` y
-  `scaffold::ALLOWED_ROOTS` siguen hardcodeados; hay que sustituirlos por
-  `read_document`/`propose_document_edit`/`propose_new_files` parametrizados
-  por `write_roots`.
-- **Contexto pineado**: `context.rs` cae a `bible` por defecto; debe leer
-  `pinned_context` del paquete y solo pinear el índice de escenas cuando
-  `format: fountain`.
-- **`context_actions`**: no existe el despacho. El motor necesita mapear
-  cada `kind` a una acción existente (convertir selección, crear archivo
-  desde template, lanzar comando) y validar que el `target` cae dentro de
-  `write_roots`.
-- **Entidades**: el catálogo `character`/`location`/`object` está cerrado en
-  `narra-app` (`NewFileKind`); el paquete usa ids propios (`personaje`,
-  `mundo`) y etiquetas localizadas, lo que exige hacerlo data-driven.
+Estado a 2026-11-03 (commits `dfb9e57`, `32b9c40`, `fb24441`):
 
-Mientras esos gaps no se cierren, este fixture es **datos de prueba**: la
-prueba Rust asociada solo verifica la integridad del paquete (frontmatter,
-rutas y referencias cruzadas), no el runtime v2.
+- ✅ **`type.yaml` v2**: el parser es solo schema 2 (sin legacy). Lee
+  `format`, `content_layout`, `write_roots`, `pinned_context`, `entities`
+  como objetos con etiqueta localizada, `export`, `context_actions` y las
+  secciones `agents`/`commands`/`skills`/`templates`/`instructions`, con
+  validación estricta de referencias cruzadas.
+- ✅ **Agentes portables**: `narra-core` carga `.narra/agents/<id>/AGENT.md`
+  (frontmatter `name`/`description`/`mode`/`write_roots`/`skills`) junto a
+  `agent.yaml`; `agent.yaml` gana si conviven. Los agentes se convierten en
+  roles con trust de solo instrucciones y `mode` como perfil de permisos.
+- ⚠️ **Comandos**: existe el loader `.narra/commands/*.md` (frontmatter
+  `name`/`description`/`agent` + prompt) y la validación contra
+  `type.yaml`, pero falta el **despacho** desde el menú `/` del chat y la
+  UI. Ese es el resto de Fase 1/Fase 3.
+- ✅ **Tools genéricas**: `read_scene`/`propose_scene_edit` retiradas;
+  `propose_document_edit`/`propose_document_create` y el scaffold resuelven
+  `write_roots` (ruta + extensiones) del paquete en cada llamada. Si el
+  paquete no resuelve, no se puede escribir nada. El kernel sigue
+  sandboxeando por encima.
+- ✅ **Contexto pineado**: `context.rs` lee `pinned_context` del paquete;
+  sin paquete no se pinea nada (no hay fallback `bible/`). El índice de
+  archivos es genérico (texto), sin lógica de escenas.
+- ⏳ **`context_actions`**: el contrato y la validación existen; falta el
+  despacho en `narra-app` (convertir selección, crear archivo desde
+  template, lanzar comando) y comprobar que el `target` cae en
+  `write_roots`.
+- ⏳ **Entidades**: el catálogo `character`/`location`/`object` sigue
+  cerrado en `narra-app` (`NewFileKind`); el paquete usa ids propios
+  (`personaje`, `mundo`) con etiquetas localizadas, lo que exige hacerlo
+  data-driven.
+- ⏳ **Plantillas y siembra**: `templates`/`instructions` se validan, pero
+  el runtime de creación de proyecto aún no copia el paquete completo
+  (Fase 2).
+
+Este fixture sigue siendo **datos de prueba**: la suite Rust verifica la
+integridad del paquete y que los loaders reales (skills, agentes, comandos,
+parser v2) lo aceptan; el despacho de comandos y `context_actions` en la UI
+es trabajo pendiente.
