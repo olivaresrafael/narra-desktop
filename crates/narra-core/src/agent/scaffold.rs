@@ -56,6 +56,7 @@ const BASE_SYSTEM: &str = "Eres un arquitecto de proyectos de escritura. \
 fn rules(
     roots: &[crate::project_type::WriteRoot],
     entities: &[crate::project_type::EntityDefinition],
+    default_document: Option<&str>,
 ) -> String {
     let folders = roots
         .iter()
@@ -82,6 +83,13 @@ fn rules(
              nombre de archivo; no agrupes varias entidades en un solo documento."
         );
     }
+    let official_rule = default_document.map_or_else(String::new, |document| {
+        format!(
+            "\n- El documento oficial del guion es `{document}`; no crees otro \
+             archivo de guion con un nombre distinto. Los demás documentos son \
+             fichas, notas o investigación."
+        )
+    });
     format!(
         "Devuelve SOLO un objeto JSON con esta forma:\n\
          {{\"files\":[{{\"path\":\"carpeta/archivo.ext\",\"content\":\"...\"}}]}}\n\
@@ -89,7 +97,7 @@ fn rules(
          - Rutas relativas bajo estas carpetas del proyecto: {folders}; \
          extensiones permitidas: {extensions}.\n\
          - Nunca .narra/, project.yaml, agents.yaml, AGENTS.md ni .gitignore.\
-         {entity_rule}\n\
+         {entity_rule}{official_rule}\n\
          - Contenido en el idioma del proyecto; no inventes datos personales.\n\
          - Sé conciso: prioriza entre 3 y 6 archivos y no repitas contenido.\n\
          - El contenido debe ser una cadena JSON válida: escapa los saltos de línea \
@@ -616,7 +624,11 @@ impl ProjectScaffoldTask {
         }
         let prompt = format!(
             "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n",
-            rules(&package.write_roots, &package.entities),
+            rules(
+                &package.write_roots,
+                &package.entities,
+                package.default_document.as_deref()
+            ),
             self.title.trim(),
             self.type_label
                 .as_deref()
@@ -833,9 +845,14 @@ mod tests {
     #[test]
     fn scaffold_rules_require_one_file_per_entity() {
         let package = crate::project_type::builtin("feature").expect("feature");
-        let text = rules(&package.write_roots, &package.entities);
+        let text = rules(
+            &package.write_roots,
+            &package.entities,
+            package.default_document.as_deref(),
+        );
         assert!(text.contains("Una entidad por archivo"), "{text}");
         assert!(text.contains("Personaje → bible/characters"), "{text}");
+        assert!(text.contains("screenplay/main.fountain"), "{text}");
     }
 
     #[test]

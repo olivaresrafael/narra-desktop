@@ -10,26 +10,44 @@ use narra_core::project_type::{LocalizedText, ProjectProfile, WriteRoot};
 /// One option in the New File chooser, derived from the package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kind {
-    /// Stable key: entity id or write-root path (dumps and UI ids).
+    /// Stable key: entity id, `episode`, or write-root path.
     pub key: String,
     pub label: LocalizedText,
     /// Project-relative folder the document lands in.
     pub folder: String,
     /// Extension without the dot (`md`, `fountain`).
     pub extension: String,
+    /// Series-like types name episodes with a `{number}` placeholder; the
+    /// typed name replaces it.
+    pub pattern: Option<String>,
 }
 
 impl Kind {
-    /// Options for a profile: entities first (in declaration order), then
-    /// write roots that are not exactly an entity folder.
+    /// Options for a profile: the episode kind first when the type declares
+    /// a pattern, then entities, then write roots that are not exactly an
+    /// entity folder.
     pub fn from_profile(profile: &ProjectProfile) -> Vec<Kind> {
         let mut kinds = Vec::new();
+        if let Some(pattern) = &profile.episode_pattern {
+            let (folder, extension) = pattern_parts(pattern);
+            kinds.push(Kind {
+                key: "episode".to_string(),
+                label: LocalizedText {
+                    en: "Episode".to_string(),
+                    es: "Episodio".to_string(),
+                },
+                folder,
+                extension,
+                pattern: Some(pattern.clone()),
+            });
+        }
         for entity in &profile.entities {
             kinds.push(Kind {
                 key: entity.id.clone(),
                 label: entity.label.clone(),
                 folder: entity.folder.clone(),
                 extension: extension_for(&profile.write_roots, &entity.folder),
+                pattern: None,
             });
         }
         for root in &profile.write_roots {
@@ -48,6 +66,7 @@ impl Kind {
                     .unwrap_or_else(|| folder_label(&root.path)),
                 folder: root.path.clone(),
                 extension: preferred_extension(root),
+                pattern: None,
             });
         }
         kinds
@@ -68,12 +87,16 @@ impl Kind {
             label: folder_label(folder),
             folder: folder.to_string(),
             extension: extension_for(&profile.write_roots, folder),
+            pattern: None,
         }
     }
 
     /// Project-relative path for a new document, or `None` for an invalid name.
     pub fn target_path(&self, name: &str) -> Option<String> {
         let stem = file_stem(name)?;
+        if let Some(pattern) = &self.pattern {
+            return Some(pattern.replace("{number}", &stem));
+        }
         Some(format!("{}/{}.{}", self.folder, stem, self.extension))
     }
 
@@ -87,6 +110,21 @@ impl Kind {
             format!("# {}\n\n", name.trim())
         }
     }
+}
+
+/// Folder and extension of an episode pattern
+/// (`screenplay/episode-{number}.fountain`).
+fn pattern_parts(pattern: &str) -> (String, String) {
+    let folder = pattern
+        .rsplit_once('/')
+        .map(|(folder, _)| folder.to_string())
+        .unwrap_or_default();
+    let file = pattern.rsplit('/').next().unwrap_or(pattern);
+    let extension = file
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_string())
+        .unwrap_or_else(|| "md".to_string());
+    (folder, extension)
 }
 
 /// Extension a folder's documents use, from the most specific write root
@@ -216,6 +254,24 @@ mod tests {
             .expect("screenplay");
         assert_eq!(screenplay.extension, "fountain");
         assert_eq!(screenplay.label.es, "Guion");
+    }
+
+    #[test]
+    fn series_chooser_offers_the_episode_pattern() {
+        let profile = builtin("series").expect("series").profile();
+        let kinds = Kind::from_profile(&profile);
+        assert_eq!(kinds[0].key, "episode");
+        assert_eq!(kinds[0].label.es, "Episodio");
+        assert_eq!(kinds[0].folder, "screenplay");
+        assert_eq!(kinds[0].extension, "fountain");
+        assert_eq!(
+            kinds[0].target_path("2").as_deref(),
+            Some("screenplay/episode-2.fountain")
+        );
+        assert_eq!(
+            kinds[0].target_path("Piloto").as_deref(),
+            Some("screenplay/episode-Piloto.fountain")
+        );
     }
 
     #[test]

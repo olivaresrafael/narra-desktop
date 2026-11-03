@@ -8359,6 +8359,12 @@ impl Editor {
             Err(ProjectError::Document(DocumentError::Io { source, .. }))
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
+                // The manifest names the official document. An AI-created
+                // base may not have it yet, which leaves the script folder
+                // empty and the chat with nothing to edit: seed it empty.
+                if let Err(error) = project.create_document(&doc_path, "") {
+                    return Err(format!("{doc_path}: {error}"));
+                }
                 String::new()
             }
             Err(error) => return Err(format!("{doc_path}: {error}")),
@@ -14567,11 +14573,13 @@ impl Editor {
         let cancel = CancellationToken::new();
         self.chat_cancel = Some(cancel.clone());
         let context_window = self.chat_model_info().and_then(|model| model.context_limit);
+        let output_limit = self.chat_model_info().and_then(|model| model.output_limit);
         let task = ChatTask::new(root, mode, history, instruction)
             .with_attachments(attachments)
             .with_project_context(true)
             .with_skills(self.skills.clone())
             .with_profile(self.profile.clone())
+            .with_max_output_tokens(output_limit)
             .with_context_window(context_window);
         let mut settings = self.agent_settings.clone();
         settings.session = Some(format!("narra-chat-{}", self.chat.thread.id));

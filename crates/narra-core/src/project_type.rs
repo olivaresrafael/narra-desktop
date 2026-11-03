@@ -51,7 +51,7 @@ const MAX_CONTEXT_ACTIONS: usize = 32;
 const MAX_EXPORTS: usize = 4;
 const MAX_SEEDS: usize = 64;
 
-const PACKAGE_KEYS: [&str; 20] = [
+const PACKAGE_KEYS: [&str; 21] = [
     "schema_version",
     "api_version",
     "id",
@@ -62,6 +62,7 @@ const PACKAGE_KEYS: [&str; 20] = [
     "skills",
     "format",
     "default_document",
+    "episode_pattern",
     "content_layout",
     "pinned_context",
     "write_roots",
@@ -218,6 +219,11 @@ pub struct ProjectProfile {
     /// The type declares `format: fountain`; the editor applies screenplay
     /// mechanics (element cycling, scene structure, PDF layout).
     pub screenplay: bool,
+    /// Document the project opens first (the official script).
+    pub default_document: Option<String>,
+    /// Series-like types declare how an episode document is named, with a
+    /// `{number}` placeholder (e.g. `screenplay/episode-{number}.fountain`).
+    pub episode_pattern: Option<String>,
     /// Entities the type offers for dossiers, mentions, the convert menu and
     /// the New File chooser.
     pub entities: Vec<EntityDefinition>,
@@ -254,6 +260,8 @@ impl Default for ProjectProfile {
         Self {
             type_id: "other".to_string(),
             screenplay: false,
+            default_document: None,
+            episode_pattern: None,
             entities: Vec::new(),
             write_roots: Vec::new(),
             export_pdf: false,
@@ -278,6 +286,9 @@ pub struct ProjectTypePackage {
     pub format: DocumentFormat,
     /// Document a new project opens first.
     pub default_document: Option<String>,
+    /// Series-like types declare the episode document name, with one
+    /// `{number}` placeholder (e.g. `screenplay/episode-{number}.fountain`).
+    pub episode_pattern: Option<String>,
     /// Explorer sections rendered from the package.
     pub content_layout: Vec<ExplorerGroup>,
     /// Paths pinned into every chat without an explicit attachment.
@@ -337,6 +348,8 @@ impl ProjectTypePackage {
         ProjectProfile {
             type_id: self.id.clone(),
             screenplay: self.format == DocumentFormat::Fountain,
+            default_document: self.default_document.clone(),
+            episode_pattern: self.episode_pattern.clone(),
             entities: self.entities.clone(),
             write_roots: self.write_roots.clone(),
             export_pdf: self.exports.iter().any(|export| export.kind == "pdf"),
@@ -455,6 +468,45 @@ impl ProjectTypePackage {
 
         if let Some(document) = &self.default_document {
             validate_relative_path("default_document", document)?;
+        }
+
+        if let Some(pattern) = &self.episode_pattern {
+            validate_relative_path("episode_pattern", pattern)?;
+            if pattern.matches("{number}").count() != 1 {
+                return Err(TypePackageError::Invalid {
+                    field: "episode_pattern",
+                    detail: "must contain exactly one `{number}` placeholder".to_string(),
+                });
+            }
+            let sample = pattern.replace("{number}", "1");
+            validate_relative_path("episode_pattern", &sample)?;
+            let Some(root) = self
+                .write_roots
+                .iter()
+                .find(|root| sample == root.path || sample.starts_with(&format!("{}/", root.path)))
+            else {
+                return Err(TypePackageError::Invalid {
+                    field: "episode_pattern",
+                    detail: format!("`{sample}` is not inside a declared write root"),
+                });
+            };
+            let extension = Path::new(&sample)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("");
+            if !root
+                .extensions
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed.trim_start_matches('.')))
+            {
+                return Err(TypePackageError::Invalid {
+                    field: "episode_pattern",
+                    detail: format!(
+                        "`{sample}` extension is not allowed by write root `{}`",
+                        root.path
+                    ),
+                });
+            }
         }
 
         if self.content_layout.len() > 8 {
@@ -900,7 +952,22 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         "other" => ("Other", "A writing project with a custom structure."),
         _ => return None,
     };
-    let (directories, files) = builtin_template();
+    let (directories, mut files) = builtin_template();
+    let series_like = matches!(id, "series" | "web_series" | "microdrama");
+    let default_document = if series_like {
+        "screenplay/episode-1.fountain".to_string()
+    } else {
+        DEFAULT_SCREENPLAY.to_string()
+    };
+    let episode_pattern = series_like.then(|| "screenplay/episode-{number}.fountain".to_string());
+    if series_like {
+        // The official document is the pilot episode, not `main.fountain`.
+        for file in &mut files {
+            if file.path == DEFAULT_SCREENPLAY {
+                file.path = default_document.clone();
+            }
+        }
+    }
     Some(ProjectTypePackage {
         schema_version: SCHEMA_VERSION,
         api_version: API_VERSION,
@@ -911,7 +978,8 @@ pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
         files,
         skills: Vec::new(),
         format: DocumentFormat::Fountain,
-        default_document: Some(DEFAULT_SCREENPLAY.to_string()),
+        default_document: Some(default_document),
+        episode_pattern,
         content_layout: builtin_content_layout(),
         pinned_context: vec![
             "bible".to_string(),
@@ -1342,6 +1410,18 @@ pub fn parse_package(
         ),
         None => None,
     };
+    let episode_pattern = match root.as_mapping_get("episode_pattern") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| TypePackageError::Invalid {
+                    field: "episode_pattern",
+                    detail: "must be a string".to_string(),
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
     let pinned_context = match root.as_mapping_get("pinned_context") {
         Some(value) => string_sequence(value, "pinned_context")?,
         None => Vec::new(),
@@ -1439,6 +1519,7 @@ pub fn parse_package(
         skills,
         format,
         default_document,
+        episode_pattern,
         content_layout,
         pinned_context,
         write_roots,
@@ -2200,6 +2281,71 @@ mod tests {
             assert!(profile.export_pdf);
         }
         assert!(builtin("unknown").is_none());
+    }
+
+    #[test]
+    fn series_types_declare_the_episode_pattern_and_pilot() {
+        let series = builtin("series").expect("series");
+        assert_eq!(
+            series.default_document.as_deref(),
+            Some("screenplay/episode-1.fountain")
+        );
+        assert_eq!(
+            series.episode_pattern.as_deref(),
+            Some("screenplay/episode-{number}.fountain")
+        );
+        assert!(
+            series
+                .files
+                .iter()
+                .any(|file| file.path == "screenplay/episode-1.fountain")
+        );
+        assert!(
+            !series
+                .files
+                .iter()
+                .any(|file| file.path == DEFAULT_SCREENPLAY),
+            "the series package seeds the pilot, not main.fountain"
+        );
+        assert_eq!(
+            series.profile().episode_pattern.as_deref(),
+            Some("screenplay/episode-{number}.fountain")
+        );
+
+        let feature = builtin("feature").expect("feature");
+        assert_eq!(
+            feature.default_document.as_deref(),
+            Some(DEFAULT_SCREENPLAY)
+        );
+        assert!(feature.episode_pattern.is_none());
+        assert!(feature.profile().episode_pattern.is_none());
+    }
+
+    #[test]
+    fn episode_patterns_are_validated() {
+        let base = "schema_version: 2\napi_version: 1\nid: series\nname: Series\ndirectories: [screenplay]\nwrite_roots:\n  - path: screenplay\n    extensions: [.fountain]\n";
+        let ok = parse_package(
+            &format!("{base}episode_pattern: \"screenplay/episode-{{number}}.fountain\"\n"),
+            TypeOrigin::User,
+        )
+        .expect("valid pattern");
+        assert_eq!(
+            ok.episode_pattern.as_deref(),
+            Some("screenplay/episode-{number}.fountain")
+        );
+
+        for bad in [
+            "screenplay/episode.fountain",
+            "screenplay/{number}/{number}.fountain",
+            "outside/episode-{number}.fountain",
+            "screenplay/episode-{number}.txt",
+        ] {
+            let text = format!("{base}episode_pattern: \"{bad}\"\n");
+            assert!(
+                parse_package(&text, TypeOrigin::User).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

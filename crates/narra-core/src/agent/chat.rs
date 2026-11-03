@@ -454,10 +454,18 @@ fn context_budget(
     }
 }
 
-/// Output budget for one chat round. A full scene (or a document rewrite)
-/// arrives inside a tool-call argument, so the old 4k budget truncated the
-/// JSON mid-string; 8k leaves room for a scene plus the surrounding answer.
-const CHAT_MAX_OUTPUT_TOKENS: u32 = 8_192;
+/// Fallback output budget when the provider does not advertise a model limit.
+/// A full scene (or a document rewrite) arrives inside a tool-call argument,
+/// so a small fixed budget truncates the JSON mid-string.
+const DEFAULT_CHAT_OUTPUT_TOKENS: u32 = 8_192;
+
+/// Provider-advertised limit, or the conservative fallback. Ignore nonsense
+/// values (0) so a bad catalog entry cannot disable generation.
+fn output_budget(limit: Option<u32>) -> u32 {
+    limit
+        .filter(|limit| *limit >= 256)
+        .unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS)
+}
 
 /// Explicit chat input. A fresh task is built for each user turn; prior
 /// conversation and attachments are inputs, never hidden global state.
@@ -476,6 +484,8 @@ pub struct ChatTask {
     pub skills: Vec<Skill>,
     /// Provider catalog context window for this model, when known.
     pub context_window: Option<u32>,
+    /// Provider-advertised output limit for this model, when known.
+    pub max_output_tokens: Option<u32>,
     /// Active type package: the prompt tells the model which roots it may
     /// propose writes into (D-062).
     pub profile: Option<ProjectProfile>,
@@ -499,6 +509,7 @@ impl ChatTask {
             include_project_context: false,
             skills: Vec::new(),
             context_window: None,
+            max_output_tokens: None,
             profile: None,
         }
     }
@@ -510,6 +521,11 @@ impl ChatTask {
 
     pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, limit: Option<u32>) -> Self {
+        self.max_output_tokens = limit;
         self
     }
 
@@ -639,6 +655,12 @@ impl ChatTask {
         if let Some(profile) = &self.profile {
             system.push_str(&profile_brief(profile));
         }
+        system.push_str(&official_document_brief(
+            &manifest.default_screenplay_path,
+            self.profile
+                .as_ref()
+                .and_then(|profile| profile.episode_pattern.as_deref()),
+        ));
 
         self.run_with_tools(
             root,
@@ -702,7 +724,7 @@ impl ChatTask {
                 } else {
                     format!("{prompt}\n\nContinúa según los resultados de las herramientas.")
                 },
-                max_output_tokens: CHAT_MAX_OUTPUT_TOKENS,
+                max_output_tokens: output_budget(self.max_output_tokens),
                 tools: specs.clone(),
                 history: history.clone(),
             };
@@ -875,6 +897,26 @@ fn summarize_run(proposals: &[serde_json::Value], audit: &[ToolResult]) -> Strin
     }
     "El agente no devolvió texto. Revisa la actividad de la herramienta o reformula la petición."
         .to_string()
+}
+
+/// Tell the model which file is the official script, so scene requests edit
+/// it instead of inventing a new document name (and know the episode pattern
+/// for series-like projects).
+fn official_document_brief(default_document: &str, episode_pattern: Option<&str>) -> String {
+    let mut out = format!(
+        "\n\nDOCUMENTO OFICIAL DEL PROYECTO: {default_document}\n\
+         Para escenas y borradores del guion edita ese archivo con \
+         propose_document_edit; no inventes un nombre de archivo. Usa \
+         propose_document_create solo para fichas, notas o investigación nuevas."
+    );
+    if let Some(pattern) = episode_pattern {
+        out.push_str(&format!(
+            "\nProyecto por episodios: el patrón es `{pattern}`. Sustituye {{number}} \
+             por el número de episodio. Si el episodio ya existe, edítalo; si no, \
+             créalo con ese nombre."
+        ));
+    }
+    out
 }
 
 /// Data-driven brief of the active type package: the model may only propose
@@ -1659,5 +1701,28 @@ mod tests {
         assert!(summary.contains("1 propuesta(s)"), "{summary}");
         assert!(summary.contains("bible/marta.md"), "{summary}");
         assert!(summarize_run(&[], &[]).contains("no devolvió texto"));
+    }
+
+    #[test]
+    fn output_budget_follows_the_provider_limit_with_a_safe_fallback() {
+        assert_eq!(output_budget(Some(16_384)), 16_384);
+        assert_eq!(output_budget(Some(0)), DEFAULT_CHAT_OUTPUT_TOKENS);
+        assert_eq!(output_budget(None), DEFAULT_CHAT_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn official_document_brief_names_the_script_and_episode_pattern() {
+        let brief = official_document_brief("guion/main.fountain", None);
+        assert!(brief.contains("DOCUMENTO OFICIAL"), "{brief}");
+        assert!(brief.contains("guion/main.fountain"), "{brief}");
+        assert!(brief.contains("propose_document_edit"), "{brief}");
+        assert!(!brief.contains("episodios"), "{brief}");
+
+        let brief = official_document_brief(
+            "guion/episode-1.fountain",
+            Some("guion/episode-{number}.fountain"),
+        );
+        assert!(brief.contains("guion/episode-{number}.fountain"), "{brief}");
+        assert!(brief.contains("episodios"), "{brief}");
     }
 }

@@ -661,8 +661,18 @@ mod tests {
                 let packaged = temp_root();
                 create_project_from_type(&packaged, "Muestra", kind, language)
                     .expect("package create");
+                let mut legacy_tree = snapshot(&legacy);
+                // Series-like built-ins now seed the pilot episode instead of
+                // `main.fountain` (the official document is per episode).
+                if matches!(
+                    kind,
+                    ProjectType::Series | ProjectType::WebSeries | ProjectType::Microdrama
+                ) {
+                    legacy_tree.remove("screenplay/main.fountain");
+                    legacy_tree.insert("screenplay/episode-1.fountain".to_string(), String::new());
+                }
                 assert_eq!(
-                    snapshot(&legacy),
+                    legacy_tree,
                     snapshot(&packaged),
                     "starter tree mismatch for {} ({language})",
                     kind.as_str()
