@@ -374,6 +374,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
         let mut usage: Option<Value> = None;
         let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
         let mut terminal = false;
+        let mut finish_reason: Option<String> = None;
         let mut line = String::new();
 
         loop {
@@ -409,11 +410,12 @@ impl ModelAdapter for OpenAiCompatAdapter {
             if let Some(message) = server_error_detail(&chunk) {
                 return Err(AgentError::Adapter(crate::git::redact_secrets(&message)));
             }
-            if chunk
+            if let Some(reason) = chunk
                 .pointer("/choices/0/finish_reason")
-                .is_some_and(|reason| !reason.is_null())
+                .and_then(Value::as_str)
             {
                 terminal = true;
+                finish_reason = Some(reason.to_string());
             }
             if let Some(name) = chunk.get("model").and_then(Value::as_str) {
                 model = Some(name.to_string());
@@ -482,6 +484,17 @@ impl ModelAdapter for OpenAiCompatAdapter {
                 "el stream terminó sin contenido de texto ni tool_calls".to_string(),
             ));
         }
+        if finish_reason.as_deref() == Some("length") && !tool_calls.is_empty() {
+            let tool = tool_calls
+                .values()
+                .find(|call| !call.name.is_empty())
+                .map(|call| call.name.as_str())
+                .unwrap_or("herramienta");
+            return Err(AgentError::Adapter(format!(
+                "la respuesta se truncó por el límite de tokens mientras se generaban los \
+                 argumentos de «{tool}»; pide un documento más corto o sube el límite de salida"
+            )));
+        }
 
         let mut parsed_calls = Vec::with_capacity(tool_calls.len());
         for partial in tool_calls.into_values() {
@@ -495,8 +508,11 @@ impl ModelAdapter for OpenAiCompatAdapter {
             } else {
                 super::scaffold::parse_any_json_object(&partial.arguments).ok_or_else(|| {
                     AgentError::Adapter(format!(
-                        "los argumentos de la herramienta «{}» no son JSON válido",
-                        partial.name
+                        "los argumentos de la herramienta «{}» llegaron incompletos o no son \
+                         JSON válido (finish_reason: {}); pide un documento más corto o sube \
+                         el límite de salida",
+                        partial.name,
+                        finish_reason.as_deref().unwrap_or("desconocida")
                     ))
                 })?
             };
@@ -597,6 +613,24 @@ fn parse_response(payload: Value) -> Result<ModelResponse, AgentError> {
     if let Some(message) = server_error_detail(&payload) {
         return Err(AgentError::Adapter(crate::git::redact_secrets(&message)));
     }
+    let finish_reason = payload
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let tool_call_count = payload
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if finish_reason.as_deref() == Some("length") && tool_call_count > 0 {
+        let tool = payload
+            .pointer("/choices/0/message/tool_calls/0/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("herramienta");
+        return Err(AgentError::Adapter(format!(
+            "la respuesta se truncó por el límite de tokens mientras se generaban los \
+             argumentos de «{tool}»; pide un documento más corto o sube el límite de salida"
+        )));
+    }
 
     // Tool calls (OpenAI function-calling wire): `arguments` is a JSON
     // *string* on the wire; a malformed one is an actionable error, never
@@ -628,7 +662,10 @@ fn parse_response(payload: Value) -> Result<ModelResponse, AgentError> {
                 Some(Value::String(raw)) => super::scaffold::parse_any_json_object(raw)
                     .ok_or_else(|| {
                         AgentError::Adapter(format!(
-                            "los argumentos de la herramienta «{name}» no son JSON válido"
+                            "los argumentos de la herramienta «{name}» llegaron incompletos o \
+                             no son JSON válido (finish_reason: {}); pide un documento más \
+                             corto o sube el límite de salida",
+                            finish_reason.as_deref().unwrap_or("desconocida")
                         ))
                     })?,
                 // Some local servers already send an object.
@@ -814,6 +851,33 @@ mod tests {
         assert_eq!(
             response.tool_calls[0].arguments["content"],
             "# Elena\n\nHermana de Marta."
+        );
+    }
+
+    #[test]
+    fn truncated_tool_arguments_report_the_budget_not_a_json_error() {
+        let payload = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "propose_document_create",
+                            "arguments": "{\"path\":\"guion/x.fountain\",\"content\":\"INT. "
+                        }
+                    }]
+                },
+                "finish_reason": "length"
+            }]
+        });
+        let error = parse_response(payload).expect_err("truncated tool call");
+        assert!(error.to_string().contains("truncó"), "{error}");
+        assert!(
+            error.to_string().contains("propose_document_create"),
+            "{error}"
         );
     }
 

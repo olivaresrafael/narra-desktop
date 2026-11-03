@@ -688,6 +688,43 @@ fn streaming_without_any_content_is_an_error() {
 }
 
 #[test]
+fn streaming_truncated_tool_arguments_are_actionable() {
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "c1",
+                    "function": {
+                        "name": "propose_document_create",
+                        "arguments": "{\"path\":\"guion/x.fountain\",\"content\":\"INT. "
+                    }
+                }]}
+            }]
+        })),
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+        })),
+        "data: [DONE]".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::ZERO, None);
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let error = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect_err("truncated tool arguments must fail clearly");
+    assert!(error.to_string().contains("truncó"), "{error}");
+    assert!(
+        error.to_string().contains("propose_document_create"),
+        "{error}"
+    );
+}
+
+#[test]
 fn streaming_accepts_an_empty_final_message_with_finish_reason() {
     // Some providers close a tool-only turn with an empty final message and
     // `finish_reason: stop`; that is a semantic end, not a truncated stream.

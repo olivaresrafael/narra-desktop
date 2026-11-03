@@ -454,6 +454,11 @@ fn context_budget(
     }
 }
 
+/// Output budget for one chat round. A full scene (or a document rewrite)
+/// arrives inside a tool-call argument, so the old 4k budget truncated the
+/// JSON mid-string; 8k leaves room for a scene plus the surrounding answer.
+const CHAT_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
 /// Explicit chat input. A fresh task is built for each user turn; prior
 /// conversation and attachments are inputs, never hidden global state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,7 +702,7 @@ impl ChatTask {
                 } else {
                     format!("{prompt}\n\nContinúa según los resultados de las herramientas.")
                 },
-                max_output_tokens: 4096,
+                max_output_tokens: CHAT_MAX_OUTPUT_TOKENS,
                 tools: specs.clone(),
                 history: history.clone(),
             };
