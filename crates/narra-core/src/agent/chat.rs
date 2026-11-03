@@ -72,7 +72,7 @@ impl ChatMode {
     fn system_prompt(self) -> &'static str {
         match self {
             ChatMode::Plan => {
-                "Eres un colaborador de guion en modo PLAN. Trabajas en solo \
+                "Eres un colaborador de escritura en modo PLAN. Trabajas en solo \
                  lectura: analiza, propone ideas, estructura y preguntas de \
                  continuidad, pero no afirmes haber cambiado archivos. Puedes \
                  usar las herramientas de lectura para listar, buscar y leer \
@@ -81,24 +81,22 @@ impl ChatMode {
                  usuario."
             }
             ChatMode::Build => {
-                "Eres un colaborador de guion en modo BUILD. Puedes usar las \
-                 herramientas de lectura para consultar el proyecto, read_scene \
-                 para leer escenas, propose_scene_edit para proponer una \
-                 reescritura de escena, propose_document_edit para proponer \
-                 una reescritura de la biblia, estructura, notas o \
-                 investigación, y propose_document_create para proponer un \
+                "Eres un colaborador de escritura en modo BUILD. Puedes usar las \
+                 herramientas de lectura para consultar el proyecto, \
+                 propose_document_edit para proponer una reescritura de un \
+                 documento existente y propose_document_create para proponer un \
                  documento nuevo. Una propuesta NO se aplica: queda para revisión \
                  humana. Nunca digas que aplicaste un cambio ni escribas \
                  archivos canónicos. Si falta información, búscala o pídela. \
                  Responde en el idioma del usuario."
             }
             ChatMode::Review => {
-                "Eres un editor de guion en modo REVIEW. Haz una crítica \
-                 concreta de estructura, ritmo, personajes y continuidad. \
-                 Puedes usar las herramientas de lectura para consultar los \
-                 documentos del proyecto; no propongas archivos ni afirmes \
-                 haber modificado nada. Si no encuentras un dato, dilo; no \
-                 inventes canon. Responde en el idioma del usuario."
+                "Eres un editor en modo REVIEW. Haz una crítica concreta de \
+                 estructura, ritmo, voz y continuidad. Puedes usar las \
+                 herramientas de lectura para consultar los documentos del \
+                 proyecto; no propongas archivos ni afirmes haber modificado \
+                 nada. Si no encuentras un dato, dilo; no inventes canon. \
+                 Responde en el idioma del usuario."
             }
         }
     }
@@ -112,11 +110,11 @@ impl ChatMode {
             }
             ChatMode::Build => {
                 "Usa las herramientas de lectura si necesitas consultar el \
-                 proyecto y cita la ruta consultada. Para escenas usa \
-                 propose_scene_edit; para editar bible, structure, notes o \
-                 research usa propose_document_edit; para crear uno nuevo usa \
-                 propose_document_create. La propuesta queda para revisión \
-                 humana."
+                 proyecto y cita la ruta consultada. Para editar un documento \
+                 existente usa propose_document_edit; para crear uno nuevo usa \
+                 propose_document_create. Solo se puede proponer escritura en \
+                 las rutas que declara el tipo de proyecto. La propuesta queda \
+                 para revisión humana."
             }
         }
     }
@@ -127,7 +125,7 @@ impl ChatMode {
 /// reports the truncation in a source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatAttachment {
-    /// Stable kind key: `scene`, `selection`, `document`, `bible`, `note`.
+    /// Stable kind key: `selection`, `document`, `note`.
     pub kind: String,
     /// Human-readable label shown as a chip, e.g. `Escena 4`.
     pub label: String,
@@ -662,7 +660,6 @@ impl ChatTask {
         let mut usage_reported = false;
         let mut policy = match self.mode {
             ChatMode::Build => GrantPolicy::new()
-                .allow("propose_scene_edit")
                 .allow("propose_document_edit")
                 .allow("propose_document_create"),
             ChatMode::Plan | ChatMode::Review => GrantPolicy::new(),
@@ -858,13 +855,6 @@ fn tool_context_source(call: &tools::ToolCall) -> Option<ContextSource> {
             format!("skill: {}", call.arguments.get("id")?.as_str()?),
             "cuerpo de skill cargado".to_string(),
         ),
-        "read_scene" => (
-            format!(
-                "escena {}",
-                call.arguments.get("scene")?.as_u64().unwrap_or(0)
-            ),
-            "escena leída por la herramienta".to_string(),
-        ),
         _ => return None,
     };
     Some(ContextSource {
@@ -931,17 +921,35 @@ mod tests {
             assert!(tools.iter().any(|tool| tool.name == "search_project"));
             assert!(tools.iter().any(|tool| tool.name == "read_document"));
             assert!(tools.iter().any(|tool| tool.name == "load_skill"));
-            assert!(tools.iter().any(|tool| tool.name == "read_scene"));
             assert!(
                 tools
                     .iter()
                     .all(|tool| tool.permission == tools::ToolPermission::ReadOnly)
             );
+            assert!(
+                tools.iter().all(|tool| !tool.name.starts_with("propose_")),
+                "read-only modes never expose proposal tools"
+            );
         }
         let build = ChatMode::Build.tools();
-        assert!(build.iter().any(|tool| tool.name == "read_scene"));
-        assert!(build.iter().any(|tool| tool.name == "propose_scene_edit"));
+        assert!(build.iter().any(|tool| tool.name == "read_document"));
+        assert!(
+            build
+                .iter()
+                .any(|tool| tool.name == "propose_document_edit")
+        );
+        assert!(
+            build
+                .iter()
+                .any(|tool| tool.name == "propose_document_create")
+        );
         assert!(build.iter().any(|tool| tool.name == "apply_proposal"));
+        assert!(
+            build
+                .iter()
+                .all(|tool| tool.name != "read_scene" && tool.name != "propose_scene_edit"),
+            "scene-specific tools are retired: the type package declares the format"
+        );
         for mode in ChatMode::ALL {
             assert_eq!(ChatMode::parse(mode.key()), Some(mode));
         }
@@ -1190,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_can_read_a_scene_but_never_applies_a_proposal() {
+    fn build_chat_can_read_a_document_but_never_applies_a_proposal() {
         let root = project();
         fs::write(
             root.join("screenplay/main.fountain"),
@@ -1203,8 +1211,8 @@ mod tests {
                 model: "mock".to_string(),
                 tool_calls: vec![crate::agent::ToolCall {
                     id: "read-1".to_string(),
-                    name: "read_scene".to_string(),
-                    arguments: json!({"scene": 1}),
+                    name: "read_document".to_string(),
+                    arguments: json!({"path": "screenplay/main.fountain"}),
                 }],
                 input_tokens: None,
                 output_tokens: None,
@@ -1499,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_stages_a_proposal_but_leaves_the_screenplay_untouched() {
+    fn build_chat_stages_a_screenplay_proposal_but_leaves_the_file_untouched() {
         let root = project();
         let screenplay = "INT. CASA - DÍA\n\nMarta entra.\n";
         fs::write(root.join("screenplay/main.fountain"), screenplay).expect("screenplay");
@@ -1509,11 +1517,11 @@ mod tests {
                 model: "mock".to_string(),
                 tool_calls: vec![crate::agent::ToolCall {
                     id: "propose-1".to_string(),
-                    name: "propose_scene_edit".to_string(),
+                    name: "propose_document_edit".to_string(),
                     arguments: json!({
-                        "scene": 1,
+                        "path": "screenplay/main.fountain",
                         "instruction": "haz que salga",
-                        "rewritten_scene": "INT. CASA - DÍA\n\nMarta sale.\n"
+                        "rewritten_document": "INT. CASA - DÍA\n\nMarta sale.\n"
                     }),
                 }],
                 input_tokens: None,

@@ -68,9 +68,9 @@ fn text_round(model: &str, text: &str) -> ModelResponse {
 
 fn rewrite_arguments() -> serde_json::Value {
     serde_json::json!({
-        "scene": 1,
+        "path": "screenplay/main.fountain",
         "instruction": "haz el diálogo más tenso",
-        "rewritten_scene": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas."
+        "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
     })
 }
 
@@ -80,23 +80,23 @@ fn granted_loop_reads_and_stages_a_proposal_without_touching_canon() {
     let canon_before =
         fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
 
-    // Round 1: request read_scene. Round 2: propose. Round 3: final text.
+    // Round 1: read a document. Round 2: propose. Round 3: final text.
     let adapter = MockAdapter::scripted(vec![
         tool_round(
             "mock-1",
             "call-1",
-            "read_scene",
-            serde_json::json!({"scene": 1}),
+            "read_document",
+            serde_json::json!({"path": "screenplay/main.fountain"}),
         ),
         tool_round(
             "mock-1",
             "call-2",
-            "propose_scene_edit",
+            "propose_document_edit",
             rewrite_arguments(),
         ),
         text_round("mock-1", "Listo: leí la escena y dejé una propuesta."),
     ]);
-    let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+    let mut policy = GrantPolicy::new().allow("propose_document_edit");
     let mut events = Vec::new();
     let output = ToolLoopTask::new(root.to_str().expect("utf8"), "haz el diálogo más tenso")
         .run(&adapter, &mut policy, &options(), |e| events.push(e))
@@ -108,8 +108,8 @@ fn granted_loop_reads_and_stages_a_proposal_without_touching_canon() {
     // Audit: two calls, both allowed.
     let tools = output.data["tools"].as_array().expect("audit array");
     assert_eq!(tools.len(), 2, "audit: {tools:?}");
-    assert_eq!(tools[0]["tool"], "read_scene");
-    assert_eq!(tools[1]["tool"], "propose_scene_edit");
+    assert_eq!(tools[0]["tool"], "read_document");
+    assert_eq!(tools[1]["tool"], "propose_document_edit");
     assert!(tools.iter().all(|entry| entry["decision"] == "Allow"));
     let ToolOutcome::ProposalCreated { .. } = outcome_of(&tools[1]) else {
         panic!("proposal expected: {}", tools[1]);
@@ -147,7 +147,7 @@ fn denied_write_is_visible_in_audit_and_canon_survives() {
         tool_round(
             "mock-1",
             "call-1",
-            "propose_scene_edit",
+            "propose_document_edit",
             rewrite_arguments(),
         ),
         text_round("mock-1", "No me permitieron editar; lo dejo indicado."),
@@ -205,7 +205,7 @@ fn denied_write_is_visible_in_audit_and_canon_survives() {
 fn destructive_apply_is_denied_even_when_writes_are_granted() {
     let root = sample_project();
     // Stage a proposal first (as a prior granted run would have).
-    let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+    let mut policy = GrantPolicy::new().allow("propose_document_edit");
     let mut executor = narra_core::agent::tools::ToolExecutor::new(Path::new(&root));
     let origin = narra_core::agent::proposal::Origin {
         task: "tool_loop".to_string(),
@@ -216,7 +216,7 @@ fn destructive_apply_is_denied_even_when_writes_are_granted() {
     let created = executor.execute(
         &narra_core::agent::ToolCall {
             id: "c0".to_string(),
-            name: "propose_scene_edit".to_string(),
+            name: "propose_document_edit".to_string(),
             arguments: rewrite_arguments(),
         },
         &mut policy,
@@ -274,7 +274,7 @@ fn explicit_destructive_grant_applies_in_the_loop() {
         tool_round(
             "mock-1",
             "call-1",
-            "propose_scene_edit",
+            "propose_document_edit",
             rewrite_arguments(),
         ),
         // The model cannot know the id it just created... the loop feeds it
@@ -283,7 +283,7 @@ fn explicit_destructive_grant_applies_in_the_loop() {
         text_round("mock-1", "Propuesta lista para revisión."),
     ]);
     let mut policy = GrantPolicy::new()
-        .allow("propose_scene_edit")
+        .allow("propose_document_edit")
         .allow_destructive("apply_proposal");
     let output = ToolLoopTask::new(root.to_str().expect("utf8"), "haz el diálogo más tenso")
         .run(&adapter, &mut policy, &options(), |_| {})
@@ -327,8 +327,8 @@ fn loop_honors_cancellation_between_rounds() {
         tool_round(
             "mock-1",
             "call-1",
-            "read_scene",
-            serde_json::json!({"scene": 1}),
+            "read_document",
+            serde_json::json!({"path": "screenplay/main.fountain"}),
         ),
         text_round("mock-1", "nunca llegaré"),
     ]);
@@ -349,7 +349,7 @@ fn loop_honors_cancellation_between_rounds() {
 #[test]
 fn tool_specs_declare_permissions_and_schemas() {
     let specs: Vec<ToolSpec> = narra_core::agent::tools::tool_specs();
-    assert_eq!(specs.len(), 9);
+    assert_eq!(specs.len(), 7);
     for spec in &specs {
         assert_eq!(spec.parameters["type"], "object", "{}", spec.name);
         assert!(!spec.description.is_empty());
@@ -359,7 +359,6 @@ fn tool_specs_declare_permissions_and_schemas() {
         "search_project",
         "read_document",
         "load_skill",
-        "read_scene",
     ] {
         let spec = specs
             .iter()

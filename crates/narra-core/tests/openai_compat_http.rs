@@ -833,8 +833,8 @@ fn spawn_tool_server(received: std::sync::Arc<std::sync::Mutex<String>>) -> Stri
                             "id": "call_abc",
                             "type": "function",
                             "function": {
-                                "name": "read_scene",
-                                "arguments": "{\"scene\": 1}"
+                                "name": "read_document",
+                                "arguments": "{\"path\": \"screenplay/main.fountain\"}"
                             }
                         }]
                     },
@@ -868,7 +868,7 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
         prompt: "prompt".to_string(),
         max_output_tokens: 100,
         tools: vec![ToolSpec {
-            name: "read_scene".to_string(),
+            name: "read_document".to_string(),
             description: "lee una escena".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -882,8 +882,8 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
                 content: String::new(),
                 tool_calls: vec![ToolCall {
                     id: "call_prev".to_string(),
-                    name: "read_scene".to_string(),
-                    arguments: serde_json::json!({"scene": 2}),
+                    name: "read_document".to_string(),
+                    arguments: serde_json::json!({"path": "screenplay/main.fountain"}),
                 }],
                 tool_call_id: None,
                 tool_name: None,
@@ -893,7 +893,7 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
                 content: "INT. CALLE - DÍA".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_prev".to_string()),
-                tool_name: Some("read_scene".to_string()),
+                tool_name: Some("read_document".to_string()),
             },
         ],
     };
@@ -905,11 +905,11 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
     let sent: serde_json::Value =
         serde_json::from_str(&received.lock().expect("lock")).expect("valid JSON body");
     assert_eq!(sent["tools"][0]["type"], "function", "{}", sent["tools"]);
-    assert_eq!(sent["tools"][0]["function"]["name"], "read_scene");
+    assert_eq!(sent["tools"][0]["function"]["name"], "read_document");
     assert_eq!(sent["tools"][0]["function"]["parameters"]["type"], "object");
     assert_eq!(
         sent["messages"][2]["tool_calls"][0]["function"]["arguments"],
-        "{\"scene\":2}"
+        "{\"path\":\"screenplay/main.fountain\"}"
     );
     assert_eq!(sent["messages"][3]["role"], "tool");
     assert_eq!(sent["messages"][3]["tool_call_id"], "call_prev");
@@ -918,10 +918,10 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
     // Incoming: arguments string parsed into a value.
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].id, "call_abc");
-    assert_eq!(response.tool_calls[0].name, "read_scene");
+    assert_eq!(response.tool_calls[0].name, "read_document");
     assert_eq!(
         response.tool_calls[0].arguments,
-        serde_json::json!({"scene": 1})
+        serde_json::json!({"path": "screenplay/main.fountain"})
     );
     assert!(response.text.is_empty(), "tool round has no final text");
 }
@@ -962,7 +962,7 @@ fn malformed_tool_arguments_are_an_error_not_a_guess() {
                 "tool_calls": [{
                     "id": "call_bad",
                     "type": "function",
-                    "function": {"name": "read_scene", "arguments": "esto no es json"}
+                    "function": {"name": "read_document", "arguments": "esto no es json"}
                 }]
             }
         }]

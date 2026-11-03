@@ -19,6 +19,12 @@
 //! Execution is sandboxed to the project: every tool reads or writes through
 //! boundary-checked document IO (no path traversal, no writes outside
 //! `<project>/.narra/` + the reviewed canonical apply).
+//!
+//! Which narrative folders may be proposed for writing is not decided here:
+//! the active project type's package declares `write_roots` (path +
+//! allowed extensions) and this executor only enforces them (D-062). The
+//! core never names story folders itself, and a package can only narrow the
+//! sandbox, never widen it.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -28,21 +34,11 @@ use serde_json::{Value, json};
 
 use super::proposal::{self, FileProposal, Origin};
 use super::skill::Skill;
-use crate::fountain;
 
 /// Maximum characters returned by `read_document` in one call.
 const READ_DOCUMENT_MAX_CHARS: usize = 8_000;
 /// Maximum rewritten document size accepted by `propose_document_edit`.
 const MAX_DOCUMENT_REWRITE_BYTES: usize = 128 * 1024;
-
-/// Documents `propose_document_edit` may target. The screenplay keeps its
-/// scene-level tool; configuration, reviews and hidden state stay out.
-fn is_document_proposal_path(path: &str) -> bool {
-    is_tool_document_path(path)
-        && ["bible/", "structure/", "notes/", "research/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
-}
 
 /// A document the read-only tools may open: project-relative, non-hidden,
 /// narrative text only. The manifest, agent config and coding-agent
@@ -314,41 +310,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             permission: ToolPermission::ReadOnly,
         },
         ToolSpec {
-            name: "read_scene".to_string(),
-            description: "Devuelve el texto de una escena del guion principal \
-                          (1-based, en orden del archivo)."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {"scene": {"type": "integer", "minimum": 1}},
-                "required": ["scene"]
-            }),
-            permission: ToolPermission::ReadOnly,
-        },
-        ToolSpec {
-            name: "propose_scene_edit".to_string(),
-            description: "Propone una reescritura de una escena. La \
-                          modificación NO se aplica: se guarda como propuesta \
-                          para revisión humana."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "scene": {"type": "integer", "minimum": 1},
-                    "instruction": {"type": "string"},
-                    "rewritten_scene": {"type": "string"}
-                },
-                "required": ["scene", "instruction", "rewritten_scene"]
-            }),
-            permission: ToolPermission::ProposeWrite,
-        },
-        ToolSpec {
             name: "propose_document_edit".to_string(),
-            description: "Propone una reescritura completa de un documento de \
-                          la biblia, estructura, notas o investigación. La \
-                          modificación NO se aplica: queda como propuesta con \
-                          diff para revisión humana. No sirve para el guion; \
-                          usa propose_scene_edit para escenas."
+            description: "Propone una reescritura completa de un documento \
+                          del proyecto dentro de las raíces de escritura que \
+                          declara el tipo de proyecto. La modificación NO se \
+                          aplica: queda como propuesta con diff para \
+                          revisión humana."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -363,10 +330,11 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "propose_document_create".to_string(),
-            description: "Propone crear un documento nuevo de la biblia, \
-                          estructura, notas o investigación. No escribe nada: \
-                          la creación queda como propuesta para revisión \
-                          humana y falla si el archivo ya existe."
+            description: "Propone crear un documento nuevo dentro de las \
+                          raíces de escritura que declara el tipo de \
+                          proyecto. No escribe nada: la creación queda como \
+                          propuesta para revisión humana y falla si el \
+                          archivo ya existe."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -491,8 +459,6 @@ impl<'a> ToolExecutor<'a> {
             "search_project" => self.search_project(call),
             "read_document" => self.read_document(call),
             "load_skill" => self.load_skill(call),
-            "read_scene" => self.read_scene(call),
-            "propose_scene_edit" => self.propose_scene_edit(call, origin),
             "propose_document_edit" => self.propose_document_edit(call, origin),
             "propose_document_create" => self.propose_document_create(call, origin),
             "apply_proposal" => self.apply_proposal(call),
@@ -699,112 +665,60 @@ impl<'a> ToolExecutor<'a> {
         ))
     }
 
-    /// Read-only: extract one scene, exactly like the context retrieval the
-    /// `scene_edit` task shows to the user.
-    fn read_scene(&self, call: &ToolCall) -> ToolOutcome {
-        let scene_number = match call.arguments.get("scene").and_then(Value::as_u64) {
-            Some(n) if n >= 1 => n as usize,
-            _ => {
-                return ToolOutcome::Failed {
-                    message: "argumento «scene» ausente o inválido (entero ≥ 1)".to_string(),
-                };
-            }
-        };
-        match self.scene_text(scene_number) {
-            Ok(text) => ToolOutcome::Text(text),
-            Err(message) => ToolOutcome::Failed { message },
-        }
+    /// The write roots the active project type declares. Resolved fresh on
+    /// every proposal, so a type/package change takes effect immediately.
+    /// The core only enforces what the package declares (D-062); when no
+    /// package resolves, nothing is writable.
+    fn write_roots(&self) -> Result<Vec<crate::project_type::WriteRoot>, String> {
+        let project = crate::project::open_project(self.root).map_err(|error| error.to_string())?;
+        let type_id = project.manifest().project_type_id.clone();
+        crate::project_type::resolve(project.root(), &type_id)
+            .map(|package| package.write_roots)
+            .ok_or_else(|| {
+                format!(
+                    "el tipo de proyecto «{type_id}» no resuelve un paquete con raíces \
+                     de escritura"
+                )
+            })
     }
 
-    /// Propose-write: stages a [`FileProposal`] from the model's rewritten
-    /// text. Canonical files are untouched; the record is reviewable and
-    /// renewable (`SceneEditTask::from_proposal` round-trips).
-    fn propose_scene_edit(&self, call: &ToolCall, origin: &Origin) -> ToolOutcome {
-        let Some(scene_number) = call.arguments.get("scene").and_then(Value::as_u64) else {
-            return ToolOutcome::Failed {
-                message: "argumento «scene» ausente o inválido (entero ≥ 1)".to_string(),
-            };
-        };
-        let scene_number = scene_number as usize;
-        let Some(instruction) = call.arguments.get("instruction").and_then(Value::as_str) else {
-            return ToolOutcome::Failed {
-                message: "argumento «instruction» ausente".to_string(),
-            };
-        };
-        let Some(rewritten) = call
-            .arguments
-            .get("rewritten_scene")
-            .and_then(Value::as_str)
-        else {
-            return ToolOutcome::Failed {
-                message: "argumento «rewritten_scene» ausente".to_string(),
-            };
-        };
-        if instruction.trim().is_empty() {
-            return ToolOutcome::Failed {
-                message: "la instrucción no puede estar vacía".to_string(),
-            };
+    /// Whether `path` may be targeted by a write proposal: a readable
+    /// project document inside one declared write root, with an extension
+    /// that root allows. Configuration and hidden files stay out whatever a
+    /// package says — a package can only narrow the sandbox, never widen it.
+    fn document_proposal_path(&self, path: &str) -> Result<(), String> {
+        if !is_tool_document_path(path) {
+            return Err(format!(
+                "«{path}» no es un documento del proyecto escribible"
+            ));
         }
-
-        // Load base content with the same boundary-checked IO the task uses.
-        let project = match crate::project::open_project(self.root) {
-            Ok(project) => project,
-            Err(error) => {
-                return ToolOutcome::Failed {
-                    message: error.to_string(),
-                };
-            }
-        };
-        let screenplay_path = project.manifest().default_screenplay_path.clone();
-        let base = match project.read_document(&screenplay_path) {
-            Ok(base) => base,
-            Err(error) => {
-                return ToolOutcome::Failed {
-                    message: error.to_string(),
-                };
-            }
-        };
-        let region = match scene_region(&base, scene_number) {
-            Ok(region) => region,
-            Err(message) => {
-                return ToolOutcome::Failed { message };
-            }
-        };
-        // The rewritten text replaces the trimmed scene region, mirroring
-        // `SceneEditTask`: the blank separator stays outside the region.
-        let proposed = rewrite_region(&base, &region, rewritten);
-        let origin = Origin {
-            task: "tool_loop".to_string(),
-            adapter: origin.adapter.clone(),
-            model: origin.model.clone(),
-            task_input: json!({
-                "scene_number": scene_number,
-                "instruction": instruction,
-            }),
-        };
-        match FileProposal::new(
-            screenplay_path.clone(),
-            &base,
-            &proposed,
-            instruction,
-            origin,
-            head_oid(self.root),
-        ) {
-            Ok(record) => {
-                let hunks = record.hunks.len();
-                let target = record.target.clone();
-                let id = record.id.clone();
-                match proposal::save(self.root, &record) {
-                    Ok(()) => ToolOutcome::ProposalCreated { id, target, hunks },
-                    Err(error) => ToolOutcome::Failed {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Err(error) => ToolOutcome::Failed {
-                message: error.to_string(),
-            },
+        let roots = self.write_roots()?;
+        if roots.is_empty() {
+            return Err(
+                "el tipo de proyecto no declara raíces de escritura: nada se puede \
+                 proponer escribir"
+                    .to_string(),
+            );
         }
+        let allowed = roots.iter().any(|root| {
+            (path == root.path || path.starts_with(&format!("{}/", root.path)))
+                && root
+                    .extensions
+                    .iter()
+                    .any(|extension| path.ends_with(extension))
+        });
+        if allowed {
+            return Ok(());
+        }
+        let declared = roots
+            .iter()
+            .map(|root| root.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "«{path}» está fuera de las raíces de escritura que declara el tipo de \
+             proyecto ({declared})"
+        ))
     }
 
     /// Propose-write: stage the creation of a new narrative document. The
@@ -815,13 +729,8 @@ impl<'a> ToolExecutor<'a> {
                 message: "argumento «path» ausente".to_string(),
             };
         };
-        if !is_document_proposal_path(path) {
-            return ToolOutcome::Failed {
-                message: format!(
-                    "«{path}» no es un documento creable de la biblia, \
-                     estructura, notas o investigación"
-                ),
-            };
+        if let Err(detail) = self.document_proposal_path(path) {
+            return ToolOutcome::Failed { message: detail };
         }
         let Some(instruction) = call.arguments.get("instruction").and_then(Value::as_str) else {
             return ToolOutcome::Failed {
@@ -905,13 +814,8 @@ impl<'a> ToolExecutor<'a> {
                 message: "argumento «path» ausente".to_string(),
             };
         };
-        if !is_document_proposal_path(path) {
-            return ToolOutcome::Failed {
-                message: format!(
-                    "«{path}» no es un documento editable de la biblia, \
-                     estructura, notas o investigación"
-                ),
-            };
+        if let Err(detail) = self.document_proposal_path(path) {
+            return ToolOutcome::Failed { message: detail };
         }
         let Some(instruction) = call.arguments.get("instruction").and_then(Value::as_str) else {
             return ToolOutcome::Failed {
@@ -1009,21 +913,6 @@ impl<'a> ToolExecutor<'a> {
             },
         }
     }
-
-    fn scene_text(&self, scene_number: usize) -> Result<String, String> {
-        let project = crate::project::open_project(self.root).map_err(|error| error.to_string())?;
-        let screenplay_path = project.manifest().default_screenplay_path.clone();
-        let base = project
-            .read_document(&screenplay_path)
-            .map_err(|error| error.to_string())?;
-        let region = scene_region(&base, scene_number)?;
-        Ok(base
-            .lines()
-            .skip(region.start)
-            .take(region.end - region.start)
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
 }
 
 /// Git HEAD oid when the project is a repository — provenance only, same
@@ -1036,59 +925,6 @@ fn head_oid(root: &Path) -> Option<String> {
         .ok()?
         .first()
         .map(|commit| commit.id.clone())
-}
-
-/// 0-based half-open line region of one scene, excluding the blank
-/// separator that precedes the next heading (same rule as `SceneEditTask`).
-struct SceneRegion {
-    start: usize,
-    end: usize,
-}
-
-fn scene_region(base: &str, scene_number: usize) -> Result<SceneRegion, String> {
-    let scenes: Vec<usize> = fountain::parse(base)
-        .iter()
-        .filter(|element| element.kind == fountain::ElementKind::SceneHeading)
-        .map(|element| element.line_number)
-        .collect();
-    if scenes.is_empty() {
-        return Err("el guion no tiene escenas".to_string());
-    }
-    if scene_number > scenes.len() {
-        return Err(format!(
-            "la escena {scene_number} no existe: el guion tiene {} escenas",
-            scenes.len()
-        ));
-    }
-    let start = scenes[scene_number - 1] - 1;
-    let end = scenes
-        .get(scene_number)
-        .map(|line| line - 1)
-        .unwrap_or(base.lines().count());
-    let mut region_end = end;
-    let lines: Vec<&str> = base.lines().collect();
-    while region_end > start && lines[region_end - 1].is_empty() {
-        region_end -= 1;
-    }
-    Ok(SceneRegion {
-        start,
-        end: region_end,
-    })
-}
-
-/// Replace a scene region with the rewritten text, keeping the blank
-/// separator before the next scene untouched.
-fn rewrite_region(base: &str, region: &SceneRegion, rewritten: &str) -> String {
-    let lines: Vec<&str> = base.lines().collect();
-    let mut out: Vec<&str> = lines[..region.start].to_vec();
-    // Trim the model's answer exactly like `SceneEditTask` does.
-    out.extend(rewritten.trim().lines());
-    out.extend_from_slice(&lines[region.end..]);
-    let mut text = out.join("\n");
-    if base.ends_with('\n') {
-        text.push('\n');
-    }
-    text
 }
 
 #[cfg(test)]
@@ -1132,12 +968,16 @@ mod tests {
     }
 
     #[test]
-    fn read_scene_is_allowed_by_default() {
+    fn read_document_is_allowed_by_default() {
         let root = sample_project();
         let mut executor = ToolExecutor::new(&root);
         let mut policy = GrantPolicy::new();
         let result = executor.execute(
-            &call("c1", "read_scene", json!({"scene": 1})),
+            &call(
+                "c1",
+                "read_document",
+                json!({"path": "screenplay/main.fountain"}),
+            ),
             &mut policy,
             &origin(),
         );
@@ -1365,7 +1205,7 @@ mod tests {
         );
         assert!(matches!(asked.decision, PermissionDecision::Ask(_)));
         let mut granted = GrantPolicy::new().allow("propose_document_create");
-        for path in ["screenplay/new.fountain", "project.yaml", "bible/empty.md"] {
+        for path in ["assets/new.md", "project.yaml", "bible/empty.md"] {
             let content = if path == "bible/empty.md" { "" } else { "x" };
             let result = executor.execute(
                 &call(
@@ -1381,10 +1221,27 @@ mod tests {
                 "{path}"
             );
         }
+
+        // A `.fountain` document is writable when the package declares the
+        // screenplay root with that extension (built-in screenplay types do).
+        let allowed = executor.execute(
+            &call(
+                "new-3",
+                "propose_document_create",
+                json!({
+                    "path": "screenplay/acto2.fountain",
+                    "instruction": "crea el segundo acto",
+                    "content": "INT. CALLE - DÍA\n\nMARCOS\nHace sol.\n"
+                }),
+            ),
+            &mut granted,
+            &origin(),
+        );
+        assert!(allowed.succeeded(), "{:?}", allowed.outcome);
     }
 
     #[test]
-    fn propose_document_edit_is_ask_without_grant_and_rejects_non_bible_paths() {
+    fn propose_document_edit_is_ask_without_grant_and_rejects_paths_outside_write_roots() {
         let root = sample_project();
         std::fs::create_dir_all(root.join("bible")).expect("bible");
         std::fs::write(root.join("bible/world.md"), "# Mundo\n").expect("world");
@@ -1408,7 +1265,7 @@ mod tests {
 
         let mut granted = GrantPolicy::new().allow("propose_document_edit");
         for path in [
-            "screenplay/main.fountain",
+            "assets/world.md",
             "project.yaml",
             ".narra/instructions.md",
             "bible/missing.md",
@@ -1432,6 +1289,23 @@ mod tests {
                 result.outcome
             );
         }
+
+        // The screenplay is a declared write root for built-in screenplay
+        // types, so the generic tool can propose it without a scene tool.
+        let screenplay = executor.execute(
+            &call(
+                "doc-3",
+                "propose_document_edit",
+                json!({
+                    "path": "screenplay/main.fountain",
+                    "instruction": "cambia el final",
+                    "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
+                }),
+            ),
+            &mut granted,
+            &origin(),
+        );
+        assert!(screenplay.succeeded(), "{:?}", screenplay.outcome);
     }
 
     #[test]
@@ -1442,11 +1316,11 @@ mod tests {
         let result = executor.execute(
             &call(
                 "c1",
-                "propose_scene_edit",
+                "propose_document_edit",
                 json!({
-                    "scene": 1,
+                    "path": "screenplay/main.fountain",
                     "instruction": "más tensión",
-                    "rewritten_scene": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas."
+                    "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
             ),
             &mut policy,
@@ -1468,15 +1342,15 @@ mod tests {
         let canon_before =
             std::fs::read_to_string(root.join("screenplay/main.fountain")).expect("read");
         let mut executor = ToolExecutor::new(&root);
-        let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+        let mut policy = GrantPolicy::new().allow("propose_document_edit");
         let result = executor.execute(
             &call(
                 "c1",
-                "propose_scene_edit",
+                "propose_document_edit",
                 json!({
-                    "scene": 1,
+                    "path": "screenplay/main.fountain",
                     "instruction": "más tensión",
-                    "rewritten_scene": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas."
+                    "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
             ),
             &mut policy,
@@ -1506,7 +1380,7 @@ mod tests {
         // Even with the write tool granted, apply must be denied unless the
         // *destructive* grant names it.
         let mut policy = GrantPolicy::new()
-            .allow("propose_scene_edit")
+            .allow("propose_document_edit")
             .allow("apply_proposal"); // wrong bucket on purpose
         let mut executor = ToolExecutor::new(&root);
         let result = executor.execute(
@@ -1527,18 +1401,18 @@ mod tests {
         let root = sample_project();
         let mut executor = ToolExecutor::new(&root);
         let mut policy = GrantPolicy::new()
-            .allow("propose_scene_edit")
+            .allow("propose_document_edit")
             .allow_destructive("apply_proposal");
 
         // Stage a proposal, then apply it with the explicit grant.
         let created = executor.execute(
             &call(
                 "c1",
-                "propose_scene_edit",
+                "propose_document_edit",
                 json!({
-                    "scene": 1,
+                    "path": "screenplay/main.fountain",
                     "instruction": "más tensión",
-                    "rewritten_scene": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas."
+                    "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
             ),
             &mut policy,
@@ -1590,38 +1464,45 @@ mod tests {
             unreachable!()
         };
         assert!(reason.contains("desconocida"), "{reason}");
-        assert!(reason.contains("read_scene"), "lists available: {reason}");
+        assert!(
+            reason.contains("read_document"),
+            "lists available: {reason}"
+        );
     }
 
     #[test]
     fn invalid_arguments_fail_without_side_effects() {
         let root = sample_project();
         let mut executor = ToolExecutor::new(&root);
-        let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+        let mut policy = GrantPolicy::new().allow("propose_document_edit");
 
-        // Missing rewritten_scene.
+        // Missing rewritten_document.
         let missing = executor.execute(
             &call(
                 "c1",
-                "propose_scene_edit",
-                json!({"scene": 1, "instruction": "x"}),
+                "propose_document_edit",
+                json!({"path": "screenplay/main.fountain", "instruction": "x"}),
             ),
             &mut policy,
             &origin(),
         );
         assert!(matches!(missing.outcome, ToolOutcome::Failed { .. }));
 
-        // Scene out of range.
-        let out_of_range = executor.execute(
+        // A path outside the declared write roots.
+        let outside = executor.execute(
             &call(
                 "c2",
-                "propose_scene_edit",
-                json!({"scene": 99, "instruction": "x", "rewritten_scene": "INT. A"}),
+                "propose_document_edit",
+                json!({
+                    "path": "assets/notas.md",
+                    "instruction": "x",
+                    "rewritten_document": "y"
+                }),
             ),
             &mut policy,
             &origin(),
         );
-        assert!(matches!(out_of_range.outcome, ToolOutcome::Failed { .. }));
+        assert!(matches!(outside.outcome, ToolOutcome::Failed { .. }));
 
         assert!(proposal::list(&root).expect("list").is_empty());
     }
@@ -1644,23 +1525,5 @@ mod tests {
         // Serializable for the task output.
         let rendered = serde_json::to_value(&denied).expect("serde");
         assert_eq!(rendered["call_id"], "c1");
-    }
-
-    #[test]
-    fn scene_region_excludes_the_separator_before_the_next_heading() {
-        let base = "INT. A\n\nTEXTO\n\nINT. B\n\nOTRO\n";
-        let region = scene_region(base, 1).expect("region");
-        assert_eq!(region.start, 0);
-        // Region ends at the last non-blank line of scene 1 (line 3), so the
-        // blank separator before INT. B stays outside the replaced range.
-        assert_eq!(region.end, 3, "{}", base.lines().count());
-    }
-
-    #[test]
-    fn rewrite_keeps_the_separator_and_trailing_newline() {
-        let base = "INT. A\n\nTEXTO\n\nINT. B\n\nOTRO\n";
-        let region = scene_region(base, 1).expect("region");
-        let rewritten = rewrite_region(base, &region, "  INT. A\n\nNUEVO  ");
-        assert_eq!(rewritten, "INT. A\n\nNUEVO\n\nINT. B\n\nOTRO\n");
     }
 }

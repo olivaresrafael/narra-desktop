@@ -301,7 +301,7 @@ mod tests {
         ToolCall {
             id: "call-1".to_string(),
             name: name.to_string(),
-            arguments: json!({"scene": 1}),
+            arguments: json!({"path": "screenplay/main.fountain"}),
         }
     }
 
@@ -315,12 +315,12 @@ mod tests {
     fn default_policy_grants_only_read_only() {
         let mut policy = GrantPolicy::new();
         assert_eq!(
-            policy.decide(&call("read_scene"), tools::ToolPermission::ReadOnly),
+            policy.decide(&call("read_document"), tools::ToolPermission::ReadOnly),
             PermissionDecision::Allow
         );
         assert!(matches!(
             policy.decide(
-                &call("propose_scene_edit"),
+                &call("propose_document_edit"),
                 tools::ToolPermission::ProposeWrite
             ),
             PermissionDecision::Ask(_)
@@ -333,10 +333,10 @@ mod tests {
 
     #[test]
     fn write_grant_does_not_imply_destructive() {
-        let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+        let mut policy = GrantPolicy::new().allow("propose_document_edit");
         assert_eq!(
             policy.decide(
-                &call("propose_scene_edit"),
+                &call("propose_document_edit"),
                 tools::ToolPermission::ProposeWrite
             ),
             PermissionDecision::Allow

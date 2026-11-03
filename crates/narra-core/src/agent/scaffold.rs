@@ -40,37 +40,45 @@ pub const MAX_PATH_CHARS: usize = 120;
 /// object instead of returning a parse error.
 const SCAFFOLD_MAX_TOKENS: u32 = 8_000;
 
-/// The only top-level folders a generated file may live in.
-pub const ALLOWED_ROOTS: [&str; 5] = ["bible", "structure", "research", "notes", "screenplay"];
+/// Paths the base project already owns (or app-managed state) that a
+/// generated base must never replace. Narrative paths are not listed here:
+/// the type package's `write_roots` decide them (D-062) and writes are
+/// create-only, so an existing narrative file is never overwritten.
+pub const RESERVED_PATHS: [&str; 4] = ["project.yaml", "AGENTS.md", "agents.yaml", ".gitignore"];
 
-/// Paths the base project already owns (or app-managed state) and that the
-/// model must never try to replace.
-pub const RESERVED_PATHS: [&str; 7] = [
-    "project.yaml",
-    "AGENTS.md",
-    "agents.yaml",
-    ".gitignore",
-    "screenplay/main.fountain",
-    "notes/decisions.md",
-    "notes/open-questions.md",
-];
+const BASE_SYSTEM: &str = "Eres un arquitecto de proyectos de escritura. \
+     Propones una base de trabajo en archivos de texto para que una persona \
+     empiece a escribir. Respondes SIEMPRE con un único objeto JSON válido, \
+     sin texto fuera del JSON.";
 
-const BASE_SYSTEM: &str = "Eres un arquitecto de proyectos de guion. \
-     Propones una base de trabajo en archivos Markdown/Fountain para que una \
-     persona empiece a escribir. Respondes SIEMPRE con un único objeto JSON \
-     válido, sin texto fuera del JSON.";
-
-const RULES: &str = "Devuelve SOLO un objeto JSON con esta forma:\n\
-{\"files\":[{\"path\":\"bible/premise.md\",\"content\":\"...\"}]}\n\
-- Entre 1 y 12 archivos.\n\
-- Rutas relativas bajo bible/, structure/, research/, notes/ o screenplay/; \
-extensión .md o .fountain.\n\
-- Nunca .narra/, project.yaml, agents.yaml, AGENTS.md, .gitignore, \
-screenplay/main.fountain, notes/decisions.md ni notes/open-questions.md.\n\
-- Contenido en el idioma del proyecto; no inventes datos personales.\n\
-- Sé conciso: prioriza entre 3 y 6 archivos y no repitas contenido.\n\
-- El contenido debe ser una cadena JSON válida: escapa los saltos de línea \
-como \\n y las comillas como \\\".";
+/// Prompt rules built from the type package's write roots: the core never
+/// names story folders or extensions itself (D-062).
+fn rules(roots: &[crate::project_type::WriteRoot]) -> String {
+    let folders = roots
+        .iter()
+        .map(|root| root.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut extensions: Vec<&str> = roots
+        .iter()
+        .flat_map(|root| root.extensions.iter().map(String::as_str))
+        .collect();
+    extensions.sort_unstable();
+    extensions.dedup();
+    let extensions = extensions.join(", ");
+    format!(
+        "Devuelve SOLO un objeto JSON con esta forma:\n\
+         {{\"files\":[{{\"path\":\"carpeta/archivo.ext\",\"content\":\"...\"}}]}}\n\
+         - Entre 1 y 12 archivos.\n\
+         - Rutas relativas bajo estas carpetas del proyecto: {folders}; \
+         extensiones permitidas: {extensions}.\n\
+         - Nunca .narra/, project.yaml, agents.yaml, AGENTS.md ni .gitignore.\n\
+         - Contenido en el idioma del proyecto; no inventes datos personales.\n\
+         - Sé conciso: prioriza entre 3 y 6 archivos y no repitas contenido.\n\
+         - El contenido debe ser una cadena JSON válida: escapa los saltos de línea \
+         como \\n y las comillas como \\\"."
+    )
+}
 
 /// One proposed file. Paths are validated before this type is exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,13 +114,44 @@ pub enum ScaffoldError {
     EmptyFile { path: String },
     #[error("scaffold: could not write `{path}`: {error}")]
     Write { path: String, error: String },
+    #[error("scaffold: the project type declares no write roots; nothing can be generated")]
+    NoWriteRoots,
+}
+
+/// Resolve the write roots of a type package (D-062). Built-ins resolve
+/// without touching the filesystem, so this also works before a new project
+/// directory exists.
+fn write_roots_for_type(
+    project_root: &Path,
+    type_id: &str,
+) -> Result<Vec<crate::project_type::WriteRoot>, ScaffoldError> {
+    let package = crate::project_type::resolve(project_root, type_id).ok_or_else(|| {
+        ScaffoldError::Parse(format!(
+            "the project type `{type_id}` does not resolve a package"
+        ))
+    })?;
+    if package.write_roots.is_empty() {
+        return Err(ScaffoldError::NoWriteRoots);
+    }
+    Ok(package.write_roots)
+}
+
+/// The write roots of an existing project, from its manifest type.
+fn project_write_roots(root: &Path) -> Result<Vec<crate::project_type::WriteRoot>, ScaffoldError> {
+    let project = crate::project::open_project(root)
+        .map_err(|error| ScaffoldError::Parse(error.to_string()))?;
+    let type_id = project.manifest().project_type_id.clone();
+    write_roots_for_type(project.root(), &type_id)
 }
 
 /// Parse the model's strict JSON, tolerating a Markdown fence, surrounding
 /// prose, raw newlines inside strings and trailing commas. Models routinely
 /// return a valid-looking plan with unescaped control characters in long
 /// Markdown bodies; a plain `serde_json` parse would reject the whole plan.
-pub fn parse_plan(text: &str) -> Result<ScaffoldPlan, ScaffoldError> {
+pub fn parse_plan(
+    text: &str,
+    roots: &[crate::project_type::WriteRoot],
+) -> Result<ScaffoldPlan, ScaffoldError> {
     let value = parse_json_object(text)?;
     let object = value
         .as_object()
@@ -154,7 +193,7 @@ pub fn parse_plan(text: &str) -> Result<ScaffoldPlan, ScaffoldError> {
             content: content.to_string(),
         });
     }
-    validate_plan(&plan)?;
+    validate_plan(&plan, roots)?;
     Ok(plan)
 }
 
@@ -292,7 +331,10 @@ fn repair_json_text(text: &str) -> String {
 }
 
 /// Validate a plan without touching the filesystem.
-pub fn validate_plan(plan: &ScaffoldPlan) -> Result<(), ScaffoldError> {
+pub fn validate_plan(
+    plan: &ScaffoldPlan,
+    roots: &[crate::project_type::WriteRoot],
+) -> Result<(), ScaffoldError> {
     if plan.files.is_empty() {
         return Err(ScaffoldError::Empty);
     }
@@ -301,7 +343,7 @@ pub fn validate_plan(plan: &ScaffoldPlan) -> Result<(), ScaffoldError> {
     }
     let mut seen = BTreeSet::new();
     for file in &plan.files {
-        validate_path(&file.path)?;
+        validate_path(&file.path, roots)?;
         if file.content.trim().is_empty() {
             return Err(ScaffoldError::EmptyFile {
                 path: file.path.clone(),
@@ -321,9 +363,14 @@ pub fn validate_plan(plan: &ScaffoldPlan) -> Result<(), ScaffoldError> {
     Ok(())
 }
 
-/// Validate one relative path (D-044 allowlist). `Path::components` rejects
-/// `..`, absolute roots and Windows prefixes before any file is touched.
-pub fn validate_path(path: &str) -> Result<(), ScaffoldError> {
+/// Validate one relative path against the type package's write roots. The
+/// folder and extension allowlists come from the package (D-062), never from
+/// this crate; `Path::components` rejects `..`, absolute roots and Windows
+/// prefixes before any file is touched.
+pub fn validate_path(
+    path: &str,
+    roots: &[crate::project_type::WriteRoot],
+) -> Result<(), ScaffoldError> {
     let invalid = |reason: &str| ScaffoldError::InvalidPath {
         path: path.to_string(),
         reason: reason.to_string(),
@@ -357,14 +404,19 @@ pub fn validate_path(path: &str) -> Result<(), ScaffoldError> {
     }
     if names.len() < 2 {
         return Err(invalid(
-            "the path must name a file inside an allowed folder",
+            "the path must name a file inside a declared write root",
         ));
     }
-    if !ALLOWED_ROOTS.contains(&names[0].as_str()) {
-        return Err(invalid(
-            "the top-level folder must be bible, structure, research, notes or screenplay",
-        ));
-    }
+    let Some(root) = roots.iter().find(|root| root.path == names[0]) else {
+        let declared = roots
+            .iter()
+            .map(|root| root.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(invalid(&format!(
+            "the top-level folder must be one the project type declares ({declared})"
+        )));
+    };
     let file = names.last().expect("length checked above");
     if file.eq_ignore_ascii_case("AGENTS.md")
         || file.eq_ignore_ascii_case("agents.yaml")
@@ -378,8 +430,15 @@ pub fn validate_path(path: &str) -> Result<(), ScaffoldError> {
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("");
-    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("fountain") {
-        return Err(invalid("only .md and .fountain files are allowed"));
+    let allowed_extension = root
+        .extensions
+        .iter()
+        .any(|allowed| extension.eq_ignore_ascii_case(allowed.trim_start_matches('.')));
+    if !allowed_extension {
+        return Err(invalid(&format!(
+            "the extension must be one the project type declares ({})",
+            root.extensions.join(", ")
+        )));
     }
     Ok(())
 }
@@ -388,7 +447,8 @@ pub fn validate_path(path: &str) -> Result<(), ScaffoldError> {
 /// files created earlier in this call are removed and the error names the
 /// failing path. Existing files are never overwritten.
 pub fn write_plan(root: &Path, plan: &ScaffoldPlan) -> Result<(), ScaffoldError> {
-    validate_plan(plan)?;
+    let roots = project_write_roots(root)?;
+    validate_plan(plan, &roots)?;
     let mut created = Vec::new();
     for file in &plan.files {
         match document::create_document(root, &file.path, &file.content) {
@@ -511,8 +571,11 @@ impl ProjectScaffoldTask {
             || BASE_SYSTEM.to_string(),
             |role| role.system_with(BASE_SYSTEM),
         );
+        let roots = write_roots_for_type(Path::new(&self.project_root), self.project_type.as_str())
+            .map_err(|error| AgentError::Adapter(error.to_string()))?;
         let prompt = format!(
-            "{RULES}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n",
+            "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n",
+            rules(&roots),
             self.title.trim(),
             self.type_label
                 .as_deref()
@@ -550,8 +613,8 @@ impl ProjectScaffoldTask {
             model: response.model.clone(),
             output_chars: response.text.chars().count(),
         });
-        let plan =
-            parse_plan(&response.text).map_err(|error| AgentError::Adapter(error.to_string()))?;
+        let plan = parse_plan(&response.text, &roots)
+            .map_err(|error| AgentError::Adapter(error.to_string()))?;
         let files = plan.files.clone();
         let data = json!({
             "plan": plan,
@@ -609,6 +672,20 @@ mod tests {
         )
     }
 
+    /// The built-in screenplay package's declared write roots (D-062).
+    fn feature_roots() -> Vec<crate::project_type::WriteRoot> {
+        crate::project_type::builtin("feature")
+            .expect("feature package")
+            .write_roots
+    }
+
+    /// A temporary directory that is a valid project of the given type.
+    fn project_dir(kind: ProjectType) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::project::create_project(dir.path(), "Proyecto", kind, "es").expect("create project");
+        dir
+    }
+
     fn options() -> TaskOptions {
         TaskOptions {
             timeout: Duration::from_secs(5),
@@ -643,7 +720,7 @@ mod tests {
     fn valid_plan_parses_and_tolerates_a_fence() {
         let text = plan_text("bible/premise.md");
         let fenced = format!("```json\n{text}\n```");
-        let plan = parse_plan(&fenced).expect("valid plan");
+        let plan = parse_plan(&fenced, &feature_roots()).expect("valid plan");
         assert_eq!(plan.files.len(), 1);
         assert_eq!(plan.files[0].path, "bible/premise.md");
     }
@@ -654,18 +731,18 @@ mod tests {
         // of JSON `\n` escapes; the repair must preserve the text.
         let raw =
             "{\"files\":[{\"path\":\"bible/a.md\",\"content\":\"# A\nline with } and { braces\"}]}";
-        let plan = parse_plan(raw).expect("raw newlines");
+        let plan = parse_plan(raw, &feature_roots()).expect("raw newlines");
         assert_eq!(plan.files[0].content, "# A\nline with } and { braces");
 
         // Prose before the real object may contain its own braces or even a
         // different JSON object without `files`.
         let prose = "{\"note\":\"ejemplo\"}. Aquí está el plan {no es JSON}. {\"files\":[{\"path\":\"notes/a.md\",\"content\":\"x\"}]} Gracias.";
-        let plan = parse_plan(prose).expect("prose");
+        let plan = parse_plan(prose, &feature_roots()).expect("prose");
         assert_eq!(plan.files[0].path, "notes/a.md");
 
         // A trailing comma before a closing delimiter is tolerated.
         let trailing = "{\"files\":[{\"path\":\"bible/a.md\",\"content\":\"x\",},],}";
-        let plan = parse_plan(trailing).expect("trailing commas");
+        let plan = parse_plan(trailing, &feature_roots()).expect("trailing commas");
         assert_eq!(plan.files[0].content, "x");
     }
 
@@ -683,7 +760,7 @@ mod tests {
             "assets/logo.md",
             "bible/AGENTS.md",
         ] {
-            let error = parse_plan(&plan_text(path)).expect_err(path);
+            let error = parse_plan(&plan_text(path), &feature_roots()).expect_err(path);
             assert!(
                 matches!(
                     error,
@@ -695,31 +772,48 @@ mod tests {
     }
 
     #[test]
+    fn write_roots_come_from_the_type_package() {
+        let campaign = vec![crate::project_type::WriteRoot {
+            path: "brief".to_string(),
+            extensions: vec![".md".to_string()],
+        }];
+        let plan = parse_plan(&plan_text("brief/premise.md"), &campaign).expect("declared root");
+        assert_eq!(plan.files[0].path, "brief/premise.md");
+
+        let error =
+            parse_plan(&plan_text("bible/premise.md"), &campaign).expect_err("undeclared root");
+        assert!(error.to_string().contains("brief"), "{error}");
+
+        let error = parse_plan(&plan_text("brief/notes.txt"), &campaign).expect_err("extension");
+        assert!(error.to_string().contains(".md"), "{error}");
+    }
+
+    #[test]
     fn rejects_empty_duplicate_oversized_and_too_many_files() {
-        let empty = parse_plan("{\"files\":[]}").expect_err("empty");
+        let empty = parse_plan("{\"files\":[]}", &feature_roots()).expect_err("empty");
         assert!(matches!(empty, ScaffoldError::Empty), "{empty}");
 
         let duplicate = r#"{"files":[{"path":"bible/a.md","content":"a"},{"path":"bible/a.md","content":"b"}]}"#;
-        let error = parse_plan(duplicate).expect_err("duplicate");
+        let error = parse_plan(duplicate, &feature_roots()).expect_err("duplicate");
         assert!(matches!(error, ScaffoldError::Duplicate { .. }), "{error}");
 
         let big = "x".repeat(MAX_FILE_BYTES + 1);
         let oversized =
             format!("{{\"files\":[{{\"path\":\"bible/a.md\",\"content\":\"{big}\"}}]}}");
-        let error = parse_plan(&oversized).expect_err("oversized");
+        let error = parse_plan(&oversized, &feature_roots()).expect_err("oversized");
         assert!(matches!(error, ScaffoldError::TooLarge { .. }), "{error}");
 
         let files: Vec<String> = (0..=MAX_FILES)
             .map(|index| format!("{{\"path\":\"bible/f{index}.md\",\"content\":\"x\"}}"))
             .collect();
         let too_many = format!("{{\"files\":[{}]}}", files.join(","));
-        let error = parse_plan(&too_many).expect_err("too many");
+        let error = parse_plan(&too_many, &feature_roots()).expect_err("too many");
         assert!(matches!(error, ScaffoldError::TooMany), "{error}");
     }
 
     #[test]
     fn write_plan_is_create_only_and_rolls_back() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = project_dir(ProjectType::Feature);
         document::create_document(dir.path(), "bible/existing.md", "keep").expect("existing file");
         let plan = ScaffoldPlan {
             files: vec![
@@ -744,7 +838,7 @@ mod tests {
 
     #[test]
     fn write_plan_creates_the_reviewed_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = project_dir(ProjectType::Feature);
         let plan = ScaffoldPlan {
             files: vec![
                 ScaffoldFile {

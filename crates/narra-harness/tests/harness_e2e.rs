@@ -670,7 +670,7 @@ fn loop_permission_flags_on_other_commands_are_explicit_errors() {
             "brief",
             root.to_str().expect("utf8"),
             "--allow-tool",
-            "read_scene",
+            "read_document",
         ])
         .output()
         .expect("run harness");
