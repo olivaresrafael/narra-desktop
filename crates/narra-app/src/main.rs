@@ -174,7 +174,7 @@ use narra_core::agent::{
     write_plan,
 };
 use narra_core::cancel::CancellationToken;
-use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
+use narra_core::entities::{EntityIndex, Mention, split_by_mentions};
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::git::{Branch, Commit, OpOptions, Repository, WorktreeStatus};
@@ -1471,14 +1471,24 @@ pub(crate) fn shape_line(window: &Window, text: &str) -> ShapedLine {
     )
 }
 
-/// Background tint for an entity category (D-029). Foreground syntax colors
-/// stay untouched, so a character cue still reads as a cue while “Marta” gets
-/// a subtle mention tint.
-fn mention_bg(category: EntityCategory) -> u32 {
-    match category {
-        EntityCategory::Character => theme::mention_character_bg(),
-        EntityCategory::Location => theme::mention_location_bg(),
-        EntityCategory::Object => theme::mention_object_bg(),
+/// Background tint for an entity kind (D-029). Foreground syntax colors stay
+/// untouched, so a character cue still reads as a cue while “Marta” gets a
+/// subtle mention tint. Unknown package kinds pick a stable palette entry.
+fn mention_bg(kind: &str) -> u32 {
+    match kind {
+        "character" => theme::mention_character_bg(),
+        "location" => theme::mention_location_bg(),
+        "object" => theme::mention_object_bg(),
+        other => {
+            let hash = other.bytes().fold(0u32, |acc, byte| {
+                acc.wrapping_mul(31).wrapping_add(byte as u32)
+            });
+            match hash % 3 {
+                0 => theme::mention_character_bg(),
+                1 => theme::mention_location_bg(),
+                _ => theme::mention_object_bg(),
+            }
+        }
     }
 }
 
@@ -1497,8 +1507,10 @@ fn mention_runs(
             len: range.len(),
             font: gpui::font(FONT_FAMILY),
             color: color.into(),
-            background_color: entity
-                .map(|index| rgba(mention_bg(entities.entities()[index].category)).into()),
+            background_color: entity.map(|index| {
+                let entity = &entities.entities()[index];
+                rgba(mention_bg(&entity.kind)).into()
+            }),
             underline: None,
             strikethrough: None,
         })
@@ -8697,6 +8709,7 @@ impl Editor {
             let draft = NewProjectDraft {
                 title,
                 kind,
+                type_id: package.id.clone(),
                 type_label: package.name.clone(),
                 lang,
                 prompt,
@@ -8789,6 +8802,7 @@ impl Editor {
                     draft.prompt.clone(),
                 )
                 .with_type_label(draft.type_label.clone())
+                .with_type_id(draft.type_id.clone())
                 .with_role(role);
                 let options = TaskOptions {
                     timeout: AGENT_TIMEOUT,
@@ -14501,6 +14515,7 @@ impl Editor {
             .with_attachments(attachments)
             .with_project_context(true)
             .with_skills(self.skills.clone())
+            .with_profile(self.profile.clone())
             .with_context_window(context_window);
         let mut settings = self.agent_settings.clone();
         settings.session = Some(format!("narra-chat-{}", self.chat.thread.id));
@@ -18812,7 +18827,7 @@ impl Editor {
                 .find(|mention| a >= mention.start && b <= mention.end)
             {
                 segment = segment.bg(rgba(mention_bg(
-                    self.entities.entities()[mention.entity].category,
+                    &self.entities.entities()[mention.entity].kind,
                 )));
             }
             row = row.child(segment.child(text[a..b].to_string()));
@@ -19009,7 +19024,7 @@ impl Editor {
                 }));
             } else if let Some(mention) = mention_state {
                 segment = segment.bg(rgba(mention_bg(
-                    self.entities.entities()[mention.entity].category,
+                    &self.entities.entities()[mention.entity].kind,
                 )));
             }
             if composing {

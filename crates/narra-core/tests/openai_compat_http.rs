@@ -688,6 +688,28 @@ fn streaming_without_any_content_is_an_error() {
 }
 
 #[test]
+fn streaming_accepts_an_empty_final_message_with_finish_reason() {
+    // Some providers close a tool-only turn with an empty final message and
+    // `finish_reason: stop`; that is a semantic end, not a truncated stream.
+    let events = vec![
+        sse(serde_json::json!({
+            "model": "qwen",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        })),
+        "data: [DONE]".to_string(),
+    ];
+    let base_url = spawn_sse_server(events, Duration::ZERO, None);
+
+    let adapter = stream_adapter(&base_url, Duration::from_secs(5));
+    let token = CancellationToken::new();
+    let response = adapter
+        .complete_streaming(&request("s", "p"), &token, &mut |_| {})
+        .expect("finish_reason ends the stream");
+    assert!(response.text.is_empty());
+    assert!(response.tool_calls.is_empty());
+}
+
+#[test]
 fn streaming_error_status_is_actionable() {
     // Errors are JSON bodies, not streams — even with stream: true.
     let base_url = spawn_mock_server(MockReply {

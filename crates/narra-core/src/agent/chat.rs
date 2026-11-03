@@ -34,6 +34,7 @@ use super::tools::{
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::document;
 use crate::project::open_project;
+use crate::project_type::ProjectProfile;
 
 /// Chat modes exposed by the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -470,6 +471,9 @@ pub struct ChatTask {
     pub skills: Vec<Skill>,
     /// Provider catalog context window for this model, when known.
     pub context_window: Option<u32>,
+    /// Active type package: the prompt tells the model which roots it may
+    /// propose writes into (D-062).
+    pub profile: Option<ProjectProfile>,
 }
 
 impl ChatTask {
@@ -490,6 +494,7 @@ impl ChatTask {
             include_project_context: false,
             skills: Vec::new(),
             context_window: None,
+            profile: None,
         }
     }
 
@@ -510,6 +515,11 @@ impl ChatTask {
 
     pub fn with_skills(mut self, skills: Vec<Skill>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    pub fn with_profile(mut self, profile: ProjectProfile) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -614,13 +624,16 @@ impl ChatTask {
             context,
             self.instruction
         );
-        let system = format!(
+        let mut system = format!(
             "{}\n\nEl manifiesto ya está en el contexto de la tarea. \
              project.yaml, agents.yaml, AGENTS.md y .narra/ son configuración, \
              no documentos narrativos: no intentes leerlos con read_document. \
              Si necesitas rutas, usa list_documents.",
             self.mode.system_prompt()
         );
+        if let Some(profile) = &self.profile {
+            system.push_str(&profile_brief(profile));
+        }
 
         self.run_with_tools(
             root,
@@ -808,11 +821,10 @@ impl ChatTask {
         if options.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let final_text = final_text.unwrap_or_else(|| {
-            "El agente agotó las rondas sin una respuesta final. Revisa las \
-             propuestas creadas o reformula la petición."
-                .to_string()
-        });
+        let final_text = match final_text {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => summarize_run(&proposals, &audit),
+        };
         emit(TaskEvent::Completed {
             summary: final_text.clone(),
         });
@@ -834,6 +846,59 @@ impl ChatTask {
             sources,
         })
     }
+}
+
+/// Final answer when the model returns no text: name what the run actually
+/// did instead of failing or saying nothing.
+fn summarize_run(proposals: &[serde_json::Value], audit: &[ToolResult]) -> String {
+    if !proposals.is_empty() {
+        let targets: Vec<&str> = proposals
+            .iter()
+            .filter_map(|proposal| proposal.get("target").and_then(serde_json::Value::as_str))
+            .collect();
+        return format!(
+            "Dejé {} propuesta(s) para revisión: {}.",
+            proposals.len(),
+            targets.join(", ")
+        );
+    }
+    if !audit.is_empty() {
+        return format!(
+            "Ejecuté {} herramienta(s) sin cambios pendientes. Revisa la actividad para el detalle.",
+            audit.len()
+        );
+    }
+    "El agente no devolvió texto. Revisa la actividad de la herramienta o reformula la petición."
+        .to_string()
+}
+
+/// Data-driven brief of the active type package: the model may only propose
+/// writes inside the declared roots (D-062).
+fn profile_brief(profile: &ProjectProfile) -> String {
+    let mut out =
+        String::from("\n\nRUTAS DE ESCRITURA DEL PROYECTO (solo puedes proponer archivos aquí):");
+    if profile.write_roots.is_empty() {
+        out.push_str("\n- (el tipo de proyecto no declara raíces: no se puede escribir)");
+    }
+    for root in &profile.write_roots {
+        out.push_str(&format!(
+            "\n- {} (extensiones: {})",
+            root.path,
+            root.extensions.join(", ")
+        ));
+    }
+    if !profile.entities.is_empty() {
+        out.push_str("\nEntidades (carpeta de cada una):");
+        for entity in &profile.entities {
+            out.push_str(&format!("\n- {} → {}", entity.id, entity.folder));
+        }
+    }
+    out.push_str(
+        "\nPara crear un documento usa propose_document_create con una ruta dentro \
+         de esas raíces; para reescribir uno existente usa propose_document_edit. \
+         Las propuestas quedan para revisión humana.",
+    );
+    out
 }
 
 /// A successful read-only call is a visible source, not hidden context.
@@ -1560,5 +1625,34 @@ mod tests {
             root.join(".narra/proposals").is_dir(),
             "proposal record should be persisted"
         );
+    }
+
+    #[test]
+    fn profile_brief_lists_declared_roots_and_entities() {
+        let profile = crate::project_type::builtin("feature")
+            .expect("feature")
+            .profile();
+        let brief = profile_brief(&profile);
+        assert!(brief.contains("RUTAS DE ESCRITURA"), "{brief}");
+        assert!(brief.contains("bible (extensiones: .md)"), "{brief}");
+        assert!(
+            brief.contains("screenplay (extensiones: .fountain, .md)"),
+            "{brief}"
+        );
+        assert!(brief.contains("character → bible/characters"), "{brief}");
+        assert!(brief.contains("propose_document_create"), "{brief}");
+
+        let empty = ProjectProfile::default();
+        let brief = profile_brief(&empty);
+        assert!(brief.contains("no declara raíces"), "{brief}");
+    }
+
+    #[test]
+    fn a_run_without_final_text_summarizes_what_it_did() {
+        let proposals = vec![json!({"id": "p1", "target": "bible/marta.md"})];
+        let summary = summarize_run(&proposals, &[]);
+        assert!(summary.contains("1 propuesta(s)"), "{summary}");
+        assert!(summary.contains("bible/marta.md"), "{summary}");
+        assert!(summarize_run(&[], &[]).contains("no devolvió texto"));
     }
 }

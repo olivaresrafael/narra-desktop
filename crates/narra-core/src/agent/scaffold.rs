@@ -51,9 +51,12 @@ const BASE_SYSTEM: &str = "Eres un arquitecto de proyectos de escritura. \
      empiece a escribir. Respondes SIEMPRE con un único objeto JSON válido, \
      sin texto fuera del JSON.";
 
-/// Prompt rules built from the type package's write roots: the core never
-/// names story folders or extensions itself (D-062).
-fn rules(roots: &[crate::project_type::WriteRoot]) -> String {
+/// Prompt rules built from the type package's write roots and entities: the
+/// core never names story folders or extensions itself (D-062).
+fn rules(
+    roots: &[crate::project_type::WriteRoot],
+    entities: &[crate::project_type::EntityDefinition],
+) -> String {
     let folders = roots
         .iter()
         .map(|root| root.path.as_str())
@@ -66,13 +69,27 @@ fn rules(roots: &[crate::project_type::WriteRoot]) -> String {
     extensions.sort_unstable();
     extensions.dedup();
     let extensions = extensions.join(", ");
+    let mut entity_rule = String::new();
+    if !entities.is_empty() {
+        let folders = entities
+            .iter()
+            .map(|entity| format!("{} → {}", entity.label.es, entity.folder))
+            .collect::<Vec<_>>()
+            .join("; ");
+        entity_rule = format!(
+            "\n- Una entidad por archivo: cada personaje, lugar u objeto va en su \
+             propia ficha dentro de su carpeta ({folders}), con el nombre como \
+             nombre de archivo; no agrupes varias entidades en un solo documento."
+        );
+    }
     format!(
         "Devuelve SOLO un objeto JSON con esta forma:\n\
          {{\"files\":[{{\"path\":\"carpeta/archivo.ext\",\"content\":\"...\"}}]}}\n\
          - Entre 1 y 12 archivos.\n\
          - Rutas relativas bajo estas carpetas del proyecto: {folders}; \
          extensiones permitidas: {extensions}.\n\
-         - Nunca .narra/, project.yaml, agents.yaml, AGENTS.md ni .gitignore.\n\
+         - Nunca .narra/, project.yaml, agents.yaml, AGENTS.md ni .gitignore.\
+         {entity_rule}\n\
          - Contenido en el idioma del proyecto; no inventes datos personales.\n\
          - Sé conciso: prioriza entre 3 y 6 archivos y no repitas contenido.\n\
          - El contenido debe ser una cadena JSON válida: escapa los saltos de línea \
@@ -118,18 +135,26 @@ pub enum ScaffoldError {
     NoWriteRoots,
 }
 
-/// Resolve the write roots of a type package (D-062). Built-ins resolve
-/// without touching the filesystem, so this also works before a new project
-/// directory exists.
+/// Resolve the active type package (D-062). Built-ins resolve without
+/// touching the filesystem, so this also works before a new project directory
+/// exists.
+fn package_for_type(
+    project_root: &Path,
+    type_id: &str,
+) -> Result<crate::project_type::ProjectTypePackage, ScaffoldError> {
+    crate::project_type::resolve(project_root, type_id).ok_or_else(|| {
+        ScaffoldError::Parse(format!(
+            "the project type `{type_id}` does not resolve a package"
+        ))
+    })
+}
+
+/// Resolve the write roots of a type package.
 fn write_roots_for_type(
     project_root: &Path,
     type_id: &str,
 ) -> Result<Vec<crate::project_type::WriteRoot>, ScaffoldError> {
-    let package = crate::project_type::resolve(project_root, type_id).ok_or_else(|| {
-        ScaffoldError::Parse(format!(
-            "the project type `{type_id}` does not resolve a package"
-        ))
-    })?;
+    let package = package_for_type(project_root, type_id)?;
     if package.write_roots.is_empty() {
         return Err(ScaffoldError::NoWriteRoots);
     }
@@ -475,6 +500,9 @@ pub struct ProjectScaffoldTask {
     pub project_root: String,
     pub title: String,
     pub project_type: ProjectType,
+    /// Selected type package id; may be a user-defined type. Falls back to
+    /// the built-in enum id when absent.
+    pub type_id: Option<String>,
     pub language: String,
     pub prompt: String,
     /// Human-readable type label for custom packages; built-ins fall back to
@@ -497,11 +525,17 @@ impl ProjectScaffoldTask {
             project_root: project_root.into(),
             title: title.into(),
             project_type,
+            type_id: None,
             language: language.into(),
             prompt: prompt.into(),
             type_label: None,
             role: None,
         }
+    }
+
+    pub fn with_type_id(mut self, id: impl Into<String>) -> Self {
+        self.type_id = Some(id.into());
+        self
     }
 
     pub fn with_type_label(mut self, label: impl Into<String>) -> Self {
@@ -571,11 +605,18 @@ impl ProjectScaffoldTask {
             || BASE_SYSTEM.to_string(),
             |role| role.system_with(BASE_SYSTEM),
         );
-        let roots = write_roots_for_type(Path::new(&self.project_root), self.project_type.as_str())
+        let type_id = self
+            .type_id
+            .as_deref()
+            .unwrap_or_else(|| self.project_type.as_str());
+        let package = package_for_type(Path::new(&self.project_root), type_id)
             .map_err(|error| AgentError::Adapter(error.to_string()))?;
+        if package.write_roots.is_empty() {
+            return Err(AgentError::Adapter(ScaffoldError::NoWriteRoots.to_string()));
+        }
         let prompt = format!(
             "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n",
-            rules(&roots),
+            rules(&package.write_roots, &package.entities),
             self.title.trim(),
             self.type_label
                 .as_deref()
@@ -613,7 +654,7 @@ impl ProjectScaffoldTask {
             model: response.model.clone(),
             output_chars: response.text.chars().count(),
         });
-        let plan = parse_plan(&response.text, &roots)
+        let plan = parse_plan(&response.text, &package.write_roots)
             .map_err(|error| AgentError::Adapter(error.to_string()))?;
         let files = plan.files.clone();
         let data = json!({
@@ -787,6 +828,14 @@ mod tests {
 
         let error = parse_plan(&plan_text("brief/notes.txt"), &campaign).expect_err("extension");
         assert!(error.to_string().contains(".md"), "{error}");
+    }
+
+    #[test]
+    fn scaffold_rules_require_one_file_per_entity() {
+        let package = crate::project_type::builtin("feature").expect("feature");
+        let text = rules(&package.write_roots, &package.entities);
+        assert!(text.contains("Una entidad por archivo"), "{text}");
+        assert!(text.contains("Personaje → bible/characters"), "{text}");
     }
 
     #[test]

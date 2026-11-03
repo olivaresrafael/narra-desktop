@@ -373,6 +373,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
         let mut model: Option<String> = None;
         let mut usage: Option<Value> = None;
         let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
+        let mut terminal = false;
         let mut line = String::new();
 
         loop {
@@ -407,6 +408,12 @@ impl ModelAdapter for OpenAiCompatAdapter {
             };
             if let Some(message) = server_error_detail(&chunk) {
                 return Err(AgentError::Adapter(crate::git::redact_secrets(&message)));
+            }
+            if chunk
+                .pointer("/choices/0/finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                terminal = true;
             }
             if let Some(name) = chunk.get("model").and_then(Value::as_str) {
                 model = Some(name.to_string());
@@ -450,7 +457,13 @@ impl ModelAdapter for OpenAiCompatAdapter {
                     if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
                         && !name.is_empty()
                     {
-                        partial.name.push_str(name);
+                        // Some compatible servers resend the full name in
+                        // later chunks instead of fragments; never duplicate.
+                        if partial.name.is_empty() || name.starts_with(partial.name.as_str()) {
+                            partial.name = name.to_string();
+                        } else if !partial.name.ends_with(name) {
+                            partial.name.push_str(name);
+                        }
                     }
                     if let Some(arguments) =
                         call.pointer("/function/arguments").and_then(Value::as_str)
@@ -464,7 +477,7 @@ impl ModelAdapter for OpenAiCompatAdapter {
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        if text.is_empty() && tool_calls.is_empty() {
+        if text.is_empty() && tool_calls.is_empty() && !terminal {
             return Err(AgentError::Adapter(
                 "el stream terminó sin contenido de texto ni tool_calls".to_string(),
             ));

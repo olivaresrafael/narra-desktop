@@ -77,6 +77,8 @@ impl NewProjectState {
 pub(crate) struct NewProjectDraft {
     pub(crate) title: String,
     pub(crate) kind: ProjectType,
+    /// Selected type package id; may be a user-defined type.
+    pub(crate) type_id: String,
     pub(crate) type_label: String,
     pub(crate) lang: Lang,
     pub(crate) prompt: String,
