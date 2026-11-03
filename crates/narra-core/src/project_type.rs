@@ -74,8 +74,11 @@ const PACKAGE_KEYS: [&str; 20] = [
     "templates",
 ];
 
-/// Editor format the type declares. The core applies Fountain mechanics only
-/// when a package asks for `fountain`; other formats stay generic text.
+/// Editor format the type declares. Formats are a native, closed engine
+/// capability (D-062 addendum): a package selects one, it never implements a
+/// parser. The core applies Fountain mechanics only when a package asks for
+/// `fountain`; other formats stay generic text. A new format needs an engine
+/// change and an `API_VERSION` bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentFormat {
     Fountain,
