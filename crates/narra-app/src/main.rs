@@ -168,10 +168,9 @@ use narra_core::agent::portable::SlashCommand;
 use narra_core::agent::{
     AgentError, AgentMode, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask,
     ChatThread, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
-    OpenAiCompatConfig, PackageOrigin, ProjectScaffoldTask, ScaffoldPlan, ScaffoldQuestion,
-    SceneEditTask, SceneReviewTask, Skill, SkillOrigin, TaskOptions, active_skills,
-    fetch_model_ids, fetch_models, load_scope, load_skills, portable, proposal, roles, trust_skill,
-    untrusted_project_skills, write_plan,
+    OpenAiCompatConfig, PackageOrigin, SceneEditTask, SceneReviewTask, Skill, SkillOrigin,
+    TaskOptions, active_skills, fetch_model_ids, fetch_models, load_scope, load_skills, portable,
+    proposal, roles, trust_skill, untrusted_project_skills,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityIndex, Mention, split_by_mentions};
@@ -189,10 +188,10 @@ use narra_core::provider::{
 };
 use narra_core::{
     DocumentError, Project, ProjectError, ProjectProfile, ProjectType, ProjectTypePackage,
-    create_project_base_from_package, create_project_from_package, open_project,
+    create_project_from_package, open_project,
 };
 use new_file::Kind as NewFileKind;
-use new_project_dialog::{NewProjectDraft, NewProjectField, NewProjectMode, NewProjectState};
+use new_project_dialog::{NewProjectField, NewProjectMode, NewProjectState};
 use project_settings::{ProjectField, ProjectSettingsState};
 use recent::RecentProjects;
 use settings::{AiProvider, AppSettings, LanguageSetting};
@@ -610,21 +609,6 @@ impl std::fmt::Debug for SettingsState {
             .field("github_token_checked", &self.github_token_checked)
             .finish()
     }
-}
-
-/// Result of one AI project-scaffold run (M16 slice 9). The generation token
-/// prevents a stale run from landing in a reopened dialog. A run either asks
-/// a bounded question round or returns the reviewed file plan.
-enum NewProjectScaffoldResult {
-    Plan(ScaffoldPlan),
-    Questions(Vec<ScaffoldQuestion>),
-}
-
-enum NewProjectMessage {
-    Scaffold {
-        generation: u64,
-        result: Result<NewProjectScaffoldResult, String>,
-    },
 }
 
 enum SettingsMessage {
@@ -1249,26 +1233,6 @@ fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
         .ok()
         .filter(|skills| !skills.is_empty());
     (active, pending)
-}
-
-/// Brief answers captured by the New Project dialog.
-struct ProjectBrief {
-    document: Option<String>,
-    answers: Vec<(String, String)>,
-}
-
-/// Seed the brief document with the answers the user gave in the New Project
-/// dialog. The type declares the path; create-only, so a plan that already
-/// wrote it wins.
-fn write_project_brief(project: &Project, document: &str, answers: &[(String, String)]) {
-    if answers.is_empty() {
-        return;
-    }
-    let mut text = String::from("# Brief\n\n");
-    for (label, answer) in answers {
-        text.push_str(&format!("## {label}\n\n{answer}\n\n"));
-    }
-    let _ = project.create_document(document, &text);
 }
 
 fn project_type_package(project: &Project) -> Option<ProjectTypePackage> {
@@ -2057,8 +2021,6 @@ struct Editor {
     new_file: Option<NewFileState>,
     /// The New Project modal, when open (M10 slice 2b).
     new_project: Option<NewProjectState>,
-    /// Monotonic token for AI scaffold runs (M16 slice 9).
-    new_project_generation: u64,
     /// Recent project roots, most recent first (M10 slice 2b).
     recents: RecentProjects,
     /// Bumped on every project switch; async search/export results carry the
@@ -6601,13 +6563,13 @@ impl Editor {
     }
 
     /// Apply an edit to the active New Project field without touching the
-    /// document. Returns true while the dialog exists, even when the field is
-    /// temporarily read-only (picking, busy or reviewing a plan).
+    /// document. Returns true while the dialog exists, even when the folder
+    /// panel temporarily owns the app.
     fn with_new_project_text(&mut self, edit: impl FnOnce(&mut TextField)) -> bool {
         let Some(state) = self.new_project.as_mut() else {
             return false;
         };
-        if state.picking || state.busy || state.plan.is_some() {
+        if state.picking {
             return true;
         }
         edit(state.active_text_field_mut());
@@ -8421,6 +8383,7 @@ impl Editor {
             cancel.cancel();
         }
         self.chat = ChatUiState::new(ChatMode::Build);
+        self.chat_follow = true;
         self.chat_markdown.borrow_mut().clear();
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
@@ -8517,7 +8480,6 @@ impl Editor {
         // the save prompt or the welcome screen.
         self.new_file = None;
         self.new_project = None;
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
         self.settings = None;
         self.project_settings = None;
         self.palette = None;
@@ -8596,7 +8558,6 @@ impl Editor {
         self.review_focus.clear();
         self.new_file = None;
         self.new_project = None;
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
         self.settings = None;
         self.project_settings = None;
         self.palette = None;
@@ -8617,7 +8578,6 @@ impl Editor {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
                 self.new_project = None;
-                self.new_project_generation = self.new_project_generation.saturating_add(1);
                 cx.notify();
             }
             return;
@@ -8626,39 +8586,18 @@ impl Editor {
             cx.notify();
             return;
         }
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
         let types = new_project_types();
-        let brief = types
-            .iter()
-            .find(|package| package.id == "feature")
-            .and_then(|package| package.brief.clone());
-        let brief_questions = brief
-            .as_ref()
-            .map(|brief| brief.questions.clone())
-            .unwrap_or_default();
-        let brief_answers = brief_questions
-            .iter()
-            .map(|_| TextField::multiline())
-            .collect();
         self.new_project = Some(NewProjectState {
             title: TextField::single_line(),
-            kind: ProjectType::Feature,
             type_id: "feature".to_string(),
             types,
             lang: self.lang,
             mode: NewProjectMode::Template,
             prompt: TextField::multiline(),
-            brief_document: brief.as_ref().map(|brief| brief.document.clone()),
-            brief_questions,
-            brief_answers,
-            model_questions: Vec::new(),
-            model_answers: Vec::new(),
             field: NewProjectField::Title,
             error: String::new(),
             picking: false,
-            busy: false,
             path: None,
-            plan: None,
         });
         cx.notify();
     }
@@ -8689,7 +8628,7 @@ impl Editor {
         let Some(state) = self.new_project.as_ref() else {
             return;
         };
-        if state.picking || state.busy {
+        if state.picking {
             return;
         }
         let folder = new_project::clean_title(state.title.text())
@@ -8751,14 +8690,15 @@ impl Editor {
         cx.notify();
     }
 
-    /// The explicit accept action. Template projects are created here; AI
-    /// projects generate the reviewable plan first, then create on the next
-    /// accept. It never opens the folder panel.
-    fn accept_new_project(&mut self, cx: &mut Context<Self>) {
+    /// The explicit accept action. Both modes create the project immediately
+    /// with the type's template. The AI mode then opens the chat and sends the
+    /// dialog prompt as the first message, so the model can ask follow-up
+    /// questions or propose files in context. It never opens the folder panel.
+    fn accept_new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.new_project.as_ref() else {
             return;
         };
-        if state.picking || state.busy {
+        if state.picking {
             return;
         }
         let Some(title) = new_project::clean_title(state.title.text()) else {
@@ -8784,7 +8724,9 @@ impl Editor {
             cx.notify();
             return;
         }
-        let kind = state.kind;
+        let lang = state.lang;
+        let mode = state.mode;
+        let prompt = state.prompt.text().trim().to_string();
         let Some(package) = state
             .types
             .iter()
@@ -8795,25 +8737,8 @@ impl Editor {
             cx.notify();
             return;
         };
-        let lang = state.lang;
-        let mode = state.mode;
-        let prompt = state.prompt.text().trim().to_string();
-        let plan_ready = state.plan.is_some();
-        let missing = state.missing_brief_answers();
-        if !missing.is_empty() {
-            let question = missing[0].clone();
-            self.set_new_project_error(
-                self.tf("newproject.brief_required", &[("question", &question)]),
-            );
-            cx.notify();
-            return;
-        }
-        let brief_document = state.brief_document.clone();
-        let brief_answers = state.brief_answers();
-        let model_answers = state.model_answers();
-        let has_model_questions = !state.model_questions.is_empty();
         if mode == NewProjectMode::Ai {
-            if !self.ai_scaffold_available() {
+            if !self.ai_available() {
                 self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
                 cx.notify();
                 return;
@@ -8823,54 +8748,9 @@ impl Editor {
                 cx.notify();
                 return;
             }
-            if plan_ready {
-                self.create_new_project_from_plan(cx);
-                return;
-            }
-            let draft = NewProjectDraft {
-                title,
-                kind,
-                type_id: package.id.clone(),
-                type_label: package.name.clone(),
-                lang,
-                prompt,
-                brief_answers: brief_answers.clone(),
-            };
-            if has_model_questions {
-                self.start_new_project_scaffold(path, draft, model_answers, false, cx);
-            } else {
-                self.start_new_project_scaffold(path, draft, Vec::new(), true, cx);
-            }
-            cx.notify();
-            return;
         }
-        self.create_new_project_from_template(
-            path,
-            title,
-            package,
-            lang,
-            ProjectBrief {
-                document: brief_document,
-                answers: brief_answers,
-            },
-            cx,
-        );
-    }
-
-    fn create_new_project_from_template(
-        &mut self,
-        path: PathBuf,
-        title: String,
-        package: ProjectTypePackage,
-        lang: Lang,
-        brief: ProjectBrief,
-        cx: &mut Context<Self>,
-    ) {
         match create_project_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => {
-                if let Some(document) = brief.document.as_deref() {
-                    write_project_brief(&project, document, &brief.answers);
-                }
                 if package.origin != narra_core::project_type::TypeOrigin::Builtin {
                     let _ = narra_core::project_type::trust_type(
                         &path,
@@ -8881,6 +8761,13 @@ impl Editor {
                 match self.install_project(project, cx) {
                     Ok(()) => {
                         self.new_project = None;
+                        if mode == NewProjectMode::Ai {
+                            self.chat.set_input(prompt);
+                            self.agent_panel_open = true;
+                            self.right_tab = RightTab::Chat;
+                            self.chat.focused = true;
+                            self.chat_send(window, cx);
+                        }
                     }
                     Err(error) => {
                         let message = self.tf("newproject.open_failed", &[("error", &error)]);
@@ -8896,187 +8783,10 @@ impl Editor {
         cx.notify();
     }
 
-    /// The AI option is available only with a real provider (D-044 option A);
-    /// Mock is the offline default and cannot plan a project.
-    fn ai_scaffold_available(&self) -> bool {
+    /// The AI mode is available only with a real provider (D-044 option A);
+    /// Mock is the offline default and cannot write.
+    fn ai_available(&self) -> bool {
         self.agent_settings.provider != AiProvider::Mock
-    }
-    /// Generate a reviewed plan without creating anything (M16 slice 9). The
-    /// first run may return a bounded question round; the run after the
-    /// answers must return the plan.
-    fn start_new_project_scaffold(
-        &mut self,
-        path: PathBuf,
-        draft: NewProjectDraft,
-        follow_up: Vec<(String, String)>,
-        allow_questions: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.ai_scaffold_available() {
-            self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
-            return;
-        }
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
-        let generation = self.new_project_generation;
-        if let Some(state) = self.new_project.as_mut() {
-            state.busy = true;
-            state.error.clear();
-            state.plan = None;
-            state.path = Some(path.clone());
-            if allow_questions {
-                state.clear_model_questions();
-            }
-        }
-        cx.notify();
-        let root = path.to_string_lossy().into_owned();
-        let settings = self.agent_settings.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<NewProjectScaffoldResult, String> {
-                let role = roles::resolve_default_with_packages(
-                    Path::new(&root),
-                    Some(&recent::config_dir()),
-                    ProjectScaffoldTask::KIND,
-                )
-                .map_err(|error| error.to_string())?;
-                let adapter = settings.build_adapter()?;
-                let task = ProjectScaffoldTask::new(
-                    root.clone(),
-                    draft.title.clone(),
-                    draft.kind,
-                    draft.lang.key(),
-                    draft.prompt.clone(),
-                )
-                .with_type_label(draft.type_label.clone())
-                .with_type_id(draft.type_id.clone())
-                .with_brief(draft.brief_answers.clone())
-                .with_follow_up(follow_up)
-                .with_role(role);
-                let task = if allow_questions {
-                    task
-                } else {
-                    task.without_questions()
-                };
-                let options = TaskOptions {
-                    timeout: AGENT_TIMEOUT,
-                    cancel: CancellationToken::new(),
-                    stream: false,
-                };
-                let output = task
-                    .run(adapter.as_ref(), &options, |_| {})
-                    .map_err(|error| error.to_string())?;
-                if let Some(questions) = output.data.get("questions") {
-                    let questions =
-                        serde_json::from_value::<Vec<ScaffoldQuestion>>(questions.clone())
-                            .map_err(|error| format!("invalid scaffold questions: {error}"))?;
-                    Ok(NewProjectScaffoldResult::Questions(questions))
-                } else {
-                    let plan = serde_json::from_value::<ScaffoldPlan>(output.data["plan"].clone())
-                        .map_err(|error| format!("invalid scaffold payload: {error}"))?;
-                    Ok(NewProjectScaffoldResult::Plan(plan))
-                }
-            })();
-            let _ = tx.send(NewProjectMessage::Scaffold { generation, result });
-        });
-        Self::spawn_message_pump(cx, rx, |view, message| {
-            let NewProjectMessage::Scaffold { generation, result } = message;
-            if generation != view.new_project_generation {
-                return true;
-            }
-            if let Some(state) = view.new_project.as_mut() {
-                state.busy = false;
-                match result {
-                    Ok(NewProjectScaffoldResult::Plan(plan)) => {
-                        state.plan = Some(plan);
-                        state.error.clear();
-                    }
-                    Ok(NewProjectScaffoldResult::Questions(questions)) => {
-                        state.apply_model_questions(questions);
-                        state.field = NewProjectField::ModelQuestion(0);
-                        state.error.clear();
-                    }
-                    Err(error) => {
-                        state.error = i18n::tf(
-                            view.lang,
-                            "newproject.scaffold_failed",
-                            &[("error", &error)],
-                        );
-                    }
-                }
-            }
-            true
-        });
-    }
-
-    /// Create the already-chosen folder, write the reviewed plan create-only
-    /// and open the project. A write failure rolls the generated files back;
-    /// the base project remains usable and is still opened.
-    fn create_new_project_from_plan(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.new_project.as_ref() else {
-            return;
-        };
-        if state.busy || state.picking {
-            return;
-        }
-        let Some(path) = state.path.clone() else {
-            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
-            return;
-        };
-        let Some(plan) = state.plan.clone() else {
-            return;
-        };
-        let title = new_project::clean_title(state.title.text())
-            .unwrap_or_else(|| state.title.text().to_string());
-        let lang = state.lang;
-        let brief_document = state.brief_document.clone();
-        let brief_answers = state.all_brief_answers();
-        let Some(package) = state
-            .types
-            .iter()
-            .find(|package| package.id == state.type_id)
-            .cloned()
-        else {
-            self.set_new_project_error(self.t("newproject.type_missing").to_string());
-            return;
-        };
-        match create_project_base_from_package(&path, &title, &package, lang.key()) {
-            Ok(project) => match write_plan(&path, &plan) {
-                Ok(()) => {
-                    if let Some(document) = brief_document.as_deref() {
-                        write_project_brief(&project, document, &brief_answers);
-                    }
-                    match self.install_project(project, cx) {
-                        Ok(()) => {
-                            self.new_project = None;
-                        }
-                        Err(error) => {
-                            let message = self.tf("newproject.open_failed", &[("error", &error)]);
-                            self.set_new_project_error(message);
-                        }
-                    }
-                }
-                Err(error) => {
-                    let message =
-                        self.tf("newproject.write_failed", &[("error", &error.to_string())]);
-                    match self.install_project(project, cx) {
-                        Ok(()) => {
-                            self.new_project = None;
-                            self.notice = Some(message);
-                        }
-                        Err(open_error) => {
-                            self.set_new_project_error(
-                                self.tf("newproject.open_failed", &[("error", &open_error)]),
-                            );
-                        }
-                    }
-                }
-            },
-            Err(error) => {
-                let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
-                self.set_new_project_error(message);
-            }
-        }
-        cx.notify();
     }
 
     /// Trust every project skill currently awaiting confirmation, persist the
@@ -11986,8 +11696,6 @@ impl Editor {
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
-                && !state.busy
-                && state.plan.is_none()
             {
                 state.active_text_field_mut().backspace();
                 state.error.clear();
@@ -12157,7 +11865,7 @@ impl Editor {
         // The New Project dialog accepts on enter. Choosing the folder is a
         // separate button; enter never opens the OS panel.
         if self.new_project.is_some() {
-            self.accept_new_project(cx);
+            self.accept_new_project(window, cx);
             return;
         }
         // While the find bar owns keystrokes, enter means "next match" in the
@@ -12262,7 +11970,7 @@ impl Editor {
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.new_project.as_mut() {
-            if state.picking || state.busy || state.plan.is_some() {
+            if state.picking {
                 return;
             }
             let text = state.text_field(state.field).selected_text().to_string();
@@ -12759,7 +12467,6 @@ impl Editor {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
                 self.new_project = None;
-                self.new_project_generation = self.new_project_generation.saturating_add(1);
             }
             cx.notify();
             return;
@@ -19449,10 +19156,9 @@ impl Editor {
             Some(state) => format!(
                 "{{\"open\":true,\"title\":\"{}\",\"type\":\"{}\",\"lang\":\"{}\",\
                  \"mode\":\"{}\",\"field\":\"{}\",\"caret\":{},\"selection\":[{},{}],\
-                 \"error\":\"{}\",\"picking\":{},\"busy\":{},\
-                 \"path\":\"{}\",\"plan_files\":{}}}",
+                 \"error\":\"{}\",\"picking\":{},\"path\":\"{}\"}}",
                 escape_json(state.title.text()),
-                state.kind.as_str(),
+                escape_json(&state.type_id),
                 state.lang.key(),
                 match state.mode {
                     NewProjectMode::Template => "template",
@@ -19461,15 +19167,12 @@ impl Editor {
                 match state.field {
                     NewProjectField::Title => "title",
                     NewProjectField::Prompt => "prompt",
-                    NewProjectField::Brief(_) => "brief",
-                    NewProjectField::ModelQuestion(_) => "question",
                 },
                 state.text_field(state.field).caret(),
                 state.text_field(state.field).selection().start,
                 state.text_field(state.field).selection().end,
                 escape_json(&state.error),
                 state.picking,
-                state.busy,
                 escape_json(
                     &state
                         .path
@@ -19477,16 +19180,10 @@ impl Editor {
                         .map(|path| path.display().to_string())
                         .unwrap_or_default()
                 ),
-                state
-                    .plan
-                    .as_ref()
-                    .map(|plan| plan.files.len())
-                    .unwrap_or(0),
             ),
             None => "{\"open\":false,\"title\":\"\",\"type\":\"\",\"lang\":\"\",\
                      \"mode\":\"\",\"field\":\"\",\"caret\":0,\"selection\":[0,0],\
-                     \"error\":\"\",\"picking\":false,\"busy\":false,\
-                     \"path\":\"\",\"plan_files\":0}"
+                     \"error\":\"\",\"picking\":false,\"path\":\"\"}"
                 .to_string(),
         };
         let project_dump = self
@@ -20738,8 +20435,6 @@ impl EntityInputHandler for Editor {
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
-                && !state.busy
-                && state.plan.is_none()
             {
                 state.active_text_field_mut().insert(new_text);
                 state.error.clear();
@@ -20876,8 +20571,6 @@ impl EntityInputHandler for Editor {
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
-                && !state.busy
-                && state.plan.is_none()
             {
                 state.active_text_field_mut().insert(new_text);
                 state.error.clear();
@@ -22091,7 +21784,6 @@ fn run() -> Result<(), String> {
                 debug_metrics: debug_metrics_flag,
                 new_file: None,
                 new_project: None,
-                new_project_generation: 0,
                 recents,
                 workspace_generation: 0,
                 window_title: "Narra".to_string(),
@@ -22811,28 +22503,5 @@ mod tests {
                 ),
             }
         }
-    }
-
-    #[test]
-    fn brief_answers_are_seeded_as_markdown() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("narra-brief-{}-{stamp}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let project =
-            narra_core::project::create_project(&root, "Brief", ProjectType::Feature, "es")
-                .expect("project");
-        write_project_brief(
-            &project,
-            "notes/brief.md",
-            &[("Premisa".to_string(), "Una historia.".to_string())],
-        );
-        let text = project.read_document("notes/brief.md").expect("brief");
-        assert!(text.contains("# Brief"), "{text}");
-        assert!(text.contains("## Premisa"), "{text}");
-        assert!(text.contains("Una historia."), "{text}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

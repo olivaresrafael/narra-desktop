@@ -50,10 +50,7 @@ pub use portable::{
 };
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use roles::{Role, RoleOrigin, RolesError};
-pub use scaffold::{
-    ProjectScaffoldTask, ScaffoldError, ScaffoldFile, ScaffoldPlan, ScaffoldQuestion,
-    ScaffoldResponse, write_plan,
-};
+pub use scaffold::{ProjectScaffoldTask, ScaffoldError, ScaffoldFile, ScaffoldPlan, write_plan};
 pub use scene_edit::SceneEditTask;
 pub use scene_review::SceneReviewTask;
 pub use skill::{

@@ -5,7 +5,6 @@
 
 use super::*;
 use gpui::prelude::*;
-use narra_core::project_type::{BriefDefinition, BriefQuestion};
 
 /// How a new project starts (M16 slices 8–9, D-044).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,23 +19,18 @@ pub(crate) enum NewProjectMode {
 pub(crate) enum NewProjectField {
     Title,
     Prompt,
-    /// One onboarding brief question, by index.
-    Brief(usize),
-    /// One model-generated question, by index.
-    ModelQuestion(usize),
 }
 
 /// The New Project modal (M10 slice 2b): title, kind, primary language, the
 /// destination folder and the native save-panel phase. Choosing a folder and
 /// accepting are separate actions: the folder is only stored here, and
-/// `accept_new_project` creates the template or starts the AI plan. `picking`
-/// is true while the OS dialog owns the app, so duplicate panels cannot open.
-/// The AI mode adds a prompt, a busy phase and a reviewable file plan.
+/// `accept_new_project` creates the project immediately. `picking` is true
+/// while the OS dialog owns the app, so duplicate panels cannot open. The AI
+/// mode adds a prompt that is sent to the chat after creation; questions
+/// happen in the conversation, not in this dialog.
 #[derive(Debug)]
 pub(crate) struct NewProjectState {
     pub(crate) title: TextField,
-    /// Legacy enum used by the AI task/labels; custom ids map to `Other`.
-    pub(crate) kind: ProjectType,
     /// Selected package id; may be a user-defined type.
     pub(crate) type_id: String,
     /// Installed types shown in the dialog (built-ins + user packages).
@@ -44,25 +38,12 @@ pub(crate) struct NewProjectState {
     pub(crate) lang: Lang,
     pub(crate) mode: NewProjectMode,
     pub(crate) prompt: TextField,
-    /// Brief document declared by the selected type (answers are seeded
-    /// there after creation).
-    pub(crate) brief_document: Option<String>,
-    pub(crate) brief_questions: Vec<BriefQuestion>,
-    pub(crate) brief_answers: Vec<TextField>,
-    /// Questions the model asked before proposing the base (one bounded
-    /// round). Answers are kept for the brief even after the plan arrives.
-    pub(crate) model_questions: Vec<ScaffoldQuestion>,
-    pub(crate) model_answers: Vec<TextField>,
     pub(crate) field: NewProjectField,
     pub(crate) error: String,
     pub(crate) picking: bool,
-    /// AI generation in progress (the save panel has already returned).
-    pub(crate) busy: bool,
     /// Destination folder chosen with the folder button. Nothing exists
     /// there until the user accepts.
     pub(crate) path: Option<PathBuf>,
-    /// Reviewable AI plan; nothing is written until the user confirms.
-    pub(crate) plan: Option<ScaffoldPlan>,
 }
 
 impl NewProjectState {
@@ -70,10 +51,6 @@ impl NewProjectState {
         match field {
             NewProjectField::Title => &self.title,
             NewProjectField::Prompt => &self.prompt,
-            NewProjectField::Brief(index) => self.brief_answers.get(index).unwrap_or(&self.title),
-            NewProjectField::ModelQuestion(index) => {
-                self.model_answers.get(index).unwrap_or(&self.title)
-            }
         }
     }
 
@@ -81,128 +58,12 @@ impl NewProjectState {
         match field {
             NewProjectField::Title => &mut self.title,
             NewProjectField::Prompt => &mut self.prompt,
-            NewProjectField::Brief(index) => {
-                if index >= self.brief_answers.len() {
-                    self.brief_answers
-                        .resize_with(index + 1, TextField::multiline);
-                }
-                &mut self.brief_answers[index]
-            }
-            NewProjectField::ModelQuestion(index) => {
-                if index >= self.model_answers.len() {
-                    self.model_answers
-                        .resize_with(index + 1, TextField::multiline);
-                }
-                &mut self.model_answers[index]
-            }
         }
-    }
-
-    /// Replace the type's brief questions and reset the answers. Model
-    /// questions belong to the previous type, so they are discarded too.
-    pub(crate) fn apply_brief(&mut self, brief: Option<&BriefDefinition>) {
-        self.brief_document = brief.map(|brief| brief.document.clone());
-        self.brief_questions = brief
-            .map(|brief| brief.questions.clone())
-            .unwrap_or_default();
-        self.brief_answers = self
-            .brief_questions
-            .iter()
-            .map(|_| TextField::multiline())
-            .collect();
-        self.clear_model_questions();
-    }
-
-    /// Show the model's question round and reset its answer fields.
-    pub(crate) fn apply_model_questions(&mut self, questions: Vec<ScaffoldQuestion>) {
-        self.model_answers = questions.iter().map(|_| TextField::multiline()).collect();
-        self.model_questions = questions;
-    }
-
-    /// Drop the model's questions and answers (type or mode changed, or a
-    /// fresh first round starts).
-    pub(crate) fn clear_model_questions(&mut self) {
-        self.model_questions.clear();
-        self.model_answers.clear();
-    }
-
-    /// Answered questions as `(localized label, answer)`, skipping blanks.
-    pub(crate) fn brief_answers(&self) -> Vec<(String, String)> {
-        self.brief_questions
-            .iter()
-            .zip(self.brief_answers.iter())
-            .filter_map(|(question, field)| {
-                let answer = field.text().trim();
-                if answer.is_empty() {
-                    None
-                } else {
-                    Some((
-                        question.label.for_language(self.lang.key()).to_string(),
-                        answer.to_string(),
-                    ))
-                }
-            })
-            .collect()
-    }
-
-    /// Required questions that are still empty.
-    pub(crate) fn missing_brief_answers(&self) -> Vec<String> {
-        self.brief_questions
-            .iter()
-            .enumerate()
-            .filter(|(index, question)| {
-                question.required
-                    && self
-                        .brief_answers
-                        .get(*index)
-                        .is_none_or(|field| field.text().trim().is_empty())
-            })
-            .map(|(_, question)| question.label.for_language(self.lang.key()).to_string())
-            .collect()
-    }
-
-    /// Answered model questions as `(question, answer)`, skipping blanks.
-    pub(crate) fn model_answers(&self) -> Vec<(String, String)> {
-        self.model_questions
-            .iter()
-            .zip(self.model_answers.iter())
-            .filter_map(|(question, field)| {
-                let answer = field.text().trim();
-                if answer.is_empty() {
-                    None
-                } else {
-                    Some((question.question.clone(), answer.to_string()))
-                }
-            })
-            .collect()
-    }
-
-    /// Every onboarding answer, for the brief document: the type's questions
-    /// first, then the model's follow-up questions.
-    pub(crate) fn all_brief_answers(&self) -> Vec<(String, String)> {
-        let mut answers = self.brief_answers();
-        answers.extend(self.model_answers());
-        answers
     }
 
     pub(crate) fn active_text_field_mut(&mut self) -> &mut TextField {
         self.text_field_mut(self.field)
     }
-}
-
-/// Snapshot of the dialog inputs handed to the AI scaffold worker: what the
-/// user saw when pressing Accept decides the plan, even if the modal is still
-/// on screen while the model runs.
-#[derive(Debug, Clone)]
-pub(crate) struct NewProjectDraft {
-    pub(crate) title: String,
-    pub(crate) kind: ProjectType,
-    /// Selected type package id; may be a user-defined type.
-    pub(crate) type_id: String,
-    pub(crate) type_label: String,
-    pub(crate) lang: Lang,
-    pub(crate) prompt: String,
-    pub(crate) brief_answers: Vec<(String, String)>,
 }
 
 impl Editor {
@@ -218,7 +79,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let text_field = state.text_field(field);
-        let focused = state.field == field && !state.picking && !state.busy && state.plan.is_none();
+        let focused = state.field == field && !state.picking;
         let text = text_field.text().to_string();
         let selection = text_field.selection();
         let caret = text_field.caret();
@@ -302,8 +163,6 @@ impl Editor {
         let id = match field {
             NewProjectField::Title => "new-project-title-input".to_string(),
             NewProjectField::Prompt => "new-project-prompt-input".to_string(),
-            NewProjectField::Brief(index) => format!("new-project-brief-{index}"),
-            NewProjectField::ModelQuestion(index) => format!("new-project-question-{index}"),
         };
         div()
             .id(gpui::ElementId::Name(id.into()))
@@ -333,7 +192,7 @@ impl Editor {
                             let Some(state) = this.new_project.as_mut() else {
                                 return;
                             };
-                            if state.picking || state.busy || state.plan.is_some() {
+                            if state.picking {
                                 return;
                             }
                             state.field = field_for_click;
@@ -424,20 +283,19 @@ impl Editor {
             .into_any_element()
     }
 
-    /// New Project dialog: title, kind, primary language, destination folder,
-    /// project base and review. The folder button opens the native panel;
-    /// Enter accepts (creating the template or starting the AI plan). Esc
-    /// closes the dialog.
+    /// New Project dialog: title, kind, primary language, destination folder
+    /// and project base. The folder button opens the native panel; Enter
+    /// creates the project immediately. Esc closes the dialog.
     pub(crate) fn new_project_overlay(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_project.as_ref().expect("overlay only when open");
-        let editable = !state.picking && !state.busy && state.plan.is_none();
+        let editable = !state.picking;
         let mut modes = div().flex().flex_wrap().gap_2();
         for (mode, key) in [
             (NewProjectMode::Template, "newproject.mode.template"),
             (NewProjectMode::Ai, "newproject.mode.ai"),
         ] {
             let selected = state.mode == mode;
-            let enabled = editable && (mode != NewProjectMode::Ai || self.ai_scaffold_available());
+            let enabled = editable && (mode != NewProjectMode::Ai || self.ai_available());
             let mut chip = div()
                 .id(key)
                 .px_3()
@@ -462,13 +320,7 @@ impl Editor {
                 .child(self.t(key));
             if enabled {
                 chip = chip.on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(state) = this.new_project.as_mut()
-                        && !state.busy
-                        && state.plan.is_none()
-                    {
-                        if state.mode != mode {
-                            state.clear_model_questions();
-                        }
+                    if let Some(state) = this.new_project.as_mut() {
                         state.mode = mode;
                         state.field = if mode == NewProjectMode::Ai {
                             NewProjectField::Prompt
@@ -491,8 +343,6 @@ impl Editor {
                 |kind| self.t(new_project::type_i18n_key(kind)).to_string(),
             );
             let package_id = package.id.clone();
-            let package_kind = kind.unwrap_or(ProjectType::Other);
-            let package_brief = package.brief.clone();
             kinds = kinds.child(
                 div()
                     .id(("project-type-chip", index as u64))
@@ -519,12 +369,8 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
-                            && !state.busy
-                            && state.plan.is_none()
                         {
                             state.type_id = package_id.clone();
-                            state.kind = package_kind;
-                            state.apply_brief(package_brief.as_ref());
                             state.error.clear();
                         }
                         cx.notify();
@@ -560,8 +406,6 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
-                            && !state.busy
-                            && state.plan.is_none()
                         {
                             state.lang = lang;
                             state.error.clear();
@@ -672,7 +516,7 @@ impl Editor {
                             .as_ref()
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| self.t("newproject.no_folder").to_string());
-                        let folder_enabled = !state.picking && !state.busy && state.plan.is_none();
+                        let folder_enabled = !state.picking;
                         let mut button = div()
                             .id("new-project-folder")
                             .flex_none()
@@ -731,7 +575,7 @@ impl Editor {
                             )
                             .child(modes),
                     )
-                    .when(!self.ai_scaffold_available(), |card| {
+                    .when(!self.ai_available(), |card| {
                         card.child(
                             div()
                                 .text_xs()
@@ -740,7 +584,7 @@ impl Editor {
                         )
                     })
                     .when(
-                        state.mode == NewProjectMode::Ai && self.ai_scaffold_available(),
+                        state.mode == NewProjectMode::Ai && self.ai_available(),
                         |card| {
                             card.child(
                                 div()
@@ -764,129 +608,15 @@ impl Editor {
                             )
                         },
                     )
-                    .when(!state.brief_questions.is_empty(), |card| {
-                        let mut section = div().flex().flex_col().gap_2().child(
-                            div()
-                                .text_color(rgb(theme::status_fg()))
-                                .child(self.t("newproject.brief")),
-                        );
-                        for (index, question) in state.brief_questions.iter().enumerate() {
-                            let placeholder = question
-                                .placeholder
-                                .as_ref()
-                                .map(|placeholder| placeholder.for_language(state.lang.key()))
-                                .unwrap_or("");
-                            let min_height = if question.multiline {
-                                px(72.0)
-                            } else {
-                                px(theme::line_height())
-                            };
-                            section = section.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_color(rgb(theme::status_fg())).child(
-                                        question.label.for_language(state.lang.key()).to_string(),
-                                    ))
-                                    .child(Self::new_project_text_input(
-                                        state,
-                                        NewProjectField::Brief(index),
-                                        window,
-                                        px(552.0),
-                                        min_height,
-                                        placeholder,
-                                        cx,
-                                    )),
-                            );
-                        }
-                        card.child(section)
-                    })
-                    .when(
-                        !state.model_questions.is_empty() && state.plan.is_none(),
-                        |card| {
-                            let mut section = div().flex().flex_col().gap_2().child(
-                                div()
-                                    .text_color(rgb(theme::status_fg()))
-                                    .child(self.t("newproject.model_questions")),
-                            );
-                            for (index, question) in state.model_questions.iter().enumerate() {
-                                let min_height = if question.multiline {
-                                    px(72.0)
-                                } else {
-                                    px(theme::line_height())
-                                };
-                                section = section.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_color(rgb(theme::status_fg()))
-                                                .child(question.question.clone()),
-                                        )
-                                        .child(Self::new_project_text_input(
-                                            state,
-                                            NewProjectField::ModelQuestion(index),
-                                            window,
-                                            px(552.0),
-                                            min_height,
-                                            "",
-                                            cx,
-                                        )),
-                                );
-                            }
-                            card.child(section)
-                        },
-                    )
-                    .when(state.plan.is_some(), |card| {
-                        let plan = state.plan.as_ref().expect("checked");
-                        let mut list = div()
-                            .id("new-project-plan")
-                            .max_h(px(180.0))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .border_1()
-                            .border_color(rgb(theme::explorer_border()));
-                        for file in &plan.files {
-                            let preview: String =
-                                file.content.lines().take(2).collect::<Vec<_>>().join(" ");
-                            let preview: String = preview.chars().take(160).collect();
-                            list = list.child(
-                                div()
-                                    .p_2()
-                                    .border_b_1()
-                                    .border_color(rgb(theme::explorer_border()))
-                                    .child(
-                                        div()
-                                            .text_color(rgb(theme::default_fg()))
-                                            .child(file.path.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::gutter_fg()))
-                                            .child(preview),
-                                    ),
-                            );
-                        }
-                        card.child(list)
-                    })
                     .child(
                         div()
                             .text_color(rgb(theme::status_fg()))
                             .child(if state.picking {
                                 self.t("newproject.waiting")
-                            } else if state.busy {
-                                self.t("newproject.generating")
-                            } else if state.plan.is_some() {
-                                self.t("newproject.plan")
-                            } else if !state.model_questions.is_empty() {
-                                self.t("newproject.model_questions_hint")
                             } else if state.path.is_none() {
                                 self.t("newproject.folder_hint")
+                            } else if state.mode == NewProjectMode::Ai {
+                                self.t("newproject.ai_hint")
                             } else {
                                 self.t("newproject.hint")
                             }),
@@ -899,15 +629,8 @@ impl Editor {
                         )
                     })
                     .child({
-                        let plan_ready = state.plan.is_some();
-                        let can_click = !state.picking && !state.busy && state.path.is_some();
-                        let label = if plan_ready || state.mode == NewProjectMode::Template {
-                            self.t("newproject.create")
-                        } else if !state.model_questions.is_empty() {
-                            self.t("newproject.continue")
-                        } else {
-                            self.t("newproject.generate")
-                        };
+                        let can_click = !state.picking && state.path.is_some();
+                        let label = self.t("newproject.create");
                         let mut primary = div()
                             .id("new-project-create")
                             .px_3()
@@ -924,12 +647,11 @@ impl Editor {
                             }))
                             .child(label);
                         if can_click {
-                            primary =
-                                primary
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.accept_new_project(cx);
-                                    }));
+                            primary = primary.cursor_pointer().on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.accept_new_project(window, cx);
+                                },
+                            ));
                         }
                         div().flex().gap_2().child(primary).child(
                             div()
@@ -944,104 +666,11 @@ impl Editor {
                                     if !this.new_project.as_ref().is_some_and(|state| state.picking)
                                     {
                                         this.new_project = None;
-                                        this.new_project_generation =
-                                            this.new_project_generation.saturating_add(1);
                                     }
                                     cx.notify();
                                 })),
                         )
                     }),
             )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use narra_core::project_type::LocalizedText;
-
-    fn test_state() -> NewProjectState {
-        NewProjectState {
-            title: TextField::single_line(),
-            kind: ProjectType::Feature,
-            type_id: "feature".to_string(),
-            types: Vec::new(),
-            lang: Lang::En,
-            mode: NewProjectMode::Ai,
-            prompt: TextField::multiline(),
-            brief_document: Some("notes/brief.md".to_string()),
-            brief_questions: vec![BriefQuestion {
-                id: "premise".to_string(),
-                label: LocalizedText {
-                    en: "Premise".to_string(),
-                    es: "Premisa".to_string(),
-                },
-                placeholder: None,
-                required: true,
-                multiline: true,
-            }],
-            brief_answers: vec![TextField::multiline()],
-            model_questions: Vec::new(),
-            model_answers: Vec::new(),
-            field: NewProjectField::Title,
-            error: String::new(),
-            picking: false,
-            busy: false,
-            path: None,
-            plan: None,
-        }
-    }
-
-    #[test]
-    fn required_brief_answers_block_accept_until_answered() {
-        let mut state = test_state();
-        assert_eq!(state.missing_brief_answers(), ["Premise"]);
-        state
-            .text_field_mut(NewProjectField::Brief(0))
-            .insert("Una historia de invierno.");
-        assert!(state.missing_brief_answers().is_empty());
-    }
-
-    #[test]
-    fn model_question_answers_join_the_brief() {
-        let mut state = test_state();
-        state
-            .text_field_mut(NewProjectField::Brief(0))
-            .insert("Una historia de invierno.");
-        state.apply_model_questions(vec![ScaffoldQuestion {
-            id: "tone".to_string(),
-            question: "¿Qué tono buscas?".to_string(),
-            multiline: false,
-        }]);
-        state
-            .text_field_mut(NewProjectField::ModelQuestion(0))
-            .insert("Íntimo y nevado.");
-        assert_eq!(
-            state.all_brief_answers(),
-            [
-                (
-                    "Premise".to_string(),
-                    "Una historia de invierno.".to_string()
-                ),
-                (
-                    "¿Qué tono buscas?".to_string(),
-                    "Íntimo y nevado.".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn changing_the_type_clears_the_model_round() {
-        let mut state = test_state();
-        state.apply_model_questions(vec![ScaffoldQuestion {
-            id: "tone".to_string(),
-            question: "¿Qué tono buscas?".to_string(),
-            multiline: false,
-        }]);
-        assert_eq!(state.model_questions.len(), 1);
-        state.apply_brief(None);
-        assert!(state.model_questions.is_empty());
-        assert!(state.model_answers.is_empty());
     }
 }
