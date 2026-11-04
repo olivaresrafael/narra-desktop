@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn finds_literal_matches_across_documents_in_deterministic_order() {
         let project = project_with(&[
-            ("screenplay/main.fountain", "INT. CASA\n\nMarta entra.\n"),
+            ("workspace/main.fountain", "INT. CASA\n\nMarta entra.\n"),
             (
                 "bible/characters/marta.md",
                 "# Marta\n\nMarta es la protagonista.\n",
@@ -178,7 +178,7 @@ mod tests {
             vec![
                 ("bible/characters/marta.md", 1),
                 ("bible/characters/marta.md", 3),
-                ("screenplay/main.fountain", 3),
+                ("workspace/main.fountain", 3),
             ],
             "ordered by document path, then line"
         );
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn matching_is_case_insensitive_but_keeps_accents() {
         let project = project_with(&[(
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
             "INT. OFICINA - DÍA\n\nELENA\nBuen día.\n",
         )]);
         let report = search(&project, "DÍA").expect("search");
@@ -226,7 +226,7 @@ mod tests {
         let project = create_project(&root, "Mixto", ProjectType::Short, "es").expect("create");
         fs::write(root.join("research/ruido.bin"), [0xff, 0xfe, 0x00, 0x01]).expect("binary");
         project
-            .write_document("screenplay/main.fountain", "INT. CASA\n\nMarta entra.\n")
+            .write_document("workspace/main.fountain", "INT. CASA\n\nMarta entra.\n")
             .expect("screenplay");
         let report = search(&project, "marta").expect("search");
         assert_eq!(report.hits.len(), 1);

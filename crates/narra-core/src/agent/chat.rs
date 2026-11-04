@@ -34,6 +34,7 @@ use super::tools::{
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::document;
 use crate::project::open_project;
+use crate::project_type::{ProjectProfile, WorkspaceDefinition, WorkspaceMode};
 
 /// Chat modes exposed by the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -72,7 +73,7 @@ impl ChatMode {
     fn system_prompt(self) -> &'static str {
         match self {
             ChatMode::Plan => {
-                "Eres un colaborador de guion en modo PLAN. Trabajas en solo \
+                "Eres un colaborador de escritura en modo PLAN. Trabajas en solo \
                  lectura: analiza, propone ideas, estructura y preguntas de \
                  continuidad, pero no afirmes haber cambiado archivos. Puedes \
                  usar las herramientas de lectura para listar, buscar y leer \
@@ -81,24 +82,22 @@ impl ChatMode {
                  usuario."
             }
             ChatMode::Build => {
-                "Eres un colaborador de guion en modo BUILD. Puedes usar las \
-                 herramientas de lectura para consultar el proyecto, read_scene \
-                 para leer escenas, propose_scene_edit para proponer una \
-                 reescritura de escena, propose_document_edit para proponer \
-                 una reescritura de la biblia, estructura, notas o \
-                 investigación, y propose_document_create para proponer un \
+                "Eres un colaborador de escritura en modo BUILD. Puedes usar las \
+                 herramientas de lectura para consultar el proyecto, \
+                 propose_document_edit para proponer una reescritura de un \
+                 documento existente y propose_document_create para proponer un \
                  documento nuevo. Una propuesta NO se aplica: queda para revisión \
                  humana. Nunca digas que aplicaste un cambio ni escribas \
                  archivos canónicos. Si falta información, búscala o pídela. \
                  Responde en el idioma del usuario."
             }
             ChatMode::Review => {
-                "Eres un editor de guion en modo REVIEW. Haz una crítica \
-                 concreta de estructura, ritmo, personajes y continuidad. \
-                 Puedes usar las herramientas de lectura para consultar los \
-                 documentos del proyecto; no propongas archivos ni afirmes \
-                 haber modificado nada. Si no encuentras un dato, dilo; no \
-                 inventes canon. Responde en el idioma del usuario."
+                "Eres un editor en modo REVIEW. Haz una crítica concreta de \
+                 estructura, ritmo, voz y continuidad. Puedes usar las \
+                 herramientas de lectura para consultar los documentos del \
+                 proyecto; no propongas archivos ni afirmes haber modificado \
+                 nada. Si no encuentras un dato, dilo; no inventes canon. \
+                 Responde en el idioma del usuario."
             }
         }
     }
@@ -112,11 +111,11 @@ impl ChatMode {
             }
             ChatMode::Build => {
                 "Usa las herramientas de lectura si necesitas consultar el \
-                 proyecto y cita la ruta consultada. Para escenas usa \
-                 propose_scene_edit; para editar bible, structure, notes o \
-                 research usa propose_document_edit; para crear uno nuevo usa \
-                 propose_document_create. La propuesta queda para revisión \
-                 humana."
+                 proyecto y cita la ruta consultada. Para editar un documento \
+                 existente usa propose_document_edit; para crear uno nuevo usa \
+                 propose_document_create. Solo se puede proponer escritura en \
+                 las rutas que declara el tipo de proyecto. La propuesta queda \
+                 para revisión humana."
             }
         }
     }
@@ -127,7 +126,7 @@ impl ChatMode {
 /// reports the truncation in a source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatAttachment {
-    /// Stable kind key: `scene`, `selection`, `document`, `bible`, `note`.
+    /// Stable kind key: `selection`, `document`, `note`.
     pub kind: String,
     /// Human-readable label shown as a chip, e.g. `Escena 4`.
     pub label: String,
@@ -455,6 +454,19 @@ fn context_budget(
     }
 }
 
+/// Fallback output budget when the provider does not advertise a model limit.
+/// A full scene (or a document rewrite) arrives inside a tool-call argument,
+/// so a small fixed budget truncates the JSON mid-string.
+const DEFAULT_CHAT_OUTPUT_TOKENS: u32 = 8_192;
+
+/// Provider-advertised limit, or the conservative fallback. Ignore nonsense
+/// values (0) so a bad catalog entry cannot disable generation.
+fn output_budget(limit: Option<u32>) -> u32 {
+    limit
+        .filter(|limit| *limit >= 256)
+        .unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS)
+}
+
 /// Explicit chat input. A fresh task is built for each user turn; prior
 /// conversation and attachments are inputs, never hidden global state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +484,11 @@ pub struct ChatTask {
     pub skills: Vec<Skill>,
     /// Provider catalog context window for this model, when known.
     pub context_window: Option<u32>,
+    /// Provider-advertised output limit for this model, when known.
+    pub max_output_tokens: Option<u32>,
+    /// Active type package: the prompt tells the model which roots it may
+    /// propose writes into (D-062).
+    pub profile: Option<ProjectProfile>,
 }
 
 impl ChatTask {
@@ -492,6 +509,8 @@ impl ChatTask {
             include_project_context: false,
             skills: Vec::new(),
             context_window: None,
+            max_output_tokens: None,
+            profile: None,
         }
     }
 
@@ -505,6 +524,11 @@ impl ChatTask {
         self
     }
 
+    pub fn with_max_output_tokens(mut self, limit: Option<u32>) -> Self {
+        self.max_output_tokens = limit;
+        self
+    }
+
     pub fn with_project_context(mut self, include: bool) -> Self {
         self.include_project_context = include;
         self
@@ -512,6 +536,11 @@ impl ChatTask {
 
     pub fn with_skills(mut self, skills: Vec<Skill>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    pub fn with_profile(mut self, profile: ProjectProfile) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -616,13 +645,22 @@ impl ChatTask {
             context,
             self.instruction
         );
-        let system = format!(
+        let mut system = format!(
             "{}\n\nEl manifiesto ya está en el contexto de la tarea. \
              project.yaml, agents.yaml, AGENTS.md y .narra/ son configuración, \
              no documentos narrativos: no intentes leerlos con read_document. \
              Si necesitas rutas, usa list_documents.",
             self.mode.system_prompt()
         );
+        if let Some(profile) = &self.profile {
+            system.push_str(&profile_brief(profile));
+        }
+        system.push_str(&official_document_brief(
+            &manifest.workspace_document,
+            self.profile
+                .as_ref()
+                .and_then(|profile| profile.workspace.as_ref()),
+        ));
 
         self.run_with_tools(
             root,
@@ -662,7 +700,6 @@ impl ChatTask {
         let mut usage_reported = false;
         let mut policy = match self.mode {
             ChatMode::Build => GrantPolicy::new()
-                .allow("propose_scene_edit")
                 .allow("propose_document_edit")
                 .allow("propose_document_create"),
             ChatMode::Plan | ChatMode::Review => GrantPolicy::new(),
@@ -687,7 +724,7 @@ impl ChatTask {
                 } else {
                     format!("{prompt}\n\nContinúa según los resultados de las herramientas.")
                 },
-                max_output_tokens: 4096,
+                max_output_tokens: output_budget(self.max_output_tokens),
                 tools: specs.clone(),
                 history: history.clone(),
             };
@@ -811,11 +848,10 @@ impl ChatTask {
         if options.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let final_text = final_text.unwrap_or_else(|| {
-            "El agente agotó las rondas sin una respuesta final. Revisa las \
-             propuestas creadas o reformula la petición."
-                .to_string()
-        });
+        let final_text = match final_text {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => summarize_run(&proposals, &audit),
+        };
         emit(TaskEvent::Completed {
             summary: final_text.clone(),
         });
@@ -839,6 +875,105 @@ impl ChatTask {
     }
 }
 
+/// Final answer when the model returns no text: name what the run actually
+/// did instead of failing or saying nothing.
+fn summarize_run(proposals: &[serde_json::Value], audit: &[ToolResult]) -> String {
+    if !proposals.is_empty() {
+        let targets: Vec<&str> = proposals
+            .iter()
+            .filter_map(|proposal| proposal.get("target").and_then(serde_json::Value::as_str))
+            .collect();
+        return format!(
+            "Dejé {} propuesta(s) para revisión: {}.",
+            proposals.len(),
+            targets.join(", ")
+        );
+    }
+    if !audit.is_empty() {
+        return format!(
+            "Ejecuté {} herramienta(s) sin cambios pendientes. Revisa la actividad para el detalle.",
+            audit.len()
+        );
+    }
+    "El agente no devolvió texto. Revisa la actividad de la herramienta o reformula la petición."
+        .to_string()
+}
+
+/// Tell the model how the type's workspace works: the official document,
+/// the episode pattern or the declared collection deliverables. Also asks for
+/// a short brief when basic information is missing.
+fn official_document_brief(
+    default_document: &str,
+    workspace: Option<&WorkspaceDefinition>,
+) -> String {
+    let mut out = String::from("\n\n");
+    if workspace.map(|workspace| workspace.mode) == Some(WorkspaceMode::Collection) {
+        out.push_str("ESPACIO DE TRABAJO (colección): no hay un documento oficial único.");
+        if let Some(workspace) = workspace {
+            if !workspace.documents.is_empty() {
+                out.push_str("\nEntregables declarados:");
+                for document in &workspace.documents {
+                    out.push_str(&format!("\n- {} → {}", document.label.es, document.path));
+                }
+            }
+            out.push_str(&format!(
+                "\nEdita el entregable que corresponda con propose_document_edit; usa \
+                 propose_document_create solo para un documento nuevo dentro de `{}`.",
+                workspace.folder
+            ));
+        }
+    } else {
+        out.push_str(&format!(
+            "DOCUMENTO OFICIAL DEL PROYECTO: {default_document}\n\
+             Para escenas y borradores edita ese archivo con propose_document_edit; no \
+             inventes un nombre de archivo. Usa propose_document_create solo para fichas, \
+             notas o investigación nuevas."
+        ));
+        if let Some(pattern) = workspace.and_then(|workspace| workspace.episode_pattern.as_deref())
+        {
+            out.push_str(&format!(
+                "\nProyecto por episodios: el patrón es `{pattern}`. Sustituye {{number}} \
+                 por el número de episodio. Si el episodio ya existe, edítalo; si no, \
+                 créalo con ese nombre."
+            ));
+        }
+    }
+    out.push_str(
+        "\nSi falta información básica (premisa, tono, personajes), haz primero 3–5 \
+         preguntas breves de brief y espera las respuestas antes de escribir.",
+    );
+    out
+}
+
+/// Data-driven brief of the active type package: the model may only propose
+/// writes inside the declared roots (D-062).
+fn profile_brief(profile: &ProjectProfile) -> String {
+    let mut out =
+        String::from("\n\nRUTAS DE ESCRITURA DEL PROYECTO (solo puedes proponer archivos aquí):");
+    if profile.write_roots.is_empty() {
+        out.push_str("\n- (el tipo de proyecto no declara raíces: no se puede escribir)");
+    }
+    for root in &profile.write_roots {
+        out.push_str(&format!(
+            "\n- {} (extensiones: {})",
+            root.path,
+            root.extensions.join(", ")
+        ));
+    }
+    if !profile.entities.is_empty() {
+        out.push_str("\nEntidades (carpeta de cada una):");
+        for entity in &profile.entities {
+            out.push_str(&format!("\n- {} → {}", entity.id, entity.folder));
+        }
+    }
+    out.push_str(
+        "\nPara crear un documento usa propose_document_create con una ruta dentro \
+         de esas raíces; para reescribir uno existente usa propose_document_edit. \
+         Las propuestas quedan para revisión humana.",
+    );
+    out
+}
+
 /// A successful read-only call is a visible source, not hidden context.
 fn tool_context_source(call: &tools::ToolCall) -> Option<ContextSource> {
     let (location, detail) = match call.name.as_str() {
@@ -857,13 +992,6 @@ fn tool_context_source(call: &tools::ToolCall) -> Option<ContextSource> {
         "load_skill" => (
             format!("skill: {}", call.arguments.get("id")?.as_str()?),
             "cuerpo de skill cargado".to_string(),
-        ),
-        "read_scene" => (
-            format!(
-                "escena {}",
-                call.arguments.get("scene")?.as_u64().unwrap_or(0)
-            ),
-            "escena leída por la herramienta".to_string(),
         ),
         _ => return None,
     };
@@ -931,17 +1059,35 @@ mod tests {
             assert!(tools.iter().any(|tool| tool.name == "search_project"));
             assert!(tools.iter().any(|tool| tool.name == "read_document"));
             assert!(tools.iter().any(|tool| tool.name == "load_skill"));
-            assert!(tools.iter().any(|tool| tool.name == "read_scene"));
             assert!(
                 tools
                     .iter()
                     .all(|tool| tool.permission == tools::ToolPermission::ReadOnly)
             );
+            assert!(
+                tools.iter().all(|tool| !tool.name.starts_with("propose_")),
+                "read-only modes never expose proposal tools"
+            );
         }
         let build = ChatMode::Build.tools();
-        assert!(build.iter().any(|tool| tool.name == "read_scene"));
-        assert!(build.iter().any(|tool| tool.name == "propose_scene_edit"));
+        assert!(build.iter().any(|tool| tool.name == "read_document"));
+        assert!(
+            build
+                .iter()
+                .any(|tool| tool.name == "propose_document_edit")
+        );
+        assert!(
+            build
+                .iter()
+                .any(|tool| tool.name == "propose_document_create")
+        );
         assert!(build.iter().any(|tool| tool.name == "apply_proposal"));
+        assert!(
+            build
+                .iter()
+                .all(|tool| tool.name != "read_scene" && tool.name != "propose_scene_edit"),
+            "scene-specific tools are retired: the type package declares the format"
+        );
         for mode in ChatMode::ALL {
             assert_eq!(ChatMode::parse(mode.key()), Some(mode));
         }
@@ -953,7 +1099,7 @@ mod tests {
         let mut thread = ChatThread::new(ChatMode::Plan);
         thread.push_user("Resume la escena 1");
         thread.push_assistant("La escena plantea el conflicto.");
-        thread.push_proposal("proposal-1", "screenplay/main.fountain", 2);
+        thread.push_proposal("proposal-1", "workspace/main.fountain", 2);
         thread.push_activity(ChatActivity {
             run: 0,
             kind: ChatActivityKind::Read,
@@ -1052,7 +1198,7 @@ mod tests {
             .with_attachments(vec![ChatAttachment::new(
                 "scene",
                 "Escena 1",
-                "screenplay/main.fountain",
+                "workspace/main.fountain",
                 "INT. CASA - DÍA\nMarta entra.",
             )]);
         let output = task
@@ -1190,10 +1336,10 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_can_read_a_scene_but_never_applies_a_proposal() {
+    fn build_chat_can_read_a_document_but_never_applies_a_proposal() {
         let root = project();
         fs::write(
-            root.join("screenplay/main.fountain"),
+            root.join("workspace/main.fountain"),
             "INT. CASA - DÍA\nMarta entra.\n",
         )
         .expect("screenplay");
@@ -1203,8 +1349,8 @@ mod tests {
                 model: "mock".to_string(),
                 tool_calls: vec![crate::agent::ToolCall {
                     id: "read-1".to_string(),
-                    name: "read_scene".to_string(),
-                    arguments: json!({"scene": 1}),
+                    name: "read_document".to_string(),
+                    arguments: json!({"path": "workspace/main.fountain"}),
                 }],
                 input_tokens: None,
                 output_tokens: None,
@@ -1499,21 +1645,21 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_stages_a_proposal_but_leaves_the_screenplay_untouched() {
+    fn build_chat_stages_a_screenplay_proposal_but_leaves_the_file_untouched() {
         let root = project();
         let screenplay = "INT. CASA - DÍA\n\nMarta entra.\n";
-        fs::write(root.join("screenplay/main.fountain"), screenplay).expect("screenplay");
+        fs::write(root.join("workspace/main.fountain"), screenplay).expect("screenplay");
         let adapter = crate::agent::MockAdapter::scripted(vec![
             crate::agent::ModelResponse {
                 text: String::new(),
                 model: "mock".to_string(),
                 tool_calls: vec![crate::agent::ToolCall {
                     id: "propose-1".to_string(),
-                    name: "propose_scene_edit".to_string(),
+                    name: "propose_document_edit".to_string(),
                     arguments: json!({
-                        "scene": 1,
+                        "path": "workspace/main.fountain",
                         "instruction": "haz que salga",
-                        "rewritten_scene": "INT. CASA - DÍA\n\nMarta sale.\n"
+                        "rewritten_document": "INT. CASA - DÍA\n\nMarta sale.\n"
                     }),
                 }],
                 input_tokens: None,
@@ -1544,7 +1690,7 @@ mod tests {
                 .is_some_and(|tools| !tools.is_empty())
         );
         assert_eq!(
-            fs::read_to_string(root.join("screenplay/main.fountain")).expect("read"),
+            fs::read_to_string(root.join("workspace/main.fountain")).expect("read"),
             screenplay,
             "proposal must not write the canonical screenplay"
         );
@@ -1552,5 +1698,79 @@ mod tests {
             root.join(".narra/proposals").is_dir(),
             "proposal record should be persisted"
         );
+    }
+
+    #[test]
+    fn profile_brief_lists_declared_roots_and_entities() {
+        let profile = crate::project_type::builtin("feature")
+            .expect("feature")
+            .profile();
+        let brief = profile_brief(&profile);
+        assert!(brief.contains("RUTAS DE ESCRITURA"), "{brief}");
+        assert!(brief.contains("bible (extensiones: .md)"), "{brief}");
+        assert!(
+            brief.contains("workspace (extensiones: .fountain, .md)"),
+            "{brief}"
+        );
+        assert!(brief.contains("character → bible/characters"), "{brief}");
+        assert!(brief.contains("propose_document_create"), "{brief}");
+
+        let empty = ProjectProfile::default();
+        let brief = profile_brief(&empty);
+        assert!(brief.contains("no declara raíces"), "{brief}");
+    }
+
+    #[test]
+    fn a_run_without_final_text_summarizes_what_it_did() {
+        let proposals = vec![json!({"id": "p1", "target": "bible/marta.md"})];
+        let summary = summarize_run(&proposals, &[]);
+        assert!(summary.contains("1 propuesta(s)"), "{summary}");
+        assert!(summary.contains("bible/marta.md"), "{summary}");
+        assert!(summarize_run(&[], &[]).contains("no devolvió texto"));
+    }
+
+    #[test]
+    fn output_budget_follows_the_provider_limit_with_a_safe_fallback() {
+        assert_eq!(output_budget(Some(16_384)), 16_384);
+        assert_eq!(output_budget(Some(0)), DEFAULT_CHAT_OUTPUT_TOKENS);
+        assert_eq!(output_budget(None), DEFAULT_CHAT_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn official_document_brief_names_the_workspace_contract() {
+        let brief = official_document_brief("guion/main.fountain", None);
+        assert!(brief.contains("DOCUMENTO OFICIAL"), "{brief}");
+        assert!(brief.contains("guion/main.fountain"), "{brief}");
+        assert!(brief.contains("propose_document_edit"), "{brief}");
+        assert!(brief.contains("preguntas breves de brief"), "{brief}");
+
+        let episodes = WorkspaceDefinition {
+            mode: WorkspaceMode::Episodes,
+            folder: "guion".to_string(),
+            default_document: Some("guion/episode-1.fountain".to_string()),
+            episode_pattern: Some("guion/episode-{number}.fountain".to_string()),
+            documents: Vec::new(),
+        };
+        let brief = official_document_brief("guion/episode-1.fountain", Some(&episodes));
+        assert!(brief.contains("guion/episode-{number}.fountain"), "{brief}");
+        assert!(brief.contains("episodios"), "{brief}");
+
+        let collection = WorkspaceDefinition {
+            mode: WorkspaceMode::Collection,
+            folder: "campaign".to_string(),
+            default_document: None,
+            episode_pattern: None,
+            documents: vec![crate::project_type::WorkspaceDocument {
+                id: "brief".to_string(),
+                label: crate::project_type::LocalizedText {
+                    en: "Brief".to_string(),
+                    es: "Brief".to_string(),
+                },
+                path: "campaign/brief.md".to_string(),
+            }],
+        };
+        let brief = official_document_brief("", Some(&collection));
+        assert!(brief.contains("colección"), "{brief}");
+        assert!(brief.contains("campaign/brief.md"), "{brief}");
     }
 }

@@ -1,0 +1,139 @@
+schema_version: 2
+api_version: 1
+id: microdrama
+name: Microdrama
+description: A microdrama project with very short episodes.
+format: fountain
+directories:
+  - bible/characters
+  - bible/locations
+  - bible/objects
+  - structure
+  - workspace
+  - research
+  - notes
+  - reviews
+files:
+  - path: workspace/episode-1.fountain
+    content:
+      en: ""
+      es: ""
+  - path: notes/decisions.md
+    content:
+      en: |
+        # Decisions
+        
+        Record accepted decisions here. Each entry: date, decision, consequence.
+      es: |
+        # Decisions
+        
+        Record accepted decisions here. Each entry: date, decision, consequence.
+  - path: notes/open-questions.md
+    content:
+      en: |
+        # Open questions
+        
+        Record unresolved questions here.
+      es: |
+        # Open questions
+        
+        Record unresolved questions here.
+  - path: bible/premise.md
+    content:
+      en: |
+        # Premise
+        
+        Write the story premise here: who wants what, and what stands in the way.
+      es: |
+        # Premisa
+        
+        Escribe aquí la premisa de la historia: quién, qué quiere y qué se lo impide.
+  - path: structure/outline.md
+    content:
+      en: |
+        # Outline
+        
+        ## Act I
+        
+        - Introduce the world and the protagonist.
+        
+        ## Act II
+        
+        - Conflict and midpoint.
+        
+        ## Act III
+        
+        - Resolution.
+      es: |
+        # Escaleta
+        
+        ## Acto I
+        
+        - Presentación del mundo y del protagonista.
+        
+        ## Acto II
+        
+        - Conflicto y punto medio.
+        
+        ## Acto III
+        
+        - Resolución.
+workspace:
+  mode: episodes
+  folder: workspace
+  default_document: workspace/episode-1.fountain
+  episode_pattern: "workspace/episode-{number}.fountain"
+brief:
+  document: notes/brief.md
+  questions:
+    - id: premise
+      label: { en: "What is the story about?", es: "¿De qué trata la historia?" }
+      placeholder: { en: "One or two sentences", es: "Una o dos frases" }
+      multiline: true
+    - id: tone
+      label: { en: "What tone and genre are you aiming for?", es: "¿Qué tono y género buscas?" }
+    - id: characters
+      label: { en: "Who are the main characters?", es: "¿Quiénes son los protagonistas?" }
+      multiline: true
+    - id: references
+      label: { en: "Any references or constraints?", es: "¿Referencias o restricciones?" }
+      required: false
+content_layout:
+  - id: story
+    folders: [bible, structure]
+  - id: script
+    folders: [workspace]
+  - id: research
+    folders: [research]
+  - id: notes
+    folders: [notes, reviews]
+pinned_context: [bible, structure, notes/decisions.md, notes/open-questions.md]
+write_roots:
+  - path: bible
+    extensions: [.md]
+    label: { en: Bible, es: Biblia }
+  - path: structure
+    extensions: [.md]
+    label: { en: Structure, es: Estructura }
+  - path: research
+    extensions: [.md]
+    label: { en: Research, es: Investigación }
+  - path: notes
+    extensions: [.md]
+    label: { en: Notes, es: Notas }
+  - path: workspace
+    extensions: [.fountain, .md]
+    label: { en: Workspace, es: Espacio de trabajo }
+entities:
+  - id: character
+    label: { en: Character, es: Personaje }
+    folder: bible/characters
+  - id: location
+    label: { en: Location, es: Lugar }
+    folder: bible/locations
+  - id: object
+    label: { en: Object, es: Objeto }
+    folder: bible/objects
+export:
+  - kind: pdf
+    roots: [workspace]

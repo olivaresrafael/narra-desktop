@@ -16,9 +16,11 @@ pub mod adapter;
 pub mod brief;
 pub mod chat;
 pub mod context;
+mod frontmatter;
 pub mod mock;
 pub mod openai_compat;
 pub mod package;
+pub mod portable;
 pub mod proposal;
 pub mod roles;
 pub mod scaffold;
@@ -42,6 +44,9 @@ pub use openai_compat::{
 };
 pub use package::{
     AgentPackage, PACKAGE_FILE, PROJECT_PACKAGES_DIR, PackageError, PackageOrigin, PackageTrust,
+};
+pub use portable::{
+    AGENT_FILE, AgentMode, PROJECT_COMMANDS_DIR, PortableAgent, SlashCommand, USER_COMMANDS_DIR,
 };
 pub use proposal::{ApplyOutcome, FileProposal, ProposalState};
 pub use roles::{Role, RoleOrigin, RolesError};

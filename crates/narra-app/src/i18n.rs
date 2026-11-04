@@ -106,9 +106,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "modo fixture: sin proyecto abierto (usa --project)",
     ),
     (
-        "notice.open_screenplay",
-        "open {path} to work on a scene",
-        "abre {path} para trabajar sobre una escena",
+        "notice.open_workspace_document",
+        "open {path} to work on the workspace",
+        "abre {path} para trabajar en el workspace",
     ),
     (
         "notice.dirty_agent",
@@ -322,9 +322,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "no hay un documento abierto para guardar",
     ),
     (
-        "notice.export_screenplay",
-        "open the screenplay tab to export the PDF",
-        "abre la pestaña del guion para exportar el PDF",
+        "notice.export_workspace_document",
+        "open the workspace document to export the PDF",
+        "abre el documento del workspace para exportar el PDF",
     ),
     (
         "notice.capability_unavailable",
@@ -426,7 +426,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Esperando la carpeta en el panel del sistema…",
     ),
     ("newproject.create", "Create project", "Crear proyecto"),
-    ("newproject.generate", "Generate base", "Generar base"),
     ("newproject.folder", "Folder:", "Carpeta:"),
     (
         "newproject.no_folder",
@@ -448,28 +447,27 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Choose folder…",
         "Elegir carpeta…",
     ),
-    ("newproject.mode", "Project base:", "Base del proyecto:"),
+    ("newproject.mode", "Start:", "Inicio:"),
     (
         "newproject.mode.template",
         "Basic template",
         "Plantilla básica",
     ),
-    ("newproject.mode.ai", "Generate with AI", "Generar con IA"),
-    ("newproject.prompt", "Prompt:", "Prompt:"),
+    ("newproject.mode.ai", "Write with AI", "Escribir con IA"),
+    (
+        "newproject.prompt",
+        "What do you want to write?",
+        "¿Qué quieres escribir?",
+    ),
     (
         "newproject.prompt_hint",
-        "Describe the story you want to start.",
-        "Describe la historia que quieres empezar.",
+        "Describe the story, characters or scene you have in mind.",
+        "Describe la historia, personajes o escena que tienes en mente.",
     ),
     (
         "newproject.ai_unavailable",
-        "Configure an AI provider in Settings to generate the project base.",
-        "Configura un proveedor de IA en Ajustes para generar la base del proyecto.",
-    ),
-    (
-        "newproject.generating",
-        "Generating the project base…",
-        "Generando la base del proyecto…",
+        "Configure an AI provider in Settings to write with AI.",
+        "Configura un proveedor de IA en Ajustes para escribir con IA.",
     ),
     (
         "newproject.prompt_required",
@@ -477,19 +475,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Describe el proyecto para la IA.",
     ),
     (
-        "newproject.plan",
-        "Review the files before creating the project.",
-        "Revisa los archivos antes de crear el proyecto.",
-    ),
-    (
-        "newproject.scaffold_failed",
-        "The AI could not generate the project base: {error}",
-        "La IA no pudo generar la base del proyecto: {error}",
-    ),
-    (
-        "newproject.write_failed",
-        "The project was created, but some generated files could not be written: {error}",
-        "El proyecto se creó, pero no se pudieron escribir algunos archivos generados: {error}",
+        "newproject.ai_hint",
+        "The project will be created and your prompt sent to the chat.",
+        "El proyecto se creará y tu prompt se enviará al chat.",
     ),
     ("newproject.cancel", "Cancel", "Cancelar"),
     (
@@ -569,9 +557,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "abierto {title} · {path}",
     ),
     (
-        "notice.screenplay_repaired",
-        "default screenplay updated to {path}",
-        "guion predeterminado actualizado a {path}",
+        "notice.workspace_document_repaired",
+        "workspace document updated to {path}",
+        "documento del workspace actualizado a {path}",
+    ),
+    (
+        "notice.commands_invalid",
+        "commands: {error}",
+        "comandos: {error}",
     ),
     (
         "notice.recents_cleared",
@@ -1106,14 +1099,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "No se pudo adjuntar {path}: {error}",
     ),
     (
-        "chat.rewrite_prompt",
-        "Rewrite the attached scene to…",
-        "Reescribe la escena adjunta para…",
-    ),
-    (
-        "chat.continuity_prompt",
-        "Check the continuity of…",
-        "Revisa la continuidad de…",
+        "chat.command_unknown",
+        "Unknown command `{command}`. Available: {commands}.",
+        "Comando desconocido `{command}`. Disponibles: {commands}.",
     ),
     (
         "chat.character_prompt",
@@ -1479,14 +1467,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Etiquetas separadas por comas, por ejemplo: es, en.",
     ),
     (
-        "project_settings.default_screenplay",
-        "Default screenplay",
-        "Guion principal",
+        "project_settings.workspace_document",
+        "Workspace document",
+        "Documento del workspace",
     ),
     (
-        "project_settings.no_screenplays",
-        "No .fountain documents found yet.",
-        "Todavía no hay documentos .fountain.",
+        "project_settings.no_workspace_documents",
+        "No workspace documents found yet.",
+        "Todavía no hay documentos en el workspace.",
     ),
     ("project_settings.save", "Save", "Guardar"),
     ("project_settings.cancel", "Cancel", "Cancelar"),
@@ -2418,9 +2406,9 @@ mod tests {
             tf(
                 Lang::Es,
                 "notice.saved",
-                &[("path", "screenplay/main.fountain")]
+                &[("path", "workspace/main.fountain")]
             ),
-            "guardado: screenplay/main.fountain"
+            "guardado: workspace/main.fountain"
         );
         assert_eq!(
             tf(Lang::En, "notice.saved", &[("path", "a.fountain")]),

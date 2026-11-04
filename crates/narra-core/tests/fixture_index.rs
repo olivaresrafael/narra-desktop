@@ -4,7 +4,7 @@
 //! parser and index must stay derived conveniences: they never modify the
 //! source file.
 
-use narra_core::{DEFAULT_SCREENPLAY, ProjectType, create_project};
+use narra_core::{DEFAULT_WORKSPACE_DOCUMENT, ProjectType, create_project};
 use std::fs;
 use std::path::PathBuf;
 
@@ -35,7 +35,7 @@ fn fixture_index_matches_scene_heading_count() {
     let root = temp_root();
     let project = create_project(&root, "Fixture", ProjectType::Feature, "es").expect("create");
     project
-        .write_document(DEFAULT_SCREENPLAY, &fixture)
+        .write_document(DEFAULT_WORKSPACE_DOCUMENT, &fixture)
         .expect("copy fixture");
 
     let index = project.rebuild_index().expect("index");
@@ -55,7 +55,7 @@ fn fixture_index_matches_scene_heading_count() {
 
     // The index is derived: the source bytes are untouched by rebuilding.
     let after = project
-        .read_document(DEFAULT_SCREENPLAY)
+        .read_document(DEFAULT_WORKSPACE_DOCUMENT)
         .expect("read back");
     assert_eq!(after, fixture, "rebuild_index must not touch source files");
 }

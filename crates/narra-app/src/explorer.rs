@@ -107,9 +107,15 @@ pub struct Row {
     pub folder_kind: FolderKind,
 }
 
-/// Build the visible rows for `paths`, honoring `collapsed` folders.
-pub fn build_rows(paths: &[String], collapsed: &HashSet<String>) -> Vec<Row> {
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
+/// Build the visible rows for `paths` plus the project's directories,
+/// honoring `collapsed` folders. Explicit directories keep empty folders
+/// visible (a package may seed them before any document exists).
+pub fn build_rows(
+    paths: &[String],
+    directories: &[String],
+    collapsed: &HashSet<String>,
+) -> Vec<Row> {
+    let mut dirs: BTreeSet<String> = directories.iter().cloned().collect();
     let mut files: Vec<&str> = Vec::new();
     for path in paths {
         files.push(path.as_str());
@@ -269,13 +275,13 @@ mod tests {
             "bible/characters/marta.md".to_string(),
             "bible/world.md".to_string(),
             "project.yaml".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
         ]
     }
 
     #[test]
     fn folders_first_then_files_at_every_level() {
-        let rows = build_rows(&paths(), &HashSet::new());
+        let rows = build_rows(&paths(), &[], &HashSet::new());
         let rendered: Vec<(usize, &str)> =
             rows.iter().map(|r| (r.depth, r.name.as_str())).collect();
         assert_eq!(
@@ -285,7 +291,7 @@ mod tests {
                 (1, "characters"),
                 (2, "marta.md"),
                 (1, "world.md"),
-                (0, "screenplay"),
+                (0, "workspace"),
                 (1, "main.fountain"),
                 (0, "agents.yaml"),
                 (0, "project.yaml"),
@@ -297,7 +303,7 @@ mod tests {
     fn collapsed_folders_hide_their_descendants() {
         let mut collapsed = HashSet::new();
         collapsed.insert("bible".to_string());
-        let rows = build_rows(&paths(), &collapsed);
+        let rows = build_rows(&paths(), &[], &collapsed);
         assert!(rows.iter().any(|row| row.path == "bible" && row.collapsed));
         assert!(!rows.iter().any(|row| row.path.starts_with("bible/")));
         // Root files still follow.
@@ -307,22 +313,18 @@ mod tests {
         );
 
         // Collapsing a nested folder hides only its own children.
-        collapsed.insert("screenplay".to_string());
-        let rows = build_rows(&paths(), &collapsed);
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.path == "screenplay/main.fountain")
-        );
+        collapsed.insert("workspace".to_string());
+        let rows = build_rows(&paths(), &[], &collapsed);
+        assert!(!rows.iter().any(|row| row.path == "workspace/main.fountain"));
     }
 
     #[test]
     fn groups_reorder_top_level_blocks_and_keep_nested_rows() {
-        let rows = build_rows(&paths(), &HashSet::new());
+        let rows = build_rows(&paths(), &[], &HashSet::new());
         let groups = vec![
             ExplorerGroup {
                 id: "script".to_string(),
-                folders: vec!["screenplay".to_string()],
+                folders: vec!["workspace".to_string()],
             },
             ExplorerGroup {
                 id: "story".to_string(),
@@ -343,7 +345,7 @@ mod tests {
         assert_eq!(
             sequence,
             vec![
-                (Some("script"), 0, "screenplay"),
+                (Some("script"), 0, "workspace"),
                 (Some("script"), 1, "main.fountain"),
                 (Some("story"), 0, "bible"),
                 (Some("story"), 1, "characters"),
@@ -377,7 +379,7 @@ mod tests {
     #[test]
     fn file_kinds_drive_the_explorer_icons() {
         assert_eq!(
-            FileKind::from_path("screenplay/main.fountain"),
+            FileKind::from_path("workspace/main.fountain"),
             FileKind::Fountain
         );
         assert_eq!(
@@ -402,14 +404,14 @@ mod tests {
             "bible/world.md".to_string(),
             "project.yaml".to_string(),
             ".narra/backups/x~".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
         ];
         let visible = visible_paths(&paths, false);
         assert_eq!(
             visible,
             vec![
                 "bible/world.md".to_string(),
-                "screenplay/main.fountain".to_string()
+                "workspace/main.fountain".to_string()
             ]
         );
         assert_eq!(visible_paths(&paths, true), paths);
@@ -425,18 +427,38 @@ mod tests {
             "exports/main.pdf".to_string(),
             "notes/ideas.txt".to_string(),
             "project.yaml".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
         ];
         assert_eq!(
             attachable_paths(&paths),
             vec![
                 "bible/world.md".to_string(),
                 "notes/ideas.txt".to_string(),
-                "screenplay/main.fountain".to_string()
+                "workspace/main.fountain".to_string()
             ]
         );
         assert!(!is_attachable_path("README"));
         assert!(is_attachable_path("notes/beats.yml"));
+    }
+
+    #[test]
+    fn empty_folders_are_visible() {
+        let rows = build_rows(
+            &["bible/world.md".to_string()],
+            &[
+                "bible/characters".to_string(),
+                "bible/locations".to_string(),
+            ],
+            &HashSet::new(),
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.path == "bible/characters" && row.is_dir)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.path == "bible/locations" && row.is_dir)
+        );
     }
 
     #[test]
@@ -447,6 +469,7 @@ mod tests {
                 "notes/b.md".to_string(),
                 "notes/deep/c.md".to_string(),
             ],
+            &[],
             &HashSet::new(),
         );
         assert_eq!(

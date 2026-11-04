@@ -29,7 +29,7 @@ fn sample_with_scenes() -> PathBuf {
     let project = narra_core::project::open_project(&root).expect("open");
     project
         .write_document(
-            narra_core::DEFAULT_SCREENPLAY,
+            narra_core::DEFAULT_WORKSPACE_DOCUMENT,
             "INT. TALLER - NOCHE\n\nELENA\nEsto es una prueba.\n\nINT. CALLE - DÍA\n\nMARCOS\nHace sol.\n",
         )
         .expect("screenplay");
@@ -260,7 +260,7 @@ fn timeout_bounds_a_stuck_task() {
 #[test]
 fn harness_never_writes_to_the_project() {
     let root = sample_project();
-    let screenplay = root.join(narra_core::DEFAULT_SCREENPLAY);
+    let screenplay = root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT);
     let before = snapshot(&root);
 
     harness()
@@ -441,7 +441,7 @@ fn propose_creates_a_reviewable_proposal_without_writing_canon() {
 fn apply_changes_the_file_and_a_second_apply_is_refused() {
     let root = sample_with_scenes();
     let id = propose(&root);
-    let screenplay = root.join(narra_core::DEFAULT_SCREENPLAY);
+    let screenplay = root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT);
     let before = fs::read_to_string(&screenplay).expect("read");
 
     let output = harness()
@@ -552,7 +552,7 @@ fn reject_leaves_canonical_files_untouched() {
 fn stale_proposal_apply_fails_and_renew_produces_a_fresh_one() {
     let root = sample_with_scenes();
     let id = propose(&root);
-    let screenplay = root.join(narra_core::DEFAULT_SCREENPLAY);
+    let screenplay = root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT);
 
     // A later user edit invalidates the base.
     fs::write(
@@ -670,7 +670,7 @@ fn loop_permission_flags_on_other_commands_are_explicit_errors() {
             "brief",
             root.to_str().expect("utf8"),
             "--allow-tool",
-            "read_scene",
+            "read_document",
         ])
         .output()
         .expect("run harness");
@@ -1450,7 +1450,7 @@ fn broken_role_config_is_an_explicit_failure_not_a_silent_fallback() {
 fn export_pdf_writes_a_well_formed_artifact_without_credentials() {
     let root = sample_with_scenes();
     let screenplay_before =
-        fs::read(root.join(narra_core::DEFAULT_SCREENPLAY)).expect("screenplay before");
+        fs::read(root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT)).expect("screenplay before");
 
     let output = harness()
         .args(["export", root.to_str().expect("utf8")])
@@ -1474,7 +1474,7 @@ fn export_pdf_writes_a_well_formed_artifact_without_credentials() {
 
     // Export is an artifact: the canonical screenplay is byte-identical.
     let screenplay_after =
-        fs::read(root.join(narra_core::DEFAULT_SCREENPLAY)).expect("screenplay after");
+        fs::read(root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT)).expect("screenplay after");
     assert_eq!(screenplay_before, screenplay_after);
 }
 

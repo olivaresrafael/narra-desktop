@@ -3,8 +3,8 @@
 //! content → rebuild index → reject an unknown schema without rewriting.
 
 use narra_core::{
-    DEFAULT_SCREENPLAY, MANIFEST_FILE, ProjectType, create_project, open_project, parse_manifest,
-    serialize_manifest,
+    DEFAULT_WORKSPACE_DOCUMENT, MANIFEST_FILE, ProjectType, create_project, open_project,
+    parse_manifest, serialize_manifest,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ fn full_lifecycle_stays_portable_and_strict() {
     // 3. Write narrative content and rebuild the disposable index.
     reopened
         .write_document(
-            DEFAULT_SCREENPLAY,
+            DEFAULT_WORKSPACE_DOCUMENT,
             "INT. OFICINA - DÍA\n\nElla teclea.\n\nEXT. AZOTEA - NOCHE\n",
         )
         .expect("write screenplay");
@@ -49,7 +49,7 @@ fn full_lifecycle_stays_portable_and_strict() {
     // 4. Everything on disk is plain text a Git client can diff.
     let status_paths = [
         MANIFEST_FILE,
-        DEFAULT_SCREENPLAY,
+        DEFAULT_WORKSPACE_DOCUMENT,
         "bible/characters/marta.md",
         "notes/decisions.md",
     ];

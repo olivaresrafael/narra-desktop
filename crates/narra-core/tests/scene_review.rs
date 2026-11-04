@@ -29,7 +29,7 @@ fn sample_project() -> PathBuf {
         create_project(&root, "Luces de Invierno", ProjectType::Feature, "es").expect("create");
     project
         .write_document(
-            narra_core::DEFAULT_SCREENPLAY,
+            narra_core::DEFAULT_WORKSPACE_DOCUMENT,
             "INT. TALLER - NOCHE\n\nELENA\nEsto es una prueba.\n\nINT. CALLE - DÍA\n\nMARCOS\nHace sol.\n",
         )
         .expect("screenplay");
@@ -187,7 +187,7 @@ fn review_is_read_only_and_shows_every_source() {
         .iter()
         .find(|source| source.kind == "scene")
         .expect("scene source");
-    assert_eq!(scene_location.location, "screenplay/main.fountain:L1-L4");
+    assert_eq!(scene_location.location, "workspace/main.fountain:L1-L4");
     let material_locations: Vec<&str> = output
         .sources
         .iter()

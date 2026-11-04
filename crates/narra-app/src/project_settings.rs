@@ -17,7 +17,7 @@ pub enum ProjectField {
     Type,
     PrimaryLanguage,
     AdditionalLanguages,
-    DefaultScreenplay,
+    WorkspaceDocument,
 }
 
 impl ProjectField {
@@ -26,7 +26,7 @@ impl ProjectField {
         ProjectField::Type,
         ProjectField::PrimaryLanguage,
         ProjectField::AdditionalLanguages,
-        ProjectField::DefaultScreenplay,
+        ProjectField::WorkspaceDocument,
     ];
 
     fn next(self, forward: bool) -> ProjectField {
@@ -53,7 +53,7 @@ pub struct ProjectSettingsState {
     pub primary_language: String,
     /// Editable comma-separated list; normalized on save.
     pub additional_languages: String,
-    pub default_screenplay: String,
+    pub workspace_document: String,
     pub field: ProjectField,
     pub error: String,
     pub status: String,
@@ -68,7 +68,7 @@ impl ProjectSettingsState {
             project_type_id: manifest.project_type_id.clone(),
             primary_language: manifest.primary_language.clone(),
             additional_languages: manifest.additional_languages.join(", "),
-            default_screenplay: manifest.default_screenplay_path.clone(),
+            workspace_document: manifest.workspace_document.clone(),
             field: ProjectField::Title,
             error: String::new(),
             status: String::new(),
@@ -84,7 +84,7 @@ impl ProjectSettingsState {
             ProjectField::Title => self.title.push_str(&cleaned),
             ProjectField::PrimaryLanguage => self.primary_language.push_str(&cleaned),
             ProjectField::AdditionalLanguages => self.additional_languages.push_str(&cleaned),
-            ProjectField::Type | ProjectField::DefaultScreenplay => {}
+            ProjectField::Type | ProjectField::WorkspaceDocument => {}
         }
         self.error.clear();
         self.status.clear();
@@ -95,7 +95,7 @@ impl ProjectSettingsState {
             ProjectField::Title => &mut self.title,
             ProjectField::PrimaryLanguage => &mut self.primary_language,
             ProjectField::AdditionalLanguages => &mut self.additional_languages,
-            ProjectField::Type | ProjectField::DefaultScreenplay => return,
+            ProjectField::Type | ProjectField::WorkspaceDocument => return,
         };
         if let Some(last) = target.chars().last() {
             let len = target.len();
@@ -132,7 +132,7 @@ impl ProjectSettingsState {
             .filter(|language| !language.is_empty())
             .map(str::to_string)
             .collect();
-        manifest.default_screenplay_path = self.default_screenplay.trim().to_string();
+        manifest.workspace_document = self.workspace_document.trim().to_string();
         project
             .update_manifest(manifest)
             .map_err(|error| error.to_string())
@@ -163,8 +163,8 @@ mod tests {
         assert_eq!(state.project_type, ProjectType::Feature);
         assert_eq!(state.primary_language, "es");
         assert_eq!(
-            state.default_screenplay,
-            narra_core::project::DEFAULT_SCREENPLAY
+            state.workspace_document,
+            narra_core::project::DEFAULT_WORKSPACE_DOCUMENT
         );
         assert_eq!(state.field, ProjectField::Title);
     }
@@ -178,7 +178,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let package = narra_core::project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\n",
             narra_core::project_type::TypeOrigin::User,
         )
         .expect("package");
@@ -230,7 +230,7 @@ mod tests {
         state.field = ProjectField::Title;
         state.title = "Marta".to_string();
         state.cycle_field(false);
-        assert_eq!(state.field, ProjectField::DefaultScreenplay);
+        assert_eq!(state.field, ProjectField::WorkspaceDocument);
         state.cycle_field(true);
         assert_eq!(state.field, ProjectField::Title);
         state.backspace();

@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn writes_and_reads_round_trip() {
         let root = root();
-        write_document(&root, "screenplay/main.fountain", "INT. ROOM - DAY\n").expect("write");
-        let read = read_document(&root, "screenplay/main.fountain").expect("read");
+        write_document(&root, "workspace/main.fountain", "INT. ROOM - DAY\n").expect("write");
+        let read = read_document(&root, "workspace/main.fountain").expect("read");
         assert_eq!(read, "INT. ROOM - DAY\n");
     }
 

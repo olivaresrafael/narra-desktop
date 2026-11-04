@@ -17,52 +17,14 @@ use std::collections::HashSet;
 
 use crate::project::Project;
 
-/// Bible category of an entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EntityCategory {
-    Character,
-    Location,
-    Object,
-}
-
-impl EntityCategory {
-    pub const ALL: [EntityCategory; 3] = [
-        EntityCategory::Character,
-        EntityCategory::Location,
-        EntityCategory::Object,
-    ];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            EntityCategory::Character => "character",
-            EntityCategory::Location => "location",
-            EntityCategory::Object => "object",
-        }
-    }
-
-    pub fn folder(self) -> &'static str {
-        match self {
-            EntityCategory::Character => "bible/characters",
-            EntityCategory::Location => "bible/locations",
-            EntityCategory::Object => "bible/objects",
-        }
-    }
-
-    pub fn from_path(path: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|category| {
-            path.starts_with(category.folder())
-                && path.len() > category.folder().len() + 1
-                && path.ends_with(".md")
-        })
-    }
-}
-
 /// One derived entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entity {
     /// Display name (the file stem, case preserved).
     pub name: String,
-    pub category: EntityCategory,
+    /// Entity id declared by the active type package (`character`,
+    /// `personaje`…). The core never assumes a fixed set of kinds.
+    pub kind: String,
     /// Project-relative Markdown path.
     pub document: String,
 }
@@ -77,10 +39,6 @@ pub struct Mention {
 }
 
 impl Mention {
-    pub fn category(&self, index: &EntityIndex) -> EntityCategory {
-        index.entities[self.entity].category
-    }
-
     pub fn document<'a>(&self, index: &'a EntityIndex) -> &'a str {
         &index.entities[self.entity].document
     }
@@ -97,13 +55,19 @@ pub struct EntityIndex {
 }
 
 impl EntityIndex {
-    /// Build the index from the project's bible folders. Files outside those
-    /// three folders are ignored; unreadable folders are reported by
-    /// `list_documents` and never guessed around.
+    /// Build the index from the entity folders the active type package
+    /// declares (D-062). Files outside those folders are ignored; unreadable
+    /// folders are reported by `list_documents` and never guessed around.
     pub fn build(project: &Project) -> Result<Self, crate::project::ProjectError> {
+        let package =
+            crate::project_type::resolve(project.root(), &project.manifest().project_type_id);
+        let definitions = package.map(|package| package.entities).unwrap_or_default();
         let mut entities = Vec::new();
         for document in project.list_documents()? {
-            let Some(category) = EntityCategory::from_path(&document) else {
+            let Some(definition) = definitions
+                .iter()
+                .find(|definition| is_entity_document(&document, &definition.folder))
+            else {
                 continue;
             };
             let Some(stem) = document
@@ -118,7 +82,7 @@ impl EntityIndex {
             }
             entities.push(Entity {
                 name: stem.to_string(),
-                category,
+                kind: definition.id.clone(),
                 document,
             });
         }
@@ -207,15 +171,23 @@ impl EntityIndex {
             .take(limit)
             .map(|entity| {
                 format!(
-                    "{{\"name\":\"{}\",\"category\":\"{}\",\"document\":\"{}\"}}",
+                    "{{\"name\":\"{}\",\"kind\":\"{}\",\"document\":\"{}\"}}",
                     json_escape(&entity.name),
-                    entity.category.key(),
+                    json_escape(&entity.kind),
                     json_escape(&entity.document)
                 )
             })
             .collect::<Vec<_>>()
             .join(",")
     }
+}
+
+/// Whether `path` is a Markdown document directly inside `folder`.
+fn is_entity_document(path: &str, folder: &str) -> bool {
+    path.starts_with(folder)
+        && path.as_bytes().get(folder.len()) == Some(&b'/')
+        && path.len() > folder.len() + 1
+        && path.ends_with(".md")
 }
 
 fn is_word_char(c: char) -> bool {
@@ -299,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn index_reads_only_the_three_bible_folders() {
+    fn index_reads_only_the_declared_entity_folders() {
         let index = EntityIndex::build(&project()).expect("index");
         assert_eq!(index.len(), 4);
         let names: Vec<&str> = index.entities().iter().map(|e| e.name.as_str()).collect();
@@ -308,7 +280,45 @@ mod tests {
         assert!(names.contains(&"Casa de Marta"));
         assert!(names.contains(&"reloj de Marta"));
         assert!(!names.contains(&"not-an-entity"));
-        assert_eq!(index.entities()[0].category, EntityCategory::Character);
+        assert_eq!(index.entities()[0].kind, "character");
+    }
+
+    #[test]
+    fn index_follows_the_package_entity_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "narra-entities-custom-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = std::env::temp_dir().join(format!(
+            "narra-entities-custom-package-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&source_root);
+        let source = source_root.join("campaign");
+        fs::create_dir_all(&source).expect("package dir");
+        fs::write(
+            source.join("type.yaml"),
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief, brief/personajes]\nwrite_roots:\n  - path: brief\n    extensions: [.md]\nentities:\n  - id: personaje\n    label: { en: Character, es: Personaje }\n    folder: brief/personajes\n",
+        )
+        .expect("type.yaml");
+        let package =
+            crate::project_type::load_package(&source, crate::project_type::TypeOrigin::User)
+                .expect("package");
+        let project = crate::project::create_project_from_package(&root, "Campaña", &package, "es")
+            .expect("project");
+        // The copied package is untrusted until the UI confirms its hash.
+        crate::project_type::trust_type(&root, &package.id, &package.content_hash).expect("trust");
+        project
+            .create_document("brief/personajes/Marta.md", "# Marta\n")
+            .expect("document");
+        let index = EntityIndex::build(&open_project(&root).expect("reopen")).expect("index");
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.entities()[0].name, "Marta");
+        assert_eq!(index.entities()[0].kind, "personaje");
+        assert_eq!(index.entities()[0].document, "brief/personajes/Marta.md");
     }
 
     #[test]

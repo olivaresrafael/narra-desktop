@@ -68,7 +68,7 @@ fn campaign_project() -> PathBuf {
     fs::create_dir_all(&package_dir).expect("package dir");
     fs::write(
         package_dir.join("type.yaml"),
-        "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief]\nfiles:\n  - path: brief/brief.md\n    content:\n      en: |\n        # Brief\n        Launch the new product.\n      es: |\n        # Brief\n        Lanzar el producto nuevo.\ncontext:\n  pinned: [brief]\n",
+        "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief]\npinned_context: [brief]\nfiles:\n  - path: brief/brief.md\n    content:\n      en: |\n        # Brief\n        Launch the new product.\n      es: |\n        # Brief\n        Lanzar el producto nuevo.\n",
     )
     .expect("type.yaml");
     let package: ProjectTypePackage =
@@ -334,12 +334,12 @@ fn eight_prompts_use_visible_context_without_writes_or_forbidden_sources() {
         vec![ChatAttachment::new(
             "selection",
             "Selección",
-            "screenplay/main.fountain:L1",
+            "workspace/main.fountain:L1",
             "La palabra clave es FARO.",
         )],
     );
     if output.summary.contains("FARO")
-        && has_source(&output, "selection", "screenplay/main.fountain:L1")
+        && has_source(&output, "selection", "workspace/main.fountain:L1")
     {
         passed += 1;
     }

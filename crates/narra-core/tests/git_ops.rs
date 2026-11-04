@@ -93,7 +93,7 @@ fn init_works_on_paths_with_spaces_and_accents() {
 #[test]
 fn offline_status_commit_log_cycle() {
     let repo = new_repo();
-    write(&repo, "screenplay/main.fountain", "INT. CASA - DÍA\n");
+    write(&repo, "workspace/main.fountain", "INT. CASA - DÍA\n");
 
     // Initial state: unborn branch, one untracked file.
     let (branch, entries) = repo.status(options()).expect("status");
@@ -573,26 +573,26 @@ fn diff_path_show_file_and_unstage_are_scoped_and_non_destructive() {
     let repo = new_repo();
     write(
         &repo,
-        "screenplay/main.fountain",
+        "workspace/main.fountain",
         "INT. CASA - DÍA\nMarta entra.\n",
     );
     let first = commit_all(&repo, "primera");
     write(
         &repo,
-        "screenplay/main.fountain",
+        "workspace/main.fountain",
         "INT. CASA - DÍA\nMarta sale.\n",
     );
     let diff = repo
         .diff_path(
             DiffScope::WorktreeVsHead,
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
             options(),
         )
         .expect("diff");
     assert!(diff.contains("Marta entra"), "{diff}");
     assert!(diff.contains("Marta sale"), "{diff}");
     let old = repo
-        .show_file(&first, "screenplay/main.fountain", options())
+        .show_file(&first, "workspace/main.fountain", options())
         .expect("show");
     assert_eq!(old, "INT. CASA - DÍA\nMarta entra.\n");
     repo.unstage_all(options()).expect("unstage");
@@ -600,7 +600,7 @@ fn diff_path_show_file_and_unstage_are_scoped_and_non_destructive() {
     assert!(
         status
             .iter()
-            .any(|entry| entry.path == "screenplay/main.fountain")
+            .any(|entry| entry.path == "workspace/main.fountain")
     );
 }
 

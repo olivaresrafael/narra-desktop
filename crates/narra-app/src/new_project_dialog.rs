@@ -4,6 +4,7 @@
 //! existing `TextField` model and forward clicks to the editor actions.
 
 use super::*;
+use gpui::prelude::*;
 
 /// How a new project starts (M16 slices 8–9, D-044).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,14 +24,13 @@ pub(crate) enum NewProjectField {
 /// The New Project modal (M10 slice 2b): title, kind, primary language, the
 /// destination folder and the native save-panel phase. Choosing a folder and
 /// accepting are separate actions: the folder is only stored here, and
-/// `accept_new_project` creates the template or starts the AI plan. `picking`
-/// is true while the OS dialog owns the app, so duplicate panels cannot open.
-/// The AI mode adds a prompt, a busy phase and a reviewable file plan.
+/// `accept_new_project` creates the project immediately. `picking` is true
+/// while the OS dialog owns the app, so duplicate panels cannot open. The AI
+/// mode adds a prompt that is sent to the chat after creation; questions
+/// happen in the conversation, not in this dialog.
 #[derive(Debug)]
 pub(crate) struct NewProjectState {
     pub(crate) title: TextField,
-    /// Legacy enum used by the AI task/labels; custom ids map to `Other`.
-    pub(crate) kind: ProjectType,
     /// Selected package id; may be a user-defined type.
     pub(crate) type_id: String,
     /// Installed types shown in the dialog (built-ins + user packages).
@@ -41,13 +41,9 @@ pub(crate) struct NewProjectState {
     pub(crate) field: NewProjectField,
     pub(crate) error: String,
     pub(crate) picking: bool,
-    /// AI generation in progress (the save panel has already returned).
-    pub(crate) busy: bool,
     /// Destination folder chosen with the folder button. Nothing exists
     /// there until the user accepts.
     pub(crate) path: Option<PathBuf>,
-    /// Reviewable AI plan; nothing is written until the user confirms.
-    pub(crate) plan: Option<ScaffoldPlan>,
 }
 
 impl NewProjectState {
@@ -70,18 +66,6 @@ impl NewProjectState {
     }
 }
 
-/// Snapshot of the dialog inputs handed to the AI scaffold worker: what the
-/// user saw when pressing Accept decides the plan, even if the modal is still
-/// on screen while the model runs.
-#[derive(Debug, Clone)]
-pub(crate) struct NewProjectDraft {
-    pub(crate) title: String,
-    pub(crate) kind: ProjectType,
-    pub(crate) type_label: String,
-    pub(crate) lang: Lang,
-    pub(crate) prompt: String,
-}
-
 impl Editor {
     /// Render the New Project title or prompt with selection, caret and
     /// mouse drag. The model lives in `TextField`; this view only lays it out.
@@ -95,7 +79,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let text_field = state.text_field(field);
-        let focused = state.field == field && !state.picking && !state.busy && state.plan.is_none();
+        let focused = state.field == field && !state.picking;
         let text = text_field.text().to_string();
         let selection = text_field.selection();
         let caret = text_field.caret();
@@ -177,11 +161,11 @@ impl Editor {
         let width_for_click = width;
         let width_for_drag = width;
         let id = match field {
-            NewProjectField::Title => "new-project-title-input",
-            NewProjectField::Prompt => "new-project-prompt-input",
+            NewProjectField::Title => "new-project-title-input".to_string(),
+            NewProjectField::Prompt => "new-project-prompt-input".to_string(),
         };
         div()
-            .id(id)
+            .id(gpui::ElementId::Name(id.into()))
             .relative()
             .w_full()
             .p_2()
@@ -208,7 +192,7 @@ impl Editor {
                             let Some(state) = this.new_project.as_mut() else {
                                 return;
                             };
-                            if state.picking || state.busy || state.plan.is_some() {
+                            if state.picking {
                                 return;
                             }
                             state.field = field_for_click;
@@ -299,20 +283,19 @@ impl Editor {
             .into_any_element()
     }
 
-    /// New Project dialog: title, kind, primary language, destination folder,
-    /// project base and review. The folder button opens the native panel;
-    /// Enter accepts (creating the template or starting the AI plan). Esc
-    /// closes the dialog.
+    /// New Project dialog: title, kind, primary language, destination folder
+    /// and project base. The folder button opens the native panel; Enter
+    /// creates the project immediately. Esc closes the dialog.
     pub(crate) fn new_project_overlay(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_project.as_ref().expect("overlay only when open");
-        let editable = !state.picking && !state.busy && state.plan.is_none();
+        let editable = !state.picking;
         let mut modes = div().flex().flex_wrap().gap_2();
         for (mode, key) in [
             (NewProjectMode::Template, "newproject.mode.template"),
             (NewProjectMode::Ai, "newproject.mode.ai"),
         ] {
             let selected = state.mode == mode;
-            let enabled = editable && (mode != NewProjectMode::Ai || self.ai_scaffold_available());
+            let enabled = editable && (mode != NewProjectMode::Ai || self.ai_available());
             let mut chip = div()
                 .id(key)
                 .px_3()
@@ -337,10 +320,7 @@ impl Editor {
                 .child(self.t(key));
             if enabled {
                 chip = chip.on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(state) = this.new_project.as_mut()
-                        && !state.busy
-                        && state.plan.is_none()
-                    {
+                    if let Some(state) = this.new_project.as_mut() {
                         state.mode = mode;
                         state.field = if mode == NewProjectMode::Ai {
                             NewProjectField::Prompt
@@ -363,7 +343,6 @@ impl Editor {
                 |kind| self.t(new_project::type_i18n_key(kind)).to_string(),
             );
             let package_id = package.id.clone();
-            let package_kind = kind.unwrap_or(ProjectType::Other);
             kinds = kinds.child(
                 div()
                     .id(("project-type-chip", index as u64))
@@ -390,11 +369,8 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
-                            && !state.busy
-                            && state.plan.is_none()
                         {
                             state.type_id = package_id.clone();
-                            state.kind = package_kind;
                             state.error.clear();
                         }
                         cx.notify();
@@ -430,8 +406,6 @@ impl Editor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_project.as_mut()
                             && !state.picking
-                            && !state.busy
-                            && state.plan.is_none()
                         {
                             state.lang = lang;
                             state.error.clear();
@@ -459,12 +433,18 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
+            .p_6()
             .bg(rgba(0x00000099))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
-                    .w(px(600.0))
+                    .id("new-project-card")
+                    .w_full()
+                    .max_w(px(680.0))
+                    .h_full()
+                    .max_h(px(700.0))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -536,7 +516,7 @@ impl Editor {
                             .as_ref()
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| self.t("newproject.no_folder").to_string());
-                        let folder_enabled = !state.picking && !state.busy && state.plan.is_none();
+                        let folder_enabled = !state.picking;
                         let mut button = div()
                             .id("new-project-folder")
                             .flex_none()
@@ -595,7 +575,7 @@ impl Editor {
                             )
                             .child(modes),
                     )
-                    .when(!self.ai_scaffold_available(), |card| {
+                    .when(!self.ai_available(), |card| {
                         card.child(
                             div()
                                 .text_xs()
@@ -604,7 +584,7 @@ impl Editor {
                         )
                     })
                     .when(
-                        state.mode == NewProjectMode::Ai && self.ai_scaffold_available(),
+                        state.mode == NewProjectMode::Ai && self.ai_available(),
                         |card| {
                             card.child(
                                 div()
@@ -628,51 +608,15 @@ impl Editor {
                             )
                         },
                     )
-                    .when(state.plan.is_some(), |card| {
-                        let plan = state.plan.as_ref().expect("checked");
-                        let mut list = div()
-                            .id("new-project-plan")
-                            .max_h(px(180.0))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .border_1()
-                            .border_color(rgb(theme::explorer_border()));
-                        for file in &plan.files {
-                            let preview: String =
-                                file.content.lines().take(2).collect::<Vec<_>>().join(" ");
-                            let preview: String = preview.chars().take(160).collect();
-                            list = list.child(
-                                div()
-                                    .p_2()
-                                    .border_b_1()
-                                    .border_color(rgb(theme::explorer_border()))
-                                    .child(
-                                        div()
-                                            .text_color(rgb(theme::default_fg()))
-                                            .child(file.path.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::gutter_fg()))
-                                            .child(preview),
-                                    ),
-                            );
-                        }
-                        card.child(list)
-                    })
                     .child(
                         div()
                             .text_color(rgb(theme::status_fg()))
                             .child(if state.picking {
                                 self.t("newproject.waiting")
-                            } else if state.busy {
-                                self.t("newproject.generating")
-                            } else if state.plan.is_some() {
-                                self.t("newproject.plan")
                             } else if state.path.is_none() {
                                 self.t("newproject.folder_hint")
+                            } else if state.mode == NewProjectMode::Ai {
+                                self.t("newproject.ai_hint")
                             } else {
                                 self.t("newproject.hint")
                             }),
@@ -685,13 +629,8 @@ impl Editor {
                         )
                     })
                     .child({
-                        let plan_ready = state.plan.is_some();
-                        let can_click = !state.picking && !state.busy && state.path.is_some();
-                        let label = if plan_ready || state.mode == NewProjectMode::Template {
-                            self.t("newproject.create")
-                        } else {
-                            self.t("newproject.generate")
-                        };
+                        let can_click = !state.picking && state.path.is_some();
+                        let label = self.t("newproject.create");
                         let mut primary = div()
                             .id("new-project-create")
                             .px_3()
@@ -708,12 +647,11 @@ impl Editor {
                             }))
                             .child(label);
                         if can_click {
-                            primary =
-                                primary
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.accept_new_project(cx);
-                                    }));
+                            primary = primary.cursor_pointer().on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.accept_new_project(window, cx);
+                                },
+                            ));
                         }
                         div().flex().gap_2().child(primary).child(
                             div()
@@ -728,8 +666,6 @@ impl Editor {
                                     if !this.new_project.as_ref().is_some_and(|state| state.picking)
                                     {
                                         this.new_project = None;
-                                        this.new_project_generation =
-                                            this.new_project_generation.saturating_add(1);
                                     }
                                     cx.notify();
                                 })),

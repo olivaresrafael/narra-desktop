@@ -1,0 +1,181 @@
+# Narra project-type package — spike port of guionista-kit (D-062, Spike I).
+# Draft of the v2 contract: every creative rule here is data, not Rust.
+
+schema_version: 2
+api_version: 1
+id: guionista
+name: Guionista
+description: >-
+  Proyecto de escritura creativa en español: biblia narrativa, método de
+  estructura, escaleta y guion en Fountain. Puerto del kit guionista-kit.
+
+# Editor capability. The core only applies Fountain mechanics when a package
+# declares this format; a markdown/novel package never sees screenplay UI.
+format: fountain
+
+# Starter tree copied into a new project (create-only; never overwrites).
+directories:
+  - biblia
+  - biblia/personajes
+  - biblia/mundo
+  - investigacion
+  - estructura
+  - guion
+  - notas
+
+# Template files seeded into the new project. Paths are package-relative under
+# templates/; targets are project-relative.
+templates:
+  - source: biblia/premisa.md
+    target: biblia/premisa.md
+  - source: biblia/cronologia.md
+    target: biblia/cronologia.md
+  - source: biblia/personajes/_template.md
+    target: biblia/personajes/_template.md
+  - source: biblia/mundo/_template.md
+    target: biblia/mundo/_template.md
+
+# Instruction files written into the project so the agent runtime reads them
+# exactly like an OpenCode-driven project.
+instructions:
+  - source: AGENTS.md
+    target: AGENTS.md
+
+# Portable agent definitions (Markdown + YAML frontmatter), copied to
+# .narra/agents/<id>/AGENT.md on project creation.
+agents:
+  - guionista
+  - editor
+  - investigador
+  - personaje
+
+# Slash commands copied to .narra/commands/<name>.md.
+commands:
+  - brief
+  - idea
+  - personaje
+  - estructura
+  - escaleta
+  - escena
+  - revisar
+  - investigar
+  - voz
+
+# Skills copied to .narra/skills/<id>/ and trusted with the package hash.
+skills:
+  - desarrollo-idea
+  - personajes
+  - metodos-estructura
+  - escaleta
+  - escribir-escena
+  - formato-fountain
+  - editor-guion
+  - investigacion
+  - microdrama
+
+# The type's writing workspace: one official document for this feature film.
+workspace:
+  mode: single
+  folder: guion
+  default_document: guion/main.fountain
+
+# Folder groups rendered in the explorer; labels are localized by the app.
+brief:
+  document: notas/brief.md
+  questions:
+    - id: premisa
+      label: { es: "¿De qué trata la historia?", en: "What is the story about?" }
+      placeholder: { es: "Una o dos frases", en: "One or two sentences" }
+      multiline: true
+    - id: tono
+      label: { es: "¿Qué tono y género buscas?", en: "What tone and genre are you aiming for?" }
+    - id: personajes
+      label: { es: "¿Quiénes son los protagonistas?", en: "Who are the main characters?" }
+      multiline: true
+    - id: referencias
+      label: { es: "¿Referencias o restricciones?", en: "Any references or constraints?" }
+      required: false
+content_layout:
+  - id: story
+    folders: [biblia, estructura]
+  - id: script
+    folders: [guion]
+  - id: research
+    folders: [investigacion]
+  - id: notes
+    folders: [notas]
+
+# AI context pinned on every chat, in order. No Rust code names these folders.
+pinned_context:
+  - biblia
+  - estructura
+
+# Where AI writes may be proposed. The kernel still sandbox-checks every path;
+# a package can only narrow, never widen, these roots.
+write_roots:
+  - path: biblia
+    extensions: [.md]
+    label: { es: Biblia, en: Bible }
+  - path: estructura
+    extensions: [.md]
+    label: { es: Estructura, en: Structure }
+  - path: investigacion
+    extensions: [.md]
+    label: { es: Investigación, en: Research }
+  - path: notas
+    extensions: [.md]
+    label: { es: Notas, en: Notes }
+  - path: guion
+    extensions: [.fountain, .md]
+    label: { es: Guion, en: Screenplay }
+
+# Narrative entities offered by the editor (dossiers, mentions, convert menu).
+entities:
+  - id: personaje
+    label: { es: Personaje, en: Character }
+    folder: biblia/personajes
+  - id: mundo
+    label: { es: Lugar, en: Location }
+    folder: biblia/mundo
+
+# Export capabilities offered in the UI. Kinds are engine formats.
+export:
+  - kind: pdf
+    roots: [guion]
+
+# Editor context-menu actions declared by this package. Each action may only
+# invoke an engine mechanism; it can never inject code or write outside
+# write_roots.
+context_actions:
+  - id: convert_to_personaje
+    kind: convert_selection_to
+    entity: personaje
+    label: { es: "Convertir a personaje", en: "Convert to character" }
+    group: entities
+  - id: convert_to_mundo
+    kind: convert_selection_to
+    entity: mundo
+    label: { es: "Convertir a lugar", en: "Convert to location" }
+    group: entities
+  - id: new_personaje
+    kind: new_file_from_template
+    label: { es: "Nuevo personaje…", en: "New character…" }
+    template: biblia/personajes/_template.md
+    target: biblia/personajes
+    group: create
+  - id: new_mundo
+    kind: new_file_from_template
+    label: { es: "Nuevo lugar…", en: "New location…" }
+    template: biblia/mundo/_template.md
+    target: biblia/mundo
+    group: create
+  - id: run_escaleta
+    kind: run_command
+    command: escaleta
+    label: { es: "Generar escaleta…", en: "Build outline…" }
+    group: ai
+  - id: run_revisar
+    kind: run_command
+    command: revisar
+    label: { es: "Pedir notas de editor…", en: "Ask for editor notes…" }
+    group: ai

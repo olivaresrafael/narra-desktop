@@ -164,15 +164,16 @@ use gpui::{
     WindowOptions, actions, canvas, div, list, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use i18n::Lang;
+use narra_core::agent::portable::SlashCommand;
 use narra_core::agent::{
-    AgentError, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask, ChatThread,
-    LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
-    OpenAiCompatConfig, ProjectScaffoldTask, ScaffoldPlan, SceneEditTask, SceneReviewTask, Skill,
-    SkillOrigin, TaskOptions, active_skills, fetch_model_ids, fetch_models, load_scope,
-    load_skills, proposal, roles, trust_skill, untrusted_project_skills, write_plan,
+    AgentError, AgentMode, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask,
+    ChatThread, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
+    OpenAiCompatConfig, PackageOrigin, SceneEditTask, SceneReviewTask, Skill, SkillOrigin,
+    TaskOptions, active_skills, fetch_model_ids, fetch_models, load_scope, load_skills, portable,
+    proposal, roles, trust_skill, untrusted_project_skills,
 };
 use narra_core::cancel::CancellationToken;
-use narra_core::entities::{EntityCategory, EntityIndex, Mention, split_by_mentions};
+use narra_core::entities::{EntityIndex, Mention, split_by_mentions};
 use narra_core::export;
 use narra_core::fountain::ElementKind as FountainKind;
 use narra_core::git::{Branch, Commit, OpOptions, Repository, WorktreeStatus};
@@ -180,16 +181,17 @@ use narra_core::language::{
     self, Diagnostic, LanguageId, LanguageReport, Severity as DiagnosticSeverity,
 };
 use narra_core::markdown::MarkdownDocument;
+use narra_core::project_type::{ContextAction as PackageContextAction, ContextActionKind};
 use narra_core::provider::{
     CachedSecretStore, GITHUB_TOKEN_ACCOUNT, GitHubClient, GitHubConfig, NewPullRequest,
     NewRepository, OsKeychain, SecretError, SecretStore,
 };
 use narra_core::{
     DocumentError, Project, ProjectError, ProjectProfile, ProjectType, ProjectTypePackage,
-    create_project_base_from_package, create_project_from_package, open_project,
+    create_project_from_package, open_project,
 };
 use new_file::Kind as NewFileKind;
-use new_project_dialog::{NewProjectDraft, NewProjectField, NewProjectMode, NewProjectState};
+use new_project_dialog::{NewProjectField, NewProjectMode, NewProjectState};
 use project_settings::{ProjectField, ProjectSettingsState};
 use recent::RecentProjects;
 use settings::{AiProvider, AppSettings, LanguageSetting};
@@ -465,6 +467,8 @@ struct NewFileState {
     kind: NewFileKind,
     name: String,
     error: String,
+    /// Package template body preloaded by a `new_file_from_template` action.
+    template: Option<String>,
 }
 
 /// Field the settings modal is editing. Tab/click moves it; typing and paste
@@ -605,15 +609,6 @@ impl std::fmt::Debug for SettingsState {
             .field("github_token_checked", &self.github_token_checked)
             .finish()
     }
-}
-
-/// Result of one AI project-scaffold run (M16 slice 9). The generation token
-/// prevents a stale run from landing in a reopened dialog.
-enum NewProjectMessage {
-    Plan {
-        generation: u64,
-        result: Result<ScaffoldPlan, String>,
-    },
 }
 
 enum SettingsMessage {
@@ -1218,7 +1213,13 @@ fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
     if let Some(package) = project_type_package(project)
         && let Some(source) = &package.source_dir
     {
+        // Legacy package layout (`skills/`) and the portable `.narra/skills/`.
         for skill in load_scope(&source.join("skills"), SkillOrigin::Project).unwrap_or_default() {
+            by_id.insert(skill.id.clone(), skill);
+        }
+        for skill in
+            load_scope(&source.join(".narra/skills"), SkillOrigin::Project).unwrap_or_default()
+        {
             by_id.insert(skill.id.clone(), skill);
         }
     }
@@ -1242,6 +1243,95 @@ fn project_type_package(project: &Project) -> Option<ProjectTypePackage> {
             .into_iter()
             .find(|package| package.id == type_id)
     })
+}
+
+/// Slash commands available to a project (D-062): user scope first, then
+/// commands bundled with the active type package, then the project's own
+/// `.narra/commands/`, which win by id. A malformed command is reported but
+/// never prevents the project from opening.
+fn project_commands(
+    project: &Project,
+    config: &std::path::Path,
+) -> (Vec<SlashCommand>, Option<String>) {
+    let mut by_id: std::collections::BTreeMap<String, SlashCommand> =
+        std::collections::BTreeMap::new();
+    let mut error = None;
+    merge_command_scope(
+        &mut by_id,
+        config,
+        portable::USER_COMMANDS_DIR,
+        PackageOrigin::User,
+        &mut error,
+    );
+    if let Some(package) = project_type_package(project)
+        && let Some(source) = &package.source_dir
+    {
+        merge_command_scope(
+            &mut by_id,
+            source,
+            portable::PROJECT_COMMANDS_DIR,
+            PackageOrigin::Project,
+            &mut error,
+        );
+    }
+    merge_command_scope(
+        &mut by_id,
+        project.root(),
+        portable::PROJECT_COMMANDS_DIR,
+        PackageOrigin::Project,
+        &mut error,
+    );
+    (by_id.into_values().collect(), error)
+}
+
+fn merge_command_scope(
+    by_id: &mut std::collections::BTreeMap<String, SlashCommand>,
+    root: &std::path::Path,
+    relative_dir: &str,
+    origin: PackageOrigin,
+    error: &mut Option<String>,
+) {
+    match portable::discover_commands(root, relative_dir, origin) {
+        Ok(commands) => {
+            for command in commands {
+                by_id.insert(command.id.clone(), command);
+            }
+        }
+        Err(found) if error.is_none() => *error = Some(found.to_string()),
+        Err(_) => {}
+    }
+}
+
+/// Body of the package template targeted by a `new_file_from_template`
+/// action: seed files are read from the package source directory, inline
+/// `files` entries use their localized content. A missing source falls back
+/// to the generic document body.
+fn package_template_body(
+    package: &ProjectTypePackage,
+    template: &str,
+    language: &str,
+) -> Option<String> {
+    const MAX_TEMPLATE_BYTES: u64 = 64 * 1024;
+    if let Some(seed) = package
+        .templates
+        .iter()
+        .find(|seed| seed.target == template)
+    {
+        // Template sources are relative to the package's `templates/` dir.
+        let source = package
+            .source_dir
+            .as_ref()?
+            .join("templates")
+            .join(&seed.source);
+        let metadata = std::fs::metadata(&source).ok()?;
+        if metadata.len() > MAX_TEMPLATE_BYTES {
+            return None;
+        }
+        return std::fs::read_to_string(source).ok();
+    }
+    package
+        .file(template)
+        .map(|file| file.content.for_language(language).to_string())
 }
 
 fn generic_profile(type_id: &str) -> ProjectProfile {
@@ -1371,14 +1461,24 @@ pub(crate) fn shape_line(window: &Window, text: &str) -> ShapedLine {
     )
 }
 
-/// Background tint for an entity category (D-029). Foreground syntax colors
-/// stay untouched, so a character cue still reads as a cue while “Marta” gets
-/// a subtle mention tint.
-fn mention_bg(category: EntityCategory) -> u32 {
-    match category {
-        EntityCategory::Character => theme::mention_character_bg(),
-        EntityCategory::Location => theme::mention_location_bg(),
-        EntityCategory::Object => theme::mention_object_bg(),
+/// Background tint for an entity kind (D-029). Foreground syntax colors stay
+/// untouched, so a character cue still reads as a cue while “Marta” gets a
+/// subtle mention tint. Unknown package kinds pick a stable palette entry.
+fn mention_bg(kind: &str) -> u32 {
+    match kind {
+        "character" => theme::mention_character_bg(),
+        "location" => theme::mention_location_bg(),
+        "object" => theme::mention_object_bg(),
+        other => {
+            let hash = other.bytes().fold(0u32, |acc, byte| {
+                acc.wrapping_mul(31).wrapping_add(byte as u32)
+            });
+            match hash % 3 {
+                0 => theme::mention_character_bg(),
+                1 => theme::mention_location_bg(),
+                _ => theme::mention_object_bg(),
+            }
+        }
     }
 }
 
@@ -1397,8 +1497,10 @@ fn mention_runs(
             len: range.len(),
             font: gpui::font(FONT_FAMILY),
             color: color.into(),
-            background_color: entity
-                .map(|index| rgba(mention_bg(entities.entities()[index].category)).into()),
+            background_color: entity.map(|index| {
+                let entity = &entities.entities()[index];
+                rgba(mention_bg(&entity.kind)).into()
+            }),
             underline: None,
             strikethrough: None,
         })
@@ -1919,8 +2021,6 @@ struct Editor {
     new_file: Option<NewFileState>,
     /// The New Project modal, when open (M10 slice 2b).
     new_project: Option<NewProjectState>,
-    /// Monotonic token for AI scaffold runs (M16 slice 9).
-    new_project_generation: u64,
     /// Recent project roots, most recent first (M10 slice 2b).
     recents: RecentProjects,
     /// Bumped on every project switch; async search/export results carry the
@@ -1980,12 +2080,17 @@ struct Editor {
     profile: ProjectProfile,
     /// Trusted/user skills active for chat commands.
     skills: Vec<Skill>,
+    /// Package slash commands available in chat (`.narra/commands/*.md`).
+    commands: Vec<SlashCommand>,
     /// Project skills awaiting an explicit trust confirmation.
     skill_trust: Option<Vec<Skill>>,
     /// Project-level type package awaiting confirmation.
     type_trust: Option<ProjectTypePackage>,
     /// Documents offered by the explorer panel (project-relative paths).
     explorer: Vec<String>,
+    /// Directories in the project, including empty ones (the tree shows
+    /// package-seeded folders before any document exists).
+    explorer_dirs: Vec<String>,
     /// Derived bible entities and mention matcher (M11).
     entities: EntityIndex,
     /// Folders the user collapsed in the explorer tree (M9 slice 4);
@@ -3421,14 +3526,25 @@ impl Editor {
                 )
                 .child(div().text_color(rgb(theme::default_fg())).child(label))
         };
-        let mut tabs = div().flex().gap_1();
+        let mut sidebar = div()
+            .id("settings-nav")
+            .w(px(200.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .border_r_1()
+            .border_color(rgb(theme::explorer_border()));
         for (index, section) in SettingsSection::ALL.into_iter().enumerate() {
             let selected = section == state.section;
-            tabs = tabs.child(
+            sidebar = sidebar.child(
                 div()
                     .id(("settings-section", index))
+                    .w_full()
                     .px_3()
-                    .py_1()
+                    .py_2()
                     .bg(rgb(if selected {
                         theme::doc_selected_bg()
                     } else {
@@ -4322,90 +4438,122 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
+            .p_6()
             .bg(rgba(0x00000099))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
-                    .w(px(760.0))
                     .id("settings-card")
-                    .max_h(px(640.0))
-                    .overflow_y_scroll()
+                    .w_full()
+                    .max_w(px(920.0))
+                    .h_full()
+                    .max_h(px(700.0))
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_4()
+                    .flex_row()
                     .bg(rgb(theme::explorer_bg()))
                     .border_1()
                     .border_color(rgb(theme::explorer_border()))
+                    .child(sidebar)
                     .child(
                         div()
-                            .text_color(rgb(theme::default_fg()))
-                            .child(self.t("settings.title")),
-                    )
-                    .child(tabs)
-                    .child(content)
-                    .when(!state.error.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .text_color(rgb(theme::agent_err_fg()))
-                                .child(state.error.clone()),
-                        )
-                    })
-                    .when(!state.status.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .text_color(rgb(theme::status_fg()))
-                                .child(state.status.clone()),
-                        )
-                    })
-                    .child(
-                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
                             .flex()
-                            .gap_2()
-                            .when(state.section == SettingsSection::Ai, |row| {
-                                row.child(
-                                    div()
-                                        .id("settings-fetch")
-                                        .px_3()
-                                        .py_1()
-                                        .bg(rgb(theme::status_bg()))
-                                        .text_color(rgb(theme::default_fg()))
-                                        .cursor_pointer()
-                                        .child(if state.fetching_models {
-                                            self.t("settings.fetching")
-                                        } else {
-                                            self.t("settings.fetch_models")
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.settings_fetch_models(cx)
-                                        })),
-                                )
-                            })
+                            .flex_col()
                             .child(
                                 div()
-                                    .id("settings-save")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(theme::status_bg()))
+                                    .px_6()
+                                    .py_4()
+                                    .text_size(px(theme::text_size() * 1.4))
                                     .text_color(rgb(theme::default_fg()))
-                                    .cursor_pointer()
-                                    .child(self.t("settings.save"))
-                                    .on_click(cx.listener(|this, _, _, cx| this.settings_save(cx))),
+                                    .child(self.t("settings.title")),
                             )
                             .child(
                                 div()
-                                    .id("settings-cancel")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(theme::status_bg()))
-                                    .text_color(rgb(theme::status_fg()))
-                                    .cursor_pointer()
-                                    .child(self.t("settings.cancel"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.settings = None;
-                                        cx.notify();
-                                    })),
+                                    .id("settings-content")
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scroll()
+                                    .px_6()
+                                    .pb_4()
+                                    .child(content),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .px_6()
+                                    .py_3()
+                                    .border_t_1()
+                                    .border_color(rgb(theme::explorer_border()))
+                                    .when(!state.error.is_empty(), |footer| {
+                                        footer.child(
+                                            div()
+                                                .text_color(rgb(theme::agent_err_fg()))
+                                                .child(state.error.clone()),
+                                        )
+                                    })
+                                    .when(!state.status.is_empty(), |footer| {
+                                        footer.child(
+                                            div()
+                                                .text_color(rgb(theme::status_fg()))
+                                                .child(state.status.clone()),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .when(state.section == SettingsSection::Ai, |row| {
+                                                row.child(
+                                                    div()
+                                                        .id("settings-fetch")
+                                                        .px_3()
+                                                        .py_1()
+                                                        .bg(rgb(theme::status_bg()))
+                                                        .text_color(rgb(theme::default_fg()))
+                                                        .cursor_pointer()
+                                                        .child(if state.fetching_models {
+                                                            self.t("settings.fetching")
+                                                        } else {
+                                                            self.t("settings.fetch_models")
+                                                        })
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.settings_fetch_models(cx)
+                                                        })),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .id("settings-save")
+                                                    .px_3()
+                                                    .py_1()
+                                                    .bg(rgb(theme::status_bg()))
+                                                    .text_color(rgb(theme::default_fg()))
+                                                    .cursor_pointer()
+                                                    .child(self.t("settings.save"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.settings_save(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-cancel")
+                                                    .px_3()
+                                                    .py_1()
+                                                    .bg(rgb(theme::status_bg()))
+                                                    .text_color(rgb(theme::status_fg()))
+                                                    .cursor_pointer()
+                                                    .child(self.t("settings.cancel"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.settings = None;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
                             ),
                     ),
             )
@@ -4611,26 +4759,34 @@ impl Editor {
                     .child(state.project_type_id.clone()),
             );
         }
-        let mut screenplay_choices = div().flex().flex_col().gap_1();
-        let mut screenplays: Vec<&String> = self
+        let mut workspace_choices = div().flex().flex_col().gap_1();
+        let workspace_folder = self
+            .profile
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.folder.clone());
+        let mut documents: Vec<&String> = self
             .explorer
             .iter()
-            .filter(|path| FileKind::from_path(path) == FileKind::Fountain)
+            .filter(|path| match &workspace_folder {
+                Some(folder) => path.starts_with(&format!("{folder}/")),
+                None => FileKind::from_path(path) == FileKind::Fountain,
+            })
             .collect();
-        screenplays.sort();
-        if screenplays.is_empty() {
-            screenplay_choices = screenplay_choices.child(
+        documents.sort();
+        if documents.is_empty() {
+            workspace_choices = workspace_choices.child(
                 div()
                     .text_color(rgb(theme::status_fg()))
-                    .child(self.t("project_settings.no_screenplays")),
+                    .child(self.t("project_settings.no_workspace_documents")),
             );
         }
-        for (index, path) in screenplays.into_iter().enumerate() {
-            let selected = path == &state.default_screenplay;
+        for (index, path) in documents.into_iter().enumerate() {
+            let selected = path == &state.workspace_document;
             let choice = path.clone();
-            screenplay_choices = screenplay_choices.child(
+            workspace_choices = workspace_choices.child(
                 div()
-                    .id(("project-screenplay", index))
+                    .id(("project-workspace-document", index))
                     .px_2()
                     .py_1()
                     .bg(rgb(if selected {
@@ -4647,8 +4803,8 @@ impl Editor {
                     .child(choice.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.project_settings.as_mut() {
-                            state.default_screenplay = choice.clone();
-                            state.field = ProjectField::DefaultScreenplay;
+                            state.workspace_document = choice.clone();
+                            state.field = ProjectField::WorkspaceDocument;
                             state.error.clear();
                         }
                         cx.notify();
@@ -4661,14 +4817,17 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
+            .p_6()
             .bg(rgba(0x00000099))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, _| {}))
             .child(
                 div()
                     .id("project-settings-card")
-                    .w(px(680.0))
-                    .max_h(px(640.0))
+                    .w_full()
+                    .max_w(px(760.0))
+                    .h_full()
+                    .max_h(px(700.0))
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
@@ -4782,9 +4941,9 @@ impl Editor {
                     .child(
                         div()
                             .text_color(rgb(theme::status_fg()))
-                            .child(self.t("project_settings.default_screenplay")),
+                            .child(self.t("project_settings.workspace_document")),
                     )
-                    .child(screenplay_choices)
+                    .child(workspace_choices)
                     .when(!state.error.is_empty(), |card| {
                         card.child(
                             div()
@@ -5286,30 +5445,62 @@ impl Editor {
             ContextMenuItem::separator(),
             ContextMenuItem::action(ContextAction::Propose, t("context.propose"), "⌘K", true),
         ];
+        // Package-declared context actions (D-062) add to the editor menu;
+        // the generic entity conversion stays available and only hides the
+        // entities a declared `convert_selection_to` action already covers.
+        let package = self.project.as_ref().and_then(project_type_package);
+        let declared = package
+            .as_ref()
+            .map(|package| package.context_actions.as_slice())
+            .unwrap_or(&[]);
+        let declared_conversions: Vec<&str> = declared
+            .iter()
+            .filter(|action| action.kind == ContextActionKind::ConvertSelectionTo)
+            .filter_map(|action| action.entity.as_deref())
+            .collect();
         let mut entity_items = Vec::new();
-        for (kind, capability) in [
-            (NewFileKind::Character, "character"),
-            (NewFileKind::Location, "location"),
-            (NewFileKind::Object, "object"),
-        ] {
-            if self.profile.allows_entity(capability) {
-                let key = match kind {
-                    NewFileKind::Character => "context.convert.character",
-                    NewFileKind::Location => "context.convert.location",
-                    NewFileKind::Object => "context.convert.object",
-                    _ => continue,
-                };
-                entity_items.push(ContextMenuItem::action(
-                    ContextAction::Convert(kind),
-                    t(key),
-                    "",
-                    entity_ok,
-                ));
+        for entity in &self.profile.entities {
+            if declared_conversions.contains(&entity.id.as_str()) {
+                continue;
             }
+            entity_items.push(ContextMenuItem::action(
+                ContextAction::Convert(entity.id.clone()),
+                entity.label.for_language(self.lang.key()).to_string(),
+                "",
+                entity_ok,
+            ));
         }
         if !entity_items.is_empty() {
             items.push(ContextMenuItem::separator());
             items.extend(entity_items);
+        }
+        if !declared.is_empty() {
+            items.push(ContextMenuItem::separator());
+            let mut last_group: Option<&str> = None;
+            for action in declared {
+                let group = action.group.as_deref();
+                if last_group.is_some() && group != last_group {
+                    items.push(ContextMenuItem::separator());
+                }
+                let enabled = match action.kind {
+                    ContextActionKind::ConvertSelectionTo => entity_ok,
+                    ContextActionKind::NewFileFromTemplate => true,
+                    ContextActionKind::RunCommand => {
+                        action.command.as_deref().is_some_and(|command| {
+                            self.commands
+                                .iter()
+                                .any(|candidate| candidate.id == command)
+                        })
+                    }
+                };
+                items.push(ContextMenuItem::action(
+                    ContextAction::Package(action.id.clone()),
+                    action.label.for_language(self.lang.key()).to_string(),
+                    "",
+                    enabled,
+                ));
+                last_group = group;
+            }
         }
         if self.profile.screenplay {
             items.push(ContextMenuItem::separator());
@@ -5588,9 +5779,10 @@ impl Editor {
                 self.rewrite_open_paths(&state.path, &target);
                 self.rename = None;
                 if let Some(project) = self.project.as_ref()
-                    && let Ok(paths) = project.list_documents()
+                    && let Ok(tree) = project.list_tree()
                 {
-                    self.explorer = paths;
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
                 }
                 self.refresh_entities();
                 self.git_refreshed_at = None;
@@ -5624,9 +5816,10 @@ impl Editor {
         match project.duplicate_document(&path, &target) {
             Ok(()) => {
                 if let Some(project) = self.project.as_ref()
-                    && let Ok(paths) = project.list_documents()
+                    && let Ok(tree) = project.list_tree()
                 {
-                    self.explorer = paths;
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
                 }
                 self.refresh_entities();
                 self.git_refreshed_at = None;
@@ -5670,9 +5863,10 @@ impl Editor {
                 }
                 self.delete_prompt = None;
                 if let Some(project) = self.project.as_ref()
-                    && let Ok(paths) = project.list_documents()
+                    && let Ok(tree) = project.list_tree()
                 {
-                    self.explorer = paths;
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
                 }
                 self.refresh_entities();
                 self.git_refreshed_at = None;
@@ -5811,7 +6005,8 @@ impl Editor {
             ContextAction::Find => self.on_toggle_find(&ToggleFind, window, cx),
             ContextAction::ProjectSearch => self.on_project_search(&ProjectSearch, window, cx),
             ContextAction::Propose => self.on_open_propose(&OpenPropose, window, cx),
-            ContextAction::Convert(kind) => self.context_convert_entity(kind, cx),
+            ContextAction::Convert(entity) => self.context_convert_entity(&entity, cx),
+            ContextAction::Package(id) => self.context_package_action(&id, cx),
             ContextAction::SetElement(kind) => self.context_set_element(kind, cx),
             ContextAction::FileNew => self.open_new_file(cx),
             ContextAction::FileRename => self.begin_rename(cx),
@@ -5835,13 +6030,17 @@ impl Editor {
         self.context_target = None;
     }
 
-    /// Convert the selected word/selection into a bible dossier. Creating a
-    /// dossier is an explicit canonical write; if the file already exists the
-    /// menu opens it instead of overwriting anything.
-    fn context_convert_entity(&mut self, kind: NewFileKind, cx: &mut Context<Self>) {
-        if !kind.is_entity() {
+    /// Convert the selected word/selection into an entity dossier declared by
+    /// the active type package. Creating a dossier is an explicit canonical
+    /// write; if the file already exists the menu opens it instead of
+    /// overwriting anything.
+    fn context_convert_entity(&mut self, entity_id: &str, cx: &mut Context<Self>) {
+        let Some(kind) = NewFileKind::from_profile(&self.profile)
+            .into_iter()
+            .find(|kind| kind.key == entity_id)
+        else {
             return;
-        }
+        };
         let name = self
             .doc
             .buffer
@@ -5853,7 +6052,7 @@ impl Editor {
             cx.notify();
             return;
         }
-        let Some(path) = new_file::target_path(kind, &name) else {
+        let Some(path) = kind.target_path(&name) else {
             self.notice = Some(self.t("notice.entity_invalid").to_string());
             cx.notify();
             return;
@@ -5864,7 +6063,7 @@ impl Editor {
             return;
         };
         if !self.explorer.iter().any(|existing| existing == &path) {
-            let template = new_file::template(kind, &name);
+            let template = kind.template(&name);
             if let Err(error) = project.create_document(&path, &template) {
                 self.notice = Some(self.tf(
                     "notice.entity_create_failed",
@@ -5875,9 +6074,10 @@ impl Editor {
             }
         }
         if let Some(project) = self.project.as_ref()
-            && let Ok(paths) = project.list_documents()
+            && let Ok(tree) = project.list_tree()
         {
-            self.explorer = paths;
+            self.explorer = tree.documents;
+            self.explorer_dirs = tree.directories;
         }
         self.refresh_entities();
         if let Err(error) = self.open_document_path(&path, true) {
@@ -5887,9 +6087,118 @@ impl Editor {
         }
         self.notice = Some(self.tf(
             "notice.entity_opened",
-            &[("kind", self.t(kind.i18n_key())), ("path", &path)],
+            &[
+                ("kind", kind.label.for_language(self.lang.key())),
+                ("path", &path),
+            ],
         ));
         cx.notify();
+    }
+
+    /// Run a context action declared by the active type package (D-062).
+    /// Actions can only call engine mechanisms: convert the selection, open
+    /// the New File flow from a package template, or prefill a slash command.
+    fn context_package_action(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let Some(package) = project_type_package(project) else {
+            return;
+        };
+        let Some(action) = package
+            .context_actions
+            .iter()
+            .find(|action| action.id == action_id)
+            .cloned()
+        else {
+            return;
+        };
+        match action.kind {
+            ContextActionKind::ConvertSelectionTo => {
+                if let Some(entity) = action.entity.as_deref() {
+                    self.context_convert_entity(entity, cx);
+                }
+            }
+            ContextActionKind::NewFileFromTemplate => {
+                self.open_new_file_from_template(&package, &action, cx);
+            }
+            ContextActionKind::RunCommand => {
+                if let Some(command) = action.command.as_deref() {
+                    self.prefill_package_command(command, cx);
+                }
+            }
+        }
+    }
+
+    /// Open the New File dialog for a `new_file_from_template` action: the
+    /// target folder selects the kind and the package template is preloaded.
+    fn open_new_file_from_template(
+        &mut self,
+        package: &ProjectTypePackage,
+        action: &PackageContextAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = action.target.as_deref() else {
+            return;
+        };
+        if self.project.is_none() {
+            self.notice = Some(self.t("notice.fixture_no_project").to_string());
+            cx.notify();
+            return;
+        }
+        let kind = NewFileKind::for_folder(&self.profile, target);
+        let template = action
+            .template
+            .as_deref()
+            .and_then(|template| package_template_body(package, template, self.lang.key()));
+        self.new_file = Some(NewFileState {
+            kind,
+            name: String::new(),
+            error: String::new(),
+            template,
+        });
+        cx.notify();
+    }
+
+    /// Prefill the chat with a package command from the context menu; the
+    /// user still reviews and sends it.
+    fn prefill_package_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if !self
+            .commands
+            .iter()
+            .any(|candidate| candidate.id == command)
+        {
+            let token = format!("/{command}");
+            let available = self.available_commands();
+            self.notice = Some(self.tf(
+                "chat.command_unknown",
+                &[("command", &token), ("commands", &available)],
+            ));
+            cx.notify();
+            return;
+        }
+        self.chat.set_input(format!("/{command} "));
+        self.chat.focused = true;
+        self.chat_menu = None;
+        self.chat_mention = None;
+        self.agent_panel_open = true;
+        self.right_tab = RightTab::Chat;
+        cx.notify();
+    }
+
+    /// `/id` list for notices and hints.
+    fn available_commands(&self) -> String {
+        let available = self
+            .commands
+            .iter()
+            .map(|command| format!("/{}", command.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if available.is_empty() {
+            "—".to_string()
+        } else {
+            available
+        }
     }
 
     /// Apply a specific Fountain element type to every line touched by the
@@ -5966,7 +6275,7 @@ impl Editor {
             } else {
                 theme::status_fg()
             };
-            let action = item.action.expect("separator handled above");
+            let action = item.action.clone().expect("separator handled above");
             rows = rows.child(
                 div()
                     .id(("context-item", index))
@@ -5998,7 +6307,7 @@ impl Editor {
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             if enabled {
-                                this.context_activate(action, window, cx);
+                                this.context_activate(action.clone(), window, cx);
                             }
                         }),
                     ),
@@ -6254,13 +6563,13 @@ impl Editor {
     }
 
     /// Apply an edit to the active New Project field without touching the
-    /// document. Returns true while the dialog exists, even when the field is
-    /// temporarily read-only (picking, busy or reviewing a plan).
+    /// document. Returns true while the dialog exists, even when the folder
+    /// panel temporarily owns the app.
     fn with_new_project_text(&mut self, edit: impl FnOnce(&mut TextField)) -> bool {
         let Some(state) = self.new_project.as_mut() else {
             return false;
         };
-        if state.picking || state.busy || state.plan.is_some() {
+        if state.picking {
             return true;
         }
         edit(state.active_text_field_mut());
@@ -7653,27 +7962,18 @@ impl Editor {
             cx.notify();
             return;
         }
-        let kind = NewFileKind::ALL
-            .into_iter()
-            .find(|kind| self.new_file_kind_allowed(*kind))
-            .unwrap_or(NewFileKind::Notes);
+        let Some(kind) = NewFileKind::from_profile(&self.profile).into_iter().next() else {
+            self.notice = Some(self.t("notice.capability_unavailable").to_string());
+            cx.notify();
+            return;
+        };
         self.new_file = Some(NewFileState {
             kind,
             name: String::new(),
             error: String::new(),
+            template: None,
         });
         cx.notify();
-    }
-
-    /// Whether the active type profile exposes a document kind.
-    fn new_file_kind_allowed(&self, kind: NewFileKind) -> bool {
-        match kind {
-            NewFileKind::Character => self.profile.allows_entity("character"),
-            NewFileKind::Location => self.profile.allows_entity("location"),
-            NewFileKind::Object => self.profile.allows_entity("object"),
-            NewFileKind::Screenplay => self.profile.screenplay,
-            NewFileKind::Notes | NewFileKind::Research => true,
-        }
     }
 
     /// Create the document described by the dialog: an explicit canonical
@@ -7682,9 +7982,10 @@ impl Editor {
         let Some(state) = self.new_file.as_ref() else {
             return;
         };
-        let kind = state.kind;
+        let kind = state.kind.clone();
         let name = state.name.clone();
-        let Some(path) = new_file::target_path(kind, &name) else {
+        let template = state.template.clone();
+        let Some(path) = kind.target_path(&name) else {
             let message = self.t("newfile.invalid_name").to_string();
             if let Some(state) = self.new_file.as_mut() {
                 state.error = message;
@@ -7706,11 +8007,17 @@ impl Editor {
             cx.notify();
             return;
         }
-        let body = new_file::template(kind, &name);
+        let body = match template {
+            Some(template) => new_file::render_template(&template, &name),
+            None => kind.template(&name),
+        };
         match project.create_document(&path, &body) {
             Ok(()) => {
                 self.new_file = None;
-                self.explorer = project.list_documents().unwrap_or_default();
+                if let Ok(tree) = project.list_tree() {
+                    self.explorer = tree.documents;
+                    self.explorer_dirs = tree.directories;
+                }
                 self.refresh_entities();
                 let created = self.tf("notice.created", &[("path", &path)]);
                 match project.read_document(&path) {
@@ -7738,20 +8045,18 @@ impl Editor {
         cx.notify();
     }
 
-    /// The New File dialog: kind chooser, name field and the format row
-    /// (Fountain for screenplays, Markdown otherwise — the format is picked
-    /// here until more screenplay formats and Save As exist).
+    /// The New File dialog: kind chooser built from the active package, name
+    /// field and the format row (the extension the chosen root declares).
     fn new_file_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.new_file.as_ref().expect("overlay only when open");
-        let mut kinds = div().flex().gap_2();
-        for kind in NewFileKind::ALL
-            .into_iter()
-            .filter(|kind| self.new_file_kind_allowed(*kind))
-        {
+        let mut kinds = div().flex().flex_wrap().gap_2();
+        for kind in NewFileKind::from_profile(&self.profile) {
             let selected = kind == state.kind;
+            let label = kind.label.for_language(self.lang.key()).to_string();
+            let kind_for_click = kind.clone();
             kinds = kinds.child(
                 div()
-                    .id(kind.key())
+                    .id(gpui::ElementId::Name(kind.key.clone().into()))
                     .px_3()
                     .py_1()
                     .bg(rgb(if selected {
@@ -7771,19 +8076,20 @@ impl Editor {
                         theme::status_fg()
                     }))
                     .cursor_pointer()
-                    .child(self.t(kind.i18n_key()))
+                    .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.new_file.as_mut() {
-                            state.kind = kind;
+                            state.kind = kind_for_click.clone();
                             state.error.clear();
                         }
                         cx.notify();
                     })),
             );
         }
-        let format = match state.kind {
-            NewFileKind::Screenplay => self.t("newfile.format_fountain"),
-            _ => self.t("newfile.format_markdown"),
+        let format = if state.kind.extension.eq_ignore_ascii_case("fountain") {
+            self.t("newfile.format_fountain")
+        } else {
+            self.t("newfile.format_markdown")
         };
         div()
             .absolute()
@@ -8038,10 +8344,11 @@ impl Editor {
             project = open_project(&root).map_err(|error| error.to_string())?;
         }
         let repaired_screenplay = project
-            .repair_default_screenplay()
+            .repair_workspace_document()
             .map_err(|error| error.to_string())?;
-        let doc_path = project.manifest().default_screenplay_path.clone();
+        let doc_path = project.manifest().workspace_document.clone();
         let title = project.manifest().title.clone();
+        let _ = project.ensure_default_document();
         let content = match project.read_document(&doc_path) {
             Ok(text) => text,
             // A project may legitimately have no screenplay file yet; the
@@ -8053,9 +8360,7 @@ impl Editor {
             }
             Err(error) => return Err(format!("{doc_path}: {error}")),
         };
-        let explorer = project
-            .list_documents()
-            .map_err(|error| error.to_string())?;
+        let tree = project.list_tree().map_err(|error| error.to_string())?;
 
         self.workspace_generation += 1;
         self.agent_generation += 1;
@@ -8066,8 +8371,11 @@ impl Editor {
         self.profile = project_profile(&project);
         self.type_trust = project_type_trust(&project);
         (self.skills, self.skill_trust) = project_skills(&project);
+        let (commands, command_error) = project_commands(&project, &recent::config_dir());
+        self.commands = commands;
         self.project = Some(project);
-        self.explorer = explorer;
+        self.explorer = tree.documents;
+        self.explorer_dirs = tree.directories;
         self.refresh_entities();
         self.collapsed.clear();
         self.chat_generation = self.chat_generation.saturating_add(1);
@@ -8075,6 +8383,7 @@ impl Editor {
             cancel.cancel();
         }
         self.chat = ChatUiState::new(ChatMode::Build);
+        self.chat_follow = true;
         self.chat_markdown.borrow_mut().clear();
         self.chat_scroll = ScrollHandle::new();
         self.chat_scroll_drag = None;
@@ -8109,7 +8418,12 @@ impl Editor {
         // backup once more before the project-opened confirmation.
         self.check_backup_notice();
         if let Some(path) = repaired_screenplay {
-            self.notice = Some(self.tf("notice.screenplay_repaired", &[("path", &path)]));
+            self.notice = Some(self.tf("notice.workspace_document_repaired", &[("path", &path)]));
+        }
+        if self.notice.is_none()
+            && let Some(error) = command_error
+        {
+            self.notice = Some(self.tf("notice.commands_invalid", &[("error", &error)]));
         }
 
         self.recents.record(&root);
@@ -8166,7 +8480,6 @@ impl Editor {
         // the save prompt or the welcome screen.
         self.new_file = None;
         self.new_project = None;
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
         self.settings = None;
         self.project_settings = None;
         self.palette = None;
@@ -8194,8 +8507,10 @@ impl Editor {
         }
         self.project = None;
         self.explorer.clear();
+        self.explorer_dirs.clear();
         self.profile = ProjectProfile::default();
         self.skills.clear();
+        self.commands.clear();
         self.skill_trust = None;
         self.type_trust = None;
         self.entities = EntityIndex::default();
@@ -8243,7 +8558,6 @@ impl Editor {
         self.review_focus.clear();
         self.new_file = None;
         self.new_project = None;
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
         self.settings = None;
         self.project_settings = None;
         self.palette = None;
@@ -8264,7 +8578,6 @@ impl Editor {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
                 self.new_project = None;
-                self.new_project_generation = self.new_project_generation.saturating_add(1);
                 cx.notify();
             }
             return;
@@ -8273,11 +8586,9 @@ impl Editor {
             cx.notify();
             return;
         }
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
         let types = new_project_types();
         self.new_project = Some(NewProjectState {
             title: TextField::single_line(),
-            kind: ProjectType::Feature,
             type_id: "feature".to_string(),
             types,
             lang: self.lang,
@@ -8286,9 +8597,7 @@ impl Editor {
             field: NewProjectField::Title,
             error: String::new(),
             picking: false,
-            busy: false,
             path: None,
-            plan: None,
         });
         cx.notify();
     }
@@ -8319,7 +8628,7 @@ impl Editor {
         let Some(state) = self.new_project.as_ref() else {
             return;
         };
-        if state.picking || state.busy {
+        if state.picking {
             return;
         }
         let folder = new_project::clean_title(state.title.text())
@@ -8381,14 +8690,15 @@ impl Editor {
         cx.notify();
     }
 
-    /// The explicit accept action. Template projects are created here; AI
-    /// projects generate the reviewable plan first, then create on the next
-    /// accept. It never opens the folder panel.
-    fn accept_new_project(&mut self, cx: &mut Context<Self>) {
+    /// The explicit accept action. Both modes create the project immediately
+    /// with the type's template. The AI mode then opens the chat and sends the
+    /// dialog prompt as the first message, so the model can ask follow-up
+    /// questions or propose files in context. It never opens the folder panel.
+    fn accept_new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.new_project.as_ref() else {
             return;
         };
-        if state.picking || state.busy {
+        if state.picking {
             return;
         }
         let Some(title) = new_project::clean_title(state.title.text()) else {
@@ -8414,7 +8724,9 @@ impl Editor {
             cx.notify();
             return;
         }
-        let kind = state.kind;
+        let lang = state.lang;
+        let mode = state.mode;
+        let prompt = state.prompt.text().trim().to_string();
         let Some(package) = state
             .types
             .iter()
@@ -8425,12 +8737,8 @@ impl Editor {
             cx.notify();
             return;
         };
-        let lang = state.lang;
-        let mode = state.mode;
-        let prompt = state.prompt.text().trim().to_string();
-        let plan_ready = state.plan.is_some();
         if mode == NewProjectMode::Ai {
-            if !self.ai_scaffold_available() {
+            if !self.ai_available() {
                 self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
                 cx.notify();
                 return;
@@ -8440,32 +8748,7 @@ impl Editor {
                 cx.notify();
                 return;
             }
-            if plan_ready {
-                self.create_new_project_from_plan(cx);
-                return;
-            }
-            let draft = NewProjectDraft {
-                title,
-                kind,
-                type_label: package.name.clone(),
-                lang,
-                prompt,
-            };
-            self.start_new_project_scaffold(path, draft, cx);
-            cx.notify();
-            return;
         }
-        self.create_new_project_from_template(path, title, package, lang, cx);
-    }
-
-    fn create_new_project_from_template(
-        &mut self,
-        path: PathBuf,
-        title: String,
-        package: ProjectTypePackage,
-        lang: Lang,
-        cx: &mut Context<Self>,
-    ) {
         match create_project_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => {
                 if package.origin != narra_core::project_type::TypeOrigin::Builtin {
@@ -8478,6 +8761,13 @@ impl Editor {
                 match self.install_project(project, cx) {
                     Ok(()) => {
                         self.new_project = None;
+                        if mode == NewProjectMode::Ai {
+                            self.chat.set_input(prompt);
+                            self.agent_panel_open = true;
+                            self.right_tab = RightTab::Chat;
+                            self.chat.focused = true;
+                            self.chat_send(window, cx);
+                        }
                     }
                     Err(error) => {
                         let message = self.tf("newproject.open_failed", &[("error", &error)]);
@@ -8493,153 +8783,10 @@ impl Editor {
         cx.notify();
     }
 
-    /// The AI option is available only with a real provider (D-044 option A);
-    /// Mock is the offline default and cannot plan a project.
-    fn ai_scaffold_available(&self) -> bool {
+    /// The AI mode is available only with a real provider (D-044 option A);
+    /// Mock is the offline default and cannot write.
+    fn ai_available(&self) -> bool {
         self.agent_settings.provider != AiProvider::Mock
-    }
-
-    /// Generate a reviewed plan without creating anything (M16 slice 9).
-    fn start_new_project_scaffold(
-        &mut self,
-        path: PathBuf,
-        draft: NewProjectDraft,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.ai_scaffold_available() {
-            self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
-            return;
-        }
-        self.new_project_generation = self.new_project_generation.saturating_add(1);
-        let generation = self.new_project_generation;
-        if let Some(state) = self.new_project.as_mut() {
-            state.busy = true;
-            state.error.clear();
-            state.plan = None;
-            state.path = Some(path.clone());
-        }
-        cx.notify();
-        let root = path.to_string_lossy().into_owned();
-        let settings = self.agent_settings.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<ScaffoldPlan, String> {
-                let role = roles::resolve_default_with_packages(
-                    Path::new(&root),
-                    Some(&recent::config_dir()),
-                    ProjectScaffoldTask::KIND,
-                )
-                .map_err(|error| error.to_string())?;
-                let adapter = settings.build_adapter()?;
-                let task = ProjectScaffoldTask::new(
-                    root.clone(),
-                    draft.title.clone(),
-                    draft.kind,
-                    draft.lang.key(),
-                    draft.prompt.clone(),
-                )
-                .with_type_label(draft.type_label.clone())
-                .with_role(role);
-                let options = TaskOptions {
-                    timeout: AGENT_TIMEOUT,
-                    cancel: CancellationToken::new(),
-                    stream: false,
-                };
-                let output = task
-                    .run(adapter.as_ref(), &options, |_| {})
-                    .map_err(|error| error.to_string())?;
-                serde_json::from_value::<ScaffoldPlan>(output.data["plan"].clone())
-                    .map_err(|error| format!("invalid scaffold payload: {error}"))
-            })();
-            let _ = tx.send(NewProjectMessage::Plan { generation, result });
-        });
-        Self::spawn_message_pump(cx, rx, |view, message| {
-            let NewProjectMessage::Plan { generation, result } = message;
-            if generation != view.new_project_generation {
-                return true;
-            }
-            if let Some(state) = view.new_project.as_mut() {
-                state.busy = false;
-                match result {
-                    Ok(plan) => {
-                        state.plan = Some(plan);
-                        state.error.clear();
-                    }
-                    Err(error) => {
-                        state.error = i18n::tf(
-                            view.lang,
-                            "newproject.scaffold_failed",
-                            &[("error", &error)],
-                        );
-                    }
-                }
-            }
-            true
-        });
-    }
-
-    /// Create the already-chosen folder, write the reviewed plan create-only
-    /// and open the project. A write failure rolls the generated files back;
-    /// the base project remains usable and is still opened.
-    fn create_new_project_from_plan(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.new_project.as_ref() else {
-            return;
-        };
-        if state.busy || state.picking {
-            return;
-        }
-        let Some(path) = state.path.clone() else {
-            self.set_new_project_error(self.t("newproject.invalid_title").to_string());
-            return;
-        };
-        let Some(plan) = state.plan.clone() else {
-            return;
-        };
-        let title = new_project::clean_title(state.title.text())
-            .unwrap_or_else(|| state.title.text().to_string());
-        let lang = state.lang;
-        let Some(package) = state
-            .types
-            .iter()
-            .find(|package| package.id == state.type_id)
-            .cloned()
-        else {
-            self.set_new_project_error(self.t("newproject.type_missing").to_string());
-            return;
-        };
-        match create_project_base_from_package(&path, &title, &package, lang.key()) {
-            Ok(project) => match write_plan(&path, &plan) {
-                Ok(()) => match self.install_project(project, cx) {
-                    Ok(()) => {
-                        self.new_project = None;
-                    }
-                    Err(error) => {
-                        let message = self.tf("newproject.open_failed", &[("error", &error)]);
-                        self.set_new_project_error(message);
-                    }
-                },
-                Err(error) => {
-                    let message =
-                        self.tf("newproject.write_failed", &[("error", &error.to_string())]);
-                    match self.install_project(project, cx) {
-                        Ok(()) => {
-                            self.new_project = None;
-                            self.notice = Some(message);
-                        }
-                        Err(open_error) => {
-                            self.set_new_project_error(
-                                self.tf("newproject.open_failed", &[("error", &open_error)]),
-                            );
-                        }
-                    }
-                }
-            },
-            Err(error) => {
-                let message = self.tf("newproject.failed", &[("error", &error.to_string())]);
-                self.set_new_project_error(message);
-            }
-        }
-        cx.notify();
     }
 
     /// Trust every project skill currently awaiting confirmation, persist the
@@ -11549,8 +11696,6 @@ impl Editor {
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
-                && !state.busy
-                && state.plan.is_none()
             {
                 state.active_text_field_mut().backspace();
                 state.error.clear();
@@ -11720,7 +11865,7 @@ impl Editor {
         // The New Project dialog accepts on enter. Choosing the folder is a
         // separate button; enter never opens the OS panel.
         if self.new_project.is_some() {
-            self.accept_new_project(cx);
+            self.accept_new_project(window, cx);
             return;
         }
         // While the find bar owns keystrokes, enter means "next match" in the
@@ -11825,7 +11970,7 @@ impl Editor {
 
     fn on_cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.new_project.as_mut() {
-            if state.picking || state.busy || state.plan.is_some() {
+            if state.picking {
                 return;
             }
             let text = state.text_field(state.field).selected_text().to_string();
@@ -12322,7 +12467,6 @@ impl Editor {
         if self.new_project.is_some() {
             if !self.new_project.as_ref().is_some_and(|state| state.picking) {
                 self.new_project = None;
-                self.new_project_generation = self.new_project_generation.saturating_add(1);
             }
             cx.notify();
             return;
@@ -12908,7 +13052,7 @@ impl Editor {
         let project_info = self.project.as_ref().map(|project| {
             (
                 project.root().to_string_lossy().into_owned(),
-                project.manifest().default_screenplay_path.clone(),
+                project.manifest().workspace_document.clone(),
             )
         });
         let Some((root, screenplay)) = project_info else {
@@ -12916,7 +13060,7 @@ impl Editor {
             return None;
         };
         if self.doc.path != screenplay {
-            self.notice = Some(self.tf("notice.open_screenplay", &[("path", &screenplay)]));
+            self.notice = Some(self.tf("notice.open_workspace_document", &[("path", &screenplay)]));
             return None;
         }
         if self.dirty() {
@@ -13285,14 +13429,14 @@ impl Editor {
         };
         // Tabs make it possible to have notes active while the screenplay is
         // open elsewhere; never export the wrong buffer under the guion name.
-        if self.doc.path != project.manifest().default_screenplay_path {
-            self.notice = Some(self.t("notice.export_screenplay").to_string());
+        if self.doc.path != project.manifest().workspace_document {
+            self.notice = Some(self.t("notice.export_workspace_document").to_string());
             cx.notify();
             return;
         }
         let root = project.root().to_string_lossy().into_owned();
         let manifest = project.manifest().clone();
-        let stem = Path::new(&manifest.default_screenplay_path)
+        let stem = Path::new(&manifest.workspace_document)
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "screenplay".to_string());
@@ -14090,6 +14234,44 @@ impl Editor {
         cx.notify();
     }
 
+    /// Chat mode a package command runs in, taken from its declared agent's
+    /// `mode` (D-062). Commands without an agent, or with one the project does
+    /// not resolve, keep the current chat mode.
+    fn command_mode(&self, command: &SlashCommand) -> ChatMode {
+        let Some(agent_id) = command.agent.as_deref() else {
+            return self.chat.mode();
+        };
+        let Some(project) = self.project.as_ref() else {
+            return self.chat.mode();
+        };
+        let mode = roles::load_roles_with_packages(project.root(), Some(&recent::config_dir()))
+            .ok()
+            .and_then(|roles| roles.into_iter().find(|role| role.id == agent_id))
+            .and_then(|role| role.mode)
+            .or_else(|| {
+                // Agents bundled with the active type package are not roles
+                // until the package is copied into the project; read them
+                // from the package source so a command still knows its mode.
+                let package = project_type_package(project)?;
+                let source = package.source_dir.as_ref()?;
+                portable::discover_agents(
+                    source,
+                    narra_core::agent::PROJECT_PACKAGES_DIR,
+                    PackageOrigin::Project,
+                )
+                .ok()?
+                .into_iter()
+                .find(|agent| agent.id == agent_id)
+                .map(|agent| agent.mode)
+            });
+        mode.map(|mode| match mode {
+            AgentMode::Plan => ChatMode::Plan,
+            AgentMode::Build => ChatMode::Build,
+            AgentMode::Review => ChatMode::Review,
+        })
+        .unwrap_or_else(|| self.chat.mode())
+    }
+
     fn chat_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat.status == ChatStatus::Running || !self.chat.can_send() {
             return;
@@ -14100,12 +14282,30 @@ impl Editor {
         }
         // A slash command that matches a trusted skill attaches its body as
         // explicit context; known built-in commands keep precedence.
-        let skill = if split_chat_command(&raw).is_none() {
+        // Precedence: built-in chat modes, then package slash commands, then
+        // trusted skills. A `/name` that matches nothing is reported instead
+        // of being sent as prose.
+        let builtin = split_chat_command(&raw);
+        let package_command = if builtin.is_none() {
+            split_package_command(&self.commands, &raw)
+        } else {
+            None
+        };
+        let skill = if builtin.is_none() && package_command.is_none() {
             split_skill_command(&self.skills, &raw)
         } else {
             None
         };
-        let (mode, instruction) = if let Some((_, rest)) = &skill {
+        let (mode, instruction) = if let Some((command, rest)) = &package_command {
+            let mode = self.command_mode(command);
+            self.chat.set_mode(mode);
+            let instruction = if rest.is_empty() {
+                command.prompt.clone()
+            } else {
+                format!("{}\n\n{}", command.prompt, rest)
+            };
+            (mode, instruction)
+        } else if let Some((_, rest)) = &skill {
             if rest.is_empty() {
                 self.notice = Some(self.t("chat.skill_prompt_required").to_string());
                 cx.notify();
@@ -14113,7 +14313,7 @@ impl Editor {
             }
             (self.chat.mode(), rest.clone())
         } else {
-            match split_chat_command(&raw) {
+            match builtin {
                 Some(("/plan", rest)) => {
                     self.chat.set_mode(ChatMode::Plan);
                     if rest.is_empty() {
@@ -14141,27 +14341,19 @@ impl Editor {
                     }
                     (ChatMode::Review, rest.to_string())
                 }
-                Some(("/rewrite", rest)) => {
-                    self.chat.set_mode(ChatMode::Build);
-                    if rest.is_empty() {
-                        self.chat
-                            .set_input(self.t("chat.rewrite_prompt").to_string());
+                _ => {
+                    if raw.trim_start().starts_with('/') {
+                        let token = raw.split_whitespace().next().unwrap_or("/");
+                        let available = self.available_commands();
+                        self.notice = Some(self.tf(
+                            "chat.command_unknown",
+                            &[("command", token), ("commands", &available)],
+                        ));
                         cx.notify();
                         return;
                     }
-                    (ChatMode::Build, rest.to_string())
+                    (self.chat.mode(), raw.clone())
                 }
-                Some(("/continuity", rest)) => {
-                    self.chat.set_mode(ChatMode::Review);
-                    if rest.is_empty() {
-                        self.chat
-                            .set_input(self.t("chat.continuity_prompt").to_string());
-                        cx.notify();
-                        return;
-                    }
-                    (ChatMode::Review, rest.to_string())
-                }
-                _ => (self.chat.mode(), raw),
             }
         };
         let Some(project) = self.project.as_ref() else {
@@ -14169,6 +14361,14 @@ impl Editor {
             cx.notify();
             return;
         };
+        // Scene requests edit the official document; make sure it exists in
+        // this session even for a base created before the seeding rule.
+        if let Ok(true) = project.ensure_default_document()
+            && let Ok(tree) = project.list_tree()
+        {
+            self.explorer = tree.documents;
+            self.explorer_dirs = tree.directories;
+        }
         let root = project.root().to_string_lossy().into_owned();
         let history = self.chat.thread.messages.clone();
         let mut attachments = self.chat.attachments.clone();
@@ -14199,10 +14399,13 @@ impl Editor {
         let cancel = CancellationToken::new();
         self.chat_cancel = Some(cancel.clone());
         let context_window = self.chat_model_info().and_then(|model| model.context_limit);
+        let output_limit = self.chat_model_info().and_then(|model| model.output_limit);
         let task = ChatTask::new(root, mode, history, instruction)
             .with_attachments(attachments)
             .with_project_context(true)
             .with_skills(self.skills.clone())
+            .with_profile(self.profile.clone())
+            .with_max_output_tokens(output_limit)
             .with_context_window(context_window);
         let mut settings = self.agent_settings.clone();
         settings.session = Some(format!("narra-chat-{}", self.chat.thread.id));
@@ -14459,29 +14662,24 @@ impl Editor {
             });
         }
 
-        // Dossiers allowed by the active project type.
-        for (kind, prefix) in [
-            ("character", "bible/characters/"),
-            ("location", "bible/locations/"),
-            ("object", "bible/objects/"),
-        ] {
-            if !self.profile.allows_entity(kind) {
-                continue;
-            }
+        // Dossiers declared by the active project type (D-062).
+        for entity in &self.profile.entities {
+            let prefix = format!("{}/", entity.folder);
             let mut entity_count = 0usize;
             for path in &self.explorer {
-                if !path.starts_with(prefix) || entity_count >= 4 {
+                if !path.starts_with(&prefix) || entity_count >= 4 {
                     continue;
                 }
                 let name = path
-                    .trim_start_matches(prefix)
+                    .trim_start_matches(prefix.as_str())
                     .trim_end_matches(".md")
                     .to_string();
                 if matches(&name) && seen.insert(path.clone()) {
+                    let icon = explorer::FolderKind::from_path(&entity.folder).icon_name();
                     items.push(ChatMentionItem {
                         category: ChatMentionCategory::Entities,
-                        icon: "users",
-                        label: format!("{}: {}", self.t(entity_kind_key(kind)), name),
+                        icon: if icon == "folder" { "users" } else { icon },
+                        label: format!("{}: {}", entity.label.for_language(self.lang.key()), name),
                         detail: path.clone(),
                         action: ChatMentionAction::File(path.clone()),
                     });
@@ -17943,6 +18141,7 @@ impl Editor {
         // so the information does not depend on color alone.
         let rows: Vec<Row> = explorer::build_rows(
             &explorer::visible_paths(&self.explorer, self.show_config_files),
+            &self.explorer_dirs,
             &self.collapsed,
         );
         let grouped = explorer::group_rows(rows, &self.profile.explorer_groups);
@@ -18519,7 +18718,7 @@ impl Editor {
                 .find(|mention| a >= mention.start && b <= mention.end)
             {
                 segment = segment.bg(rgba(mention_bg(
-                    self.entities.entities()[mention.entity].category,
+                    &self.entities.entities()[mention.entity].kind,
                 )));
             }
             row = row.child(segment.child(text[a..b].to_string()));
@@ -18716,7 +18915,7 @@ impl Editor {
                 }));
             } else if let Some(mention) = mention_state {
                 segment = segment.bg(rgba(mention_bg(
-                    self.entities.entities()[mention.entity].category,
+                    &self.entities.entities()[mention.entity].kind,
                 )));
             }
             if composing {
@@ -18947,7 +19146,7 @@ impl Editor {
         let new_file_dump = match &self.new_file {
             Some(state) => format!(
                 "{{\"open\":true,\"kind\":\"{}\",\"name\":\"{}\",\"error\":\"{}\"}}",
-                state.kind.key(),
+                state.kind.key.as_str(),
                 escape_json(&state.name),
                 escape_json(&state.error),
             ),
@@ -18957,10 +19156,9 @@ impl Editor {
             Some(state) => format!(
                 "{{\"open\":true,\"title\":\"{}\",\"type\":\"{}\",\"lang\":\"{}\",\
                  \"mode\":\"{}\",\"field\":\"{}\",\"caret\":{},\"selection\":[{},{}],\
-                 \"error\":\"{}\",\"picking\":{},\"busy\":{},\
-                 \"path\":\"{}\",\"plan_files\":{}}}",
+                 \"error\":\"{}\",\"picking\":{},\"path\":\"{}\"}}",
                 escape_json(state.title.text()),
-                state.kind.as_str(),
+                escape_json(&state.type_id),
                 state.lang.key(),
                 match state.mode {
                     NewProjectMode::Template => "template",
@@ -18975,7 +19173,6 @@ impl Editor {
                 state.text_field(state.field).selection().end,
                 escape_json(&state.error),
                 state.picking,
-                state.busy,
                 escape_json(
                     &state
                         .path
@@ -18983,16 +19180,10 @@ impl Editor {
                         .map(|path| path.display().to_string())
                         .unwrap_or_default()
                 ),
-                state
-                    .plan
-                    .as_ref()
-                    .map(|plan| plan.files.len())
-                    .unwrap_or(0),
             ),
             None => "{\"open\":false,\"title\":\"\",\"type\":\"\",\"lang\":\"\",\
                      \"mode\":\"\",\"field\":\"\",\"caret\":0,\"selection\":[0,0],\
-                     \"error\":\"\",\"picking\":false,\"busy\":false,\
-                     \"path\":\"\",\"plan_files\":0}"
+                     \"error\":\"\",\"picking\":false,\"path\":\"\"}"
                 .to_string(),
         };
         let project_dump = self
@@ -19050,9 +19241,9 @@ impl Editor {
         };
         let profile_entities = self
             .profile
-            .entity_kinds
+            .entities
             .iter()
-            .map(|kind| format!("\"{}\"", escape_json(kind)))
+            .map(|entity| format!("\"{}\"", escape_json(&entity.id)))
             .collect::<Vec<_>>()
             .join(",");
         let profile_groups = self
@@ -19075,7 +19266,7 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(",");
         let profile_dump = format!(
-            "{{\"type\":\"{}\",\"screenplay\":{},\"entity_kinds\":[{}],\"export_pdf\":{},\"explorer_groups\":[{}]}}",
+            "{{\"type\":\"{}\",\"screenplay\":{},\"entities\":[{}],\"export_pdf\":{},\"explorer_groups\":[{}]}}",
             escape_json(&self.profile.type_id),
             self.profile.screenplay,
             profile_entities,
@@ -19314,6 +19505,7 @@ impl Editor {
         let entities_dump = self.entities.dump_json(200);
         let tree_rows: Vec<String> = explorer::build_rows(
             &explorer::visible_paths(&self.explorer, self.show_config_files),
+            &self.explorer_dirs,
             &self.collapsed,
         )
         .iter()
@@ -19751,9 +19943,26 @@ fn split_skill_command(skills: &[Skill], input: &str) -> Option<(Skill, String)>
         .map(|skill| (skill, rest.to_string()))
 }
 
+/// Resolve `/command-id rest` against the package commands (D-062). Built-in
+/// chat commands are checked first by the caller.
+fn split_package_command<'a>(
+    commands: &'a [SlashCommand],
+    input: &str,
+) -> Option<(&'a SlashCommand, String)> {
+    let trimmed = input.trim_start().strip_prefix('/')?;
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let id = parts.next()?;
+    let rest = parts.next().unwrap_or("").trim_start().to_string();
+    commands
+        .iter()
+        .find(|command| command.id == id)
+        .map(|command| (command, rest))
+}
+
 /// Parse `/command rest` at the start of a chat message. Returns the command
 /// (including slash) and the remaining instruction; unknown text returns
-/// `None` and is sent untouched.
+/// `None` and is sent untouched. Only engine-level mode switches live here:
+/// creative commands come from the project type package.
 fn split_chat_command(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim_start();
     if !trimmed.starts_with('/') {
@@ -19763,20 +19972,8 @@ fn split_chat_command(input: &str) -> Option<(&str, &str)> {
     let command = parts.next()?;
     let rest = parts.next().unwrap_or("").trim_start();
     match command {
-        "/plan" | "/build" | "/review" | "/rewrite" | "/continuity" | "/character" => {
-            Some((command, rest))
-        }
+        "/plan" | "/build" | "/review" => Some((command, rest)),
         _ => None,
-    }
-}
-
-/// i18n key for a chat mode button.
-fn entity_kind_key(kind: &str) -> &'static str {
-    match kind {
-        "character" => "chat.kind.character",
-        "location" => "chat.kind.location",
-        "object" => "chat.kind.object",
-        _ => "chat.kind.entity",
     }
 }
 
@@ -20238,8 +20435,6 @@ impl EntityInputHandler for Editor {
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
-                && !state.busy
-                && state.plan.is_none()
             {
                 state.active_text_field_mut().insert(new_text);
                 state.error.clear();
@@ -20376,8 +20571,6 @@ impl EntityInputHandler for Editor {
         if self.new_project.is_some() {
             if let Some(state) = self.new_project.as_mut()
                 && !state.picking
-                && !state.busy
-                && state.plan.is_none()
             {
                 state.active_text_field_mut().insert(new_text);
                 state.error.clear();
@@ -21304,7 +21497,7 @@ fn run() -> Result<(), String> {
         None => None,
     };
     if let Some(project) = project.as_mut() {
-        project.repair_default_screenplay().ok();
+        project.repair_workspace_document().ok();
     }
     if let Some(project) = project.as_ref() {
         recents.record(project.root());
@@ -21313,7 +21506,7 @@ fn run() -> Result<(), String> {
 
     let (content, doc_path) = match &project {
         Some(project) => {
-            let path = project.manifest().default_screenplay_path.clone();
+            let path = project.manifest().workspace_document.clone();
             let text = match project.read_document(&path) {
                 Ok(text) => text,
                 // A project created without a screenplay opens as a blank
@@ -21335,13 +21528,17 @@ fn run() -> Result<(), String> {
     };
     let fixture_read_ms = duration_ms(started.elapsed());
 
-    // The explorer's document list comes from the core: sorted, hidden state
-    // (.git/.narra/dot-files) excluded, symlinks not followed.
-    let explorer = match &project {
-        Some(project) => project
-            .list_documents()
-            .map_err(|error| format!("no se pudo listar el proyecto: {error}"))?,
-        None => Vec::new(),
+    // The explorer's tree comes from the core: sorted, hidden state
+    // (.git/.narra/dot-files) excluded, symlinks not followed, empty folders
+    // included.
+    let (explorer, explorer_dirs) = match &project {
+        Some(project) => {
+            let tree = project
+                .list_tree()
+                .map_err(|error| format!("no se pudo listar el proyecto: {error}"))?;
+            (tree.documents, tree.directories)
+        }
+        None => (Vec::new(), Vec::new()),
     };
     let entities = project
         .as_ref()
@@ -21587,7 +21784,6 @@ fn run() -> Result<(), String> {
                 debug_metrics: debug_metrics_flag,
                 new_file: None,
                 new_project: None,
-                new_project_generation: 0,
                 recents,
                 workspace_generation: 0,
                 window_title: "Narra".to_string(),
@@ -21614,10 +21810,15 @@ fn run() -> Result<(), String> {
                 diff_probe_total: diff_steps,
                 profile: startup_profile,
                 skills: startup_skills,
+                commands: project
+                    .as_ref()
+                    .map(|project| project_commands(project, &recent::config_dir()).0)
+                    .unwrap_or_default(),
                 skill_trust: startup_skill_trust,
                 type_trust: startup_type_trust,
                 project,
                 explorer,
+                explorer_dirs,
                 entities,
                 collapsed: HashSet::new(),
                 notice: None,
@@ -21985,7 +22186,7 @@ mod tests {
 
     #[test]
     fn language_names_follow_the_document_extension() {
-        assert_eq!(language_name("screenplay/main.fountain"), "Fountain");
+        assert_eq!(language_name("workspace/main.fountain"), "Fountain");
         assert_eq!(language_name("notes/a.md"), "Markdown");
         assert_eq!(language_name("agents.yml"), "YAML");
         assert_eq!(language_name("README"), "Text");
@@ -22012,8 +22213,8 @@ mod tests {
 
     #[test]
     fn document_state_seeds_the_save_and_diff_base() {
-        let doc = DocumentState::new("screenplay/main.fountain".to_string(), "uno\ndos\n");
-        assert_eq!(doc.path, "screenplay/main.fountain");
+        let doc = DocumentState::new("workspace/main.fountain".to_string(), "uno\ndos\n");
+        assert_eq!(doc.path, "workspace/main.fountain");
         assert_eq!(doc.base_text, "uno\ndos\n");
         assert_eq!(doc.buffer.line_count(), 3);
         assert_eq!(doc.diff.base_lines, vec!["uno", "dos", ""]);
@@ -22064,7 +22265,7 @@ mod tests {
         let paths = vec![
             "notes/decisions.md".to_string(),
             "bible/desire.md".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
             "notes/old-decisions.md".to_string(),
         ];
         assert_eq!(
@@ -22080,7 +22281,7 @@ mod tests {
         );
         assert_eq!(
             filter_palette_paths(paths, "MAIN"),
-            vec!["screenplay/main.fountain".to_string()]
+            vec!["workspace/main.fountain".to_string()]
         );
         assert!(filter_palette_paths(Vec::new(), "x").is_empty());
     }
@@ -22092,8 +22293,8 @@ mod tests {
             ("notes", "decisions", ".md")
         );
         assert_eq!(
-            split_path_name("screenplay/S01E01.fountain"),
-            ("screenplay", "S01E01", ".fountain")
+            split_path_name("workspace/S01E01.fountain"),
+            ("workspace", "S01E01", ".fountain")
         );
         assert_eq!(split_path_name("README"), ("", "README", ""));
         assert_eq!(split_path_name("notes/.hidden"), ("notes", ".hidden", ""));
@@ -22145,5 +22346,162 @@ mod tests {
         assert_eq!(utf16_to_byte_in("a\u{1f600}b", 2..4), 5..6);
         // Offsets past the end clamp to the text length.
         assert_eq!(utf16_to_byte_in("ab", 5..9), 2..2);
+    }
+
+    fn command(id: &str, agent: Option<&str>, prompt: &str) -> SlashCommand {
+        SlashCommand {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: format!("{id} command"),
+            agent: agent.map(str::to_string),
+            prompt: prompt.to_string(),
+            origin: PackageOrigin::Project,
+            hash: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn package_commands_resolve_before_skills_with_their_arguments() {
+        let commands = vec![command(
+            "escaleta",
+            Some("guionista"),
+            "Desglosa la estructura.",
+        )];
+        let (resolved, rest) =
+            split_package_command(&commands, "/escaleta 12 escenas").expect("command");
+        assert_eq!(resolved.id, "escaleta");
+        assert_eq!(rest, "12 escenas");
+        assert_eq!(
+            split_package_command(&commands, "/escaleta").map(|(_, rest)| rest),
+            Some(String::new())
+        );
+        assert!(split_package_command(&commands, "/idea").is_none());
+
+        // Mode switches stay engine commands; creative commands come from the
+        // package, so the retired built-ins are no longer special.
+        assert_eq!(split_chat_command("/plan"), Some(("/plan", "")));
+        assert_eq!(
+            split_chat_command("/review algo"),
+            Some(("/review", "algo"))
+        );
+        assert!(split_chat_command("/rewrite").is_none());
+        assert!(split_chat_command("/continuity").is_none());
+        assert!(split_chat_command("/character").is_none());
+    }
+
+    #[test]
+    fn project_commands_merge_user_package_and_project_scopes() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("narra-commands-{}-{stamp}", std::process::id()));
+        let config = std::env::temp_dir().join(format!(
+            "narra-commands-config-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&config);
+        let project =
+            narra_core::project::create_project(&root, "Comandos", ProjectType::Feature, "es")
+                .expect("project");
+
+        let user_commands = config.join("commands");
+        std::fs::create_dir_all(&user_commands).expect("user commands");
+        std::fs::write(
+            user_commands.join("idea.md"),
+            "---\nname: Idea\ndescription: User idea\nagent: guionista\n---\nUser prompt\n",
+        )
+        .expect("user command");
+
+        let project_commands_dir = root.join(".narra/commands");
+        std::fs::create_dir_all(&project_commands_dir).expect("project commands");
+        std::fs::write(
+            project_commands_dir.join("idea.md"),
+            "---\nname: Idea\ndescription: Project idea\nagent: guionista\n---\nProject prompt\n",
+        )
+        .expect("project command");
+        std::fs::write(
+            project_commands_dir.join("escaleta.md"),
+            "---\nname: Escaleta\ndescription: Outline\nagent: guionista\n---\nOutline prompt\n",
+        )
+        .expect("project command");
+
+        let (commands, error) = project_commands(&project, &config);
+        assert!(error.is_none(), "{error:?}");
+        let ids: Vec<&str> = commands.iter().map(|command| command.id.as_str()).collect();
+        assert_eq!(ids, ["escaleta", "idea"]);
+        let idea = commands
+            .iter()
+            .find(|command| command.id == "idea")
+            .expect("idea");
+        assert_eq!(idea.prompt, "Project prompt", "project scope wins by id");
+        assert_eq!(idea.agent.as_deref(), Some("guionista"));
+
+        // A malformed command is reported, never fatal.
+        std::fs::write(project_commands_dir.join("rota.md"), "sin frontmatter")
+            .expect("broken command");
+        let (_, error) = project_commands(&project, &config);
+        assert!(error.is_some(), "malformed commands surface an error");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn package_context_actions_resolve_templates_and_targets() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/packages/guionista");
+        let package = narra_core::project_type::load_package(
+            &root,
+            narra_core::project_type::TypeOrigin::User,
+        )
+        .expect("fixture package");
+        let action = package
+            .context_actions
+            .iter()
+            .find(|action| action.id == "new_personaje")
+            .expect("new_personaje action");
+        assert_eq!(action.target.as_deref(), Some("biblia/personajes"));
+        let template = action.template.as_deref().expect("template");
+        let body = package_template_body(&package, template, "es").expect("template body");
+        let rendered = new_file::render_template(&body, "Marta");
+        assert!(
+            rendered.starts_with("# Marta\n\n## Rol en la historia"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("## Voz"));
+
+        let kind = NewFileKind::for_folder(&package.profile(), "biblia/personajes");
+        assert_eq!(kind.key, "personaje");
+        assert_eq!(kind.folder, "biblia/personajes");
+        assert_eq!(kind.extension, "md");
+
+        // Every declared action resolves to an engine mechanism.
+        for action in &package.context_actions {
+            match action.kind {
+                ContextActionKind::ConvertSelectionTo => assert!(
+                    package
+                        .profile()
+                        .allows_entity(action.entity.as_deref().unwrap_or("")),
+                    "{}",
+                    action.id
+                ),
+                ContextActionKind::NewFileFromTemplate => assert!(
+                    action.target.is_some() && action.template.is_some(),
+                    "{}",
+                    action.id
+                ),
+                ContextActionKind::RunCommand => assert!(
+                    package
+                        .commands
+                        .iter()
+                        .any(|command| Some(command.as_str()) == action.command.as_deref()),
+                    "{}",
+                    action.id
+                ),
+            }
+        }
     }
 }

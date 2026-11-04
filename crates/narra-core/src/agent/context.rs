@@ -95,10 +95,12 @@ fn push_pinned(
 ) {
     let type_id = project.manifest().project_type_id.as_str();
     let package = project_type::resolve(project.root(), type_id);
+    // The package declares what gets pinned; without a resolvable package
+    // nothing is pinned. The core never names narrative folders itself.
     let pinned = package
         .as_ref()
         .map(project_type::ProjectTypePackage::pinned_context)
-        .unwrap_or_else(|| vec!["bible".to_string()]);
+        .unwrap_or_default();
     let mut paths = BTreeSet::new();
     for entry in &pinned {
         let prefix = format!("{entry}/");
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn custom_package_can_pin_its_own_folders() {
         let package = project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief]\nfiles: []\ncontext:\n  pinned: [brief]\n",
+            "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [brief]\nfiles: []\npinned_context: [brief]\n",
             project_type::TypeOrigin::User,
         )
         .expect("package");
@@ -218,20 +220,13 @@ mod tests {
     }
 
     #[test]
-    fn omitted_context_inherits_bible_and_empty_context_pins_nothing() {
+    fn omitted_pinned_context_pins_nothing() {
         let omitted = project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\n",
+            "schema_version: 2\napi_version: 1\nid: documentary\nname: Documentary\n",
             project_type::TypeOrigin::User,
         )
         .expect("package");
-        assert_eq!(omitted.pinned_context(), vec!["bible".to_string()]);
-
-        let empty = project_type::parse_package(
-            "schema_version: 1\napi_version: 1\nid: documentary\nname: Documentary\ncontext:\n  pinned: []\n",
-            project_type::TypeOrigin::User,
-        )
-        .expect("package");
-        assert!(empty.pinned_context().is_empty());
+        assert!(omitted.pinned_context().is_empty());
     }
 
     #[test]

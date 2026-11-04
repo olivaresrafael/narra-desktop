@@ -15,17 +15,17 @@ use narra_core::cancel::CancellationToken;
 
 fn sample_project() -> PathBuf {
     let root = std::env::temp_dir().join(format!("narra-loop-test-{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(root.join("screenplay")).expect("mkdir");
+    fs::create_dir_all(root.join("workspace")).expect("mkdir");
     fs::write(
         root.join("project.yaml"),
         "schema_version: 1\nproject_id: 00000000-0000-4000-8000-000000000002\n\
          title: Bucle de Prueba\nproject_type: feature\nprimary_language: es\n\
          additional_languages: []\ncreated_at: 2026-01-01T00:00:00Z\n\
-         default_screenplay_path: screenplay/main.fountain\n",
+         workspace_document: workspace/main.fountain\n",
     )
     .expect("manifest");
     fs::write(
-        root.join("screenplay/main.fountain"),
+        root.join("workspace/main.fountain"),
         "INT. TALLER - NOCHE\n\nELENA\nEsto es una prueba.\n\nINT. CALLE - DÍA\n\nMARCOS\nHace sol.\n",
     )
     .expect("screenplay");
@@ -68,9 +68,9 @@ fn text_round(model: &str, text: &str) -> ModelResponse {
 
 fn rewrite_arguments() -> serde_json::Value {
     serde_json::json!({
-        "scene": 1,
+        "path": "workspace/main.fountain",
         "instruction": "haz el diálogo más tenso",
-        "rewritten_scene": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas."
+        "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
     })
 }
 
@@ -78,25 +78,25 @@ fn rewrite_arguments() -> serde_json::Value {
 fn granted_loop_reads_and_stages_a_proposal_without_touching_canon() {
     let root = sample_project();
     let canon_before =
-        fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
+        fs::read_to_string(root.join("workspace/main.fountain")).expect("read canon");
 
-    // Round 1: request read_scene. Round 2: propose. Round 3: final text.
+    // Round 1: read a document. Round 2: propose. Round 3: final text.
     let adapter = MockAdapter::scripted(vec![
         tool_round(
             "mock-1",
             "call-1",
-            "read_scene",
-            serde_json::json!({"scene": 1}),
+            "read_document",
+            serde_json::json!({"path": "workspace/main.fountain"}),
         ),
         tool_round(
             "mock-1",
             "call-2",
-            "propose_scene_edit",
+            "propose_document_edit",
             rewrite_arguments(),
         ),
         text_round("mock-1", "Listo: leí la escena y dejé una propuesta."),
     ]);
-    let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+    let mut policy = GrantPolicy::new().allow("propose_document_edit");
     let mut events = Vec::new();
     let output = ToolLoopTask::new(root.to_str().expect("utf8"), "haz el diálogo más tenso")
         .run(&adapter, &mut policy, &options(), |e| events.push(e))
@@ -108,8 +108,8 @@ fn granted_loop_reads_and_stages_a_proposal_without_touching_canon() {
     // Audit: two calls, both allowed.
     let tools = output.data["tools"].as_array().expect("audit array");
     assert_eq!(tools.len(), 2, "audit: {tools:?}");
-    assert_eq!(tools[0]["tool"], "read_scene");
-    assert_eq!(tools[1]["tool"], "propose_scene_edit");
+    assert_eq!(tools[0]["tool"], "read_document");
+    assert_eq!(tools[1]["tool"], "propose_document_edit");
     assert!(tools.iter().all(|entry| entry["decision"] == "Allow"));
     let ToolOutcome::ProposalCreated { .. } = outcome_of(&tools[1]) else {
         panic!("proposal expected: {}", tools[1]);
@@ -123,12 +123,11 @@ fn granted_loop_reads_and_stages_a_proposal_without_touching_canon() {
     assert_eq!(tool_events.len(), 2, "{tool_events:?}");
 
     // Canon untouched; exactly one reviewable proposal exists.
-    let canon_after =
-        fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
+    let canon_after = fs::read_to_string(root.join("workspace/main.fountain")).expect("read canon");
     assert_eq!(canon_before, canon_after, "canon must be untouched");
     let proposals = narra_core::agent::proposal::list(&root).expect("list");
     assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0].target, "screenplay/main.fountain");
+    assert_eq!(proposals[0].target, "workspace/main.fountain");
     assert_eq!(proposals[0].origin.task, "tool_loop");
 }
 
@@ -140,14 +139,14 @@ fn outcome_of(entry: &serde_json::Value) -> ToolOutcome {
 fn denied_write_is_visible_in_audit_and_canon_survives() {
     let root = sample_project();
     let canon_before =
-        fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
+        fs::read_to_string(root.join("workspace/main.fountain")).expect("read canon");
 
     // The model asks to write with *no* grants at all.
     let adapter = MockAdapter::scripted(vec![
         tool_round(
             "mock-1",
             "call-1",
-            "propose_scene_edit",
+            "propose_document_edit",
             rewrite_arguments(),
         ),
         text_round("mock-1", "No me permitieron editar; lo dejo indicado."),
@@ -196,8 +195,7 @@ fn denied_write_is_visible_in_audit_and_canon_survives() {
             .expect("list")
             .is_empty()
     );
-    let canon_after =
-        fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
+    let canon_after = fs::read_to_string(root.join("workspace/main.fountain")).expect("read canon");
     assert_eq!(canon_before, canon_after);
 }
 
@@ -205,7 +203,7 @@ fn denied_write_is_visible_in_audit_and_canon_survives() {
 fn destructive_apply_is_denied_even_when_writes_are_granted() {
     let root = sample_project();
     // Stage a proposal first (as a prior granted run would have).
-    let mut policy = GrantPolicy::new().allow("propose_scene_edit");
+    let mut policy = GrantPolicy::new().allow("propose_document_edit");
     let mut executor = narra_core::agent::tools::ToolExecutor::new(Path::new(&root));
     let origin = narra_core::agent::proposal::Origin {
         task: "tool_loop".to_string(),
@@ -216,7 +214,7 @@ fn destructive_apply_is_denied_even_when_writes_are_granted() {
     let created = executor.execute(
         &narra_core::agent::ToolCall {
             id: "c0".to_string(),
-            name: "propose_scene_edit".to_string(),
+            name: "propose_document_edit".to_string(),
             arguments: rewrite_arguments(),
         },
         &mut policy,
@@ -226,7 +224,7 @@ fn destructive_apply_is_denied_even_when_writes_are_granted() {
         panic!("proposal expected: {:?}", created.outcome);
     };
     let canon_before =
-        fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
+        fs::read_to_string(root.join("workspace/main.fountain")).expect("read canon");
 
     // The model asks to apply it — the write grant must NOT cover this.
     let adapter = MockAdapter::scripted(vec![
@@ -255,8 +253,7 @@ fn destructive_apply_is_denied_even_when_writes_are_granted() {
     };
     assert!(reason.contains("destructiva"), "{reason}");
 
-    let canon_after =
-        fs::read_to_string(root.join("screenplay/main.fountain")).expect("read canon");
+    let canon_after = fs::read_to_string(root.join("workspace/main.fountain")).expect("read canon");
     assert_eq!(canon_before, canon_after, "canon must be untouched");
     // The proposal is still ready for review.
     let record = narra_core::agent::proposal::load(Path::new(&root), &id).expect("load");
@@ -274,7 +271,7 @@ fn explicit_destructive_grant_applies_in_the_loop() {
         tool_round(
             "mock-1",
             "call-1",
-            "propose_scene_edit",
+            "propose_document_edit",
             rewrite_arguments(),
         ),
         // The model cannot know the id it just created... the loop feeds it
@@ -283,7 +280,7 @@ fn explicit_destructive_grant_applies_in_the_loop() {
         text_round("mock-1", "Propuesta lista para revisión."),
     ]);
     let mut policy = GrantPolicy::new()
-        .allow("propose_scene_edit")
+        .allow("propose_document_edit")
         .allow_destructive("apply_proposal");
     let output = ToolLoopTask::new(root.to_str().expect("utf8"), "haz el diálogo más tenso")
         .run(&adapter, &mut policy, &options(), |_| {})
@@ -316,7 +313,7 @@ fn explicit_destructive_grant_applies_in_the_loop() {
         "{:?}",
         applied.outcome
     );
-    let canon = fs::read_to_string(root.join("screenplay/main.fountain")).expect("read");
+    let canon = fs::read_to_string(root.join("workspace/main.fountain")).expect("read");
     assert!(canon.contains("Cerrando cuentas."), "applied to canon");
 }
 
@@ -327,8 +324,8 @@ fn loop_honors_cancellation_between_rounds() {
         tool_round(
             "mock-1",
             "call-1",
-            "read_scene",
-            serde_json::json!({"scene": 1}),
+            "read_document",
+            serde_json::json!({"path": "workspace/main.fountain"}),
         ),
         text_round("mock-1", "nunca llegaré"),
     ]);
@@ -349,7 +346,7 @@ fn loop_honors_cancellation_between_rounds() {
 #[test]
 fn tool_specs_declare_permissions_and_schemas() {
     let specs: Vec<ToolSpec> = narra_core::agent::tools::tool_specs();
-    assert_eq!(specs.len(), 9);
+    assert_eq!(specs.len(), 7);
     for spec in &specs {
         assert_eq!(spec.parameters["type"], "object", "{}", spec.name);
         assert!(!spec.description.is_empty());
@@ -359,7 +356,6 @@ fn tool_specs_declare_permissions_and_schemas() {
         "search_project",
         "read_document",
         "load_skill",
-        "read_scene",
     ] {
         let spec = specs
             .iter()

@@ -682,7 +682,7 @@ mod tests {
         chat.begin_run("reescribe".to_string(), Vec::new());
         chat.apply_event(&TaskEvent::ProposalCreated {
             id: "p1".to_string(),
-            target: "screenplay/main.fountain".to_string(),
+            target: "workspace/main.fountain".to_string(),
             hunks: 2,
         });
         assert_eq!(chat.proposals.len(), 1);
@@ -691,7 +691,7 @@ mod tests {
         chat.finish_with_prices(
             Ok(output(
                 "lista",
-                serde_json::json!([{"id":"p1","target":"screenplay/main.fountain","hunks":2}]),
+                serde_json::json!([{"id":"p1","target":"workspace/main.fountain","hunks":2}]),
             )),
             0.0,
             0.0,

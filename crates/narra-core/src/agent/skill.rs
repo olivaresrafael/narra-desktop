@@ -366,27 +366,10 @@ struct TrustFile {
 }
 
 fn split_frontmatter(text: &str, path: &Path) -> Result<(String, String), SkillError> {
-    let normalized = text.replace("\r\n", "\n");
-    let rest = normalized
-        .strip_prefix("---\n")
-        .ok_or_else(|| SkillError::Invalid {
-            path: path.to_path_buf(),
-            error: "must start with YAML frontmatter (`---`)".to_string(),
-        })?;
-    let end = rest
-        .find("\n---\n")
-        .or_else(|| rest.strip_suffix("\n---").map(|body| body.len()))
-        .ok_or_else(|| SkillError::Invalid {
-            path: path.to_path_buf(),
-            error: "frontmatter must end with a `---` line".to_string(),
-        })?;
-    let frontmatter = rest[..end].to_string();
-    let body_start = if rest[end..].starts_with("\n---\n") {
-        end + 5
-    } else {
-        rest.len()
-    };
-    Ok((frontmatter, rest[body_start..].to_string()))
+    super::frontmatter::split_frontmatter(text).map_err(|error| SkillError::Invalid {
+        path: path.to_path_buf(),
+        error,
+    })
 }
 
 fn parse_frontmatter(frontmatter: &str, path: &Path) -> Result<(String, String), SkillError> {

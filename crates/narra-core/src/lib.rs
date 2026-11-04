@@ -52,13 +52,14 @@ pub use manifest::{
 };
 pub use markdown::{Block as MarkdownBlock, InlineSpan, MarkdownDocument};
 pub use project::{
-    DEFAULT_SCREENPLAY, MANIFEST_FILE, Project, ProjectError, ProjectIndex, SceneRef,
-    TEMPLATE_DIRS, create_project, create_project_base_from_package, create_project_from_package,
-    create_project_from_type, open_project,
+    DEFAULT_WORKSPACE_DOCUMENT, MANIFEST_FILE, Project, ProjectError, ProjectIndex, ProjectTree,
+    SceneRef, TEMPLATE_DIRS, create_project, create_project_base_from_package,
+    create_project_from_package, create_project_from_type, open_project,
 };
 pub use project_type::{
-    ExplorerGroup, ProjectProfile, ProjectTypePackage, TemplateFile, TypeCapabilities, TypeOrigin,
-    TypePackageError, builtin, builtins, registry,
+    ContextAction, ContextActionKind, DocumentFormat, EntityDefinition, ExplorerGroup,
+    ExportCapability, ProjectProfile, ProjectTypePackage, SeedFile, TemplateFile, TypeOrigin,
+    TypePackageError, WriteRoot, builtin, builtins, registry,
 };
 
 /// Marker for the core boundary, so the crate is exercised by CI from day one.

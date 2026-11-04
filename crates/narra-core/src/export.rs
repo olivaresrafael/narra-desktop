@@ -49,7 +49,7 @@ mod tests {
 
     fn manifest(title: &str) -> Manifest {
         let yaml = format!(
-            "schema_version: 1\nproject_id: 00000000-0000-0000-0000-000000000001\ntitle: '{title}'\nproject_type: feature\nprimary_language: es\ncreated_at: 2026-10-20T12:00:00Z\ndefault_screenplay_path: screenplay/main.fountain\n"
+            "schema_version: 1\nproject_id: 00000000-0000-0000-0000-000000000001\ntitle: '{title}'\nproject_type: feature\nprimary_language: es\ncreated_at: 2026-10-20T12:00:00Z\nworkspace_document: workspace/main.fountain\n"
         );
         parse_manifest(&yaml).expect("manifest")
     }

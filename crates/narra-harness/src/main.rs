@@ -1169,7 +1169,7 @@ fn run_export(root: &str, format: ExportFormat, out: Option<&str>) -> ExitCode {
         }
     };
     let manifest = project.manifest().clone();
-    let screenplay_path = manifest.default_screenplay_path.clone();
+    let screenplay_path = manifest.workspace_document.clone();
     let source = match project.read_document(&screenplay_path) {
         Ok(source) => source,
         Err(error) => {

@@ -28,6 +28,7 @@ use thiserror::Error;
 use crate::document::{self, DocumentError};
 
 use super::package::{self, AgentPackage, PackageError, PackageOrigin, PackageTrust};
+use super::portable::{self, AgentMode, PortableAgent};
 
 /// The project-level role configuration file (relative to the root).
 pub const CONFIG_PATH: &str = "agents.yaml";
@@ -101,6 +102,15 @@ pub struct Role {
     /// Whether this effective role is built in, comes from `agents.yaml` or
     /// from a project/user package.
     pub origin: RoleOrigin,
+    /// Declared `mode` for portable `AGENT.md` roles (D-062); `None` for
+    /// built-ins, `agents.yaml` roles and `agent.yaml` packages.
+    pub mode: Option<super::portable::AgentMode>,
+    /// Folders this role may propose writes into (portable agents only). An
+    /// empty list means no agent-level narrowing: the type package's write
+    /// roots apply unchanged.
+    pub write_roots: Vec<String>,
+    /// Skill ids the role asks for (portable agents only).
+    pub skills: Vec<String>,
 }
 
 impl Role {
@@ -177,6 +187,9 @@ pub fn builtin_roles() -> Vec<Role> {
         version: None,
         trust: PackageTrust::Instructions,
         origin: RoleOrigin::Builtin,
+        mode: None,
+        write_roots: Vec::new(),
+        skills: Vec::new(),
     })
     .collect()
 }
@@ -218,9 +231,14 @@ pub fn load_roles_with_packages(
         let user_dir = package::user_packages_dir(config_dir);
         let packages = package::discover(&user_dir, "", PackageOrigin::User)?;
         merge_packages(&mut roles, packages);
+        let portable = portable::discover_agents(&user_dir, "", PackageOrigin::User)?;
+        merge_portable(&mut roles, portable);
     }
     let packages = package::discover(root, package::PROJECT_PACKAGES_DIR, PackageOrigin::Project)?;
     merge_packages(&mut roles, packages);
+    let portable =
+        portable::discover_agents(root, package::PROJECT_PACKAGES_DIR, PackageOrigin::Project)?;
+    merge_portable(&mut roles, portable);
 
     let text = match document::read_document(root, CONFIG_PATH) {
         Ok(text) => text,
@@ -280,7 +298,10 @@ pub fn resolve_default_with_packages(
     resolve_role_with_packages(root, user_config_dir, id)
 }
 
-/// Convert discovered packages into roles and apply precedence.
+/// Convert discovered `agent.yaml` packages into roles and apply precedence.
+/// The structured contract wins for its id: portable metadata (`mode`,
+/// `write_roots`, `skills`) from a previously merged `AGENT.md` is replaced,
+/// because the same id now resolves to the `agent.yaml` definition.
 fn merge_packages(roles: &mut Vec<Role>, packages: Vec<AgentPackage>) {
     for package in packages {
         let role = Role {
@@ -296,11 +317,58 @@ fn merge_packages(roles: &mut Vec<Role>, packages: Vec<AgentPackage>) {
                 PackageOrigin::User => RoleOrigin::UserPackage,
                 PackageOrigin::Project => RoleOrigin::ProjectPackage,
             },
+            mode: None,
+            write_roots: Vec::new(),
+            skills: Vec::new(),
         };
         match roles.iter_mut().find(|existing| existing.id == role.id) {
             Some(existing) => *existing = role,
             None => roles.push(role),
         }
+    }
+}
+
+/// Convert portable `AGENT.md` agents (D-062) into roles, following the
+/// same precedence as `agent.yaml` packages. The declared `mode` is the
+/// permission profile: `plan`/`review` are read-only, `build` may propose
+/// edits. The agent's `write_roots` narrow what the role may propose; the
+/// kernel sandbox still applies on top.
+fn merge_portable(roles: &mut Vec<Role>, agents: Vec<PortableAgent>) {
+    for agent in agents {
+        let mode = agent.mode;
+        let role = Role {
+            id: agent.id,
+            name: agent.name,
+            instructions: agent.instructions,
+            tasks: tasks_for_mode(mode),
+            model: None,
+            description: agent.description,
+            version: None,
+            trust: PackageTrust::Instructions,
+            origin: match agent.origin {
+                PackageOrigin::User => RoleOrigin::UserPackage,
+                PackageOrigin::Project => RoleOrigin::ProjectPackage,
+            },
+            mode: Some(mode),
+            write_roots: agent.write_roots,
+            skills: agent.skills,
+        };
+        match roles.iter_mut().find(|existing| existing.id == role.id) {
+            Some(existing) => *existing = role,
+            None => roles.push(role),
+        }
+    }
+}
+
+/// Permission profile a portable agent's `mode` grants. `plan` produces a
+/// brief and reviews without edits; `review` only reviews; `build` may also
+/// propose edits and scaffolding. The hard guarantees stay in the tasks —
+/// edits remain reviewable proposals whatever the mode says.
+fn tasks_for_mode(mode: AgentMode) -> Vec<String> {
+    match mode {
+        AgentMode::Plan => vec!["project_brief".to_string(), "scene_review".to_string()],
+        AgentMode::Review => vec!["scene_review".to_string()],
+        AgentMode::Build => TASK_KINDS.iter().map(|task| (*task).to_string()).collect(),
     }
 }
 
@@ -440,6 +508,18 @@ fn merge_project_roles(roles: &mut Vec<Role>, text: &str) -> Result<(), RolesErr
             Some(value) => parse_tasks(value, id)?,
         };
 
+        // `agents.yaml` cannot express portable-agent metadata, so an
+        // override keeps the overridden role's `mode`, `write_roots` and
+        // `skills` (same rule as `tasks` when the file omits it).
+        let (mode, write_roots, skills) = match builtin_ix {
+            Some(ix) => (
+                roles[ix].mode,
+                roles[ix].write_roots.clone(),
+                roles[ix].skills.clone(),
+            ),
+            None => (None, Vec::new(), Vec::new()),
+        };
+
         let resolved = Role {
             id: id.to_string(),
             name,
@@ -450,6 +530,9 @@ fn merge_project_roles(roles: &mut Vec<Role>, text: &str) -> Result<(), RolesErr
             version: None,
             trust: PackageTrust::Instructions,
             origin: RoleOrigin::Project,
+            mode,
+            write_roots,
+            skills,
         };
         match builtin_ix {
             Some(ix) => roles[ix] = resolved,
@@ -818,5 +901,78 @@ mod tests {
         assert!(system.starts_with("BASE FIJO"));
         assert!(system.contains("PERFIL (rol `editor-reviewer`, builtin)"));
         assert!(system.contains(&role.instructions));
+    }
+
+    /// Write a portable `AGENT.md` under `<project>/.narra/agents/<id>`.
+    fn write_agent(project: &tempfile::TempDir, id: &str, frontmatter: &str, body: &str) {
+        let dir = project.path().join(package::PROJECT_PACKAGES_DIR).join(id);
+        std::fs::create_dir_all(&dir).expect("agent dir");
+        std::fs::write(
+            dir.join(portable::AGENT_FILE),
+            format!("---\n{frontmatter}---\n{body}"),
+        )
+        .expect("AGENT.md");
+    }
+
+    #[test]
+    fn portable_agent_files_become_roles_with_mode_profiles() {
+        let project = project_empty();
+        write_agent(
+            &project,
+            "escritor",
+            "name: Escritor\ndescription: Escribe borradores.\nmode: build\nwrite_roots: [guion]\nskills: [escaleta]\n",
+            "\nEscribe siguiendo la biblia.\n",
+        );
+        write_agent(
+            &project,
+            "editor",
+            "name: Editor\ndescription: Da notas.\nmode: review\nwrite_roots: [notas]\n",
+            "\nDa notas de editor.\n",
+        );
+
+        let roles = load_roles(project.path()).expect("roles");
+        let writer = role_by_id(&roles, "escritor").expect("portable role");
+        assert_eq!(writer.origin, RoleOrigin::ProjectPackage);
+        assert_eq!(writer.mode, Some(portable::AgentMode::Build));
+        assert!(writer.allows("scene_edit"), "build may propose edits");
+        assert!(writer.allows("scene_review"));
+        assert_eq!(writer.write_roots, ["guion"], "agent narrowing is kept");
+        assert_eq!(writer.skills, ["escaleta"]);
+        assert_eq!(writer.version, None, "portable agents carry no version");
+
+        let editor = role_by_id(&roles, "editor").expect("review role");
+        assert_eq!(editor.mode, Some(portable::AgentMode::Review));
+        assert!(!editor.allows("scene_edit"), "review stays read-only");
+        assert!(editor.allows("scene_review"));
+    }
+
+    #[test]
+    fn an_agents_yaml_override_keeps_portable_metadata() {
+        let project = project_empty();
+        write_agent(
+            &project,
+            "escritor",
+            "name: Escritor\ndescription: Escribe borradores.\nmode: build\nwrite_roots: [guion]\nskills: [escaleta]\n",
+            "\nEscribe siguiendo la biblia.\n",
+        );
+        std::fs::write(
+            project.path().join(CONFIG_PATH),
+            "roles:\n  - id: escritor\n    name: Escritor jefe\n    instructions: |\n      Otra persona.\n",
+        )
+        .expect("agents.yaml");
+
+        let roles = load_roles(project.path()).expect("roles");
+        let role = role_by_id(&roles, "escritor").expect("override");
+        assert_eq!(role.name, "Escritor jefe");
+        assert_eq!(role.origin, RoleOrigin::Project);
+        // `agents.yaml` cannot express mode/roots/skills, so the override
+        // keeps them — and with them the agent's write narrowing.
+        assert_eq!(role.mode, Some(portable::AgentMode::Build));
+        assert_eq!(role.write_roots, ["guion"]);
+        assert_eq!(role.skills, ["escaleta"]);
+        assert!(
+            role.allows("scene_edit"),
+            "the portable permission profile survives too"
+        );
     }
 }

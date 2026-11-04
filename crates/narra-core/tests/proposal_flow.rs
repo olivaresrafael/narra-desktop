@@ -27,7 +27,7 @@ fn sample_project() -> PathBuf {
     let project =
         create_project(&root, "Luces de Invierno", ProjectType::Feature, "es").expect("create");
     project
-        .write_document(narra_core::DEFAULT_SCREENPLAY, TWO_SCENES)
+        .write_document(narra_core::DEFAULT_WORKSPACE_DOCUMENT, TWO_SCENES)
         .expect("screenplay");
     root
 }
@@ -47,7 +47,7 @@ fn propose(root: &Path, scene: usize, instruction: &str) -> narra_core::agent::T
 }
 
 fn screenplay(root: &Path) -> String {
-    fs::read_to_string(root.join(narra_core::DEFAULT_SCREENPLAY)).expect("read screenplay")
+    fs::read_to_string(root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT)).expect("read screenplay")
 }
 
 // --- Creating a proposal ----------------------------------------------------
@@ -71,7 +71,7 @@ fn propose_persists_a_reviewable_record_and_leaves_the_screenplay_untouched() {
     let id = output.data["proposal_id"].as_str().expect("proposal id");
     let record = proposal::load(&root, id).expect("load proposal");
     assert_eq!(record.state, ProposalState::ReadyForReview);
-    assert_eq!(record.target, narra_core::DEFAULT_SCREENPLAY);
+    assert_eq!(record.target, narra_core::DEFAULT_WORKSPACE_DOCUMENT);
     assert_eq!(record.origin.task, "scene_edit");
     assert_eq!(record.origin.adapter, "mock");
     assert_eq!(record.origin.model, "mock-1");
@@ -89,7 +89,7 @@ fn propose_persists_a_reviewable_record_and_leaves_the_screenplay_untouched() {
         events.iter().any(|event| matches!(
             event,
             TaskEvent::ProposalCreated { id: event_id, target, hunks }
-            if event_id == id && target == narra_core::DEFAULT_SCREENPLAY && *hunks > 0
+            if event_id == id && target == narra_core::DEFAULT_WORKSPACE_DOCUMENT && *hunks > 0
         )),
         "proposal_created event must identify the record: {events:?}"
     );
@@ -250,7 +250,7 @@ fn applying_over_a_changed_file_is_refused_as_stale() {
 
     // A later user edit to the same file invalidates the base.
     let user_edit = "INT. TALLER - NOCHE\n\nELENA\nEditado por el usuario.\n";
-    fs::write(root.join(narra_core::DEFAULT_SCREENPLAY), user_edit).expect("user edit");
+    fs::write(root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT), user_edit).expect("user edit");
 
     let error = proposal::apply(&root, id, None).expect_err("stale base");
     assert!(
@@ -275,7 +275,7 @@ fn a_stale_proposal_is_renewed_by_rerunning_the_same_task() {
     let id = output.data["proposal_id"].as_str().expect("proposal id");
 
     let user_edit = "INT. TALLER - NOCHE\n\nELENA\nEditado por el usuario.\n\nINT. CALLE - DÍA\n\nMARCOS\nHace sol.\n";
-    fs::write(root.join(narra_core::DEFAULT_SCREENPLAY), user_edit).expect("user edit");
+    fs::write(root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT), user_edit).expect("user edit");
     proposal::apply(&root, id, None).expect_err("stale base");
 
     // Renewed review: rebuild the task from provenance and run it again.

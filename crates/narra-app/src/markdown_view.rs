@@ -110,7 +110,7 @@ fn render_block(block: &Block, index: usize) -> Div {
                     .text_color(rgb(theme::status_fg()))
                     .child(marker.clone()),
             )
-            .child(div().flex_1().child(inline_column(spans))),
+            .child(div().flex_1().min_w(px(0.0)).child(inline_column(spans))),
         Block::Quote { depth, spans } => div()
             .mb_3()
             .ml(px(*depth as f32 * 12.0))
