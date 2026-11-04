@@ -51,6 +51,7 @@ agents:
 
 # Slash commands copied to .narra/commands/<name>.md.
 commands:
+  - brief
   - idea
   - personaje
   - estructura
@@ -79,6 +80,21 @@ workspace:
   default_document: guion/main.fountain
 
 # Folder groups rendered in the explorer; labels are localized by the app.
+brief:
+  document: notas/brief.md
+  questions:
+    - id: premisa
+      label: { es: "¿De qué trata la historia?", en: "What is the story about?" }
+      placeholder: { es: "Una o dos frases", en: "One or two sentences" }
+      multiline: true
+    - id: tono
+      label: { es: "¿Qué tono y género buscas?", en: "What tone and genre are you aiming for?" }
+    - id: personajes
+      label: { es: "¿Quiénes son los protagonistas?", en: "Who are the main characters?" }
+      multiline: true
+    - id: referencias
+      label: { es: "¿Referencias o restricciones?", en: "Any references or constraints?" }
+      required: false
 content_layout:
   - id: story
     folders: [biblia, estructura]

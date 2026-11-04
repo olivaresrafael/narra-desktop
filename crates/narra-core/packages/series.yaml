@@ -83,6 +83,21 @@ workspace:
   folder: workspace
   default_document: workspace/episode-1.fountain
   episode_pattern: "workspace/episode-{number}.fountain"
+brief:
+  document: notes/brief.md
+  questions:
+    - id: premise
+      label: { en: "What is the story about?", es: "¿De qué trata la historia?" }
+      placeholder: { en: "One or two sentences", es: "Una o dos frases" }
+      multiline: true
+    - id: tone
+      label: { en: "What tone and genre are you aiming for?", es: "¿Qué tono y género buscas?" }
+    - id: characters
+      label: { en: "Who are the main characters?", es: "¿Quiénes son los protagonistas?" }
+      multiline: true
+    - id: references
+      label: { en: "Any references or constraints?", es: "¿Referencias o restricciones?" }
+      required: false
 content_layout:
   - id: story
     folders: [bible, structure]

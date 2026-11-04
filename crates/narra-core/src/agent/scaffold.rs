@@ -516,6 +516,8 @@ pub struct ProjectScaffoldTask {
     /// Human-readable type label for custom packages; built-ins fall back to
     /// the enum label.
     pub type_label: Option<String>,
+    /// Answers from the type-declared onboarding brief.
+    pub brief: Vec<(String, String)>,
     pub role: Option<Role>,
 }
 
@@ -537,8 +539,14 @@ impl ProjectScaffoldTask {
             language: language.into(),
             prompt: prompt.into(),
             type_label: None,
+            brief: Vec::new(),
             role: None,
         }
+    }
+
+    pub fn with_brief(mut self, brief: Vec<(String, String)>) -> Self {
+        self.brief = brief;
+        self
     }
 
     pub fn with_type_id(mut self, id: impl Into<String>) -> Self {
@@ -622,8 +630,19 @@ impl ProjectScaffoldTask {
         if package.write_roots.is_empty() {
             return Err(AgentError::Adapter(ScaffoldError::NoWriteRoots.to_string()));
         }
+        let brief = if self.brief.is_empty() {
+            String::new()
+        } else {
+            let answers = self
+                .brief
+                .iter()
+                .map(|(label, answer)| format!("- {label}: {answer}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\nRESPUESTAS DEL BRIEF:\n{answers}\n")
+        };
         let prompt = format!(
-            "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n",
+            "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n{}",
             rules(
                 &package.write_roots,
                 &package.entities,
@@ -637,7 +656,8 @@ impl ProjectScaffoldTask {
                 .as_deref()
                 .unwrap_or_else(|| project_type_label(self.project_type)),
             self.language.trim(),
-            self.prompt.trim()
+            self.prompt.trim(),
+            brief
         );
         let request = ModelRequest {
             system,

@@ -455,6 +455,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Plantilla básica",
     ),
     ("newproject.mode.ai", "Generate with AI", "Generar con IA"),
+    ("newproject.brief", "Brief", "Brief"),
+    (
+        "newproject.brief_required",
+        "Please answer: {question}",
+        "Responde: {question}",
+    ),
     ("newproject.prompt", "Prompt:", "Prompt:"),
     (
         "newproject.prompt_hint",

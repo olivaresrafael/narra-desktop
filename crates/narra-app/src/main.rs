@@ -1245,6 +1245,26 @@ fn project_skills(project: &Project) -> (Vec<Skill>, Option<Vec<Skill>>) {
     (active, pending)
 }
 
+/// Brief answers captured by the New Project dialog.
+struct ProjectBrief {
+    document: Option<String>,
+    answers: Vec<(String, String)>,
+}
+
+/// Seed the brief document with the answers the user gave in the New Project
+/// dialog. The type declares the path; create-only, so a plan that already
+/// wrote it wins.
+fn write_project_brief(project: &Project, document: &str, answers: &[(String, String)]) {
+    if answers.is_empty() {
+        return;
+    }
+    let mut text = String::from("# Brief\n\n");
+    for (label, answer) in answers {
+        text.push_str(&format!("## {label}\n\n{answer}\n\n"));
+    }
+    let _ = project.create_document(document, &text);
+}
+
 fn project_type_package(project: &Project) -> Option<ProjectTypePackage> {
     let type_id = project.manifest().project_type_id.as_str();
     narra_core::project_type::builtin(type_id).or_else(|| {
@@ -8602,6 +8622,18 @@ impl Editor {
         }
         self.new_project_generation = self.new_project_generation.saturating_add(1);
         let types = new_project_types();
+        let brief = types
+            .iter()
+            .find(|package| package.id == "feature")
+            .and_then(|package| package.brief.clone());
+        let brief_questions = brief
+            .as_ref()
+            .map(|brief| brief.questions.clone())
+            .unwrap_or_default();
+        let brief_answers = brief_questions
+            .iter()
+            .map(|_| TextField::multiline())
+            .collect();
         self.new_project = Some(NewProjectState {
             title: TextField::single_line(),
             kind: ProjectType::Feature,
@@ -8610,6 +8642,9 @@ impl Editor {
             lang: self.lang,
             mode: NewProjectMode::Template,
             prompt: TextField::multiline(),
+            brief_document: brief.as_ref().map(|brief| brief.document.clone()),
+            brief_questions,
+            brief_answers,
             field: NewProjectField::Title,
             error: String::new(),
             picking: false,
@@ -8756,6 +8791,17 @@ impl Editor {
         let mode = state.mode;
         let prompt = state.prompt.text().trim().to_string();
         let plan_ready = state.plan.is_some();
+        let missing = state.missing_brief_answers();
+        if !missing.is_empty() {
+            let question = missing[0].clone();
+            self.set_new_project_error(
+                self.tf("newproject.brief_required", &[("question", &question)]),
+            );
+            cx.notify();
+            return;
+        }
+        let brief_document = state.brief_document.clone();
+        let brief_answers = state.brief_answers();
         if mode == NewProjectMode::Ai {
             if !self.ai_scaffold_available() {
                 self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
@@ -8778,12 +8824,23 @@ impl Editor {
                 type_label: package.name.clone(),
                 lang,
                 prompt,
+                brief_answers: brief_answers.clone(),
             };
             self.start_new_project_scaffold(path, draft, cx);
             cx.notify();
             return;
         }
-        self.create_new_project_from_template(path, title, package, lang, cx);
+        self.create_new_project_from_template(
+            path,
+            title,
+            package,
+            lang,
+            ProjectBrief {
+                document: brief_document,
+                answers: brief_answers,
+            },
+            cx,
+        );
     }
 
     fn create_new_project_from_template(
@@ -8792,10 +8849,14 @@ impl Editor {
         title: String,
         package: ProjectTypePackage,
         lang: Lang,
+        brief: ProjectBrief,
         cx: &mut Context<Self>,
     ) {
         match create_project_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => {
+                if let Some(document) = brief.document.as_deref() {
+                    write_project_brief(&project, document, &brief.answers);
+                }
                 if package.origin != narra_core::project_type::TypeOrigin::Builtin {
                     let _ = narra_core::project_type::trust_type(
                         &path,
@@ -8826,7 +8887,6 @@ impl Editor {
     fn ai_scaffold_available(&self) -> bool {
         self.agent_settings.provider != AiProvider::Mock
     }
-
     /// Generate a reviewed plan without creating anything (M16 slice 9).
     fn start_new_project_scaffold(
         &mut self,
@@ -8868,6 +8928,7 @@ impl Editor {
                 )
                 .with_type_label(draft.type_label.clone())
                 .with_type_id(draft.type_id.clone())
+                .with_brief(draft.brief_answers.clone())
                 .with_role(role);
                 let options = TaskOptions {
                     timeout: AGENT_TIMEOUT,
@@ -8938,15 +8999,20 @@ impl Editor {
         };
         match create_project_base_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => match write_plan(&path, &plan) {
-                Ok(()) => match self.install_project(project, cx) {
-                    Ok(()) => {
-                        self.new_project = None;
+                Ok(()) => {
+                    if let Some(document) = state.brief_document.as_deref() {
+                        write_project_brief(&project, document, &state.brief_answers());
                     }
-                    Err(error) => {
-                        let message = self.tf("newproject.open_failed", &[("error", &error)]);
-                        self.set_new_project_error(message);
+                    match self.install_project(project, cx) {
+                        Ok(()) => {
+                            self.new_project = None;
+                        }
+                        Err(error) => {
+                            let message = self.tf("newproject.open_failed", &[("error", &error)]);
+                            self.set_new_project_error(message);
+                        }
                     }
-                },
+                }
                 Err(error) => {
                     let message =
                         self.tf("newproject.write_failed", &[("error", &error.to_string())]);
@@ -19353,6 +19419,7 @@ impl Editor {
                 match state.field {
                     NewProjectField::Title => "title",
                     NewProjectField::Prompt => "prompt",
+                    NewProjectField::Brief(_) => "brief",
                 },
                 state.text_field(state.field).caret(),
                 state.text_field(state.field).selection().start,
@@ -22701,5 +22768,28 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn brief_answers_are_seeded_as_markdown() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("narra-brief-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project =
+            narra_core::project::create_project(&root, "Brief", ProjectType::Feature, "es")
+                .expect("project");
+        write_project_brief(
+            &project,
+            "notes/brief.md",
+            &[("Premisa".to_string(), "Una historia.".to_string())],
+        );
+        let text = project.read_document("notes/brief.md").expect("brief");
+        assert!(text.contains("# Brief"), "{text}");
+        assert!(text.contains("## Premisa"), "{text}");
+        assert!(text.contains("Una historia."), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

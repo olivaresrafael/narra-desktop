@@ -49,7 +49,7 @@ const MAX_CONTEXT_ACTIONS: usize = 32;
 const MAX_EXPORTS: usize = 4;
 const MAX_SEEDS: usize = 64;
 
-const PACKAGE_KEYS: [&str; 20] = [
+const PACKAGE_KEYS: [&str; 21] = [
     "schema_version",
     "api_version",
     "id",
@@ -60,6 +60,7 @@ const PACKAGE_KEYS: [&str; 20] = [
     "skills",
     "format",
     "workspace",
+    "brief",
     "content_layout",
     "pinned_context",
     "write_roots",
@@ -92,6 +93,26 @@ impl DocumentFormat {
             DocumentFormat::Plain => "plain",
         }
     }
+}
+
+/// One question the New Project flow asks before generating a base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BriefQuestion {
+    pub id: String,
+    pub label: LocalizedText,
+    pub placeholder: Option<LocalizedText>,
+    /// Required questions block the New Project accept action when empty.
+    pub required: bool,
+    /// Render a taller input for multi-line answers (premise, characters…).
+    pub multiline: bool,
+}
+
+/// The type's brief: where the answers are written and what to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BriefDefinition {
+    /// Project-relative Markdown document that receives the answers.
+    pub document: String,
+    pub questions: Vec<BriefQuestion>,
 }
 
 /// How the type's primary writing area works (D-063).
@@ -275,6 +296,8 @@ pub struct ProjectProfile {
     pub screenplay: bool,
     /// The type's workspace contract, when it declares one.
     pub workspace: Option<WorkspaceDefinition>,
+    /// The type's onboarding brief, when it declares one.
+    pub brief: Option<BriefDefinition>,
     /// Entities the type offers for dossiers, mentions, the convert menu and
     /// the New File chooser.
     pub entities: Vec<EntityDefinition>,
@@ -312,6 +335,7 @@ impl Default for ProjectProfile {
             type_id: "other".to_string(),
             screenplay: false,
             workspace: None,
+            brief: None,
             entities: Vec::new(),
             write_roots: Vec::new(),
             export_pdf: false,
@@ -337,6 +361,9 @@ pub struct ProjectTypePackage {
     /// The type's workspace contract (single document, episodes or a
     /// collection). `None` means the type has no primary writing area.
     pub workspace: Option<WorkspaceDefinition>,
+    /// The type's onboarding brief (document + questions). `None` means the
+    /// type does not ask a brief.
+    pub brief: Option<BriefDefinition>,
     /// Explorer sections rendered from the package.
     pub content_layout: Vec<ExplorerGroup>,
     /// Paths pinned into every chat without an explicit attachment.
@@ -384,6 +411,7 @@ impl ProjectTypePackage {
             type_id: self.id.clone(),
             screenplay: self.format == DocumentFormat::Fountain,
             workspace: self.workspace.clone(),
+            brief: self.brief.clone(),
             entities: self.entities.clone(),
             write_roots: self.write_roots.clone(),
             export_pdf: self.exports.iter().any(|export| export.kind == "pdf"),
@@ -543,6 +571,47 @@ impl ProjectTypePackage {
         Ok(())
     }
 
+    /// The onboarding brief: a document and the questions the New Project
+    /// flow asks. Answers are written by the app, not by the model.
+    fn validate_brief(&self) -> Result<(), TypePackageError> {
+        let Some(brief) = &self.brief else {
+            return Ok(());
+        };
+        validate_relative_path("brief.document", &brief.document)?;
+        let parent = brief
+            .document
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        if parent.is_empty() || !self.declares(parent) {
+            return Err(TypePackageError::Invalid {
+                field: "brief.document",
+                detail: format!("`{}` is not inside a declared directory", brief.document),
+            });
+        }
+        if brief.questions.is_empty() || brief.questions.len() > 8 {
+            return Err(TypePackageError::Invalid {
+                field: "brief.questions",
+                detail: "needs between 1 and 8 questions".to_string(),
+            });
+        }
+        let mut ids = BTreeSet::new();
+        for question in &brief.questions {
+            validate_id(&question.id)?;
+            if !ids.insert(question.id.as_str()) {
+                return Err(TypePackageError::Invalid {
+                    field: "brief.questions",
+                    detail: format!("duplicate question `{}`", question.id),
+                });
+            }
+            validate_localized("brief.questions", &question.label)?;
+            if let Some(placeholder) = &question.placeholder {
+                validate_localized("brief.questions", placeholder)?;
+            }
+        }
+        Ok(())
+    }
+
     fn declares(&self, path: &str) -> bool {
         self.directories
             .iter()
@@ -647,6 +716,7 @@ impl ProjectTypePackage {
         }
 
         self.validate_workspace()?;
+        self.validate_brief()?;
 
         if self.content_layout.len() > 8 {
             return Err(TypePackageError::Invalid {
@@ -1429,6 +1499,10 @@ pub fn parse_package(
         Some(value) => Some(parse_workspace(value)?),
         None => None,
     };
+    let brief = match root.as_mapping_get("brief") {
+        Some(value) => Some(parse_brief(value)?),
+        None => None,
+    };
     let pinned_context = match root.as_mapping_get("pinned_context") {
         Some(value) => string_sequence(value, "pinned_context")?,
         None => Vec::new(),
@@ -1526,6 +1600,7 @@ pub fn parse_package(
         skills,
         format,
         workspace,
+        brief,
         content_layout,
         pinned_context,
         write_roots,
@@ -1648,6 +1723,103 @@ fn parse_write_roots(value: &Yaml) -> Result<Vec<WriteRoot>, TypePackageError> {
         });
     }
     Ok(roots)
+}
+
+fn parse_brief(value: &Yaml) -> Result<BriefDefinition, TypePackageError> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "brief",
+            detail: "must be a mapping".to_string(),
+        })?;
+    for key in mapping.keys() {
+        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+            field: "brief",
+            detail: "keys must be strings".to_string(),
+        })?;
+        if !matches!(key, "document" | "questions") {
+            return Err(TypePackageError::Invalid {
+                field: "brief",
+                detail: format!("unknown key `{key}`"),
+            });
+        }
+    }
+    let document = mapping_get(mapping, "document")
+        .and_then(Yaml::as_str)
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "brief.document",
+            detail: "must be a string".to_string(),
+        })?
+        .to_string();
+    let questions = mapping_get(mapping, "questions")
+        .and_then(Yaml::as_sequence)
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "brief.questions",
+            detail: "must be a list".to_string(),
+        })?;
+    let mut parsed = Vec::with_capacity(questions.len());
+    for item in questions {
+        let question = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+            field: "brief.questions",
+            detail: "each question must be a mapping".to_string(),
+        })?;
+        for key in question.keys() {
+            let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                field: "brief.questions",
+                detail: "keys must be strings".to_string(),
+            })?;
+            if !matches!(
+                key,
+                "id" | "label" | "placeholder" | "required" | "multiline"
+            ) {
+                return Err(TypePackageError::Invalid {
+                    field: "brief.questions",
+                    detail: format!("unknown key `{key}`"),
+                });
+            }
+        }
+        let id = mapping_get(question, "id")
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| TypePackageError::Invalid {
+                field: "brief.questions",
+                detail: "each question needs a string `id`".to_string(),
+            })?
+            .to_string();
+        let label = mapping_get(question, "label").ok_or_else(|| TypePackageError::Invalid {
+            field: "brief.questions",
+            detail: format!("`{id}` needs `label`"),
+        })?;
+        let label = parse_localized_at(label, "brief.questions")?;
+        let placeholder = match mapping_get(question, "placeholder") {
+            Some(value) => Some(parse_localized_at(value, "brief.questions")?),
+            None => None,
+        };
+        let required = match mapping_get(question, "required") {
+            Some(value) => value.as_bool().ok_or_else(|| TypePackageError::Invalid {
+                field: "brief.questions",
+                detail: format!("`{id}`: `required` must be a boolean"),
+            })?,
+            None => true,
+        };
+        let multiline = match mapping_get(question, "multiline") {
+            Some(value) => value.as_bool().ok_or_else(|| TypePackageError::Invalid {
+                field: "brief.questions",
+                detail: format!("`{id}`: `multiline` must be a boolean"),
+            })?,
+            None => false,
+        };
+        parsed.push(BriefQuestion {
+            id,
+            label,
+            placeholder,
+            required,
+            multiline,
+        });
+    }
+    Ok(BriefDefinition {
+        document,
+        questions: parsed,
+    })
 }
 
 fn parse_workspace(value: &Yaml) -> Result<WorkspaceDefinition, TypePackageError> {
@@ -2342,6 +2514,63 @@ mod tests {
             assert!(profile.export_pdf);
         }
         assert!(builtin("unknown").is_none());
+    }
+
+    #[test]
+    fn builtins_declare_a_brief_with_document_and_questions() {
+        let feature = builtin("feature").expect("feature");
+        let brief = feature.brief.as_ref().expect("brief");
+        assert_eq!(brief.document, "notes/brief.md");
+        assert!(
+            brief
+                .questions
+                .iter()
+                .any(|question| question.id == "premise"
+                    && question.multiline
+                    && question.required)
+        );
+        assert!(
+            brief
+                .questions
+                .iter()
+                .any(|question| question.id == "references" && !question.required)
+        );
+        assert_eq!(
+            feature
+                .profile()
+                .brief
+                .expect("profile brief")
+                .questions
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn brief_contract_is_validated() {
+        let base = "schema_version: 2\napi_version: 1\nid: campaign\nname: Campaign\ndirectories: [notes]\n";
+        let ok = parse_package(
+            &format!("{base}brief:\n  document: notes/brief.md\n  questions:\n    - id: premise\n      label: {{ en: Premise, es: Premisa }}\n"),
+            TypeOrigin::User,
+        )
+        .expect("valid brief");
+        assert_eq!(ok.brief.expect("brief").questions.len(), 1);
+
+        for bad in [
+            // unknown key
+            "brief:\n  document: notes/brief.md\n  questions:\n    - id: premise\n      label: { en: P, es: P }\n      nope: true\n",
+            // missing document
+            "brief:\n  questions:\n    - id: premise\n      label: { en: P, es: P }\n",
+            // duplicate question
+            "brief:\n  document: notes/brief.md\n  questions:\n    - id: premise\n      label: { en: P, es: P }\n    - id: premise\n      label: { en: P2, es: P2 }\n",
+            // empty questions
+            "brief:\n  document: notes/brief.md\n  questions: []\n",
+            // document outside a declared directory
+            "brief:\n  document: outside/brief.md\n  questions:\n    - id: premise\n      label: { en: P, es: P }\n",
+        ] {
+            let text = format!("{base}{bad}");
+            assert!(parse_package(&text, TypeOrigin::User).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -30,9 +30,12 @@ fn the_real_v2_parser_loads_the_package() {
         workspace.default_document.as_deref(),
         Some("guion/main.fountain")
     );
+    let brief = package.brief.as_ref().expect("brief");
+    assert_eq!(brief.document, "notas/brief.md");
+    assert_eq!(brief.questions.len(), 4);
     assert_eq!(package.pinned_context(), ["biblia", "estructura"]);
     assert_eq!(package.skills.len(), 9);
-    assert_eq!(package.commands.len(), 8);
+    assert_eq!(package.commands.len(), 9);
     assert_eq!(package.agents.len(), 4);
 
     let profile = package.profile();
@@ -340,7 +343,7 @@ fn bundled_commands_load_with_the_real_loader_and_resolve_their_agents() {
     let root = package_root();
     let commands = portable::discover_commands(&root, ".narra/commands", PackageOrigin::Project)
         .expect("command .md files must satisfy the slash-command contract");
-    assert_eq!(commands.len(), 8, "the package ships eight commands");
+    assert_eq!(commands.len(), 9, "the package ships nine commands");
     for id in [
         "idea",
         "investigar",

@@ -5,6 +5,7 @@
 
 use super::*;
 use gpui::prelude::*;
+use narra_core::project_type::{BriefDefinition, BriefQuestion};
 
 /// How a new project starts (M16 slices 8–9, D-044).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub(crate) enum NewProjectMode {
 pub(crate) enum NewProjectField {
     Title,
     Prompt,
+    /// One onboarding brief question, by index.
+    Brief(usize),
 }
 
 /// The New Project modal (M10 slice 2b): title, kind, primary language, the
@@ -39,6 +42,11 @@ pub(crate) struct NewProjectState {
     pub(crate) lang: Lang,
     pub(crate) mode: NewProjectMode,
     pub(crate) prompt: TextField,
+    /// Brief document declared by the selected type (answers are seeded
+    /// there after creation).
+    pub(crate) brief_document: Option<String>,
+    pub(crate) brief_questions: Vec<BriefQuestion>,
+    pub(crate) brief_answers: Vec<TextField>,
     pub(crate) field: NewProjectField,
     pub(crate) error: String,
     pub(crate) picking: bool,
@@ -56,6 +64,7 @@ impl NewProjectState {
         match field {
             NewProjectField::Title => &self.title,
             NewProjectField::Prompt => &self.prompt,
+            NewProjectField::Brief(index) => self.brief_answers.get(index).unwrap_or(&self.title),
         }
     }
 
@@ -63,7 +72,62 @@ impl NewProjectState {
         match field {
             NewProjectField::Title => &mut self.title,
             NewProjectField::Prompt => &mut self.prompt,
+            NewProjectField::Brief(index) => {
+                if index >= self.brief_answers.len() {
+                    self.brief_answers
+                        .resize_with(index + 1, TextField::multiline);
+                }
+                &mut self.brief_answers[index]
+            }
         }
+    }
+
+    /// Replace the type's brief questions and reset the answers.
+    pub(crate) fn apply_brief(&mut self, brief: Option<&BriefDefinition>) {
+        self.brief_document = brief.map(|brief| brief.document.clone());
+        self.brief_questions = brief
+            .map(|brief| brief.questions.clone())
+            .unwrap_or_default();
+        self.brief_answers = self
+            .brief_questions
+            .iter()
+            .map(|_| TextField::multiline())
+            .collect();
+    }
+
+    /// Answered questions as `(localized label, answer)`, skipping blanks.
+    pub(crate) fn brief_answers(&self) -> Vec<(String, String)> {
+        self.brief_questions
+            .iter()
+            .zip(self.brief_answers.iter())
+            .filter_map(|(question, field)| {
+                let answer = field.text().trim();
+                if answer.is_empty() {
+                    None
+                } else {
+                    Some((
+                        question.label.for_language(self.lang.key()).to_string(),
+                        answer.to_string(),
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    /// Required questions that are still empty.
+    pub(crate) fn missing_brief_answers(&self) -> Vec<String> {
+        self.brief_questions
+            .iter()
+            .enumerate()
+            .filter(|(index, question)| {
+                question.required
+                    && self
+                        .brief_answers
+                        .get(*index)
+                        .is_none_or(|field| field.text().trim().is_empty())
+            })
+            .map(|(_, question)| question.label.for_language(self.lang.key()).to_string())
+            .collect()
     }
 
     pub(crate) fn active_text_field_mut(&mut self) -> &mut TextField {
@@ -83,6 +147,7 @@ pub(crate) struct NewProjectDraft {
     pub(crate) type_label: String,
     pub(crate) lang: Lang,
     pub(crate) prompt: String,
+    pub(crate) brief_answers: Vec<(String, String)>,
 }
 
 impl Editor {
@@ -180,11 +245,12 @@ impl Editor {
         let width_for_click = width;
         let width_for_drag = width;
         let id = match field {
-            NewProjectField::Title => "new-project-title-input",
-            NewProjectField::Prompt => "new-project-prompt-input",
+            NewProjectField::Title => "new-project-title-input".to_string(),
+            NewProjectField::Prompt => "new-project-prompt-input".to_string(),
+            NewProjectField::Brief(index) => format!("new-project-brief-{index}"),
         };
         div()
-            .id(id)
+            .id(gpui::ElementId::Name(id.into()))
             .relative()
             .w_full()
             .p_2()
@@ -367,6 +433,7 @@ impl Editor {
             );
             let package_id = package.id.clone();
             let package_kind = kind.unwrap_or(ProjectType::Other);
+            let package_brief = package.brief.clone();
             kinds = kinds.child(
                 div()
                     .id(("project-type-chip", index as u64))
@@ -398,6 +465,7 @@ impl Editor {
                         {
                             state.type_id = package_id.clone();
                             state.kind = package_kind;
+                            state.apply_brief(package_brief.as_ref());
                             state.error.clear();
                         }
                         cx.notify();
@@ -637,6 +705,44 @@ impl Editor {
                             )
                         },
                     )
+                    .when(!state.brief_questions.is_empty(), |card| {
+                        let mut section = div().flex().flex_col().gap_2().child(
+                            div()
+                                .text_color(rgb(theme::status_fg()))
+                                .child(self.t("newproject.brief")),
+                        );
+                        for (index, question) in state.brief_questions.iter().enumerate() {
+                            let placeholder = question
+                                .placeholder
+                                .as_ref()
+                                .map(|placeholder| placeholder.for_language(state.lang.key()))
+                                .unwrap_or("");
+                            let min_height = if question.multiline {
+                                px(72.0)
+                            } else {
+                                px(theme::line_height())
+                            };
+                            section = section.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_color(rgb(theme::status_fg())).child(
+                                        question.label.for_language(state.lang.key()).to_string(),
+                                    ))
+                                    .child(Self::new_project_text_input(
+                                        state,
+                                        NewProjectField::Brief(index),
+                                        window,
+                                        px(552.0),
+                                        min_height,
+                                        placeholder,
+                                        cx,
+                                    )),
+                            );
+                        }
+                        card.child(section)
+                    })
                     .when(state.plan.is_some(), |card| {
                         let plan = state.plan.as_ref().expect("checked");
                         let mut list = div()
