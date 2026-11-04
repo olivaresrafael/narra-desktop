@@ -6,9 +6,11 @@ toda la lógica creativa puede vivir en datos y no en Rust.
 
 ## Qué contiene
 
-- `type.yaml` — borrador del contrato **v2**: `format`, `content_layout`,
-  `write_roots`, `pinned_context`, `entities`, `export`, `context_actions`
-  y secciones `agents`/`commands`/`skills`/`templates`/`instructions`.
+- `type.yaml` — contrato **v2**: `format`, `workspace` (`mode: single`,
+  carpeta `guion`, documento oficial `guion/main.fountain`),
+  `content_layout`, `write_roots`, `pinned_context`, `entities`, `export`,
+  `context_actions` y secciones
+  `agents`/`commands`/`skills`/`templates`/`instructions`.
 - `AGENTS.md` — contrato creativo superior del proyecto (se siembra en la
   raíz del proyecto nuevo).
 - `.narra/agents/<id>/AGENT.md` — cuatro agentes portables (guionista,
