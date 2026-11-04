@@ -29,7 +29,7 @@ const V1_FIELDS: &[&str] = &[
     "primary_language",
     "additional_languages",
     "created_at",
-    "default_screenplay_path",
+    "workspace_document",
 ];
 
 /// Project kinds from `DATA_MODEL.md` §3.
@@ -83,8 +83,8 @@ pub struct Manifest {
     pub additional_languages: Vec<String>,
     /// RFC 3339, UTC. Set once at creation and never rewritten afterwards.
     pub created_at: String,
-    /// Project-relative path, e.g. `screenplay/main.fountain`.
-    pub default_screenplay_path: String,
+    /// Project-relative path, e.g. `workspace/main.fountain`.
+    pub workspace_document: String,
 }
 
 impl Manifest {
@@ -93,7 +93,7 @@ impl Manifest {
         title: &str,
         project_type: ProjectType,
         primary_language: &str,
-        default_screenplay_path: &str,
+        workspace_document: &str,
     ) -> Self {
         let created_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -107,7 +107,7 @@ impl Manifest {
             primary_language: primary_language.to_string(),
             additional_languages: Vec::new(),
             created_at,
-            default_screenplay_path: default_screenplay_path.to_string(),
+            workspace_document: workspace_document.to_string(),
         }
     }
 
@@ -117,16 +117,11 @@ impl Manifest {
         title: &str,
         project_type_id: &str,
         primary_language: &str,
-        default_screenplay_path: &str,
+        workspace_document: &str,
     ) -> Result<Self, ManifestError> {
         validate_project_type_id(project_type_id)?;
         let project_type = ProjectType::parse(project_type_id).unwrap_or(ProjectType::Other);
-        let mut manifest = Self::new_v1(
-            title,
-            project_type,
-            primary_language,
-            default_screenplay_path,
-        );
+        let mut manifest = Self::new_v1(title, project_type, primary_language, workspace_document);
         manifest.project_type_id = project_type_id.to_string();
         Ok(manifest)
     }
@@ -166,7 +161,7 @@ impl Manifest {
         for language in &self.additional_languages {
             require_language("additional_languages", language)?;
         }
-        require_relative_path("default_screenplay_path", &self.default_screenplay_path)?;
+        require_relative_path("workspace_document", &self.workspace_document)?;
         parse_rfc3339("created_at", &self.created_at)?;
         Ok(())
     }
@@ -290,8 +285,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
     };
 
     let created_at = required_string(&root, "created_at", "RFC 3339 timestamp string")?.to_string();
-    let default_screenplay_path =
-        required_string(&root, "default_screenplay_path", "relative path string")?.to_string();
+    let workspace_document =
+        required_string(&root, "workspace_document", "relative path string")?.to_string();
 
     let manifest = Manifest {
         schema_version: u32::try_from(schema_version).map_err(|_| ManifestError::InvalidValue {
@@ -305,7 +300,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
         primary_language,
         additional_languages,
         created_at,
-        default_screenplay_path,
+        workspace_document,
     };
     manifest.validate()?;
     Ok(manifest)
@@ -351,8 +346,8 @@ pub fn serialize_manifest(manifest: &Manifest) -> Result<String, ManifestError> 
         yaml_string(&manifest.created_at)
     ));
     out.push_str(&format!(
-        "default_screenplay_path: {}\n",
-        yaml_string(&manifest.default_screenplay_path)
+        "workspace_document: {}\n",
+        yaml_string(&manifest.workspace_document)
     ));
     Ok(out)
 }
@@ -479,7 +474,7 @@ mod tests {
             "Mi serie",
             ProjectType::Series,
             "es",
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
         )
     }
 
@@ -567,12 +562,12 @@ mod tests {
     #[test]
     fn rejects_absolute_screenplay_path() {
         let mut manifest = sample();
-        manifest.default_screenplay_path = "/Users/someone/screen.fountain".to_string();
+        manifest.workspace_document = "/Users/someone/screen.fountain".to_string();
         let error = serialize_manifest(&manifest).expect_err("absolute path");
         assert!(matches!(
             error,
             ManifestError::InvalidValue {
-                field: "default_screenplay_path",
+                field: "workspace_document",
                 ..
             }
         ));
@@ -581,14 +576,14 @@ mod tests {
     #[test]
     fn rejects_parent_traversal_in_screenplay_path() {
         let text = serialize_manifest(&sample()).expect("serialize").replace(
-            "default_screenplay_path: \"screenplay/main.fountain\"",
-            "default_screenplay_path: \"../outside.fountain\"",
+            "workspace_document: \"workspace/main.fountain\"",
+            "workspace_document: \"../outside.fountain\"",
         );
         let error = parse_manifest(&text).expect_err("traversal must be rejected");
         assert!(matches!(
             error,
             ManifestError::InvalidValue {
-                field: "default_screenplay_path",
+                field: "workspace_document",
                 ..
             }
         ));
@@ -655,7 +650,7 @@ mod tests {
             "project_type: feature\n",
             "primary_language: es\n",
             "created_at: 2026-10-22T09:00:00Z\n",
-            "default_screenplay_path: screenplay/main.fountain\n",
+            "workspace_document: workspace/main.fountain\n",
         );
         let manifest = parse_manifest(text).expect("hand-written manifest");
         assert_eq!(manifest.title, "Proyecto a mano");

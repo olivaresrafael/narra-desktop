@@ -143,7 +143,7 @@ impl SceneEditTask {
         });
         let project = open_project(root)?;
         let manifest = project.manifest();
-        let screenplay_path = manifest.default_screenplay_path.clone();
+        let screenplay_path = manifest.workspace_document.clone();
 
         emit(TaskEvent::Progress {
             stage: "collect_context".to_string(),
@@ -474,7 +474,7 @@ mod tests {
             task_input: json!({"scene_number": 3, "instruction": "más tensión"}),
         };
         let proposal = FileProposal::new(
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
             "INT. A - DÍA\n\nHola.\n",
             "INT. A - DÍA\n\nBuenos días.\n",
             "más tensión",
@@ -497,7 +497,7 @@ mod tests {
             task_input: json!({}),
         };
         let proposal = FileProposal::new(
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
             "INT. A - DÍA\n\nHola.\n",
             "INT. A - DÍA\n\nBuenos días.\n",
             "r",

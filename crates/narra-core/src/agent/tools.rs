@@ -939,11 +939,12 @@ mod tests {
             "schema_version: 1\nproject_id: 00000000-0000-4000-8000-000000000001\n\
              title: Herramientas\nproject_type: feature\nprimary_language: es\n\
              additional_languages: []\ncreated_at: 2026-01-01T00:00:00Z\n\
-             default_screenplay_path: screenplay/main.fountain\n",
+             workspace_document: workspace/main.fountain\n",
         )
         .expect("manifest");
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace dir");
         std::fs::write(
-            root.join("screenplay/main.fountain"),
+            root.join("workspace/main.fountain"),
             "INT. TALLER - NOCHE\n\nELENA\nEsto es una prueba.\n\nINT. CALLE - DÍA\n\nMARCOS\nHace sol.\n",
         )
         .expect("screenplay");
@@ -976,7 +977,7 @@ mod tests {
             &call(
                 "c1",
                 "read_document",
-                json!({"path": "screenplay/main.fountain"}),
+                json!({"path": "workspace/main.fountain"}),
             ),
             &mut policy,
             &origin(),
@@ -1229,7 +1230,7 @@ mod tests {
                 "new-3",
                 "propose_document_create",
                 json!({
-                    "path": "screenplay/acto2.fountain",
+                    "path": "workspace/acto2.fountain",
                     "instruction": "crea el segundo acto",
                     "content": "INT. CALLE - DÍA\n\nMARCOS\nHace sol.\n"
                 }),
@@ -1297,7 +1298,7 @@ mod tests {
                 "doc-3",
                 "propose_document_edit",
                 json!({
-                    "path": "screenplay/main.fountain",
+                    "path": "workspace/main.fountain",
                     "instruction": "cambia el final",
                     "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
@@ -1318,7 +1319,7 @@ mod tests {
                 "c1",
                 "propose_document_edit",
                 json!({
-                    "path": "screenplay/main.fountain",
+                    "path": "workspace/main.fountain",
                     "instruction": "más tensión",
                     "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
@@ -1340,7 +1341,7 @@ mod tests {
     fn granted_propose_stages_a_proposal_without_touching_canon() {
         let root = sample_project();
         let canon_before =
-            std::fs::read_to_string(root.join("screenplay/main.fountain")).expect("read");
+            std::fs::read_to_string(root.join("workspace/main.fountain")).expect("read");
         let mut executor = ToolExecutor::new(&root);
         let mut policy = GrantPolicy::new().allow("propose_document_edit");
         let result = executor.execute(
@@ -1348,7 +1349,7 @@ mod tests {
                 "c1",
                 "propose_document_edit",
                 json!({
-                    "path": "screenplay/main.fountain",
+                    "path": "workspace/main.fountain",
                     "instruction": "más tensión",
                     "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
@@ -1360,7 +1361,7 @@ mod tests {
         let ToolOutcome::ProposalCreated { id, target, hunks } = &result.outcome else {
             panic!("expected proposal, got {:?}", result.outcome);
         };
-        assert_eq!(target, "screenplay/main.fountain");
+        assert_eq!(target, "workspace/main.fountain");
         assert!(*hunks >= 1);
         assert!(
             !proposal::load(&root, id)
@@ -1370,7 +1371,7 @@ mod tests {
         );
 
         let canon_after =
-            std::fs::read_to_string(root.join("screenplay/main.fountain")).expect("read");
+            std::fs::read_to_string(root.join("workspace/main.fountain")).expect("read");
         assert_eq!(canon_before, canon_after, "canon must be untouched");
     }
 
@@ -1410,7 +1411,7 @@ mod tests {
                 "c1",
                 "propose_document_edit",
                 json!({
-                    "path": "screenplay/main.fountain",
+                    "path": "workspace/main.fountain",
                     "instruction": "más tensión",
                     "rewritten_document": "INT. TALLER - NOCHE\n\nELENA\nCerrando cuentas.\n"
                 }),
@@ -1433,7 +1434,7 @@ mod tests {
             "{:?}",
             applied.outcome
         );
-        let canon = std::fs::read_to_string(root.join("screenplay/main.fountain")).expect("read");
+        let canon = std::fs::read_to_string(root.join("workspace/main.fountain")).expect("read");
         assert!(canon.contains("Cerrando cuentas."), "applied to canon");
 
         // Applying twice fails cleanly (state is now `applied`).
@@ -1481,7 +1482,7 @@ mod tests {
             &call(
                 "c1",
                 "propose_document_edit",
-                json!({"path": "screenplay/main.fountain", "instruction": "x"}),
+                json!({"path": "workspace/main.fountain", "instruction": "x"}),
             ),
             &mut policy,
             &origin(),

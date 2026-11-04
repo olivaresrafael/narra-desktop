@@ -893,7 +893,7 @@ fn spawn_tool_server(received: std::sync::Arc<std::sync::Mutex<String>>) -> Stri
                             "type": "function",
                             "function": {
                                 "name": "read_document",
-                                "arguments": "{\"path\": \"screenplay/main.fountain\"}"
+                                "arguments": "{\"path\": \"workspace/main.fountain\"}"
                             }
                         }]
                     },
@@ -942,7 +942,7 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
                 tool_calls: vec![ToolCall {
                     id: "call_prev".to_string(),
                     name: "read_document".to_string(),
-                    arguments: serde_json::json!({"path": "screenplay/main.fountain"}),
+                    arguments: serde_json::json!({"path": "workspace/main.fountain"}),
                 }],
                 tool_call_id: None,
                 tool_name: None,
@@ -968,7 +968,7 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
     assert_eq!(sent["tools"][0]["function"]["parameters"]["type"], "object");
     assert_eq!(
         sent["messages"][2]["tool_calls"][0]["function"]["arguments"],
-        "{\"path\":\"screenplay/main.fountain\"}"
+        "{\"path\":\"workspace/main.fountain\"}"
     );
     assert_eq!(sent["messages"][3]["role"], "tool");
     assert_eq!(sent["messages"][3]["tool_call_id"], "call_prev");
@@ -980,7 +980,7 @@ fn tool_declarations_and_history_go_out_in_openai_wire_format() {
     assert_eq!(response.tool_calls[0].name, "read_document");
     assert_eq!(
         response.tool_calls[0].arguments,
-        serde_json::json!({"path": "screenplay/main.fountain"})
+        serde_json::json!({"path": "workspace/main.fountain"})
     );
     assert!(response.text.is_empty(), "tool round has no final text");
 }

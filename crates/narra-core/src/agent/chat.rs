@@ -34,7 +34,7 @@ use super::tools::{
 use super::{AgentError, ContextSource, TaskEvent, TaskExit, TaskOptions, TaskOutput};
 use crate::document;
 use crate::project::open_project;
-use crate::project_type::ProjectProfile;
+use crate::project_type::{ProjectProfile, WorkspaceDefinition, WorkspaceMode};
 
 /// Chat modes exposed by the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -656,10 +656,10 @@ impl ChatTask {
             system.push_str(&profile_brief(profile));
         }
         system.push_str(&official_document_brief(
-            &manifest.default_screenplay_path,
+            &manifest.workspace_document,
             self.profile
                 .as_ref()
-                .and_then(|profile| profile.episode_pattern.as_deref()),
+                .and_then(|profile| profile.workspace.as_ref()),
         ));
 
         self.run_with_tools(
@@ -899,23 +899,49 @@ fn summarize_run(proposals: &[serde_json::Value], audit: &[ToolResult]) -> Strin
         .to_string()
 }
 
-/// Tell the model which file is the official script, so scene requests edit
-/// it instead of inventing a new document name (and know the episode pattern
-/// for series-like projects).
-fn official_document_brief(default_document: &str, episode_pattern: Option<&str>) -> String {
-    let mut out = format!(
-        "\n\nDOCUMENTO OFICIAL DEL PROYECTO: {default_document}\n\
-         Para escenas y borradores del guion edita ese archivo con \
-         propose_document_edit; no inventes un nombre de archivo. Usa \
-         propose_document_create solo para fichas, notas o investigación nuevas."
-    );
-    if let Some(pattern) = episode_pattern {
+/// Tell the model how the type's workspace works: the official document,
+/// the episode pattern or the declared collection deliverables. Also asks for
+/// a short brief when basic information is missing.
+fn official_document_brief(
+    default_document: &str,
+    workspace: Option<&WorkspaceDefinition>,
+) -> String {
+    let mut out = String::from("\n\n");
+    if workspace.map(|workspace| workspace.mode) == Some(WorkspaceMode::Collection) {
+        out.push_str("ESPACIO DE TRABAJO (colección): no hay un documento oficial único.");
+        if let Some(workspace) = workspace {
+            if !workspace.documents.is_empty() {
+                out.push_str("\nEntregables declarados:");
+                for document in &workspace.documents {
+                    out.push_str(&format!("\n- {} → {}", document.label.es, document.path));
+                }
+            }
+            out.push_str(&format!(
+                "\nEdita el entregable que corresponda con propose_document_edit; usa \
+                 propose_document_create solo para un documento nuevo dentro de `{}`.",
+                workspace.folder
+            ));
+        }
+    } else {
         out.push_str(&format!(
-            "\nProyecto por episodios: el patrón es `{pattern}`. Sustituye {{number}} \
-             por el número de episodio. Si el episodio ya existe, edítalo; si no, \
-             créalo con ese nombre."
+            "DOCUMENTO OFICIAL DEL PROYECTO: {default_document}\n\
+             Para escenas y borradores edita ese archivo con propose_document_edit; no \
+             inventes un nombre de archivo. Usa propose_document_create solo para fichas, \
+             notas o investigación nuevas."
         ));
+        if let Some(pattern) = workspace.and_then(|workspace| workspace.episode_pattern.as_deref())
+        {
+            out.push_str(&format!(
+                "\nProyecto por episodios: el patrón es `{pattern}`. Sustituye {{number}} \
+                 por el número de episodio. Si el episodio ya existe, edítalo; si no, \
+                 créalo con ese nombre."
+            ));
+        }
     }
+    out.push_str(
+        "\nSi falta información básica (premisa, tono, personajes), haz primero 3–5 \
+         preguntas breves de brief y espera las respuestas antes de escribir.",
+    );
     out
 }
 
@@ -1073,7 +1099,7 @@ mod tests {
         let mut thread = ChatThread::new(ChatMode::Plan);
         thread.push_user("Resume la escena 1");
         thread.push_assistant("La escena plantea el conflicto.");
-        thread.push_proposal("proposal-1", "screenplay/main.fountain", 2);
+        thread.push_proposal("proposal-1", "workspace/main.fountain", 2);
         thread.push_activity(ChatActivity {
             run: 0,
             kind: ChatActivityKind::Read,
@@ -1172,7 +1198,7 @@ mod tests {
             .with_attachments(vec![ChatAttachment::new(
                 "scene",
                 "Escena 1",
-                "screenplay/main.fountain",
+                "workspace/main.fountain",
                 "INT. CASA - DÍA\nMarta entra.",
             )]);
         let output = task
@@ -1313,7 +1339,7 @@ mod tests {
     fn build_chat_can_read_a_document_but_never_applies_a_proposal() {
         let root = project();
         fs::write(
-            root.join("screenplay/main.fountain"),
+            root.join("workspace/main.fountain"),
             "INT. CASA - DÍA\nMarta entra.\n",
         )
         .expect("screenplay");
@@ -1324,7 +1350,7 @@ mod tests {
                 tool_calls: vec![crate::agent::ToolCall {
                     id: "read-1".to_string(),
                     name: "read_document".to_string(),
-                    arguments: json!({"path": "screenplay/main.fountain"}),
+                    arguments: json!({"path": "workspace/main.fountain"}),
                 }],
                 input_tokens: None,
                 output_tokens: None,
@@ -1622,7 +1648,7 @@ mod tests {
     fn build_chat_stages_a_screenplay_proposal_but_leaves_the_file_untouched() {
         let root = project();
         let screenplay = "INT. CASA - DÍA\n\nMarta entra.\n";
-        fs::write(root.join("screenplay/main.fountain"), screenplay).expect("screenplay");
+        fs::write(root.join("workspace/main.fountain"), screenplay).expect("screenplay");
         let adapter = crate::agent::MockAdapter::scripted(vec![
             crate::agent::ModelResponse {
                 text: String::new(),
@@ -1631,7 +1657,7 @@ mod tests {
                     id: "propose-1".to_string(),
                     name: "propose_document_edit".to_string(),
                     arguments: json!({
-                        "path": "screenplay/main.fountain",
+                        "path": "workspace/main.fountain",
                         "instruction": "haz que salga",
                         "rewritten_document": "INT. CASA - DÍA\n\nMarta sale.\n"
                     }),
@@ -1664,7 +1690,7 @@ mod tests {
                 .is_some_and(|tools| !tools.is_empty())
         );
         assert_eq!(
-            fs::read_to_string(root.join("screenplay/main.fountain")).expect("read"),
+            fs::read_to_string(root.join("workspace/main.fountain")).expect("read"),
             screenplay,
             "proposal must not write the canonical screenplay"
         );
@@ -1683,7 +1709,7 @@ mod tests {
         assert!(brief.contains("RUTAS DE ESCRITURA"), "{brief}");
         assert!(brief.contains("bible (extensiones: .md)"), "{brief}");
         assert!(
-            brief.contains("screenplay (extensiones: .fountain, .md)"),
+            brief.contains("workspace (extensiones: .fountain, .md)"),
             "{brief}"
         );
         assert!(brief.contains("character → bible/characters"), "{brief}");
@@ -1711,18 +1737,40 @@ mod tests {
     }
 
     #[test]
-    fn official_document_brief_names_the_script_and_episode_pattern() {
+    fn official_document_brief_names_the_workspace_contract() {
         let brief = official_document_brief("guion/main.fountain", None);
         assert!(brief.contains("DOCUMENTO OFICIAL"), "{brief}");
         assert!(brief.contains("guion/main.fountain"), "{brief}");
         assert!(brief.contains("propose_document_edit"), "{brief}");
-        assert!(!brief.contains("episodios"), "{brief}");
+        assert!(brief.contains("preguntas breves de brief"), "{brief}");
 
-        let brief = official_document_brief(
-            "guion/episode-1.fountain",
-            Some("guion/episode-{number}.fountain"),
-        );
+        let episodes = WorkspaceDefinition {
+            mode: WorkspaceMode::Episodes,
+            folder: "guion".to_string(),
+            default_document: Some("guion/episode-1.fountain".to_string()),
+            episode_pattern: Some("guion/episode-{number}.fountain".to_string()),
+            documents: Vec::new(),
+        };
+        let brief = official_document_brief("guion/episode-1.fountain", Some(&episodes));
         assert!(brief.contains("guion/episode-{number}.fountain"), "{brief}");
         assert!(brief.contains("episodios"), "{brief}");
+
+        let collection = WorkspaceDefinition {
+            mode: WorkspaceMode::Collection,
+            folder: "campaign".to_string(),
+            default_document: None,
+            episode_pattern: None,
+            documents: vec![crate::project_type::WorkspaceDocument {
+                id: "brief".to_string(),
+                label: crate::project_type::LocalizedText {
+                    en: "Brief".to_string(),
+                    es: "Brief".to_string(),
+                },
+                path: "campaign/brief.md".to_string(),
+            }],
+        };
+        let brief = official_document_brief("", Some(&collection));
+        assert!(brief.contains("colección"), "{brief}");
+        assert!(brief.contains("campaign/brief.md"), "{brief}");
     }
 }

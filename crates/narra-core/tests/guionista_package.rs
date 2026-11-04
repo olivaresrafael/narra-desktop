@@ -23,8 +23,11 @@ fn the_real_v2_parser_loads_the_package() {
     let package = load_package(&package_root(), TypeOrigin::User).expect("load guionista");
     assert_eq!(package.id, "guionista");
     assert_eq!(package.format.key(), "fountain");
+    let workspace = package.workspace.as_ref().expect("workspace");
+    assert_eq!(workspace.mode.key(), "single");
+    assert_eq!(workspace.folder, "guion");
     assert_eq!(
-        package.default_document.as_deref(),
+        workspace.default_document.as_deref(),
         Some("guion/main.fountain")
     );
     assert_eq!(package.pinned_context(), ["biblia", "estructura"]);

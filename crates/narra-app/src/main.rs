@@ -4771,26 +4771,34 @@ impl Editor {
                     .child(state.project_type_id.clone()),
             );
         }
-        let mut screenplay_choices = div().flex().flex_col().gap_1();
-        let mut screenplays: Vec<&String> = self
+        let mut workspace_choices = div().flex().flex_col().gap_1();
+        let workspace_folder = self
+            .profile
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.folder.clone());
+        let mut documents: Vec<&String> = self
             .explorer
             .iter()
-            .filter(|path| FileKind::from_path(path) == FileKind::Fountain)
+            .filter(|path| match &workspace_folder {
+                Some(folder) => path.starts_with(&format!("{folder}/")),
+                None => FileKind::from_path(path) == FileKind::Fountain,
+            })
             .collect();
-        screenplays.sort();
-        if screenplays.is_empty() {
-            screenplay_choices = screenplay_choices.child(
+        documents.sort();
+        if documents.is_empty() {
+            workspace_choices = workspace_choices.child(
                 div()
                     .text_color(rgb(theme::status_fg()))
-                    .child(self.t("project_settings.no_screenplays")),
+                    .child(self.t("project_settings.no_workspace_documents")),
             );
         }
-        for (index, path) in screenplays.into_iter().enumerate() {
-            let selected = path == &state.default_screenplay;
+        for (index, path) in documents.into_iter().enumerate() {
+            let selected = path == &state.workspace_document;
             let choice = path.clone();
-            screenplay_choices = screenplay_choices.child(
+            workspace_choices = workspace_choices.child(
                 div()
-                    .id(("project-screenplay", index))
+                    .id(("project-workspace-document", index))
                     .px_2()
                     .py_1()
                     .bg(rgb(if selected {
@@ -4807,8 +4815,8 @@ impl Editor {
                     .child(choice.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(state) = this.project_settings.as_mut() {
-                            state.default_screenplay = choice.clone();
-                            state.field = ProjectField::DefaultScreenplay;
+                            state.workspace_document = choice.clone();
+                            state.field = ProjectField::WorkspaceDocument;
                             state.error.clear();
                         }
                         cx.notify();
@@ -4945,9 +4953,9 @@ impl Editor {
                     .child(
                         div()
                             .text_color(rgb(theme::status_fg()))
-                            .child(self.t("project_settings.default_screenplay")),
+                            .child(self.t("project_settings.workspace_document")),
                     )
-                    .child(screenplay_choices)
+                    .child(workspace_choices)
                     .when(!state.error.is_empty(), |card| {
                         card.child(
                             div()
@@ -8348,9 +8356,9 @@ impl Editor {
             project = open_project(&root).map_err(|error| error.to_string())?;
         }
         let repaired_screenplay = project
-            .repair_default_screenplay()
+            .repair_workspace_document()
             .map_err(|error| error.to_string())?;
-        let doc_path = project.manifest().default_screenplay_path.clone();
+        let doc_path = project.manifest().workspace_document.clone();
         let title = project.manifest().title.clone();
         let _ = project.ensure_default_document();
         let content = match project.read_document(&doc_path) {
@@ -8421,7 +8429,7 @@ impl Editor {
         // backup once more before the project-opened confirmation.
         self.check_backup_notice();
         if let Some(path) = repaired_screenplay {
-            self.notice = Some(self.tf("notice.screenplay_repaired", &[("path", &path)]));
+            self.notice = Some(self.tf("notice.workspace_document_repaired", &[("path", &path)]));
         }
         if self.notice.is_none()
             && let Some(error) = command_error
@@ -13229,7 +13237,7 @@ impl Editor {
         let project_info = self.project.as_ref().map(|project| {
             (
                 project.root().to_string_lossy().into_owned(),
-                project.manifest().default_screenplay_path.clone(),
+                project.manifest().workspace_document.clone(),
             )
         });
         let Some((root, screenplay)) = project_info else {
@@ -13237,7 +13245,7 @@ impl Editor {
             return None;
         };
         if self.doc.path != screenplay {
-            self.notice = Some(self.tf("notice.open_screenplay", &[("path", &screenplay)]));
+            self.notice = Some(self.tf("notice.open_workspace_document", &[("path", &screenplay)]));
             return None;
         }
         if self.dirty() {
@@ -13606,14 +13614,14 @@ impl Editor {
         };
         // Tabs make it possible to have notes active while the screenplay is
         // open elsewhere; never export the wrong buffer under the guion name.
-        if self.doc.path != project.manifest().default_screenplay_path {
-            self.notice = Some(self.t("notice.export_screenplay").to_string());
+        if self.doc.path != project.manifest().workspace_document {
+            self.notice = Some(self.t("notice.export_workspace_document").to_string());
             cx.notify();
             return;
         }
         let root = project.root().to_string_lossy().into_owned();
         let manifest = project.manifest().clone();
-        let stem = Path::new(&manifest.default_screenplay_path)
+        let stem = Path::new(&manifest.workspace_document)
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "screenplay".to_string());
@@ -21686,7 +21694,7 @@ fn run() -> Result<(), String> {
         None => None,
     };
     if let Some(project) = project.as_mut() {
-        project.repair_default_screenplay().ok();
+        project.repair_workspace_document().ok();
     }
     if let Some(project) = project.as_ref() {
         recents.record(project.root());
@@ -21695,7 +21703,7 @@ fn run() -> Result<(), String> {
 
     let (content, doc_path) = match &project {
         Some(project) => {
-            let path = project.manifest().default_screenplay_path.clone();
+            let path = project.manifest().workspace_document.clone();
             let text = match project.read_document(&path) {
                 Ok(text) => text,
                 // A project created without a screenplay opens as a blank
@@ -22376,7 +22384,7 @@ mod tests {
 
     #[test]
     fn language_names_follow_the_document_extension() {
-        assert_eq!(language_name("screenplay/main.fountain"), "Fountain");
+        assert_eq!(language_name("workspace/main.fountain"), "Fountain");
         assert_eq!(language_name("notes/a.md"), "Markdown");
         assert_eq!(language_name("agents.yml"), "YAML");
         assert_eq!(language_name("README"), "Text");
@@ -22403,8 +22411,8 @@ mod tests {
 
     #[test]
     fn document_state_seeds_the_save_and_diff_base() {
-        let doc = DocumentState::new("screenplay/main.fountain".to_string(), "uno\ndos\n");
-        assert_eq!(doc.path, "screenplay/main.fountain");
+        let doc = DocumentState::new("workspace/main.fountain".to_string(), "uno\ndos\n");
+        assert_eq!(doc.path, "workspace/main.fountain");
         assert_eq!(doc.base_text, "uno\ndos\n");
         assert_eq!(doc.buffer.line_count(), 3);
         assert_eq!(doc.diff.base_lines, vec!["uno", "dos", ""]);
@@ -22455,7 +22463,7 @@ mod tests {
         let paths = vec![
             "notes/decisions.md".to_string(),
             "bible/desire.md".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
             "notes/old-decisions.md".to_string(),
         ];
         assert_eq!(
@@ -22471,7 +22479,7 @@ mod tests {
         );
         assert_eq!(
             filter_palette_paths(paths, "MAIN"),
-            vec!["screenplay/main.fountain".to_string()]
+            vec!["workspace/main.fountain".to_string()]
         );
         assert!(filter_palette_paths(Vec::new(), "x").is_empty());
     }
@@ -22483,8 +22491,8 @@ mod tests {
             ("notes", "decisions", ".md")
         );
         assert_eq!(
-            split_path_name("screenplay/S01E01.fountain"),
-            ("screenplay", "S01E01", ".fountain")
+            split_path_name("workspace/S01E01.fountain"),
+            ("workspace", "S01E01", ".fountain")
         );
         assert_eq!(split_path_name("README"), ("", "README", ""));
         assert_eq!(split_path_name("notes/.hidden"), ("notes", ".hidden", ""));

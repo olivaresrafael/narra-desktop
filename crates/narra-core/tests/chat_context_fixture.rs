@@ -334,12 +334,12 @@ fn eight_prompts_use_visible_context_without_writes_or_forbidden_sources() {
         vec![ChatAttachment::new(
             "selection",
             "Selección",
-            "screenplay/main.fountain:L1",
+            "workspace/main.fountain:L1",
             "La palabra clave es FARO.",
         )],
     );
     if output.summary.contains("FARO")
-        && has_source(&output, "selection", "screenplay/main.fountain:L1")
+        && has_source(&output, "selection", "workspace/main.fountain:L1")
     {
         passed += 1;
     }

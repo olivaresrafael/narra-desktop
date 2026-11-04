@@ -586,7 +586,7 @@ Luis espera.
     #[test]
     fn detects_languages_by_extension() {
         assert_eq!(
-            LanguageId::from_path("screenplay/main.fountain"),
+            LanguageId::from_path("workspace/main.fountain"),
             LanguageId::Fountain
         );
         assert_eq!(LanguageId::from_path("notes/a.md"), LanguageId::Markdown);
@@ -596,7 +596,7 @@ Luis espera.
 
     #[test]
     fn fountain_report_has_scenes_sections_symbols_and_no_errors() {
-        let report = analyze("screenplay/main.fountain", FOUNTAIN);
+        let report = analyze("workspace/main.fountain", FOUNTAIN);
         assert_eq!(report.language, LanguageId::Fountain);
         let scenes: Vec<&OutlineItem> = report
             .outline
@@ -630,7 +630,7 @@ Luis espera.
     #[test]
     fn fountain_reports_unclosed_boneyard_and_notes() {
         let report = analyze(
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
             "INT. CASA - DÍA\n\n/* no cierra\n\n[[ nota\n",
         );
         assert!(report.diagnostics.iter().any(|diagnostic| {
@@ -662,7 +662,7 @@ Luis espera.
     fn project_manifest_reports_invalid_field_at_its_line() {
         let report = analyze(
             "project.yaml",
-            "schema_version: 1\nproject_id: 00000000-0000-4000-8000-000000000001\ntitle: \"\"\nproject_type: feature\nprimary_language: es\ncreated_at: 2026-10-28T00:00:00Z\ndefault_screenplay_path: screenplay/main.fountain\n",
+            "schema_version: 1\nproject_id: 00000000-0000-4000-8000-000000000001\ntitle: \"\"\nproject_type: feature\nprimary_language: es\ncreated_at: 2026-10-28T00:00:00Z\nworkspace_document: workspace/main.fountain\n",
         );
         let diagnostic = report
             .diagnostics
@@ -684,7 +684,7 @@ project_type: series
 primary_language: es
 additional_languages: []
 created_at: 2026-10-28T00:00:00Z
-default_screenplay_path: screenplay/main.fountain
+workspace_document: workspace/main.fountain
 ";
         let report = analyze("project.yaml", text);
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);

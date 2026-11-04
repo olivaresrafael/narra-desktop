@@ -187,7 +187,7 @@ mod tests {
                     WorktreeStatus::Unmodified,
                 ),
                 entry(
-                    "screenplay/main.fountain",
+                    "workspace/main.fountain",
                     WorktreeStatus::Conflicted,
                     WorktreeStatus::Conflicted,
                 ),
@@ -207,7 +207,7 @@ mod tests {
             Some(WorktreeStatus::Modified)
         );
         assert_eq!(
-            status.dir_status("screenplay"),
+            status.dir_status("workspace"),
             Some(WorktreeStatus::Conflicted)
         );
         assert_eq!(status.changed_count(), 4);
@@ -230,14 +230,14 @@ mod tests {
                     WorktreeStatus::Untracked,
                 ),
                 entry(
-                    "screenplay/main.fountain",
+                    "workspace/main.fountain",
                     WorktreeStatus::Unmodified,
                     WorktreeStatus::Modified,
                 ),
             ],
         );
         assert_eq!(status.changed_count(), 1);
-        assert!(status.file_status("screenplay/main.fountain").is_some());
+        assert!(status.file_status("workspace/main.fountain").is_some());
         assert!(status.file_status(".narra/backups/x").is_none());
         assert!(status.file_status("exports/main.pdf").is_none());
     }

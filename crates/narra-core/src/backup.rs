@@ -120,17 +120,17 @@ mod tests {
     #[test]
     fn backups_round_trip_into_the_hidden_state_directory() {
         let root = temp_root();
-        let path = write_backup(&root, "screenplay/main.fountain", "INT. CASA\n").expect("write");
-        assert_eq!(path, root.join(".narra/backups/screenplay__main.fountain~"));
+        let path = write_backup(&root, "workspace/main.fountain", "INT. CASA\n").expect("write");
+        assert_eq!(path, root.join(".narra/backups/workspace__main.fountain~"));
         assert_eq!(
-            read_backup(&root, "screenplay/main.fountain").expect("read"),
+            read_backup(&root, "workspace/main.fountain").expect("read"),
             Some("INT. CASA\n".to_string())
         );
         // The canonical file is untouched: only the backup exists.
-        assert!(!root.join("screenplay/main.fountain").exists());
-        remove_backup(&root, "screenplay/main.fountain").expect("remove");
+        assert!(!root.join("workspace/main.fountain").exists());
+        remove_backup(&root, "workspace/main.fountain").expect("remove");
         assert_eq!(
-            read_backup(&root, "screenplay/main.fountain").expect("read"),
+            read_backup(&root, "workspace/main.fountain").expect("read"),
             None
         );
     }
@@ -164,10 +164,10 @@ mod tests {
     #[test]
     fn writing_replaces_the_previous_backup_atomically() {
         let root = temp_root();
-        write_backup(&root, "screenplay/main.fountain", "primera").expect("first");
-        write_backup(&root, "screenplay/main.fountain", "segunda").expect("second");
+        write_backup(&root, "workspace/main.fountain", "primera").expect("first");
+        write_backup(&root, "workspace/main.fountain", "segunda").expect("second");
         assert_eq!(
-            read_backup(&root, "screenplay/main.fountain").expect("read"),
+            read_backup(&root, "workspace/main.fountain").expect("read"),
             Some("segunda".to_string())
         );
         // No temp file is left behind.

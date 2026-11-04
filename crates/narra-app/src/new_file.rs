@@ -28,7 +28,11 @@ impl Kind {
     /// entity folder.
     pub fn from_profile(profile: &ProjectProfile) -> Vec<Kind> {
         let mut kinds = Vec::new();
-        if let Some(pattern) = &profile.episode_pattern {
+        if let Some(pattern) = profile
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.episode_pattern.as_deref())
+        {
             let (folder, extension) = pattern_parts(pattern);
             kinds.push(Kind {
                 key: "episode".to_string(),
@@ -38,7 +42,7 @@ impl Kind {
                 },
                 folder,
                 extension,
-                pattern: Some(pattern.clone()),
+                pattern: Some(pattern.to_string()),
             });
         }
         for entity in &profile.entities {
@@ -238,7 +242,7 @@ mod tests {
                 "structure",
                 "research",
                 "notes",
-                "screenplay"
+                "workspace"
             ]
         );
         let character = kinds
@@ -250,10 +254,10 @@ mod tests {
         assert_eq!(character.label.es, "Personaje");
         let screenplay = kinds
             .iter()
-            .find(|kind| kind.key == "screenplay")
-            .expect("screenplay");
+            .find(|kind| kind.key == "workspace")
+            .expect("workspace");
         assert_eq!(screenplay.extension, "fountain");
-        assert_eq!(screenplay.label.es, "Guion");
+        assert_eq!(screenplay.label.es, "Espacio de trabajo");
     }
 
     #[test]
@@ -262,15 +266,15 @@ mod tests {
         let kinds = Kind::from_profile(&profile);
         assert_eq!(kinds[0].key, "episode");
         assert_eq!(kinds[0].label.es, "Episodio");
-        assert_eq!(kinds[0].folder, "screenplay");
+        assert_eq!(kinds[0].folder, "workspace");
         assert_eq!(kinds[0].extension, "fountain");
         assert_eq!(
             kinds[0].target_path("2").as_deref(),
-            Some("screenplay/episode-2.fountain")
+            Some("workspace/episode-2.fountain")
         );
         assert_eq!(
             kinds[0].target_path("Piloto").as_deref(),
-            Some("screenplay/episode-Piloto.fountain")
+            Some("workspace/episode-Piloto.fountain")
         );
     }
 
@@ -303,11 +307,11 @@ mod tests {
 
         let screenplay = kinds
             .iter()
-            .find(|kind| kind.key == "screenplay")
-            .expect("screenplay");
+            .find(|kind| kind.key == "workspace")
+            .expect("workspace");
         assert_eq!(
             screenplay.target_path("S01E01 Piloto").as_deref(),
-            Some("screenplay/S01E01 Piloto.fountain")
+            Some("workspace/S01E01 Piloto.fountain")
         );
         assert_eq!(screenplay.template("Piloto"), "");
     }

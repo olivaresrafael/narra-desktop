@@ -106,9 +106,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "modo fixture: sin proyecto abierto (usa --project)",
     ),
     (
-        "notice.open_screenplay",
-        "open {path} to work on a scene",
-        "abre {path} para trabajar sobre una escena",
+        "notice.open_workspace_document",
+        "open {path} to work on the workspace",
+        "abre {path} para trabajar en el workspace",
     ),
     (
         "notice.dirty_agent",
@@ -322,9 +322,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "no hay un documento abierto para guardar",
     ),
     (
-        "notice.export_screenplay",
-        "open the screenplay tab to export the PDF",
-        "abre la pestaña del guion para exportar el PDF",
+        "notice.export_workspace_document",
+        "open the workspace document to export the PDF",
+        "abre el documento del workspace para exportar el PDF",
     ),
     (
         "notice.capability_unavailable",
@@ -569,9 +569,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "abierto {title} · {path}",
     ),
     (
-        "notice.screenplay_repaired",
-        "default screenplay updated to {path}",
-        "guion predeterminado actualizado a {path}",
+        "notice.workspace_document_repaired",
+        "workspace document updated to {path}",
+        "documento del workspace actualizado a {path}",
     ),
     (
         "notice.commands_invalid",
@@ -1479,14 +1479,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Etiquetas separadas por comas, por ejemplo: es, en.",
     ),
     (
-        "project_settings.default_screenplay",
-        "Default screenplay",
-        "Guion principal",
+        "project_settings.workspace_document",
+        "Workspace document",
+        "Documento del workspace",
     ),
     (
-        "project_settings.no_screenplays",
-        "No .fountain documents found yet.",
-        "Todavía no hay documentos .fountain.",
+        "project_settings.no_workspace_documents",
+        "No workspace documents found yet.",
+        "Todavía no hay documentos en el workspace.",
     ),
     ("project_settings.save", "Save", "Guardar"),
     ("project_settings.cancel", "Cancel", "Cancelar"),
@@ -2418,9 +2418,9 @@ mod tests {
             tf(
                 Lang::Es,
                 "notice.saved",
-                &[("path", "screenplay/main.fountain")]
+                &[("path", "workspace/main.fountain")]
             ),
-            "guardado: screenplay/main.fountain"
+            "guardado: workspace/main.fountain"
         );
         assert_eq!(
             tf(Lang::En, "notice.saved", &[("path", "a.fountain")]),

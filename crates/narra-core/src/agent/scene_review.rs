@@ -115,7 +115,7 @@ impl SceneReviewTask {
         });
         let project = open_project(root)?;
         let manifest = project.manifest();
-        let screenplay_path = manifest.default_screenplay_path.clone();
+        let screenplay_path = manifest.workspace_document.clone();
 
         emit(TaskEvent::Progress {
             stage: "collect_context".to_string(),

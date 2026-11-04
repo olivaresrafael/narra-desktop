@@ -627,7 +627,10 @@ impl ProjectScaffoldTask {
             rules(
                 &package.write_roots,
                 &package.entities,
-                package.default_document.as_deref()
+                package
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.default_document.as_deref())
             ),
             self.title.trim(),
             self.type_label
@@ -848,11 +851,14 @@ mod tests {
         let text = rules(
             &package.write_roots,
             &package.entities,
-            package.default_document.as_deref(),
+            package
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.default_document.as_deref()),
         );
         assert!(text.contains("Una entidad por archivo"), "{text}");
         assert!(text.contains("Personaje → bible/characters"), "{text}");
-        assert!(text.contains("screenplay/main.fountain"), "{text}");
+        assert!(text.contains("workspace/main.fountain"), "{text}");
     }
 
     #[test]

@@ -111,7 +111,7 @@ impl ProjectBriefTask {
         let shown_scenes = &index.scenes[..total_scenes.min(MAX_SCENES_IN_CONTEXT)];
         sources.push(ContextSource {
             kind: "scene_index".to_string(),
-            location: manifest.default_screenplay_path.clone(),
+            location: manifest.workspace_document.clone(),
             detail: format!(
                 "{total_scenes} escenas (índice derivado); se envían las primeras {}",
                 shown_scenes.len()

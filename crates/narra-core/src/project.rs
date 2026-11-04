@@ -21,7 +21,7 @@ use crate::manifest::{self, Manifest, ManifestError, ProjectType};
 pub const TEMPLATE_DIRS: &[&str] = &[
     "bible/characters",
     "structure",
-    "screenplay",
+    "workspace",
     "research",
     "notes",
     "reviews",
@@ -31,7 +31,7 @@ pub const TEMPLATE_DIRS: &[&str] = &[
 pub const MANIFEST_FILE: &str = "project.yaml";
 /// Versioned project-level instructions for the assistant (D-047).
 pub const INSTRUCTIONS_FILE: &str = ".narra/instructions.md";
-pub const DEFAULT_SCREENPLAY: &str = "screenplay/main.fountain";
+pub const DEFAULT_WORKSPACE_DOCUMENT: &str = "workspace/main.fountain";
 /// Export artifacts (M7): written by `narra-harness export` and the app's
 /// ⌘E, and excluded from the document scan — they are outputs, never
 /// canonical content.
@@ -126,9 +126,9 @@ impl Project {
     /// file rename back so the project never points at a missing screenplay.
     pub fn rename_document(&mut self, from: &str, to: &str) -> Result<(), ProjectError> {
         document::rename_document(&self.root, from, to)?;
-        if self.manifest.default_screenplay_path == from {
+        if self.manifest.workspace_document == from {
             let mut manifest = self.manifest.clone();
-            manifest.default_screenplay_path = to.to_string();
+            manifest.workspace_document = to.to_string();
             if let Err(error) = self.update_manifest(manifest) {
                 let _ = document::rename_document(&self.root, to, from);
                 return Err(error);
@@ -147,7 +147,7 @@ impl Project {
     /// Delete a document. The default screenplay is protected because losing
     /// it would leave the project opening into a missing path.
     pub fn delete_document(&self, relative: &str) -> Result<(), ProjectError> {
-        if relative == self.manifest.default_screenplay_path {
+        if relative == self.manifest.workspace_document {
             return Err(ProjectError::CannotDeleteDefaultScreenplay);
         }
         Ok(document::delete_document(&self.root, relative)?)
@@ -157,8 +157,8 @@ impl Project {
     /// when the configured file is gone and exactly one `.fountain` remains,
     /// point the manifest at it. This never guesses between multiple scripts
     /// and never creates or deletes content.
-    pub fn repair_default_screenplay(&mut self) -> Result<Option<String>, ProjectError> {
-        let current = self.manifest.default_screenplay_path.clone();
+    pub fn repair_workspace_document(&mut self) -> Result<Option<String>, ProjectError> {
+        let current = self.manifest.workspace_document.clone();
         if self.root.join(&current).exists() {
             return Ok(None);
         }
@@ -175,7 +175,7 @@ impl Project {
             return Ok(None);
         }
         let mut manifest = self.manifest.clone();
-        manifest.default_screenplay_path = path.clone();
+        manifest.workspace_document = path.clone();
         self.update_manifest(manifest)?;
         Ok(Some(path))
     }
@@ -191,7 +191,7 @@ impl Project {
         // Scene headings from the primary screenplay via the derived Fountain
         // parser (Spike G-1). The Fountain file, not this index, stays
         // authoritative (`DATA_MODEL.md` §1).
-        match self.read_document(&self.manifest.default_screenplay_path) {
+        match self.read_document(&self.manifest.workspace_document) {
             Ok(text) => {
                 for element in crate::fountain::parse(&text) {
                     if element.kind == crate::fountain::ElementKind::SceneHeading {
@@ -234,7 +234,7 @@ impl Project {
     /// start without it, and scene requests need a real file to edit.
     /// Returns whether the file was created.
     pub fn ensure_default_document(&self) -> Result<bool, ProjectError> {
-        let path = self.manifest.default_screenplay_path.clone();
+        let path = self.manifest.workspace_document.clone();
         match self.read_document(&path) {
             Ok(_) => Ok(false),
             Err(ProjectError::Document(crate::document::DocumentError::Io { source, .. }))
@@ -373,13 +373,18 @@ pub fn create_project(
         })?;
     }
 
-    let manifest = Manifest::new_v1(title, project_type, primary_language, DEFAULT_SCREENPLAY);
+    let manifest = Manifest::new_v1(
+        title,
+        project_type,
+        primary_language,
+        DEFAULT_WORKSPACE_DOCUMENT,
+    );
     let text = manifest::serialize_manifest(&manifest)?;
     document::write_document(root, MANIFEST_FILE, &text)?;
     write_project_instructions(root, primary_language)?;
 
     // Seed content files. Empty screenplay: the writer starts from a blank page.
-    document::write_document(root, DEFAULT_SCREENPLAY, "")?;
+    document::write_document(root, DEFAULT_WORKSPACE_DOCUMENT, "")?;
     document::write_document(
         root,
         "notes/decisions.md",
@@ -466,8 +471,8 @@ pub fn create_project_base_from_package(
         copy_directory(source, &destination)?;
     }
     let default_screenplay = package
-        .default_screenplay_path()
-        .unwrap_or_else(|| DEFAULT_SCREENPLAY.to_string());
+        .initial_workspace_document()
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_DOCUMENT.to_string());
     let manifest =
         Manifest::new_v1_with_type_id(title, &package.id, primary_language, &default_screenplay)?;
     let text = manifest::serialize_manifest(&manifest)?;
@@ -595,7 +600,7 @@ mod tests {
             assert!(root.join(dir).is_dir(), "missing dir {dir}");
         }
         assert!(root.join(MANIFEST_FILE).is_file());
-        assert!(root.join(DEFAULT_SCREENPLAY).is_file());
+        assert!(root.join(DEFAULT_WORKSPACE_DOCUMENT).is_file());
         assert!(root.join("notes/decisions.md").is_file());
         assert!(root.join("notes/open-questions.md").is_file());
         // No Spanish directory names on disk (D-017).
@@ -685,8 +690,8 @@ mod tests {
                     kind,
                     ProjectType::Series | ProjectType::WebSeries | ProjectType::Microdrama
                 ) {
-                    legacy_tree.remove("screenplay/main.fountain");
-                    legacy_tree.insert("screenplay/episode-1.fountain".to_string(), String::new());
+                    legacy_tree.remove("workspace/main.fountain");
+                    legacy_tree.insert("workspace/episode-1.fountain".to_string(), String::new());
                 }
                 assert_eq!(
                     legacy_tree,
@@ -711,38 +716,38 @@ mod tests {
         let root = temp_root();
         let mut project =
             create_project(&root, "Renombrado", ProjectType::Feature, "es").expect("create");
-        fs::remove_file(root.join(DEFAULT_SCREENPLAY)).expect("remove original");
-        fs::write(root.join("screenplay/pilot.fountain"), "INT. CASA - DÍA\n").expect("pilot");
-        let repaired = project.repair_default_screenplay().expect("repair");
-        assert_eq!(repaired.as_deref(), Some("screenplay/pilot.fountain"));
+        fs::remove_file(root.join(DEFAULT_WORKSPACE_DOCUMENT)).expect("remove original");
+        fs::write(root.join("workspace/pilot.fountain"), "INT. CASA - DÍA\n").expect("pilot");
+        let repaired = project.repair_workspace_document().expect("repair");
+        assert_eq!(repaired.as_deref(), Some("workspace/pilot.fountain"));
         assert_eq!(
-            project.manifest().default_screenplay_path,
-            "screenplay/pilot.fountain"
+            project.manifest().workspace_document,
+            "workspace/pilot.fountain"
         );
         let reopened = open_project(&root).expect("reopen");
         assert_eq!(
-            reopened.manifest().default_screenplay_path,
-            "screenplay/pilot.fountain"
+            reopened.manifest().workspace_document,
+            "workspace/pilot.fountain"
         );
     }
 
     #[test]
-    fn custom_package_uses_its_own_screenplay_as_default() {
+    fn custom_package_uses_its_own_workspace_as_default() {
         let root = temp_root();
         let package = crate::project_type::parse_package(
-            "schema_version: 2\napi_version: 1\nid: pilot\nname: Pilot\ndirectories: [screenplay]\nformat: fountain\nfiles:\n  - path: screenplay/S01E01.fountain\n    content: INT. CASA - DÍA\n",
+            "schema_version: 2\napi_version: 1\nid: pilot\nname: Pilot\ndirectories: [workspace]\nformat: fountain\nworkspace:\n  mode: single\n  folder: workspace\n  default_document: workspace/S01E01.fountain\nfiles:\n  - path: workspace/S01E01.fountain\n    content: INT. CASA - DÍA\n",
             crate::project_type::TypeOrigin::User,
         )
         .expect("package");
         let project = create_project_from_package(&root, "Piloto", &package, "es")
-            .expect("create custom screenplay package");
+            .expect("create custom workspace package");
         assert_eq!(
-            project.manifest().default_screenplay_path,
-            "screenplay/S01E01.fountain"
+            project.manifest().workspace_document,
+            "workspace/S01E01.fountain"
         );
         assert!(
-            root.join("screenplay/S01E01.fountain").is_file(),
-            "custom screenplay template must be written"
+            root.join("workspace/S01E01.fountain").is_file(),
+            "custom workspace template must be written"
         );
     }
 
@@ -837,41 +842,41 @@ mod tests {
         let mut project =
             create_project(&root, "Serie", ProjectType::Series, "es").expect("create");
         project
-            .write_document("screenplay/S01E01.fountain", "INT. CASA - DÍA\n")
+            .write_document("workspace/S01E01.fountain", "INT. CASA - DÍA\n")
             .expect("write");
         let mut manifest = project.manifest().clone();
-        manifest.default_screenplay_path = "screenplay/S01E01.fountain".to_string();
+        manifest.workspace_document = "workspace/S01E01.fountain".to_string();
         project.update_manifest(manifest).expect("manifest");
         project
             .rename_document(
-                "screenplay/S01E01.fountain",
-                "screenplay/S01E01 Piloto.fountain",
+                "workspace/S01E01.fountain",
+                "workspace/S01E01 Piloto.fountain",
             )
             .expect("rename");
         assert_eq!(
-            project.manifest().default_screenplay_path,
-            "screenplay/S01E01 Piloto.fountain"
+            project.manifest().workspace_document,
+            "workspace/S01E01 Piloto.fountain"
         );
-        assert!(root.join("screenplay/S01E01 Piloto.fountain").is_file());
-        assert!(!root.join("screenplay/S01E01.fountain").exists());
+        assert!(root.join("workspace/S01E01 Piloto.fountain").is_file());
+        assert!(!root.join("workspace/S01E01.fountain").exists());
         let reopened = open_project(&root).expect("reopen");
         assert_eq!(
-            reopened.manifest().default_screenplay_path,
-            "screenplay/S01E01 Piloto.fountain"
+            reopened.manifest().workspace_document,
+            "workspace/S01E01 Piloto.fountain"
         );
 
         project
-            .write_document("screenplay/other.fountain", "")
+            .write_document("workspace/other.fountain", "")
             .expect("other");
         assert!(
             project
                 .rename_document(
-                    "screenplay/S01E01 Piloto.fountain",
-                    "screenplay/other.fountain"
+                    "workspace/S01E01 Piloto.fountain",
+                    "workspace/other.fountain"
                 )
                 .is_err()
         );
-        assert!(root.join("screenplay/S01E01 Piloto.fountain").is_file());
+        assert!(root.join("workspace/S01E01 Piloto.fountain").is_file());
     }
 
     #[test]
@@ -896,7 +901,7 @@ mod tests {
         );
         assert!(
             project
-                .delete_document(project.manifest().default_screenplay_path.as_str())
+                .delete_document(project.manifest().workspace_document.as_str())
                 .is_err(),
             "the default screenplay is protected"
         );
@@ -954,7 +959,7 @@ mod tests {
         let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
         project
             .write_document(
-                DEFAULT_SCREENPLAY,
+                DEFAULT_WORKSPACE_DOCUMENT,
                 "INT. CASA - DÍA\n\nUn texto cualquiera.\n\nEXT. CALLE - NOCHE\n",
             )
             .expect("write screenplay");
@@ -982,7 +987,7 @@ mod tests {
         let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
         project
             .write_document(
-                DEFAULT_SCREENPLAY,
+                DEFAULT_WORKSPACE_DOCUMENT,
                 "MARÍA\n(interior, por decir algo)\n\nINTRO de canción\n",
             )
             .expect("write");
@@ -1035,7 +1040,7 @@ mod tests {
                 "notes/decisions.md",
                 "notes/open-questions.md",
                 "project.yaml",
-                "screenplay/main.fountain",
+                "workspace/main.fountain",
             ],
             "sorted, nested, no hidden entries"
         );
@@ -1062,9 +1067,9 @@ mod tests {
     fn ensure_default_document_seeds_a_missing_official_script() {
         let root = temp_root();
         let project = create_project(&root, "Muestra", ProjectType::Feature, "es").expect("create");
-        fs::remove_file(root.join(DEFAULT_SCREENPLAY)).expect("remove official script");
+        fs::remove_file(root.join(DEFAULT_WORKSPACE_DOCUMENT)).expect("remove official script");
         assert!(project.ensure_default_document().expect("seed"));
-        assert!(root.join(DEFAULT_SCREENPLAY).is_file());
+        assert!(root.join(DEFAULT_WORKSPACE_DOCUMENT).is_file());
         assert!(
             !project.ensure_default_document().expect("already present"),
             "an existing official document is never rewritten"

@@ -52,9 +52,9 @@ pub use manifest::{
 };
 pub use markdown::{Block as MarkdownBlock, InlineSpan, MarkdownDocument};
 pub use project::{
-    DEFAULT_SCREENPLAY, MANIFEST_FILE, Project, ProjectError, ProjectIndex, ProjectTree, SceneRef,
-    TEMPLATE_DIRS, create_project, create_project_base_from_package, create_project_from_package,
-    create_project_from_type, open_project,
+    DEFAULT_WORKSPACE_DOCUMENT, MANIFEST_FILE, Project, ProjectError, ProjectIndex, ProjectTree,
+    SceneRef, TEMPLATE_DIRS, create_project, create_project_base_from_package,
+    create_project_from_package, create_project_from_type, open_project,
 };
 pub use project_type::{
     ContextAction, ContextActionKind, DocumentFormat, EntityDefinition, ExplorerGroup,

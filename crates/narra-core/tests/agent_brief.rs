@@ -24,7 +24,7 @@ fn sample_project() -> PathBuf {
         create_project(&root, "Luces de Invierno", ProjectType::Feature, "es").expect("create");
     project
         .write_document(
-            narra_core::DEFAULT_SCREENPLAY,
+            narra_core::DEFAULT_WORKSPACE_DOCUMENT,
             "INT. TALLER - NOCHE\n\nELENA\nEsto es una prueba.\n",
         )
         .expect("screenplay");
@@ -193,7 +193,7 @@ fn empty_project_root_is_rejected_before_opening() {
 #[test]
 fn brief_leaves_canonical_files_unchanged() {
     let root = sample_project();
-    let screenplay = root.join(narra_core::DEFAULT_SCREENPLAY);
+    let screenplay = root.join(narra_core::DEFAULT_WORKSPACE_DOCUMENT);
     let before = fs::read(&screenplay).expect("read");
 
     ProjectBriefTask::new(root.to_str().expect("utf8"))

@@ -301,7 +301,7 @@ mod tests {
         ToolCall {
             id: "call-1".to_string(),
             name: name.to_string(),
-            arguments: json!({"path": "screenplay/main.fountain"}),
+            arguments: json!({"path": "workspace/main.fountain"}),
         }
     }
 

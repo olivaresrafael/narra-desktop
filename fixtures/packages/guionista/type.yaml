@@ -72,8 +72,11 @@ skills:
   - investigacion
   - microdrama
 
-# Default document the project opens after creation.
-default_document: guion/main.fountain
+# The type's writing workspace: one official document for this feature film.
+workspace:
+  mode: single
+  folder: guion
+  default_document: guion/main.fountain
 
 # Folder groups rendered in the explorer; labels are localized by the app.
 content_layout:

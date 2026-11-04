@@ -763,7 +763,7 @@ mod tests {
             task_input: serde_json::json!({"scene": 1}),
         };
         let error = FileProposal::new(
-            "screenplay/main.fountain",
+            "workspace/main.fountain",
             "same\n",
             "same\n",
             "r",

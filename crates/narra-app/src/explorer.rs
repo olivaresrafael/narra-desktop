@@ -275,7 +275,7 @@ mod tests {
             "bible/characters/marta.md".to_string(),
             "bible/world.md".to_string(),
             "project.yaml".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
         ]
     }
 
@@ -291,7 +291,7 @@ mod tests {
                 (1, "characters"),
                 (2, "marta.md"),
                 (1, "world.md"),
-                (0, "screenplay"),
+                (0, "workspace"),
                 (1, "main.fountain"),
                 (0, "agents.yaml"),
                 (0, "project.yaml"),
@@ -313,13 +313,9 @@ mod tests {
         );
 
         // Collapsing a nested folder hides only its own children.
-        collapsed.insert("screenplay".to_string());
+        collapsed.insert("workspace".to_string());
         let rows = build_rows(&paths(), &[], &collapsed);
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.path == "screenplay/main.fountain")
-        );
+        assert!(!rows.iter().any(|row| row.path == "workspace/main.fountain"));
     }
 
     #[test]
@@ -328,7 +324,7 @@ mod tests {
         let groups = vec![
             ExplorerGroup {
                 id: "script".to_string(),
-                folders: vec!["screenplay".to_string()],
+                folders: vec!["workspace".to_string()],
             },
             ExplorerGroup {
                 id: "story".to_string(),
@@ -349,7 +345,7 @@ mod tests {
         assert_eq!(
             sequence,
             vec![
-                (Some("script"), 0, "screenplay"),
+                (Some("script"), 0, "workspace"),
                 (Some("script"), 1, "main.fountain"),
                 (Some("story"), 0, "bible"),
                 (Some("story"), 1, "characters"),
@@ -383,7 +379,7 @@ mod tests {
     #[test]
     fn file_kinds_drive_the_explorer_icons() {
         assert_eq!(
-            FileKind::from_path("screenplay/main.fountain"),
+            FileKind::from_path("workspace/main.fountain"),
             FileKind::Fountain
         );
         assert_eq!(
@@ -408,14 +404,14 @@ mod tests {
             "bible/world.md".to_string(),
             "project.yaml".to_string(),
             ".narra/backups/x~".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
         ];
         let visible = visible_paths(&paths, false);
         assert_eq!(
             visible,
             vec![
                 "bible/world.md".to_string(),
-                "screenplay/main.fountain".to_string()
+                "workspace/main.fountain".to_string()
             ]
         );
         assert_eq!(visible_paths(&paths, true), paths);
@@ -431,14 +427,14 @@ mod tests {
             "exports/main.pdf".to_string(),
             "notes/ideas.txt".to_string(),
             "project.yaml".to_string(),
-            "screenplay/main.fountain".to_string(),
+            "workspace/main.fountain".to_string(),
         ];
         assert_eq!(
             attachable_paths(&paths),
             vec![
                 "bible/world.md".to_string(),
                 "notes/ideas.txt".to_string(),
-                "screenplay/main.fountain".to_string()
+                "workspace/main.fountain".to_string()
             ]
         );
         assert!(!is_attachable_path("README"));

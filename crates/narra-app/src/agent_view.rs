@@ -536,7 +536,7 @@ mod tests {
             exit: TaskExit::Success,
             summary: "resumen".to_string(),
             data: serde_json::json!({ "review": review }),
-            sources: vec![source("scene", "screenplay/main.fountain:L1-L3")],
+            sources: vec![source("scene", "workspace/main.fountain:L1-L3")],
         }
     }
 
@@ -670,7 +670,7 @@ mod tests {
         // A task that skipped the event (defensive): sources still shown.
         state.apply(AgentMessage::Done(Ok(task_output("r"))));
         assert_eq!(state.sources.len(), 1);
-        assert_eq!(state.sources[0].location, "screenplay/main.fountain:L1-L3");
+        assert_eq!(state.sources[0].location, "workspace/main.fountain:L1-L3");
     }
 
     // --- Proposal surface (M6 slice 4) ------------------------------------
@@ -682,7 +682,7 @@ mod tests {
                 summary: "Propuesta ab12 lista".to_string(),
                 data: serde_json::json!({
                     "proposal_id": "abcd-1234",
-                    "target": "screenplay/main.fountain",
+                    "target": "workspace/main.fountain",
                     "hunks": 1,
                 }),
                 sources: Vec::new(),
@@ -701,7 +701,7 @@ mod tests {
 
         view.apply(ProposeMessage::Event(TaskEvent::ProposalCreated {
             id: "abcd-1234".to_string(),
-            target: "screenplay/main.fountain".to_string(),
+            target: "workspace/main.fountain".to_string(),
             hunks: 1,
         }));
         assert!(view.is_running());
@@ -711,7 +711,7 @@ mod tests {
         view.apply(ProposeMessage::Done(Ok(propose_result(rows.clone()))));
         assert_eq!(view.status, ProposeStatus::Ready);
         assert_eq!(view.id, "abcd-1234");
-        assert_eq!(view.target, "screenplay/main.fountain");
+        assert_eq!(view.target, "workspace/main.fountain");
         assert_eq!(view.hunks, 1);
         assert_eq!(view.diff_rows, rows);
         assert!(view.can_apply());
@@ -764,7 +764,7 @@ mod tests {
         view.begin(1, "reescribe".to_string());
         view.apply(ProposeMessage::Event(TaskEvent::ProposalCreated {
             id: "abcd-1234".to_string(),
-            target: "screenplay/main.fountain".to_string(),
+            target: "workspace/main.fountain".to_string(),
             hunks,
         }));
         view.apply(ProposeMessage::Done(Ok(propose_result(Vec::new()))));

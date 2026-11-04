@@ -18,8 +18,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::project::DEFAULT_SCREENPLAY;
-
 /// File inside each package directory.
 pub const TYPE_FILE: &str = "type.yaml";
 /// Project-local type packages, relative to the project root.
@@ -51,7 +49,7 @@ const MAX_CONTEXT_ACTIONS: usize = 32;
 const MAX_EXPORTS: usize = 4;
 const MAX_SEEDS: usize = 64;
 
-const PACKAGE_KEYS: [&str; 21] = [
+const PACKAGE_KEYS: [&str; 20] = [
     "schema_version",
     "api_version",
     "id",
@@ -61,8 +59,7 @@ const PACKAGE_KEYS: [&str; 21] = [
     "files",
     "skills",
     "format",
-    "default_document",
-    "episode_pattern",
+    "workspace",
     "content_layout",
     "pinned_context",
     "write_roots",
@@ -94,6 +91,63 @@ impl DocumentFormat {
             DocumentFormat::Markdown => "markdown",
             DocumentFormat::Plain => "plain",
         }
+    }
+}
+
+/// How the type's primary writing area works (D-063).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMode {
+    /// One official document (a feature film, a short, a single brief).
+    Single,
+    /// One document per episode, named by a pattern.
+    Episodes,
+    /// A declared set of deliverables (a campaign: brief, spot, posts…).
+    Collection,
+}
+
+impl WorkspaceMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            WorkspaceMode::Single => "single",
+            WorkspaceMode::Episodes => "episodes",
+            WorkspaceMode::Collection => "collection",
+        }
+    }
+}
+
+/// One declared deliverable in a collection workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDocument {
+    pub id: String,
+    pub label: LocalizedText,
+    /// Project-relative path.
+    pub path: String,
+}
+
+/// The type's workspace contract: where the writing lives and how it is
+/// organized. A package can only narrow what the engine allows; the engine
+/// still sandboxes every path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDefinition {
+    pub mode: WorkspaceMode,
+    /// Project-relative folder that holds the workspace documents.
+    pub folder: String,
+    /// Single mode: the official document. Episodes mode: the pilot.
+    /// Collection mode: optional initial document.
+    pub default_document: Option<String>,
+    /// Episodes mode: document name with exactly one `{number}` placeholder.
+    pub episode_pattern: Option<String>,
+    /// Collection mode: the declared deliverables.
+    pub documents: Vec<WorkspaceDocument>,
+}
+
+impl WorkspaceDefinition {
+    /// Document a new project opens first: the declared default, or the first
+    /// collection deliverable.
+    pub fn initial_document(&self) -> Option<String> {
+        self.default_document
+            .clone()
+            .or_else(|| self.documents.first().map(|document| document.path.clone()))
     }
 }
 
@@ -219,11 +273,8 @@ pub struct ProjectProfile {
     /// The type declares `format: fountain`; the editor applies screenplay
     /// mechanics (element cycling, scene structure, PDF layout).
     pub screenplay: bool,
-    /// Document the project opens first (the official script).
-    pub default_document: Option<String>,
-    /// Series-like types declare how an episode document is named, with a
-    /// `{number}` placeholder (e.g. `screenplay/episode-{number}.fountain`).
-    pub episode_pattern: Option<String>,
+    /// The type's workspace contract, when it declares one.
+    pub workspace: Option<WorkspaceDefinition>,
     /// Entities the type offers for dossiers, mentions, the convert menu and
     /// the New File chooser.
     pub entities: Vec<EntityDefinition>,
@@ -260,8 +311,7 @@ impl Default for ProjectProfile {
         Self {
             type_id: "other".to_string(),
             screenplay: false,
-            default_document: None,
-            episode_pattern: None,
+            workspace: None,
             entities: Vec::new(),
             write_roots: Vec::new(),
             export_pdf: false,
@@ -284,11 +334,9 @@ pub struct ProjectTypePackage {
     pub skills: Vec<String>,
     /// Editor format the type declares.
     pub format: DocumentFormat,
-    /// Document a new project opens first.
-    pub default_document: Option<String>,
-    /// Series-like types declare the episode document name, with one
-    /// `{number}` placeholder (e.g. `screenplay/episode-{number}.fountain`).
-    pub episode_pattern: Option<String>,
+    /// The type's workspace contract (single document, episodes or a
+    /// collection). `None` means the type has no primary writing area.
+    pub workspace: Option<WorkspaceDefinition>,
     /// Explorer sections rendered from the package.
     pub content_layout: Vec<ExplorerGroup>,
     /// Paths pinned into every chat without an explicit attachment.
@@ -322,25 +370,12 @@ impl ProjectTypePackage {
         self.files.iter().find(|file| file.path == path)
     }
 
-    /// The screenplay template path this package wants the project to open.
-    /// Only Fountain types have one; the manifest must point at it instead of
-    /// the built-in default.
-    pub fn default_screenplay_path(&self) -> Option<String> {
-        if self.format != DocumentFormat::Fountain {
-            return None;
-        }
-        if let Some(document) = &self.default_document {
-            return Some(document.clone());
-        }
-        self.files
-            .iter()
-            .find(|file| file.path.starts_with("screenplay/") && file.path.ends_with(".fountain"))
-            .or_else(|| {
-                self.files
-                    .iter()
-                    .find(|file| file.path.ends_with(".fountain"))
-            })
-            .map(|file| file.path.clone())
+    /// The document a new project opens first, from the workspace contract.
+    /// `None` when the type has no workspace (or no collection default).
+    pub fn initial_workspace_document(&self) -> Option<String> {
+        self.workspace
+            .as_ref()
+            .and_then(WorkspaceDefinition::initial_document)
     }
 
     /// UI view derived from the package data; the app never matches on ids.
@@ -348,8 +383,7 @@ impl ProjectTypePackage {
         ProjectProfile {
             type_id: self.id.clone(),
             screenplay: self.format == DocumentFormat::Fountain,
-            default_document: self.default_document.clone(),
-            episode_pattern: self.episode_pattern.clone(),
+            workspace: self.workspace.clone(),
             entities: self.entities.clone(),
             write_roots: self.write_roots.clone(),
             export_pdf: self.exports.iter().any(|export| export.kind == "pdf"),
@@ -363,6 +397,152 @@ impl ProjectTypePackage {
     }
 
     /// Whether `path` is a declared directory or lives under one.
+    /// Validate the workspace contract: mode-specific fields, paths inside
+    /// the workspace folder, and (when the type declares write roots) inside a
+    /// root that allows the document's extension.
+    fn validate_workspace(&self) -> Result<(), TypePackageError> {
+        let Some(workspace) = &self.workspace else {
+            return Ok(());
+        };
+        validate_relative_path("workspace.folder", &workspace.folder)?;
+        if !self.declares(&workspace.folder) {
+            return Err(TypePackageError::Invalid {
+                field: "workspace.folder",
+                detail: format!("`{}` is not a declared directory", workspace.folder),
+            });
+        }
+        if let Some(document) = &workspace.default_document {
+            self.validate_workspace_path(
+                "workspace.default_document",
+                document,
+                &workspace.folder,
+            )?;
+        }
+        match workspace.mode {
+            WorkspaceMode::Single => {
+                if workspace.default_document.is_none() {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace.default_document",
+                        detail: "single mode needs a default document".to_string(),
+                    });
+                }
+                if workspace.episode_pattern.is_some() || !workspace.documents.is_empty() {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace",
+                        detail: "single mode cannot declare episode_pattern or documents"
+                            .to_string(),
+                    });
+                }
+            }
+            WorkspaceMode::Episodes => {
+                let Some(pattern) = &workspace.episode_pattern else {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace.episode_pattern",
+                        detail: "episodes mode needs an episode pattern".to_string(),
+                    });
+                };
+                if pattern.matches("{number}").count() != 1 {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace.episode_pattern",
+                        detail: "must contain exactly one `{number}` placeholder".to_string(),
+                    });
+                }
+                let sample = pattern.replace("{number}", "1");
+                self.validate_workspace_path(
+                    "workspace.episode_pattern",
+                    &sample,
+                    &workspace.folder,
+                )?;
+                if !workspace.documents.is_empty() {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace",
+                        detail: "episodes mode cannot declare documents".to_string(),
+                    });
+                }
+            }
+            WorkspaceMode::Collection => {
+                if workspace.episode_pattern.is_some() {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace",
+                        detail: "collection mode cannot declare an episode pattern".to_string(),
+                    });
+                }
+                if workspace.documents.is_empty() {
+                    return Err(TypePackageError::Invalid {
+                        field: "workspace.documents",
+                        detail: "collection mode needs at least one document".to_string(),
+                    });
+                }
+                let mut ids = BTreeSet::new();
+                for document in &workspace.documents {
+                    validate_id(&document.id)?;
+                    if !ids.insert(document.id.as_str()) {
+                        return Err(TypePackageError::Invalid {
+                            field: "workspace.documents",
+                            detail: format!("duplicate document `{}`", document.id),
+                        });
+                    }
+                    validate_localized("workspace.documents", &document.label)?;
+                    self.validate_workspace_path(
+                        "workspace.documents",
+                        &document.path,
+                        &workspace.folder,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A workspace document must live inside its folder and, when write roots
+    /// exist, inside a root that allows its extension. The kernel still
+    /// sandboxes every write.
+    fn validate_workspace_path(
+        &self,
+        field: &'static str,
+        path: &str,
+        folder: &str,
+    ) -> Result<(), TypePackageError> {
+        validate_relative_path(field, path)?;
+        if !path.starts_with(&format!("{folder}/")) {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!("`{path}` must live inside the workspace folder `{folder}`"),
+            });
+        }
+        if self.write_roots.is_empty() {
+            return Ok(());
+        }
+        let Some(root) = self
+            .write_roots
+            .iter()
+            .find(|root| path == root.path || path.starts_with(&format!("{}/", root.path)))
+        else {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!("`{path}` is not inside a declared write root"),
+            });
+        };
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("");
+        if !root
+            .extensions
+            .iter()
+            .any(|allowed| extension.eq_ignore_ascii_case(allowed.trim_start_matches('.')))
+        {
+            return Err(TypePackageError::Invalid {
+                field,
+                detail: format!(
+                    "`{path}` extension is not allowed by write root `{}`",
+                    root.path
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn declares(&self, path: &str) -> bool {
         self.directories
             .iter()
@@ -466,48 +646,7 @@ impl ProjectTypePackage {
             }
         }
 
-        if let Some(document) = &self.default_document {
-            validate_relative_path("default_document", document)?;
-        }
-
-        if let Some(pattern) = &self.episode_pattern {
-            validate_relative_path("episode_pattern", pattern)?;
-            if pattern.matches("{number}").count() != 1 {
-                return Err(TypePackageError::Invalid {
-                    field: "episode_pattern",
-                    detail: "must contain exactly one `{number}` placeholder".to_string(),
-                });
-            }
-            let sample = pattern.replace("{number}", "1");
-            validate_relative_path("episode_pattern", &sample)?;
-            let Some(root) = self
-                .write_roots
-                .iter()
-                .find(|root| sample == root.path || sample.starts_with(&format!("{}/", root.path)))
-            else {
-                return Err(TypePackageError::Invalid {
-                    field: "episode_pattern",
-                    detail: format!("`{sample}` is not inside a declared write root"),
-                });
-            };
-            let extension = Path::new(&sample)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("");
-            if !root
-                .extensions
-                .iter()
-                .any(|allowed| extension.eq_ignore_ascii_case(allowed.trim_start_matches('.')))
-            {
-                return Err(TypePackageError::Invalid {
-                    field: "episode_pattern",
-                    detail: format!(
-                        "`{sample}` extension is not allowed by write root `{}`",
-                        root.path
-                    ),
-                });
-            }
-        }
+        self.validate_workspace()?;
 
         if self.content_layout.len() > 8 {
             return Err(TypePackageError::Invalid {
@@ -812,10 +951,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn builtin_hash(id: &str) -> String {
-    sha256_hex(format!("builtin-project-type:{id}:v{SCHEMA_VERSION}").as_bytes())
-}
-
 fn directory_hash(directory: &Path) -> Result<String, TypePackageError> {
     fn collect(
         base: &Path,
@@ -935,131 +1070,23 @@ struct TypeTrustFile {
     types: BTreeMap<String, String>,
 }
 
-/// Look up a built-in package by id.
+/// Look up a built-in package by id. Built-ins are embedded v2 YAML packages,
+/// parsed by the same contract as user packages; no creative data lives in
+/// Rust branches (D-062).
 pub fn builtin(id: &str) -> Option<ProjectTypePackage> {
-    let (name, description) = match id {
-        "feature" => ("Feature film", "A feature-length screenplay project."),
-        "series" => (
-            "Series",
-            "A series project with one screenplay per episode.",
-        ),
-        "web_series" => ("Web series", "A short-form series project."),
-        "short" => ("Short film", "A short-film screenplay project."),
-        "microdrama" => (
-            "Microdrama",
-            "A microdrama project with very short episodes.",
-        ),
-        "other" => ("Other", "A writing project with a custom structure."),
+    let text = match id {
+        "feature" => include_str!("../packages/feature.yaml"),
+        "series" => include_str!("../packages/series.yaml"),
+        "web_series" => include_str!("../packages/web_series.yaml"),
+        "short" => include_str!("../packages/short.yaml"),
+        "microdrama" => include_str!("../packages/microdrama.yaml"),
+        "other" => include_str!("../packages/other.yaml"),
         _ => return None,
     };
-    let (directories, mut files) = builtin_template();
-    let series_like = matches!(id, "series" | "web_series" | "microdrama");
-    let default_document = if series_like {
-        "screenplay/episode-1.fountain".to_string()
-    } else {
-        DEFAULT_SCREENPLAY.to_string()
-    };
-    let episode_pattern = series_like.then(|| "screenplay/episode-{number}.fountain".to_string());
-    if series_like {
-        // The official document is the pilot episode, not `main.fountain`.
-        for file in &mut files {
-            if file.path == DEFAULT_SCREENPLAY {
-                file.path = default_document.clone();
-            }
-        }
-    }
-    Some(ProjectTypePackage {
-        schema_version: SCHEMA_VERSION,
-        api_version: API_VERSION,
-        id: id.to_string(),
-        name: name.to_string(),
-        description: description.to_string(),
-        directories,
-        files,
-        skills: Vec::new(),
-        format: DocumentFormat::Fountain,
-        default_document: Some(default_document),
-        episode_pattern,
-        content_layout: builtin_content_layout(),
-        pinned_context: vec![
-            "bible".to_string(),
-            "structure".to_string(),
-            "notes/decisions.md".to_string(),
-            "notes/open-questions.md".to_string(),
-        ],
-        write_roots: builtin_write_roots(),
-        entities: builtin_entities(),
-        exports: vec![ExportCapability {
-            kind: "pdf".to_string(),
-            roots: vec!["screenplay".to_string()],
-        }],
-        context_actions: Vec::new(),
-        agents: Vec::new(),
-        commands: Vec::new(),
-        instructions: Vec::new(),
-        templates: Vec::new(),
-        origin: TypeOrigin::Builtin,
-        source_dir: None,
-        content_hash: builtin_hash(id),
-    })
-}
-
-/// Explorer groups the built-in screenplay types render.
-fn builtin_content_layout() -> Vec<ExplorerGroup> {
-    let groups: [(&str, &[&str]); 4] = [
-        ("story", &["bible", "structure"]),
-        ("script", &["screenplay"]),
-        ("research", &["research"]),
-        ("notes", &["notes", "reviews"]),
-    ];
-    groups
-        .iter()
-        .map(|(id, folders)| ExplorerGroup {
-            id: (*id).to_string(),
-            folders: folders.iter().map(|folder| (*folder).to_string()).collect(),
-        })
-        .collect()
-}
-
-/// Write roots the built-in screenplay types grant to the assistant.
-fn builtin_write_roots() -> Vec<WriteRoot> {
-    let roots: [(&str, &[&str], (&str, &str)); 5] = [
-        ("bible", &[".md"], ("Bible", "Biblia")),
-        ("structure", &[".md"], ("Structure", "Estructura")),
-        ("research", &[".md"], ("Research", "Investigación")),
-        ("notes", &[".md"], ("Notes", "Notas")),
-        ("screenplay", &[".fountain", ".md"], ("Screenplay", "Guion")),
-    ];
-    roots
-        .iter()
-        .map(|(path, extensions, (en, es))| WriteRoot {
-            path: (*path).to_string(),
-            extensions: extensions.iter().map(|ext| (*ext).to_string()).collect(),
-            label: Some(LocalizedText {
-                en: (*en).to_string(),
-                es: (*es).to_string(),
-            }),
-        })
-        .collect()
-}
-
-/// Narrative entities the built-in screenplay types offer.
-fn builtin_entities() -> Vec<EntityDefinition> {
-    [
-        ("character", "Character", "Personaje", "bible/characters"),
-        ("location", "Location", "Lugar", "bible/locations"),
-        ("object", "Object", "Objeto", "bible/objects"),
-    ]
-    .iter()
-    .map(|(id, en, es, folder)| EntityDefinition {
-        id: (*id).to_string(),
-        label: LocalizedText {
-            en: (*en).to_string(),
-            es: (*es).to_string(),
-        },
-        folder: (*folder).to_string(),
-    })
-    .collect()
+    let mut package = parse_package(text, TypeOrigin::Builtin)
+        .unwrap_or_else(|error| panic!("built-in package `{id}` is invalid: {error}"));
+    package.content_hash = sha256_hex(text.as_bytes());
+    Some(package)
 }
 
 /// All six built-in packages, in menu order.
@@ -1398,28 +1425,8 @@ pub fn parse_package(
         Some(value) => parse_format(value)?,
         None => DocumentFormat::Markdown,
     };
-    let default_document = match root.as_mapping_get("default_document") {
-        Some(value) => Some(
-            value
-                .as_str()
-                .ok_or_else(|| TypePackageError::Invalid {
-                    field: "default_document",
-                    detail: "must be a string".to_string(),
-                })?
-                .to_string(),
-        ),
-        None => None,
-    };
-    let episode_pattern = match root.as_mapping_get("episode_pattern") {
-        Some(value) => Some(
-            value
-                .as_str()
-                .ok_or_else(|| TypePackageError::Invalid {
-                    field: "episode_pattern",
-                    detail: "must be a string".to_string(),
-                })?
-                .to_string(),
-        ),
+    let workspace = match root.as_mapping_get("workspace") {
+        Some(value) => Some(parse_workspace(value)?),
         None => None,
     };
     let pinned_context = match root.as_mapping_get("pinned_context") {
@@ -1518,8 +1525,7 @@ pub fn parse_package(
         files,
         skills,
         format,
-        default_document,
-        episode_pattern,
+        workspace,
         content_layout,
         pinned_context,
         write_roots,
@@ -1642,6 +1648,119 @@ fn parse_write_roots(value: &Yaml) -> Result<Vec<WriteRoot>, TypePackageError> {
         });
     }
     Ok(roots)
+}
+
+fn parse_workspace(value: &Yaml) -> Result<WorkspaceDefinition, TypePackageError> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "workspace",
+            detail: "must be a mapping".to_string(),
+        })?;
+    for key in mapping.keys() {
+        let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+            field: "workspace",
+            detail: "keys must be strings".to_string(),
+        })?;
+        if !matches!(
+            key,
+            "mode" | "folder" | "default_document" | "episode_pattern" | "documents"
+        ) {
+            return Err(TypePackageError::Invalid {
+                field: "workspace",
+                detail: format!("unknown key `{key}`"),
+            });
+        }
+    }
+    let mode = match mapping_get(mapping, "mode").and_then(Yaml::as_str) {
+        Some("single") => WorkspaceMode::Single,
+        Some("episodes") => WorkspaceMode::Episodes,
+        Some("collection") => WorkspaceMode::Collection,
+        Some(other) => {
+            return Err(TypePackageError::Invalid {
+                field: "workspace.mode",
+                detail: format!("unknown mode `{other}` (expected single, episodes or collection)"),
+            });
+        }
+        None => {
+            return Err(TypePackageError::Invalid {
+                field: "workspace.mode",
+                detail: "must be a string".to_string(),
+            });
+        }
+    };
+    let folder = mapping_get(mapping, "folder")
+        .and_then(Yaml::as_str)
+        .ok_or_else(|| TypePackageError::Invalid {
+            field: "workspace.folder",
+            detail: "must be a string".to_string(),
+        })?
+        .to_string();
+    let default_document = mapping_get(mapping, "default_document")
+        .and_then(Yaml::as_str)
+        .map(str::to_string);
+    let episode_pattern = mapping_get(mapping, "episode_pattern")
+        .and_then(Yaml::as_str)
+        .map(str::to_string);
+    let documents = match mapping_get(mapping, "documents") {
+        Some(value) => {
+            let sequence = value
+                .as_sequence()
+                .ok_or_else(|| TypePackageError::Invalid {
+                    field: "workspace.documents",
+                    detail: "must be a list".to_string(),
+                })?;
+            let mut documents = Vec::with_capacity(sequence.len());
+            for item in sequence {
+                let document = item.as_mapping().ok_or_else(|| TypePackageError::Invalid {
+                    field: "workspace.documents",
+                    detail: "each document must be a mapping".to_string(),
+                })?;
+                for key in document.keys() {
+                    let key = key.as_str().ok_or_else(|| TypePackageError::Invalid {
+                        field: "workspace.documents",
+                        detail: "keys must be strings".to_string(),
+                    })?;
+                    if !matches!(key, "id" | "label" | "path") {
+                        return Err(TypePackageError::Invalid {
+                            field: "workspace.documents",
+                            detail: format!("unknown key `{key}`"),
+                        });
+                    }
+                }
+                let id = mapping_get(document, "id")
+                    .and_then(Yaml::as_str)
+                    .ok_or_else(|| TypePackageError::Invalid {
+                        field: "workspace.documents",
+                        detail: "each document needs a string `id`".to_string(),
+                    })?
+                    .to_string();
+                let label =
+                    mapping_get(document, "label").ok_or_else(|| TypePackageError::Invalid {
+                        field: "workspace.documents",
+                        detail: format!("`{id}` needs `label`"),
+                    })?;
+                let label = parse_localized_at(label, "workspace.documents")?;
+                let path = mapping_get(document, "path")
+                    .and_then(Yaml::as_str)
+                    .ok_or_else(|| TypePackageError::Invalid {
+                        field: "workspace.documents",
+                        detail: format!("`{id}` needs a string `path`"),
+                    })?
+                    .to_string();
+                documents.push(WorkspaceDocument { id, label, path });
+            }
+            documents
+        }
+        None => Vec::new(),
+    };
+    Ok(WorkspaceDefinition {
+        mode,
+        folder,
+        default_document,
+        episode_pattern,
+        documents,
+    })
 }
 
 fn parse_entities(value: &Yaml) -> Result<Vec<EntityDefinition>, TypePackageError> {
@@ -2160,65 +2279,6 @@ fn string_sequence(value: &Yaml, field: &'static str) -> Result<Vec<String>, Typ
     Ok(out)
 }
 
-fn builtin_template() -> (Vec<String>, Vec<TemplateFile>) {
-    let directories = [
-        "bible/characters",
-        "bible/locations",
-        "bible/objects",
-        "structure",
-        "screenplay",
-        "research",
-        "notes",
-        "reviews",
-    ]
-    .iter()
-    .map(|directory| (*directory).to_string())
-    .collect();
-    let (premise_en, outline_en) = basic_template_documents("en");
-    let (premise_es, outline_es) = basic_template_documents("es");
-    let decisions =
-        "# Decisions\n\nRecord accepted decisions here. Each entry: date, decision, consequence.\n";
-    let questions = "# Open questions\n\nRecord unresolved questions here.\n";
-    let files = vec![
-        TemplateFile {
-            path: "screenplay/main.fountain".to_string(),
-            content: LocalizedText {
-                en: String::new(),
-                es: String::new(),
-            },
-        },
-        TemplateFile {
-            path: "notes/decisions.md".to_string(),
-            content: LocalizedText {
-                en: decisions.to_string(),
-                es: decisions.to_string(),
-            },
-        },
-        TemplateFile {
-            path: "notes/open-questions.md".to_string(),
-            content: LocalizedText {
-                en: questions.to_string(),
-                es: questions.to_string(),
-            },
-        },
-        TemplateFile {
-            path: "bible/premise.md".to_string(),
-            content: LocalizedText {
-                en: premise_en.to_string(),
-                es: premise_es.to_string(),
-            },
-        },
-        TemplateFile {
-            path: "structure/outline.md".to_string(),
-            content: LocalizedText {
-                en: outline_en.to_string(),
-                es: outline_es.to_string(),
-            },
-        },
-    ];
-    (directories, files)
-}
-
 /// Localized starter documents. Kept here so project creation and package
 /// templates share the exact same text.
 pub fn basic_template_documents(primary_language: &str) -> (&'static str, &'static str) {
@@ -2263,6 +2323,7 @@ pub fn write_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::DEFAULT_WORKSPACE_DOCUMENT;
 
     fn temp_root() -> PathBuf {
         tempfile::tempdir().expect("tempdir").keep()
@@ -2284,67 +2345,87 @@ mod tests {
     }
 
     #[test]
-    fn series_types_declare_the_episode_pattern_and_pilot() {
+    fn series_types_declare_an_episode_workspace() {
         let series = builtin("series").expect("series");
+        let workspace = series.workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.mode, WorkspaceMode::Episodes);
+        assert_eq!(workspace.folder, "workspace");
         assert_eq!(
-            series.default_document.as_deref(),
-            Some("screenplay/episode-1.fountain")
+            workspace.default_document.as_deref(),
+            Some("workspace/episode-1.fountain")
         );
         assert_eq!(
-            series.episode_pattern.as_deref(),
-            Some("screenplay/episode-{number}.fountain")
+            workspace.episode_pattern.as_deref(),
+            Some("workspace/episode-{number}.fountain")
         );
         assert!(
             series
                 .files
                 .iter()
-                .any(|file| file.path == "screenplay/episode-1.fountain")
+                .any(|file| file.path == "workspace/episode-1.fountain")
         );
         assert!(
             !series
                 .files
                 .iter()
-                .any(|file| file.path == DEFAULT_SCREENPLAY),
+                .any(|file| file.path == DEFAULT_WORKSPACE_DOCUMENT),
             "the series package seeds the pilot, not main.fountain"
         );
         assert_eq!(
-            series.profile().episode_pattern.as_deref(),
-            Some("screenplay/episode-{number}.fountain")
+            series.profile().workspace.expect("profile workspace").mode,
+            WorkspaceMode::Episodes
         );
 
         let feature = builtin("feature").expect("feature");
+        let workspace = feature.workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.mode, WorkspaceMode::Single);
         assert_eq!(
-            feature.default_document.as_deref(),
-            Some(DEFAULT_SCREENPLAY)
+            workspace.default_document.as_deref(),
+            Some(DEFAULT_WORKSPACE_DOCUMENT)
         );
-        assert!(feature.episode_pattern.is_none());
-        assert!(feature.profile().episode_pattern.is_none());
+        assert!(workspace.episode_pattern.is_none());
     }
 
     #[test]
-    fn episode_patterns_are_validated() {
-        let base = "schema_version: 2\napi_version: 1\nid: series\nname: Series\ndirectories: [screenplay]\nwrite_roots:\n  - path: screenplay\n    extensions: [.fountain]\n";
-        let ok = parse_package(
-            &format!("{base}episode_pattern: \"screenplay/episode-{{number}}.fountain\"\n"),
+    fn workspace_contract_is_validated_by_mode() {
+        let base = "schema_version: 2\napi_version: 1\nid: series\nname: Series\ndirectories: [workspace]\nwrite_roots:\n  - path: workspace\n    extensions: [.fountain, .md]\n";
+        let single = parse_package(
+            &format!("{base}workspace:\n  mode: single\n  folder: workspace\n  default_document: workspace/main.fountain\n"),
             TypeOrigin::User,
         )
-        .expect("valid pattern");
+        .expect("single workspace");
         assert_eq!(
-            ok.episode_pattern.as_deref(),
-            Some("screenplay/episode-{number}.fountain")
+            single.workspace.expect("workspace").mode,
+            WorkspaceMode::Single
         );
 
+        let episodes = parse_package(
+            &format!("{base}workspace:\n  mode: episodes\n  folder: workspace\n  default_document: workspace/episode-1.fountain\n  episode_pattern: \"workspace/episode-{{number}}.fountain\"\n"),
+            TypeOrigin::User,
+        )
+        .expect("episodes workspace");
+        assert_eq!(
+            episodes.workspace.expect("workspace").mode,
+            WorkspaceMode::Episodes
+        );
+
+        let collection = parse_package(
+            &format!("{base}workspace:\n  mode: collection\n  folder: workspace\n  documents:\n    - id: brief\n      label: {{ en: Brief, es: Brief }}\n      path: workspace/brief.md\n"),
+            TypeOrigin::User,
+        )
+        .expect("collection workspace");
+        assert_eq!(collection.workspace.expect("workspace").documents.len(), 1);
+
         for bad in [
-            "screenplay/episode.fountain",
-            "screenplay/{number}/{number}.fountain",
-            "outside/episode-{number}.fountain",
-            "screenplay/episode-{number}.txt",
+            "workspace:\n  mode: single\n  folder: workspace\n",
+            "workspace:\n  mode: episodes\n  folder: workspace\n  default_document: workspace/episode-1.fountain\n",
+            "workspace:\n  mode: episodes\n  folder: workspace\n  episode_pattern: \"workspace/{number}/{number}.fountain\"\n",
+            "workspace:\n  mode: collection\n  folder: workspace\n",
+            "workspace:\n  mode: collection\n  folder: workspace\n  documents:\n    - id: brief\n      label: {{ en: Brief, es: Brief }}\n      path: outside/brief.md\n",
+            "workspace:\n  mode: whatever\n  folder: workspace\n",
         ] {
-            let text = format!("{base}episode_pattern: \"{bad}\"\n");
-            assert!(
-                parse_package(&text, TypeOrigin::User).is_err(),
-                "{bad} must be rejected"
-            );
+            let text = format!("{base}{bad}");
+            assert!(parse_package(&text, TypeOrigin::User).is_err(), "{bad}");
         }
     }
 
@@ -2437,7 +2518,7 @@ mod tests {
         assert!(root.join("structure/outline.md").is_file());
         assert!(root.join("bible/characters").is_dir());
         assert_eq!(
-            fs::read_to_string(root.join("screenplay/main.fountain")).expect("screenplay"),
+            fs::read_to_string(root.join("workspace/main.fountain")).expect("screenplay"),
             ""
         );
     }
