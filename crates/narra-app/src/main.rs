@@ -168,10 +168,10 @@ use narra_core::agent::portable::SlashCommand;
 use narra_core::agent::{
     AgentError, AgentMode, ChatActivity, ChatActivityKind, ChatAttachment, ChatMode, ChatTask,
     ChatThread, LOCAL_DEFAULT_BASE_URL, MockAdapter, ModelAdapter, ModelInfo, OpenAiCompatAdapter,
-    OpenAiCompatConfig, PackageOrigin, ProjectScaffoldTask, ScaffoldPlan, SceneEditTask,
-    SceneReviewTask, Skill, SkillOrigin, TaskOptions, active_skills, fetch_model_ids, fetch_models,
-    load_scope, load_skills, portable, proposal, roles, trust_skill, untrusted_project_skills,
-    write_plan,
+    OpenAiCompatConfig, PackageOrigin, ProjectScaffoldTask, ScaffoldPlan, ScaffoldQuestion,
+    SceneEditTask, SceneReviewTask, Skill, SkillOrigin, TaskOptions, active_skills,
+    fetch_model_ids, fetch_models, load_scope, load_skills, portable, proposal, roles, trust_skill,
+    untrusted_project_skills, write_plan,
 };
 use narra_core::cancel::CancellationToken;
 use narra_core::entities::{EntityIndex, Mention, split_by_mentions};
@@ -613,11 +613,17 @@ impl std::fmt::Debug for SettingsState {
 }
 
 /// Result of one AI project-scaffold run (M16 slice 9). The generation token
-/// prevents a stale run from landing in a reopened dialog.
+/// prevents a stale run from landing in a reopened dialog. A run either asks
+/// a bounded question round or returns the reviewed file plan.
+enum NewProjectScaffoldResult {
+    Plan(ScaffoldPlan),
+    Questions(Vec<ScaffoldQuestion>),
+}
+
 enum NewProjectMessage {
-    Plan {
+    Scaffold {
         generation: u64,
-        result: Result<ScaffoldPlan, String>,
+        result: Result<NewProjectScaffoldResult, String>,
     },
 }
 
@@ -8645,6 +8651,8 @@ impl Editor {
             brief_document: brief.as_ref().map(|brief| brief.document.clone()),
             brief_questions,
             brief_answers,
+            model_questions: Vec::new(),
+            model_answers: Vec::new(),
             field: NewProjectField::Title,
             error: String::new(),
             picking: false,
@@ -8802,6 +8810,8 @@ impl Editor {
         }
         let brief_document = state.brief_document.clone();
         let brief_answers = state.brief_answers();
+        let model_answers = state.model_answers();
+        let has_model_questions = !state.model_questions.is_empty();
         if mode == NewProjectMode::Ai {
             if !self.ai_scaffold_available() {
                 self.set_new_project_error(self.t("newproject.ai_unavailable").to_string());
@@ -8826,7 +8836,11 @@ impl Editor {
                 prompt,
                 brief_answers: brief_answers.clone(),
             };
-            self.start_new_project_scaffold(path, draft, cx);
+            if has_model_questions {
+                self.start_new_project_scaffold(path, draft, model_answers, false, cx);
+            } else {
+                self.start_new_project_scaffold(path, draft, Vec::new(), true, cx);
+            }
             cx.notify();
             return;
         }
@@ -8887,11 +8901,15 @@ impl Editor {
     fn ai_scaffold_available(&self) -> bool {
         self.agent_settings.provider != AiProvider::Mock
     }
-    /// Generate a reviewed plan without creating anything (M16 slice 9).
+    /// Generate a reviewed plan without creating anything (M16 slice 9). The
+    /// first run may return a bounded question round; the run after the
+    /// answers must return the plan.
     fn start_new_project_scaffold(
         &mut self,
         path: PathBuf,
         draft: NewProjectDraft,
+        follow_up: Vec<(String, String)>,
+        allow_questions: bool,
         cx: &mut Context<Self>,
     ) {
         if !self.ai_scaffold_available() {
@@ -8905,13 +8923,16 @@ impl Editor {
             state.error.clear();
             state.plan = None;
             state.path = Some(path.clone());
+            if allow_questions {
+                state.clear_model_questions();
+            }
         }
         cx.notify();
         let root = path.to_string_lossy().into_owned();
         let settings = self.agent_settings.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = (|| -> Result<ScaffoldPlan, String> {
+            let result = (|| -> Result<NewProjectScaffoldResult, String> {
                 let role = roles::resolve_default_with_packages(
                     Path::new(&root),
                     Some(&recent::config_dir()),
@@ -8929,7 +8950,13 @@ impl Editor {
                 .with_type_label(draft.type_label.clone())
                 .with_type_id(draft.type_id.clone())
                 .with_brief(draft.brief_answers.clone())
+                .with_follow_up(follow_up)
                 .with_role(role);
+                let task = if allow_questions {
+                    task
+                } else {
+                    task.without_questions()
+                };
                 let options = TaskOptions {
                     timeout: AGENT_TIMEOUT,
                     cancel: CancellationToken::new(),
@@ -8938,21 +8965,34 @@ impl Editor {
                 let output = task
                     .run(adapter.as_ref(), &options, |_| {})
                     .map_err(|error| error.to_string())?;
-                serde_json::from_value::<ScaffoldPlan>(output.data["plan"].clone())
-                    .map_err(|error| format!("invalid scaffold payload: {error}"))
+                if let Some(questions) = output.data.get("questions") {
+                    let questions =
+                        serde_json::from_value::<Vec<ScaffoldQuestion>>(questions.clone())
+                            .map_err(|error| format!("invalid scaffold questions: {error}"))?;
+                    Ok(NewProjectScaffoldResult::Questions(questions))
+                } else {
+                    let plan = serde_json::from_value::<ScaffoldPlan>(output.data["plan"].clone())
+                        .map_err(|error| format!("invalid scaffold payload: {error}"))?;
+                    Ok(NewProjectScaffoldResult::Plan(plan))
+                }
             })();
-            let _ = tx.send(NewProjectMessage::Plan { generation, result });
+            let _ = tx.send(NewProjectMessage::Scaffold { generation, result });
         });
         Self::spawn_message_pump(cx, rx, |view, message| {
-            let NewProjectMessage::Plan { generation, result } = message;
+            let NewProjectMessage::Scaffold { generation, result } = message;
             if generation != view.new_project_generation {
                 return true;
             }
             if let Some(state) = view.new_project.as_mut() {
                 state.busy = false;
                 match result {
-                    Ok(plan) => {
+                    Ok(NewProjectScaffoldResult::Plan(plan)) => {
                         state.plan = Some(plan);
+                        state.error.clear();
+                    }
+                    Ok(NewProjectScaffoldResult::Questions(questions)) => {
+                        state.apply_model_questions(questions);
+                        state.field = NewProjectField::ModelQuestion(0);
                         state.error.clear();
                     }
                     Err(error) => {
@@ -8988,6 +9028,8 @@ impl Editor {
         let title = new_project::clean_title(state.title.text())
             .unwrap_or_else(|| state.title.text().to_string());
         let lang = state.lang;
+        let brief_document = state.brief_document.clone();
+        let brief_answers = state.all_brief_answers();
         let Some(package) = state
             .types
             .iter()
@@ -9000,8 +9042,8 @@ impl Editor {
         match create_project_base_from_package(&path, &title, &package, lang.key()) {
             Ok(project) => match write_plan(&path, &plan) {
                 Ok(()) => {
-                    if let Some(document) = state.brief_document.as_deref() {
-                        write_project_brief(&project, document, &state.brief_answers());
+                    if let Some(document) = brief_document.as_deref() {
+                        write_project_brief(&project, document, &brief_answers);
                     }
                     match self.install_project(project, cx) {
                         Ok(()) => {
@@ -19420,6 +19462,7 @@ impl Editor {
                     NewProjectField::Title => "title",
                     NewProjectField::Prompt => "prompt",
                     NewProjectField::Brief(_) => "brief",
+                    NewProjectField::ModelQuestion(_) => "question",
                 },
                 state.text_field(state.field).caret(),
                 state.text_field(state.field).selection().start,

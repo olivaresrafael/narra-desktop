@@ -7,11 +7,17 @@
 //! what it created if a write fails. The UI must show the plan for review
 //! before calling it.
 //!
+//! The model may instead answer with up to [`MAX_QUESTIONS`] questions when
+//! the request lacks key information. That is a single bounded round: the UI
+//! collects the answers and runs the task again with
+//! [`ProjectScaffoldTask::without_questions`], so the second answer must be a
+//! file plan.
+//!
 //! Safety rules (D-044):
-//! - only relative paths under `bible/`, `structure/`, `research/`, `notes/`
-//!   or `screenplay/`, with `.md`/`.fountain` extensions;
+//! - only relative paths under the type package's `write_roots`, with the
+//!   extensions it declares (D-062);
 //! - never `.narra/`, `project.yaml`, `agents.yaml`, `AGENTS.md`,
-//!   `.gitignore`, the default screenplay or the seeded notes;
+//!   `.gitignore`, the workspace document or the seeded notes;
 //! - at most 12 files of 16 KB each; duplicate paths are rejected;
 //! - an existing file is never overwritten.
 
@@ -35,6 +41,9 @@ pub const KIND: &str = "project_scaffold";
 pub const MAX_FILES: usize = 12;
 pub const MAX_FILE_BYTES: usize = 16 * 1024;
 pub const MAX_PATH_CHARS: usize = 120;
+/// One bounded question round before the file plan.
+pub const MAX_QUESTIONS: usize = 4;
+pub const MAX_QUESTION_CHARS: usize = 300;
 /// Output budget for the plan. 2k truncated multi-file plans mid-JSON; the
 /// plan is capped at 12 files, so give the model enough room to finish the
 /// object instead of returning a parse error.
@@ -57,6 +66,7 @@ fn rules(
     roots: &[crate::project_type::WriteRoot],
     entities: &[crate::project_type::EntityDefinition],
     default_document: Option<&str>,
+    allow_questions: bool,
 ) -> String {
     let folders = roots
         .iter()
@@ -90,9 +100,25 @@ fn rules(
              fichas, notas o investigación."
         )
     });
-    format!(
+    let shape = if allow_questions {
+        format!(
+            "Devuelve SOLO un objeto JSON, con una de estas dos formas:\n\
+             {{\"files\":[{{\"path\":\"carpeta/archivo.ext\",\"content\":\"...\"}}]}}\n\
+             {{\"questions\":[{{\"id\":\"premisa\",\"question\":\"...\",\"multiline\":true}}]}}\n\
+             - Usa `files` cuando ya tienes información suficiente para proponer la base.\n\
+             - Usa `questions` solo si falta información clave (premisa, tono, \
+             protagonistas, estructura…): entre 1 y {MAX_QUESTIONS} preguntas \
+             concretas, en el idioma del proyecto, que se respondan en una o dos frases.\n\
+             - No preguntes lo que ya respondió el brief ni pidas datos personales."
+        )
+    } else {
         "Devuelve SOLO un objeto JSON con esta forma:\n\
-         {{\"files\":[{{\"path\":\"carpeta/archivo.ext\",\"content\":\"...\"}}]}}\n\
+         {\"files\":[{\"path\":\"carpeta/archivo.ext\",\"content\":\"...\"}]}\n\
+         - Ya tienes las respuestas del usuario: no devuelvas preguntas."
+            .to_string()
+    };
+    format!(
+        "{shape}\n\
          - Entre 1 y 12 archivos.\n\
          - Rutas relativas bajo estas carpetas del proyecto: {folders}; \
          extensiones permitidas: {extensions}.\n\
@@ -118,6 +144,26 @@ pub struct ScaffoldPlan {
     pub files: Vec<ScaffoldFile>,
 }
 
+/// One question the model asks before proposing the base. Questions are
+/// generated in the project language, so they carry plain text rather than a
+/// localized package label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaffoldQuestion {
+    /// Stable identifier used by the UI to match an answer.
+    pub id: String,
+    pub question: String,
+    /// The UI renders a taller input for open-ended questions.
+    #[serde(default)]
+    pub multiline: bool,
+}
+
+/// The model either asks for information or returns the file plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScaffoldResponse {
+    Questions(Vec<ScaffoldQuestion>),
+    Plan(ScaffoldPlan),
+}
+
 /// Validation/write failures. Messages name the path and never echo content.
 #[derive(Debug, Error)]
 pub enum ScaffoldError {
@@ -127,6 +173,14 @@ pub enum ScaffoldError {
     Empty,
     #[error("scaffold: more than {MAX_FILES} files")]
     TooMany,
+    #[error("scaffold: the model returned no questions")]
+    NoQuestions,
+    #[error("scaffold: more than {MAX_QUESTIONS} questions")]
+    TooManyQuestions,
+    #[error("scaffold: question {} has no text", index + 1)]
+    EmptyQuestion { index: usize },
+    #[error("scaffold: the model asked for information after it was already answered")]
+    QuestionsAfterAnswers,
     #[error("scaffold: invalid path `{path}`: {reason}")]
     InvalidPath { path: String, reason: String },
     #[error("scaffold: `{path}` is reserved and cannot be generated")]
@@ -186,6 +240,45 @@ pub fn parse_plan(
     roots: &[crate::project_type::WriteRoot],
 ) -> Result<ScaffoldPlan, ScaffoldError> {
     let value = parse_json_object(text)?;
+    plan_from_value(&value, roots)
+}
+
+/// Parse the first answer of a scaffold run: either a file plan or a bounded
+/// question round. `allow_questions` is false after the user answered, so the
+/// model cannot loop forever asking for more information.
+pub fn parse_response(
+    text: &str,
+    roots: &[crate::project_type::WriteRoot],
+    allow_questions: bool,
+) -> Result<ScaffoldResponse, ScaffoldError> {
+    let value = parse_json_object(text)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ScaffoldError::Parse("top level must be an object".to_string()))?;
+    let has_files = object.get("files").is_some_and(Value::is_array);
+    let has_questions = object.get("questions").is_some_and(Value::is_array);
+    match (has_files, has_questions) {
+        (true, true) => Err(ScaffoldError::Parse(
+            "return either `files` or `questions`, not both".to_string(),
+        )),
+        (true, false) => Ok(ScaffoldResponse::Plan(plan_from_value(&value, roots)?)),
+        (false, true) => {
+            if !allow_questions {
+                return Err(ScaffoldError::QuestionsAfterAnswers);
+            }
+            Ok(ScaffoldResponse::Questions(parse_questions(&value)?))
+        }
+        (false, false) => Err(ScaffoldError::Parse(
+            "missing `files` or `questions` array".to_string(),
+        )),
+    }
+}
+
+/// Decode and validate a file plan from an already-parsed JSON object.
+fn plan_from_value(
+    value: &Value,
+    roots: &[crate::project_type::WriteRoot],
+) -> Result<ScaffoldPlan, ScaffoldError> {
     let object = value
         .as_object()
         .ok_or_else(|| ScaffoldError::Parse("top level must be an object".to_string()))?;
@@ -230,6 +323,76 @@ pub fn parse_plan(
     Ok(plan)
 }
 
+/// Decode the question round. Unknown keys are tolerated because this payload
+/// only carries text; the bounds (count, length, unique ids) are enforced.
+fn parse_questions(value: &Value) -> Result<Vec<ScaffoldQuestion>, ScaffoldError> {
+    let questions = value
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ScaffoldError::Parse("missing `questions` array".to_string()))?;
+    if questions.is_empty() {
+        return Err(ScaffoldError::NoQuestions);
+    }
+    if questions.len() > MAX_QUESTIONS {
+        return Err(ScaffoldError::TooManyQuestions);
+    }
+    let mut seen = BTreeSet::new();
+    let mut parsed = Vec::with_capacity(questions.len());
+    for (index, item) in questions.iter().enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| ScaffoldError::Parse("each question must be an object".to_string()))?;
+        let text = object
+            .get("question")
+            .or_else(|| object.get("label"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or(ScaffoldError::EmptyQuestion { index })?;
+        let text: String = text.chars().take(MAX_QUESTION_CHARS).collect();
+        let id = unique_question_id(object.get("id").and_then(Value::as_str), index, &mut seen);
+        let multiline = object
+            .get("multiline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        parsed.push(ScaffoldQuestion {
+            id,
+            question: text,
+            multiline,
+        });
+    }
+    Ok(parsed)
+}
+
+/// Keep model-provided ids when they are simple and unique; otherwise derive
+/// a stable `q1…qN` id. The UI only needs the id to match answers.
+fn unique_question_id(raw: Option<&str>, index: usize, seen: &mut BTreeSet<String>) -> String {
+    let normalized = raw
+        .unwrap_or("")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('-').to_string();
+    let base = if normalized.is_empty() {
+        format!("q{}", index + 1)
+    } else {
+        normalized
+    };
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while !seen.insert(candidate.clone()) {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
 /// Find and decode the first usable JSON object in the model's answer.
 /// Balanced braces inside strings are ignored; prose before/after the object
 /// is skipped. Each candidate is tried as-is and then with a conservative
@@ -240,11 +403,14 @@ fn parse_json_object(text: &str) -> Result<Value, ScaffoldError> {
         let repaired = repair_json_text(&candidate);
         for attempt in [candidate.as_str(), repaired.as_str()] {
             match serde_json::from_str::<Value>(attempt) {
-                Ok(value) if value.get("files").is_some_and(Value::is_array) => {
+                Ok(value)
+                    if value.get("files").is_some_and(Value::is_array)
+                        || value.get("questions").is_some_and(Value::is_array) =>
+                {
                     return Ok(value);
                 }
                 Ok(value) if value.is_object() => {
-                    last_error = Some("missing `files` array".to_string());
+                    last_error = Some("missing `files` or `questions` array".to_string());
                 }
                 Ok(_) => {
                     last_error = Some("top level must be an object".to_string());
@@ -518,6 +684,11 @@ pub struct ProjectScaffoldTask {
     pub type_label: Option<String>,
     /// Answers from the type-declared onboarding brief.
     pub brief: Vec<(String, String)>,
+    /// Answers to the model's own questions, as `(question, answer)`.
+    pub follow_up: Vec<(String, String)>,
+    /// The first run may ask a bounded question round; the run after the
+    /// answers must return the file plan.
+    pub allow_questions: bool,
     pub role: Option<Role>,
 }
 
@@ -540,12 +711,26 @@ impl ProjectScaffoldTask {
             prompt: prompt.into(),
             type_label: None,
             brief: Vec::new(),
+            follow_up: Vec::new(),
+            allow_questions: true,
             role: None,
         }
     }
 
     pub fn with_brief(mut self, brief: Vec<(String, String)>) -> Self {
         self.brief = brief;
+        self
+    }
+
+    /// Answers to the model's questions. The next run always returns a plan.
+    pub fn with_follow_up(mut self, answers: Vec<(String, String)>) -> Self {
+        self.follow_up = answers;
+        self
+    }
+
+    /// Disable the question round for the run that follows the answers.
+    pub fn without_questions(mut self) -> Self {
+        self.allow_questions = false;
         self
     }
 
@@ -641,15 +826,27 @@ impl ProjectScaffoldTask {
                 .join("\n");
             format!("\nRESPUESTAS DEL BRIEF:\n{answers}\n")
         };
+        let follow_up = if self.follow_up.is_empty() {
+            String::new()
+        } else {
+            let answers = self
+                .follow_up
+                .iter()
+                .map(|(question, answer)| format!("- {question}: {answer}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\nRESPUESTAS A TUS PREGUNTAS:\n{answers}\n")
+        };
         let prompt = format!(
-            "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n{}",
+            "{}\n\nPROYECTO: {}\nTIPO: {}\nIDIOMA: {}\nPETICIÓN DEL USUARIO:\n{}\n{}{}",
             rules(
                 &package.write_roots,
                 &package.entities,
                 package
                     .workspace
                     .as_ref()
-                    .and_then(|workspace| workspace.default_document.as_deref())
+                    .and_then(|workspace| workspace.default_document.as_deref()),
+                self.allow_questions,
             ),
             self.title.trim(),
             self.type_label
@@ -657,7 +854,8 @@ impl ProjectScaffoldTask {
                 .unwrap_or_else(|| project_type_label(self.project_type)),
             self.language.trim(),
             self.prompt.trim(),
-            brief
+            brief,
+            follow_up
         );
         let request = ModelRequest {
             system,
@@ -689,29 +887,63 @@ impl ProjectScaffoldTask {
             model: response.model.clone(),
             output_chars: response.text.chars().count(),
         });
-        let plan = parse_plan(&response.text, &package.write_roots)
-            .map_err(|error| AgentError::Adapter(error.to_string()))?;
-        let files = plan.files.clone();
-        let data = json!({
-            "plan": plan,
-            "files": files,
-            "adapter": adapter.name(),
-            "model": response.model,
-            "role": self.role.as_ref().map(|role| role.id.as_str()),
-            "role_source": self.role.as_ref().map(|role| role.origin_key()),
-            "usage": {
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
-            },
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-        });
-        let summary = format!(
-            "Base del proyecto propuesta: {} archivos (revisión previa).",
-            data["plan"]["files"]
-                .as_array()
-                .map(Vec::len)
-                .unwrap_or_default()
-        );
+        let response_kind =
+            parse_response(&response.text, &package.write_roots, self.allow_questions)
+                .map_err(|error| AgentError::Adapter(error.to_string()))?;
+        let (data, summary) = match response_kind {
+            ScaffoldResponse::Questions(questions) => {
+                let summary = if questions.len() == 1 {
+                    "El modelo necesita 1 respuesta antes de proponer la base.".to_string()
+                } else {
+                    format!(
+                        "El modelo necesita {} respuestas antes de proponer la base.",
+                        questions.len()
+                    )
+                };
+                (
+                    json!({
+                        "questions": questions,
+                        "adapter": adapter.name(),
+                        "model": response.model,
+                        "role": self.role.as_ref().map(|role| role.id.as_str()),
+                        "role_source": self.role.as_ref().map(|role| role.origin_key()),
+                        "usage": {
+                            "input_tokens": response.input_tokens,
+                            "output_tokens": response.output_tokens,
+                        },
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                    }),
+                    summary,
+                )
+            }
+            ScaffoldResponse::Plan(plan) => {
+                let files = plan.files.clone();
+                let summary = if files.len() == 1 {
+                    "Base del proyecto propuesta: 1 archivo (revisión previa).".to_string()
+                } else {
+                    format!(
+                        "Base del proyecto propuesta: {} archivos (revisión previa).",
+                        files.len()
+                    )
+                };
+                (
+                    json!({
+                        "plan": plan,
+                        "files": files,
+                        "adapter": adapter.name(),
+                        "model": response.model,
+                        "role": self.role.as_ref().map(|role| role.id.as_str()),
+                        "role_source": self.role.as_ref().map(|role| role.origin_key()),
+                        "usage": {
+                            "input_tokens": response.input_tokens,
+                            "output_tokens": response.output_tokens,
+                        },
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                    }),
+                    summary,
+                )
+            }
+        };
         emit(TaskEvent::Completed {
             summary: summary.clone(),
         });
@@ -785,6 +1017,30 @@ mod tests {
             Ok(ModelResponse {
                 text: self.0.clone(),
                 model: "fixed".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    /// Adapter that records the last prompt and returns a fixed plan.
+    struct Capture(std::sync::Mutex<String>);
+
+    impl ModelAdapter for Capture {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        fn complete(
+            &self,
+            request: &ModelRequest,
+            _: &CancellationToken,
+        ) -> Result<ModelResponse, AgentError> {
+            *self.0.lock().expect("prompt lock") = request.prompt.clone();
+            Ok(ModelResponse {
+                text: plan_text("bible/premise.md"),
+                model: "capture".to_string(),
                 tool_calls: Vec::new(),
                 input_tokens: None,
                 output_tokens: None,
@@ -875,10 +1131,131 @@ mod tests {
                 .workspace
                 .as_ref()
                 .and_then(|workspace| workspace.default_document.as_deref()),
+            true,
         );
         assert!(text.contains("Una entidad por archivo"), "{text}");
         assert!(text.contains("Personaje → bible/characters"), "{text}");
         assert!(text.contains("workspace/main.fountain"), "{text}");
+        assert!(text.contains("\"questions\""), "{text}");
+
+        let final_round = rules(
+            &package.write_roots,
+            &package.entities,
+            package
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.default_document.as_deref()),
+            false,
+        );
+        assert!(!final_round.contains("\"questions\""), "{final_round}");
+        assert!(
+            final_round.contains("no devuelvas preguntas"),
+            "{final_round}"
+        );
+    }
+
+    #[test]
+    fn parse_response_reads_a_bounded_question_round() {
+        let text = r#"{"questions":[
+            {"id":"premise","question":"¿De qué trata la historia?","multiline":true},
+            {"id":"premise","question":"¿Quiénes son los protagonistas?"},
+            {"question":"¿Qué tono buscas?"}
+        ]}"#;
+        let response = parse_response(text, &feature_roots(), true).expect("questions");
+        let ScaffoldResponse::Questions(questions) = response else {
+            panic!("expected questions");
+        };
+        assert_eq!(questions.len(), 3);
+        assert_eq!(questions[0].id, "premise");
+        assert!(questions[0].multiline);
+        assert_eq!(questions[1].id, "premise-2");
+        assert!(!questions[1].multiline);
+        assert_eq!(questions[2].id, "q3");
+
+        let error = parse_response(text, &feature_roots(), false).expect_err("answered already");
+        assert!(
+            matches!(error, ScaffoldError::QuestionsAfterAnswers),
+            "{error}"
+        );
+
+        let plan =
+            parse_response(&plan_text("bible/premise.md"), &feature_roots(), true).expect("plan");
+        assert!(matches!(plan, ScaffoldResponse::Plan(_)));
+    }
+
+    #[test]
+    fn question_round_rejects_empty_excess_and_mixed_payloads() {
+        let empty =
+            parse_response("{\"questions\":[]}", &feature_roots(), true).expect_err("no questions");
+        assert!(matches!(empty, ScaffoldError::NoQuestions), "{empty}");
+
+        let questions: Vec<String> = (0..=MAX_QUESTIONS)
+            .map(|index| format!("{{\"question\":\"Q{index}\"}}"))
+            .collect();
+        let excess = format!("{{\"questions\":[{}]}}", questions.join(","));
+        let error = parse_response(&excess, &feature_roots(), true).expect_err("too many");
+        assert!(matches!(error, ScaffoldError::TooManyQuestions), "{error}");
+
+        let blank = "{\"questions\":[{\"id\":\"x\",\"question\":\"   \"}]}";
+        let error = parse_response(blank, &feature_roots(), true).expect_err("blank");
+        assert!(
+            matches!(error, ScaffoldError::EmptyQuestion { .. }),
+            "{error}"
+        );
+
+        let mixed = "{\"files\":[],\"questions\":[{\"question\":\"Q\"}]}";
+        let error = parse_response(mixed, &feature_roots(), true).expect_err("mixed");
+        assert!(error.to_string().contains("not both"), "{error}");
+    }
+
+    #[test]
+    fn task_returns_questions_before_the_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task = ProjectScaffoldTask::new(
+            dir.path().to_string_lossy(),
+            "Luces de Invierno",
+            ProjectType::Feature,
+            "es",
+            "Una historia de invierno.",
+        );
+        let questions = r#"{"questions":[{"id":"tone","question":"¿Qué tono buscas?"}]}"#;
+        let output = task
+            .run(&Fixed(questions.to_string()), &options(), |_| {})
+            .expect("questions");
+        assert_eq!(output.data["questions"].as_array().map(Vec::len), Some(1));
+        assert!(output.data.get("plan").is_none());
+        assert!(output.summary.contains("1 respuesta"));
+
+        let error = task
+            .clone()
+            .without_questions()
+            .run(&Fixed(questions.to_string()), &options(), |_| {})
+            .expect_err("questions after answers");
+        assert!(matches!(error, AgentError::Adapter(_)), "{error}");
+    }
+
+    #[test]
+    fn follow_up_answers_reach_the_model_and_disable_questions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adapter = Capture(std::sync::Mutex::new(String::new()));
+        let task = ProjectScaffoldTask::new(
+            dir.path().to_string_lossy(),
+            "Luces de Invierno",
+            ProjectType::Feature,
+            "es",
+            "Una historia de invierno.",
+        )
+        .with_follow_up(vec![(
+            "¿Qué tono buscas?".to_string(),
+            "Invernal.".to_string(),
+        )])
+        .without_questions();
+        task.run(&adapter, &options(), |_| {}).expect("plan");
+        let prompt = adapter.0.lock().expect("prompt lock").clone();
+        assert!(prompt.contains("RESPUESTAS A TUS PREGUNTAS"), "{prompt}");
+        assert!(prompt.contains("¿Qué tono buscas?: Invernal."), "{prompt}");
+        assert!(prompt.contains("no devuelvas preguntas"), "{prompt}");
+        assert!(!prompt.contains("\"questions\""), "{prompt}");
     }
 
     #[test]
@@ -969,7 +1346,7 @@ mod tests {
             output.data["plan"]["files"].as_array().map(Vec::len),
             Some(1)
         );
-        assert!(output.summary.contains("1 archivos"));
+        assert!(output.summary.contains("1 archivo"));
     }
 
     #[test]

@@ -461,6 +461,17 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Please answer: {question}",
         "Responde: {question}",
     ),
+    (
+        "newproject.model_questions",
+        "The model needs a little more information",
+        "El modelo necesita un poco más de información",
+    ),
+    (
+        "newproject.model_questions_hint",
+        "Answer the model's questions, then continue.",
+        "Responde las preguntas del modelo y luego continúa.",
+    ),
+    ("newproject.continue", "Continue", "Continuar"),
     ("newproject.prompt", "Prompt:", "Prompt:"),
     (
         "newproject.prompt_hint",
