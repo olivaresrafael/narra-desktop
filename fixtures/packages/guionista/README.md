@@ -7,16 +7,17 @@ toda la lógica creativa puede vivir en datos y no en Rust.
 ## Qué contiene
 
 - `type.yaml` — contrato **v2**: `format`, `workspace` (`mode: single`,
-  carpeta `guion`, documento oficial `guion/main.fountain`),
-  `content_layout`, `write_roots`, `pinned_context`, `entities`, `export`,
-  `context_actions` y secciones
+  carpeta `guion`, documento oficial `guion/main.fountain`), `brief`
+  (`notas/brief.md` y preguntas de arranque), `content_layout`,
+  `write_roots`, `pinned_context`, `entities`, `export`, `context_actions`
+  y secciones
   `agents`/`commands`/`skills`/`templates`/`instructions`.
 - `AGENTS.md` — contrato creativo superior del proyecto (se siembra en la
   raíz del proyecto nuevo).
 - `.narra/agents/<id>/AGENT.md` — cuatro agentes portables (guionista,
   editor, investigador, personaje) con frontmatter YAML (`name`,
   `description`, `mode`, `write_roots`, `skills`).
-- `.narra/commands/*.md` — ocho comandos (`/idea`, `/personaje`,
+- `.narra/commands/*.md` — nueve comandos (`/brief`, `/idea`, `/personaje`,
   `/estructura`, `/escaleta`, `/escena`, `/revisar`, `/investigar`,
   `/voz`).
 - `.narra/skills/*/SKILL.md` — nueve skills de metodología, incluidos los
